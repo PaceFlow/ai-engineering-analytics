@@ -1,6 +1,7 @@
 use anyhow::Result;
 use rusqlite::{Connection, params};
 
+use crate::change_intel::schema::init_change_intel_schema;
 use crate::events::Event;
 
 pub fn open() -> Result<Connection> {
@@ -36,6 +37,7 @@ fn init_schema(conn: &Connection) -> Result<()> {
     )?;
     // Migration: add last_updated column to existing DBs (ignored if already present)
     let _ = conn.execute_batch("ALTER TABLE events ADD COLUMN last_updated TEXT;");
+    init_change_intel_schema(conn)?;
     Ok(())
 }
 
