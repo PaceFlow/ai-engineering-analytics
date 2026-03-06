@@ -1,3 +1,4 @@
+pub mod commit_assoc;
 pub mod line_hash;
 pub mod path_resolver;
 pub mod pipeline;
