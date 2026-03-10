@@ -2,17 +2,22 @@ use anyhow::Result;
 use std::io::{IsTerminal, Write};
 
 use crate::db::{self, SessionStat};
+use crate::metrics::quality::{compute_quality_metrics, render_quality_metrics};
 
 pub fn run() -> Result<()> {
     let db = db::open()?;
     let stats = db::query_stats(&db)?;
+    let quality = compute_quality_metrics(&db)?;
 
+    let mut output = String::new();
+    output.push_str(&render_quality_metrics(&quality));
+    output.push('\n');
     if stats.is_empty() {
-        println!("No data yet. Run `vca ingest` first.");
-        return Ok(());
+        output.push_str("No session stats yet. Run `vca ingest` first.\n");
+    } else {
+        output.push('\n');
+        output.push_str(&render_stats(&stats));
     }
-
-    let output = render_stats(&stats);
 
     if std::io::stdout().is_terminal() && output.lines().count() > terminal_height() {
         pipe_to_pager(&output)

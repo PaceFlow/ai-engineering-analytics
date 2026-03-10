@@ -4,6 +4,7 @@ mod commands;
 mod db;
 mod error;
 mod events;
+mod metrics;
 mod path_utils;
 mod providers;
 
