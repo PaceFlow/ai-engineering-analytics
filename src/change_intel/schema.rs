@@ -125,6 +125,34 @@ pub fn init_change_intel_schema(conn: &Connection) -> Result<()> {
             FOREIGN KEY(commit_id) REFERENCES git_commits(id) ON DELETE CASCADE
         );
 
+        CREATE TABLE IF NOT EXISTS commit_ai_session_attributions (
+            commit_id       INTEGER NOT NULL,
+            algo_version    TEXT    NOT NULL,
+            provider        TEXT    NOT NULL,
+            session_id      TEXT    NOT NULL,
+            matched_lines   REAL    NOT NULL,
+            share_of_commit REAL    NOT NULL,
+            share_of_ai     REAL    NOT NULL,
+            computed_at     TEXT DEFAULT (datetime('now')),
+            PRIMARY KEY(commit_id, algo_version, provider, session_id),
+            FOREIGN KEY(commit_id) REFERENCES git_commits(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS commit_task_attributions (
+            commit_id       INTEGER NOT NULL,
+            algo_version    TEXT    NOT NULL,
+            branch_name     TEXT    NOT NULL,
+            task_key        TEXT    NOT NULL,
+            source          TEXT    NOT NULL,
+            is_fallback     INTEGER NOT NULL,
+            candidate_count INTEGER NOT NULL,
+            distance_to_tip INTEGER,
+            confidence      REAL    NOT NULL,
+            computed_at     TEXT DEFAULT (datetime('now')),
+            PRIMARY KEY(commit_id, algo_version),
+            FOREIGN KEY(commit_id) REFERENCES git_commits(id) ON DELETE CASCADE
+        );
+
         CREATE TABLE IF NOT EXISTS commit_assoc_cursors (
             repo_root       TEXT NOT NULL,
             branch_scope    TEXT NOT NULL,
@@ -169,7 +197,16 @@ pub fn init_change_intel_schema(conn: &Connection) -> Result<()> {
             ON git_commit_line_hashes(side, line_hash);
 
         CREATE INDEX IF NOT EXISTS idx_commit_ai_share_heavy
-            ON commit_ai_attributions(ai_share, heavy_ai);",
+            ON commit_ai_attributions(ai_share, heavy_ai);
+
+        CREATE INDEX IF NOT EXISTS idx_commit_ai_session_provider_session
+            ON commit_ai_session_attributions(provider, session_id);
+
+        CREATE INDEX IF NOT EXISTS idx_commit_task_task_key
+            ON commit_task_attributions(task_key);
+
+        CREATE INDEX IF NOT EXISTS idx_commit_task_branch_name
+            ON commit_task_attributions(branch_name);",
     )?;
 
     Ok(())

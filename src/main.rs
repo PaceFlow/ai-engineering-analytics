@@ -17,6 +17,7 @@ fn main() -> anyhow::Result<()> {
         Commands::Ingest(args) => commands::ingest::run(args.with_code_changes, cli.verbose)?,
         Commands::AssociateCommits(args) => commands::associate_commits::run(args, cli.verbose)?,
         Commands::Stats => commands::stats::run()?,
+        Commands::TaskStats(args) => commands::task_stats::run(args)?,
     }
     Ok(())
 }

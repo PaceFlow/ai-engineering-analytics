@@ -84,6 +84,21 @@ struct SessionTurn {
     assistant_text: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct SessionKey {
+    provider: String,
+    session_id: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionQualitySignals {
+    pub provider: String,
+    pub session_id: String,
+    pub user_turns: i64,
+    pub debug_loop: bool,
+    pub mid_session_error_paste: bool,
+}
+
 #[derive(Debug, Clone)]
 struct CandidateCommit {
     commit_id: i64,
@@ -263,6 +278,41 @@ pub fn compute_quality_metrics(conn: &Connection) -> Result<QualityMetricsReport
     })
 }
 
+pub fn compute_session_quality_signals(conn: &Connection) -> Result<Vec<SessionQualitySignals>> {
+    let sessions = load_session_messages(conn)?;
+    let mut out = Vec::new();
+
+    for (session, messages) in sessions {
+        let turns = build_session_turns(&messages);
+        if turns.is_empty() {
+            continue;
+        }
+
+        let user_turns = turns
+            .iter()
+            .filter(|turn| !turn.user_text.trim().is_empty())
+            .count() as i64;
+        if user_turns <= 0 {
+            continue;
+        }
+
+        out.push(SessionQualitySignals {
+            provider: session.provider,
+            session_id: session.session_id,
+            user_turns,
+            debug_loop: is_debug_loop_session(&turns),
+            mid_session_error_paste: has_mid_session_error_paste(&messages),
+        });
+    }
+
+    out.sort_by(|a, b| {
+        a.provider
+            .cmp(&b.provider)
+            .then_with(|| a.session_id.cmp(&b.session_id))
+    });
+    Ok(out)
+}
+
 pub fn render_quality_metrics(report: &QualityMetricsReport) -> String {
     let mut out = String::new();
     out.push_str("AI Quality Metrics (heavy commits only)\n");
@@ -360,31 +410,20 @@ fn shorten_repo(path: &str) -> String {
 }
 
 fn compute_s4_debug_loop_metric(conn: &Connection) -> Result<RatioMetric> {
-    let sessions = load_session_messages(conn)?;
-    let mut total_sessions = 0i64;
-    let mut debug_loop_sessions = 0i64;
-
-    for messages in sessions.values() {
-        let turns = build_session_turns(messages);
-        if turns.is_empty() {
-            continue;
-        }
-        total_sessions += 1;
-        if is_debug_loop_session(&turns) {
-            debug_loop_sessions += 1;
-        }
-    }
+    let sessions = compute_session_quality_signals(conn)?;
+    let total_sessions = sessions.len() as i64;
+    let debug_loop_sessions = sessions.iter().filter(|s| s.debug_loop).count() as i64;
 
     Ok(make_lower_better(debug_loop_sessions, total_sessions, 20.0, 40.0))
 }
 
-fn load_session_messages(conn: &Connection) -> Result<BTreeMap<String, Vec<SessionMessage>>> {
+fn load_session_messages(conn: &Connection) -> Result<BTreeMap<SessionKey, Vec<SessionMessage>>> {
     let mut stmt = conn.prepare(
-        "SELECT session_id, role, content
+        "SELECT provider, session_id, role, content
          FROM events
          WHERE event_type = 'message'
            AND role IN ('user', 'assistant')
-         ORDER BY session_id, COALESCE(event_ts, session_started_at), id",
+         ORDER BY provider, session_id, COALESCE(event_ts, session_started_at), id",
     )?;
 
     let rows = stmt.query_map([], |r| {
@@ -392,14 +431,18 @@ fn load_session_messages(conn: &Connection) -> Result<BTreeMap<String, Vec<Sessi
             r.get::<_, String>(0)?,
             r.get::<_, String>(1)?,
             r.get::<_, String>(2)?,
+            r.get::<_, String>(3)?,
         ))
     })?;
 
-    let mut sessions: BTreeMap<String, Vec<SessionMessage>> = BTreeMap::new();
+    let mut sessions: BTreeMap<SessionKey, Vec<SessionMessage>> = BTreeMap::new();
     for row in rows {
-        let (session_id, role, content) = row?;
+        let (provider, session_id, role, content) = row?;
         sessions
-            .entry(session_id)
+            .entry(SessionKey {
+                provider,
+                session_id,
+            })
             .or_default()
             .push(SessionMessage { role, content });
     }
@@ -440,6 +483,91 @@ fn build_session_turns(messages: &[SessionMessage]) -> Vec<SessionTurn> {
     }
 
     turns
+}
+
+fn has_mid_session_error_paste(messages: &[SessionMessage]) -> bool {
+    let mut user_message_index = 0usize;
+
+    for message in messages {
+        if message.role != "user" {
+            continue;
+        }
+
+        user_message_index += 1;
+        if user_message_index <= 1 {
+            continue;
+        }
+
+        if contains_error_paste_signal(&message.content) {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn contains_error_paste_signal(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+
+    const STRONG_MARKERS: [&str; 17] = [
+        "traceback (most recent call last):",
+        "error ts",
+        "typeerror:",
+        "referenceerror:",
+        "syntaxerror:",
+        "runtimeerror:",
+        "cannot find module",
+        "module not found",
+        "build failed",
+        "test failed",
+        "tests failed",
+        "compilation failed",
+        "failed with exit code",
+        "panic:",
+        "assertionerror",
+        "exception:",
+        "stack trace",
+    ];
+    if STRONG_MARKERS.iter().any(|marker| lower.contains(marker)) {
+        return true;
+    }
+
+    if lower.contains("error[") || lower.contains("error:") || lower.contains("traceback") {
+        return true;
+    }
+
+    if lower.contains(" failed")
+        && (lower.contains("test")
+            || lower.contains("build")
+            || lower.contains("compile")
+            || lower.contains("lint"))
+    {
+        return true;
+    }
+
+    contains_numbered_errors(&lower)
+}
+
+fn contains_numbered_errors(lower: &str) -> bool {
+    let mut tokens = lower.split_whitespace().peekable();
+    while let Some(token) = tokens.next() {
+        let numeric = token
+            .trim_matches(|c: char| !c.is_ascii_digit())
+            .parse::<usize>()
+            .ok();
+        if numeric.is_none() {
+            continue;
+        }
+
+        let Some(next) = tokens.peek() else {
+            break;
+        };
+        let next_clean = next.trim_matches(|c: char| !c.is_ascii_alphabetic());
+        if next_clean == "error" || next_clean == "errors" {
+            return true;
+        }
+    }
+    false
 }
 
 fn is_debug_loop_session(turns: &[SessionTurn]) -> bool {

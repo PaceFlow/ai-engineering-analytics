@@ -70,18 +70,3 @@ pub fn strip_file_scheme(uri: &str) -> String {
         uri.to_string()
     }
 }
-
-pub fn find_project_root(path: &str) -> String {
-    let p = Path::new(path);
-    let start = if p.extension().is_some() {
-        p.parent().unwrap_or(p)
-    } else {
-        p
-    };
-
-    if let Some(root) = detect_repo_root(start) {
-        return root.to_string_lossy().into_owned();
-    }
-
-    start.to_string_lossy().into_owned()
-}

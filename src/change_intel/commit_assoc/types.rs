@@ -92,3 +92,23 @@ pub struct ProviderAttributionRow {
     pub share_of_commit: f64,
     pub share_of_ai: f64,
 }
+
+#[derive(Debug, Clone)]
+pub struct SessionAttributionRow {
+    pub provider: String,
+    pub session_id: String,
+    pub matched_lines: f64,
+    pub share_of_commit: f64,
+    pub share_of_ai: f64,
+}
+
+#[derive(Debug, Clone)]
+pub struct CommitTaskAttribution {
+    pub branch_name: String,
+    pub task_key: String,
+    pub source: String,
+    pub is_fallback: bool,
+    pub candidate_count: i64,
+    pub distance_to_tip: Option<i64>,
+    pub confidence: f64,
+}

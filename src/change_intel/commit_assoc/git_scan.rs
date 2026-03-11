@@ -109,6 +109,120 @@ pub fn list_commits_range(
     list_from_rev_list(repo_root, &args)
 }
 
+pub fn list_local_head_branches(repo_root: &str) -> Result<Vec<String>> {
+    let out = run_git_capture(
+        repo_root,
+        &[
+            "for-each-ref".to_string(),
+            "--format=%(refname:short)".to_string(),
+            "refs/heads".to_string(),
+        ],
+    )?;
+    Ok(out
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(ToOwned::to_owned)
+        .collect())
+}
+
+pub fn branches_containing_commit(repo_root: &str, commit_sha: &str) -> Result<Vec<String>> {
+    let out = run_git_capture(
+        repo_root,
+        &[
+            "for-each-ref".to_string(),
+            "--contains".to_string(),
+            commit_sha.to_string(),
+            "--format=%(refname:short)".to_string(),
+            "refs/heads".to_string(),
+        ],
+    )?;
+    Ok(out
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(ToOwned::to_owned)
+        .collect())
+}
+
+pub fn distance_to_branch_tip(repo_root: &str, commit_sha: &str, branch: &str) -> Result<i64> {
+    let out = run_git_capture(
+        repo_root,
+        &[
+            "rev-list".to_string(),
+            "--count".to_string(),
+            format!("{commit_sha}..{branch}"),
+        ],
+    )?;
+
+    let count_raw = out.trim();
+    count_raw
+        .parse::<i64>()
+        .map_err(|e| anyhow!("failed to parse rev-list count '{count_raw}': {e}"))
+}
+
+pub fn merge_base(repo_root: &str, left: &str, right: &str) -> Result<Option<String>> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .arg("merge-base")
+        .arg(left)
+        .arg(right)
+        .output()?;
+
+    if output.status.success() {
+        let mb = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if mb.is_empty() {
+            return Ok(None);
+        }
+        return Ok(Some(mb));
+    }
+
+    if output.status.code() == Some(1) {
+        return Ok(None);
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    Err(anyhow!("git merge-base {left} {right} failed: {stderr}"))
+}
+
+pub fn first_parent_distance(repo_root: &str, from_exclusive: &str, to_inclusive: &str) -> Result<i64> {
+    let out = run_git_capture(
+        repo_root,
+        &[
+            "rev-list".to_string(),
+            "--count".to_string(),
+            "--first-parent".to_string(),
+            format!("{from_exclusive}..{to_inclusive}"),
+        ],
+    )?;
+    let raw = out.trim();
+    raw.parse::<i64>()
+        .map_err(|e| anyhow!("failed to parse first-parent distance '{raw}': {e}"))
+}
+
+pub fn first_parent_commits_range(
+    repo_root: &str,
+    from_exclusive: &str,
+    to_inclusive: &str,
+) -> Result<Vec<String>> {
+    let out = run_git_capture(
+        repo_root,
+        &[
+            "rev-list".to_string(),
+            "--reverse".to_string(),
+            "--first-parent".to_string(),
+            format!("{from_exclusive}..{to_inclusive}"),
+        ],
+    )?;
+    Ok(out
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(ToOwned::to_owned)
+        .collect())
+}
+
 pub fn load_commit_metadata(
     repo_root: &str,
     commit_sha: &str,

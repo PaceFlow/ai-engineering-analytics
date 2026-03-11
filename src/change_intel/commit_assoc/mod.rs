@@ -6,6 +6,7 @@ use std::path::PathBuf;
 
 pub mod git_scan;
 pub mod matcher;
+pub mod task_matcher;
 pub mod storage;
 pub mod types;
 
@@ -14,9 +15,11 @@ use git_scan::{
     load_commit_metadata, validate_git_repo,
 };
 use matcher::compute_commit_attribution;
+use task_matcher::{RepoBranchContext, attribute_commit_to_task, load_repo_branch_context};
 use storage::{
     branch_scope_head, get_commit_cursor, insert_commit_assoc_error, list_repo_roots_from_change_ops,
-    min_ai_timestamp, upsert_commit_attribution, upsert_commit_cursor, upsert_git_commit_with_diffs,
+    min_ai_timestamp, upsert_commit_attribution, upsert_commit_cursor,
+    upsert_commit_task_attribution, upsert_git_commit_with_diffs,
 };
 use types::{AssociationSummary, RepoSummary, RunOptions};
 
@@ -69,6 +72,19 @@ pub fn run(conn: &Connection, options: RunOptions, verbose: bool) -> Result<Asso
         }
 
         summary.repos_processed += 1;
+        let branch_ctx = match load_repo_branch_context(&repo_root) {
+            Ok(v) => v,
+            Err(e) => {
+                insert_commit_assoc_error(
+                    conn,
+                    &repo_root,
+                    None,
+                    "load_repo_branches",
+                    &e.to_string(),
+                )?;
+                RepoBranchContext::default()
+            }
+        };
 
         let Some(ai_min_ts) = min_ai_timestamp(conn, &repo_root)? else {
             summary.repo_summaries.push(repo_summary);
@@ -134,7 +150,7 @@ pub fn run(conn: &Connection, options: RunOptions, verbose: bool) -> Result<Asso
                 }
             };
 
-            let (attribution, provider_rows) =
+            let (attribution, provider_rows, session_rows) =
                 match compute_commit_attribution(conn, &repo_root, commit_id) {
                     Ok(v) => v,
                     Err(e) => {
@@ -151,7 +167,13 @@ pub fn run(conn: &Connection, options: RunOptions, verbose: bool) -> Result<Asso
                     }
                 };
 
-            if let Err(e) = upsert_commit_attribution(conn, commit_id, &attribution, &provider_rows)
+            if let Err(e) = upsert_commit_attribution(
+                conn,
+                commit_id,
+                &attribution,
+                &provider_rows,
+                &session_rows,
+            )
             {
                 repo_summary.errors += 1;
                 summary.errors += 1;
@@ -163,6 +185,43 @@ pub fn run(conn: &Connection, options: RunOptions, verbose: bool) -> Result<Asso
                     &e.to_string(),
                 )?;
                 continue;
+            }
+
+            match attribute_commit_to_task(&repo_root, &commit.commit_sha, &branch_ctx) {
+                Ok(task_attr) => {
+                    if let Err(e) = upsert_commit_task_attribution(conn, commit_id, &task_attr) {
+                        repo_summary.errors += 1;
+                        summary.errors += 1;
+                        insert_commit_assoc_error(
+                            conn,
+                            &repo_root,
+                            Some(&commit_sha),
+                            "persist_task_attribution",
+                            &e.to_string(),
+                        )?;
+                    } else if verbose {
+                        eprintln!(
+                            "[commit-task] {} {} branch={} task={} fallback={} confidence={:.2}",
+                            repo_root,
+                            commit.commit_sha,
+                            task_attr.branch_name,
+                            task_attr.task_key,
+                            task_attr.is_fallback,
+                            task_attr.confidence
+                        );
+                    }
+                }
+                Err(e) => {
+                    repo_summary.errors += 1;
+                    summary.errors += 1;
+                    insert_commit_assoc_error(
+                        conn,
+                        &repo_root,
+                        Some(&commit_sha),
+                        "compute_task_attribution",
+                        &e.to_string(),
+                    )?;
+                }
             }
 
             if verbose {

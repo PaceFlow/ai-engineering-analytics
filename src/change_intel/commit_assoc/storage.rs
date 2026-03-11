@@ -2,10 +2,14 @@ use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension, params};
 
 use super::matcher::ALGO_VERSION;
-use super::types::{CommitAttribution, CommitCursor, GitCommitDiff, ProviderAttributionRow};
+use super::types::{
+    CommitAttribution, CommitCursor, CommitTaskAttribution, GitCommitDiff, ProviderAttributionRow,
+    SessionAttributionRow,
+};
 
 const BRANCH_SCOPE_HEAD: &str = "head";
 const WINDOW_DAYS_UNUSED: i64 = 0;
+pub const TASK_ALGO_VERSION: &str = "task_assoc_v1";
 
 pub fn branch_scope_head() -> &'static str {
     BRANCH_SCOPE_HEAD
@@ -172,6 +176,7 @@ pub fn upsert_commit_attribution(
     commit_id: i64,
     attribution: &CommitAttribution,
     provider_rows: &[ProviderAttributionRow],
+    session_rows: &[SessionAttributionRow],
 ) -> Result<()> {
     conn.execute(
         "INSERT INTO commit_ai_attributions (
@@ -222,6 +227,63 @@ pub fn upsert_commit_attribution(
         )?;
     }
 
+    conn.execute(
+        "DELETE FROM commit_ai_session_attributions
+         WHERE commit_id = ?1 AND algo_version = ?2",
+        params![commit_id, ALGO_VERSION],
+    )?;
+
+    for row in session_rows {
+        conn.execute(
+            "INSERT INTO commit_ai_session_attributions (
+                commit_id, algo_version, provider, session_id, matched_lines, share_of_commit, share_of_ai
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                commit_id,
+                ALGO_VERSION,
+                row.provider,
+                row.session_id,
+                row.matched_lines,
+                row.share_of_commit,
+                row.share_of_ai
+            ],
+        )?;
+    }
+
+    Ok(())
+}
+
+pub fn upsert_commit_task_attribution(
+    conn: &Connection,
+    commit_id: i64,
+    task: &CommitTaskAttribution,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO commit_task_attributions (
+            commit_id, algo_version, branch_name, task_key, source, is_fallback,
+            candidate_count, distance_to_tip, confidence
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+         ON CONFLICT(commit_id, algo_version) DO UPDATE SET
+            branch_name = excluded.branch_name,
+            task_key = excluded.task_key,
+            source = excluded.source,
+            is_fallback = excluded.is_fallback,
+            candidate_count = excluded.candidate_count,
+            distance_to_tip = excluded.distance_to_tip,
+            confidence = excluded.confidence,
+            computed_at = datetime('now')",
+        params![
+            commit_id,
+            TASK_ALGO_VERSION,
+            task.branch_name,
+            task.task_key,
+            task.source,
+            task.is_fallback as i64,
+            task.candidate_count,
+            task.distance_to_tip,
+            task.confidence
+        ],
+    )?;
     Ok(())
 }
 

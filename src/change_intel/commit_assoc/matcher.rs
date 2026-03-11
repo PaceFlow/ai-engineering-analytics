@@ -2,7 +2,9 @@ use anyhow::Result;
 use rusqlite::{Connection, params};
 use std::collections::HashMap;
 
-use super::types::{CommitAttribution, CommitHashRow, ProviderAttributionRow};
+use super::types::{
+    CommitAttribution, CommitHashRow, ProviderAttributionRow, SessionAttributionRow,
+};
 
 pub const ALGO_VERSION: &str = "commit_assoc_v1";
 const FALLBACK_STRICT_WEAK_RATIO: f64 = 0.20;
@@ -15,6 +17,7 @@ struct PathMatch {
     matched_added: i64,
     matched_removed: i64,
     provider_matched: HashMap<String, f64>,
+    session_matched: HashMap<(String, String), f64>,
 }
 
 impl PathMatch {
@@ -30,11 +33,22 @@ struct FileCommitRows {
     total_lines: i64,
 }
 
+#[derive(Debug, Clone)]
+struct SessionAvailability {
+    provider: String,
+    session_id: String,
+    avail: i64,
+}
+
 pub fn compute_commit_attribution(
     conn: &Connection,
     repo_root: &str,
     commit_id: i64,
-) -> Result<(CommitAttribution, Vec<ProviderAttributionRow>)> {
+) -> Result<(
+    CommitAttribution,
+    Vec<ProviderAttributionRow>,
+    Vec<SessionAttributionRow>,
+)> {
     let (total_added, total_removed) = load_commit_totals(conn, commit_id)?;
     let commit_total = total_added + total_removed;
 
@@ -43,16 +57,17 @@ pub fn compute_commit_attribution(
     let mut matched_added = 0i64;
     let mut matched_removed = 0i64;
     let mut provider_matched: HashMap<String, f64> = HashMap::new();
+    let mut session_matched: HashMap<(String, String), f64> = HashMap::new();
 
     let mut availability_stmt = conn.prepare(
-        "SELECT co.provider, MAX(hol.count) AS avail
+        "SELECT co.provider, co.session_id, MAX(hol.count) AS avail
          FROM change_ops co
          JOIN change_op_line_hashes hol ON hol.op_id = co.id
          WHERE co.repo_root = ?1
            AND co.rel_path = ?2
            AND hol.side = ?3
            AND hol.line_hash = ?4
-         GROUP BY co.provider",
+         GROUP BY co.provider, co.session_id",
     )?;
     let mut fallback_candidates_stmt = conn.prepare(
         "SELECT co.rel_path, MAX(hol.count) AS avail
@@ -111,6 +126,9 @@ pub fn compute_commit_attribution(
         for (provider, lines) in selected.provider_matched {
             *provider_matched.entry(provider).or_insert(0.0) += lines;
         }
+        for (session_key, lines) in selected.session_matched {
+            *session_matched.entry(session_key).or_insert(0.0) += lines;
+        }
     }
 
     let matched_total = matched_added + matched_removed;
@@ -140,6 +158,30 @@ pub fn compute_commit_attribution(
         .collect();
     provider_rows.sort_by(|a, b| a.provider.cmp(&b.provider));
 
+    let mut session_rows: Vec<SessionAttributionRow> = session_matched
+        .iter()
+        .map(|((provider, session_id), matched_lines)| SessionAttributionRow {
+            provider: provider.clone(),
+            session_id: session_id.clone(),
+            matched_lines: *matched_lines,
+            share_of_commit: if commit_total > 0 {
+                *matched_lines / commit_total as f64
+            } else {
+                0.0
+            },
+            share_of_ai: if matched_total > 0 {
+                *matched_lines / matched_total as f64
+            } else {
+                0.0
+            },
+        })
+        .collect();
+    session_rows.sort_by(|a, b| {
+        a.provider
+            .cmp(&b.provider)
+            .then_with(|| a.session_id.cmp(&b.session_id))
+    });
+
     Ok((
         CommitAttribution {
             commit_total_lines: commit_total,
@@ -150,6 +192,7 @@ pub fn compute_commit_attribution(
             heavy_ai,
         },
         provider_rows,
+        session_rows,
     ))
 }
 
@@ -216,7 +259,7 @@ fn evaluate_file_match_for_path(
     let mut out = PathMatch::default();
 
     for row in rows {
-        let avail = load_provider_availability(
+        let avail = load_session_availability(
             availability_stmt,
             repo_root,
             target_path,
@@ -227,7 +270,7 @@ fn evaluate_file_match_for_path(
             continue;
         }
 
-        let avail_total: i64 = avail.values().sum();
+        let avail_total: i64 = avail.iter().map(|a| a.avail).sum();
         if avail_total <= 0 {
             continue;
         }
@@ -245,9 +288,14 @@ fn evaluate_file_match_for_path(
 
         let matched_f = matched as f64;
         let avail_total_f = avail_total as f64;
-        for (provider, provider_avail) in avail {
-            let contribution = matched_f * (provider_avail as f64 / avail_total_f);
-            *out.provider_matched.entry(provider).or_insert(0.0) += contribution;
+        for availability in avail {
+            let contribution = matched_f * (availability.avail as f64 / avail_total_f);
+            *out.provider_matched
+                .entry(availability.provider.clone())
+                .or_insert(0.0) += contribution;
+            *out.session_matched
+                .entry((availability.provider, availability.session_id))
+                .or_insert(0.0) += contribution;
         }
     }
 
@@ -335,22 +383,27 @@ fn basename(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
 }
 
-fn load_provider_availability(
+fn load_session_availability(
     stmt: &mut rusqlite::Statement<'_>,
     repo_root: &str,
     rel_path: &str,
     side: &str,
     line_hash: &str,
-) -> Result<HashMap<String, i64>> {
+) -> Result<Vec<SessionAvailability>> {
     let rows = stmt.query_map(
         params![repo_root, rel_path, side, line_hash],
-        |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
+        |r| {
+            Ok(SessionAvailability {
+                provider: r.get::<_, String>(0)?,
+                session_id: r.get::<_, String>(1)?,
+                avail: r.get::<_, i64>(2)?,
+            })
+        },
     )?;
 
-    let mut out = HashMap::new();
+    let mut out = Vec::new();
     for row in rows {
-        let (provider, avail) = row?;
-        out.insert(provider, avail);
+        out.push(row?);
     }
     Ok(out)
 }
