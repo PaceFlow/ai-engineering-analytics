@@ -4,7 +4,7 @@ use clap::{Args, Parser, Subcommand};
 #[command(
     name = "vca",
     about = "Vibe coding analytics for AI-assisted development sessions",
-    after_help = "Quick start:\n  vca ingest --with-code-changes\n  vca associate-commits --repo /absolute/repo/path\n  vca task-stats --limit 20\n  vca stats\n\nDiscover options:\n  vca --help\n  vca <command> --help"
+    after_help = "Quick start:\n  vca ingest\n  vca associate-commits --repo /absolute/repo/path\n  vca task-stats --limit 20\n  vca stats\n\nDiscover options:\n  vca --help\n  vca <command> --help"
 )]
 pub struct Cli {
     #[arg(short, long, global = true)]
@@ -15,21 +15,14 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Commands {
-    /// Ingest conversation data from all providers into the local DB
-    Ingest(IngestArgs),
+    /// Ingest conversation and code-change data from all providers into the local DB
+    Ingest,
     /// Associate git commits with AI-generated code via line-hash matching
     AssociateCommits(AssociateCommitsArgs),
     /// Show global quality metrics and per-session productivity stats
     Stats,
     /// Show per-task quality metrics (S2, S4, S6, S9) and change size vs staging
     TaskStats(TaskStatsArgs),
-}
-
-#[derive(Args, Debug, Clone)]
-pub struct IngestArgs {
-    /// Also ingest code-change hashes for later git-diff matching
-    #[arg(long)]
-    pub with_code_changes: bool,
 }
 
 #[derive(Args, Debug, Clone)]

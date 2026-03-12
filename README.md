@@ -23,7 +23,7 @@ vca stats --help
 1. Ingest session and code-change events.
 
 ```bash
-vca ingest --with-code-changes
+vca ingest
 ```
 
 2. Associate AI-attributed commits for the target repo.
