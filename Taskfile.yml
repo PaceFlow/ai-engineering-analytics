@@ -1,0 +1,38 @@
+version: "3"
+
+tasks:
+  install-profiler:
+    desc: Install samply for recording a fresh process and viewing it in a browser
+    cmds:
+      - cargo install samply --locked
+
+  install-live-profiler:
+    desc: Install Linux perf tooling for live terminal profiling on Ubuntu/WSL
+    cmds:
+      - sudo apt-get update
+      - sudo apt-get install -y linux-tools-common linux-tools-generic
+
+  build-release:
+    desc: Build the release binary with profiling-friendly project settings
+    cmds:
+      - cargo build --release
+
+  profile:
+    desc: "Profile the release binary with samply. Example: task profile -- ingest"
+    deps:
+      - build-release
+    cmds:
+      - samply record ./target/release/vca {{.CLI_ARGS}}
+
+  profile-live:
+    desc: "Attach perf top to an existing PID and watch live samples in the terminal. Example: task profile-live PID=12345"
+    requires:
+      vars: [PID]
+    cmds:
+      - |
+        PERF_BIN="$(find /usr/lib/linux-tools -type f -name perf 2>/dev/null | sort -V | tail -n1)"
+        if [ -z "$PERF_BIN" ]; then
+          echo "No perf binary found under /usr/lib/linux-tools. Run: task install-live-profiler" >&2
+          exit 1
+        fi
+        exec "$PERF_BIN" top -p {{.PID}} -g --call-graph fp
