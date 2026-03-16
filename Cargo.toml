@@ -20,5 +20,10 @@ chrono = { version = "0.4.44", features = ["serde"] }
 similar = "2"
 terminal_size = "0.4"
 
+[dev-dependencies]
+assert_cmd = "2.1.1"
+insta = { version = "1.43.2", features = ["yaml"] }
+tempfile = "3.23.0"
+
 [profile.release]
 debug = "line-tables-only"

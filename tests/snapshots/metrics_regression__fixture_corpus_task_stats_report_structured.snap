@@ -1,0 +1,16 @@
+---
+source: tests/metrics_regression.rs
+expression: parse_task_stats_report(&task_stats)?
+---
+task_rows:
+  - task: PAC-999
+    branch: codex/PAC-999-task-stat...
+    commits: "1"
+    sessions_with_signals: "1"
+    sessions_total: "1"
+    s2_avg: "15.00"
+    s4_loop: 0.0%
+    s6_mid_error: 100.0%
+    s9_4h: 100.0%
+    vs_staging: +2/-0
+    grade: Warning

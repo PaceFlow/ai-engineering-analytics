@@ -1,0 +1,23 @@
+---
+source: tests/metrics_regression.rs
+expression: stats
+---
+AI Quality Metrics (heavy commits only)
+Sample floor for status: 20
+
+L4 Revert Rate                         0.00% (0/5)  [Insufficient data]  Healthy <2% | Warning >5%
+C2 Merge Rate (git proxy, squash-aware)  80.00% (4/5)  [Insufficient data]  Healthy >80% | Warning <60%
+L1 Code Churn Rate (14d, mainline-only)   1.98% (101/5097)  [Healthy]  Healthy <15% | Warning >30%
+S4 Debug Loop Rate                     0.00% (0/3)  [Insufficient data]  Healthy <20% | Warning >40%
+
+Per-repo breakdown
+Repo                                      Heavy   L4(rev/den)           C2(merged/den)        L1(churn/den)
+────────────────────────────────────────  ─────  ────────────────────  ────────────────────  ────────────────────
+~/work/fixture-vca                            5  0.0% (0/5) Insufficient data  80.0% (4/5) Insufficient data  2.0% (101/5097) Healthy
+
+
+Provider  Session   Project                Last active          LOC   +Lines   -Lines  Words/LOC
+────────  ────────  ─────────────────────  ────────────────  ──────  ───────  ───────  ─────────
+codex     019cd678  ~/work/fixture-vca     2026-03-10T06:39       0        0        0        N/A
+cursor    b052dae4  ~/work/fixture-cursor  2026-03-05T07:03     262      144      118        0.1
+codex     019cb311  ~/work/fixture-vca     2026-03-03T09:40    3855     3855        0        2.9
