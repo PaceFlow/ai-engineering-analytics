@@ -29,10 +29,12 @@ pub fn run(args: SessionReportArgs) -> Result<()> {
 fn render_session_report(rows: &[analytics::SessionReportRow], args: &SessionReportArgs) -> String {
     let mut out = String::new();
     out.push_str("Session Metrics\n");
-    out.push_str("S2 = average user prompts per session\n");
-    out.push_str("S4 = debug-loop session rate\n");
-    out.push_str("S6 = mid-session error-paste rate\n");
-    out.push_str("S9 = session-to-commit rate (session end + 4h)\n\n");
+    out.push_str("Average user prompts = average user prompts per session\n");
+    out.push_str("Avg time to first accepted change = minutes from session start to first accepted code change\n");
+    out.push_str("Debug loop rate = debug-loop session rate\n");
+    out.push_str("Error paste rate = mid-session error-paste rate\n");
+    out.push_str("Session-to-commit rate = session end + 4h commit rate\n");
+    out.push_str("No-output session rate = sessions with no accepted code changes\n\n");
 
     if rows.is_empty() {
         out.push_str("No session rows found. Run `vca ingest` first.\n");
@@ -42,13 +44,27 @@ fn render_session_report(rows: &[analytics::SessionReportRow], args: &SessionRep
     if !args.report.weekly && args.report.group_by.is_none() {
         let row = &rows[0];
         out.push_str(&format!("Sessions: {}\n", row.session_count));
-        out.push_str(&format!("S2 Re-Prompt Avg: {}\n", fmt_opt_decimal(row.s2_avg, 2)));
         out.push_str(&format!(
-            "S4 Debug Loop Rate: {}\n",
+            "Average User Prompts: {}\n",
+            fmt_opt_decimal(row.s2_avg, 2)
+        ));
+        out.push_str(&format!(
+            "Avg Time to First Accepted Change (min): {}\n",
+            fmt_opt_decimal(row.avg_minutes_to_first_accepted_change, 2)
+        ));
+        out.push_str(&format!(
+            "Debug Loop Rate: {}\n",
             fmt_ratio(&row.debug_loop_rate, 2)
         ));
-        out.push_str(&format!("S6 Error Paste Rate: {}\n", fmt_ratio(&row.s6_rate, 2)));
-        out.push_str(&format!("S9 Session-to-Commit Rate: {}\n", fmt_ratio(&row.s9_rate, 2)));
+        out.push_str(&format!("Error Paste Rate: {}\n", fmt_ratio(&row.s6_rate, 2)));
+        out.push_str(&format!(
+            "Session-to-Commit Rate: {}\n",
+            fmt_ratio(&row.s9_rate, 2)
+        ));
+        out.push_str(&format!(
+            "No-Output Session Rate: {}\n",
+            fmt_ratio(&row.no_output_session_rate, 2)
+        ));
         return out;
     }
 
@@ -66,10 +82,12 @@ fn render_session_report(rows: &[analytics::SessionReportRow], args: &SessionRep
         headers.push(format!("{:<26}", "Branch"));
     }
     headers.push(format!("{:>8}", "Sessions"));
-    headers.push(format!("{:>10}", "S2(avg)"));
-    headers.push(format!("{:>14}", "S4(loop)"));
-    headers.push(format!("{:>14}", "S6(error)"));
-    headers.push(format!("{:>14}", "S9(4h)"));
+    headers.push(format!("{:>10}", "Prompts"));
+    headers.push(format!("{:>11}", "First Chg"));
+    headers.push(format!("{:>14}", "Loop"));
+    headers.push(format!("{:>14}", "Error"));
+    headers.push(format!("{:>14}", "To Commit"));
+    headers.push(format!("{:>14}", "No Output"));
     out.push_str(&format!("{}\n", headers.join("  ")));
 
     for row in rows {
@@ -86,11 +104,19 @@ fn render_session_report(rows: &[analytics::SessionReportRow], args: &SessionRep
         cols.push(format!("{:>8}", row.session_count));
         cols.push(format!("{:>10}", fmt_opt_decimal(row.s2_avg, 2)));
         cols.push(format!(
+            "{:>11}",
+            fmt_opt_decimal(row.avg_minutes_to_first_accepted_change, 1)
+        ));
+        cols.push(format!(
             "{:>14}",
             fmt_ratio_percent(&row.debug_loop_rate, 1)
         ));
         cols.push(format!("{:>14}", fmt_ratio_percent(&row.s6_rate, 1)));
         cols.push(format!("{:>14}", fmt_ratio_percent(&row.s9_rate, 1)));
+        cols.push(format!(
+            "{:>14}",
+            fmt_ratio_percent(&row.no_output_session_rate, 1)
+        ));
         out.push_str(&format!("{}\n", cols.join("  ")));
     }
 

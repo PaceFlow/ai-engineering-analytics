@@ -54,9 +54,11 @@ pub struct SessionReportRow {
     pub branch_name: Option<String>,
     pub session_count: i64,
     pub s2_avg: Option<f64>,
+    pub avg_minutes_to_first_accepted_change: Option<f64>,
     pub debug_loop_rate: RatioMetric,
     pub s6_rate: RatioMetric,
     pub s9_rate: RatioMetric,
+    pub no_output_session_rate: RatioMetric,
 }
 
 #[derive(Debug, Clone)]
@@ -464,6 +466,28 @@ pub fn create_reporting_views(conn: &Connection) -> Result<()> {
          DROP VIEW IF EXISTS view_session_productivity;
          
          CREATE VIEW view_session_metrics_base AS
+         WITH session_change_summary AS (
+             SELECT
+                 provider,
+                 session_id,
+                 MIN(
+                     CASE
+                         WHEN change_ts IS NOT NULL
+                          AND source_kind IN ('accepted_change', 'tool_write')
+                          AND (lines_added > 0 OR lines_removed > 0)
+                         THEN change_ts
+                     END
+                 ) AS first_accepted_change_at,
+                 MAX(
+                     CASE
+                         WHEN source_kind IN ('accepted_change', 'tool_write')
+                          AND (lines_added > 0 OR lines_removed > 0)
+                         THEN 1 ELSE 0
+                     END
+                 ) AS accepted_output_flag
+             FROM fact_session_code_change
+             GROUP BY provider, session_id
+         )
          SELECT
              sq.provider,
              sq.session_id,
@@ -477,6 +501,13 @@ pub fn create_reporting_views(conn: &Connection) -> Result<()> {
              sq.user_turn_count,
              sq.debug_loop_flag,
              sq.mid_session_error_paste_flag,
+             COALESCE(scs.accepted_output_flag, 0) AS accepted_output_flag,
+             scs.first_accepted_change_at,
+             CASE
+                 WHEN COALESCE(sq.started_at, ep.started_at) IS NOT NULL
+                  AND scs.first_accepted_change_at IS NOT NULL
+                 THEN (julianday(scs.first_accepted_change_at) - julianday(COALESCE(sq.started_at, ep.started_at))) * 24.0 * 60.0
+             END AS minutes_to_first_accepted_change,
              CASE
                  WHEN EXISTS (
                      SELECT 1
@@ -496,6 +527,9 @@ pub fn create_reporting_views(conn: &Connection) -> Result<()> {
          LEFT JOIN event_session_productivity ep
            ON ep.provider = sq.provider
           AND ep.session_id = sq.session_id
+         LEFT JOIN session_change_summary scs
+           ON scs.provider = sq.provider
+          AND scs.session_id = sq.session_id
          LEFT JOIN metadata_sessions ms
            ON ms.provider = sq.provider
           AND ms.session_id = sq.session_id
@@ -503,6 +537,28 @@ pub fn create_reporting_views(conn: &Connection) -> Result<()> {
            ON mm.id = ms.model_id;
 
          CREATE VIEW view_task_session_metrics_base AS
+         WITH session_change_summary AS (
+             SELECT
+                 provider,
+                 session_id,
+                 MIN(
+                     CASE
+                         WHEN change_ts IS NOT NULL
+                          AND source_kind IN ('accepted_change', 'tool_write')
+                          AND (lines_added > 0 OR lines_removed > 0)
+                         THEN change_ts
+                     END
+                 ) AS first_accepted_change_at,
+                 MAX(
+                     CASE
+                         WHEN source_kind IN ('accepted_change', 'tool_write')
+                          AND (lines_added > 0 OR lines_removed > 0)
+                         THEN 1 ELSE 0
+                     END
+                 ) AS accepted_output_flag
+             FROM fact_session_code_change
+             GROUP BY provider, session_id
+         )
          SELECT
              ts.repo_root,
              ts.task_key,
@@ -519,11 +575,21 @@ pub fn create_reporting_views(conn: &Connection) -> Result<()> {
              ts.user_turn_count,
              ts.debug_loop_flag,
              ts.mid_session_error_paste_flag,
+             COALESCE(scs.accepted_output_flag, 0) AS accepted_output_flag,
+             scs.first_accepted_change_at,
+             CASE
+                 WHEN ms.started_at IS NOT NULL
+                  AND scs.first_accepted_change_at IS NOT NULL
+                 THEN (julianday(scs.first_accepted_change_at) - julianday(ms.started_at)) * 24.0 * 60.0
+             END AS minutes_to_first_accepted_change,
              ts.commit_within_window_flag
          FROM event_task_session ts
          LEFT JOIN metadata_sessions ms
            ON ms.provider = ts.provider
           AND ms.session_id = ts.session_id
+         LEFT JOIN session_change_summary scs
+           ON scs.provider = ts.provider
+          AND scs.session_id = ts.session_id
          LEFT JOIN metadata_models mm
            ON mm.id = ms.model_id;
 
@@ -704,6 +770,10 @@ pub fn query_session_report(conn: &Connection, args: &ReportArgs) -> Result<Vec<
              NULLIF(SUM(CASE WHEN user_turn_count IS NOT NULL THEN {weight} ELSE 0 END), 0) AS s2_avg"
         ));
         select.push(format!(
+            "SUM(CASE WHEN minutes_to_first_accepted_change IS NOT NULL THEN {weight} * minutes_to_first_accepted_change ELSE 0 END) /
+             NULLIF(SUM(CASE WHEN minutes_to_first_accepted_change IS NOT NULL THEN {weight} ELSE 0 END), 0) AS time_to_first_accept_avg"
+        ));
+        select.push(format!(
             "CAST(ROUND(SUM(CASE WHEN debug_loop_flag = 1 THEN {weight} ELSE 0 END), 0) AS INTEGER) AS s4_n"
         ));
         select.push(format!(
@@ -721,15 +791,30 @@ pub fn query_session_report(conn: &Connection, args: &ReportArgs) -> Result<Vec<
         select.push(format!(
             "CAST(ROUND(SUM(CASE WHEN commit_within_window_flag IS NOT NULL THEN {weight} ELSE 0 END), 0) AS INTEGER) AS s9_d"
         ));
+        select.push(format!(
+            "CAST(ROUND(SUM(CASE WHEN user_turn_count IS NOT NULL AND accepted_output_flag = 0 THEN {weight} ELSE 0 END), 0) AS INTEGER) AS no_output_n"
+        ));
+        select.push(format!(
+            "CAST(ROUND(SUM(CASE WHEN user_turn_count IS NOT NULL THEN {weight} ELSE 0 END), 0) AS INTEGER) AS no_output_d"
+        ));
     } else {
         select.push("COUNT(*) AS session_count".to_string());
         select.push("AVG(CASE WHEN user_turn_count IS NOT NULL THEN CAST(user_turn_count AS REAL) END) AS s2_avg".to_string());
+        select.push(
+            "AVG(CASE WHEN minutes_to_first_accepted_change IS NOT NULL THEN CAST(minutes_to_first_accepted_change AS REAL) END) AS time_to_first_accept_avg"
+                .to_string(),
+        );
         select.push("COALESCE(SUM(CASE WHEN debug_loop_flag = 1 THEN 1 ELSE 0 END), 0) AS s4_n".to_string());
         select.push("COUNT(CASE WHEN debug_loop_flag IS NOT NULL THEN 1 END) AS s4_d".to_string());
         select.push("COALESCE(SUM(CASE WHEN mid_session_error_paste_flag = 1 THEN 1 ELSE 0 END), 0) AS s6_n".to_string());
         select.push("COUNT(CASE WHEN mid_session_error_paste_flag IS NOT NULL THEN 1 END) AS s6_d".to_string());
         select.push("COALESCE(SUM(CASE WHEN session_commit_within_4h_flag = 1 THEN 1 ELSE 0 END), 0) AS s9_n".to_string());
         select.push("COUNT(CASE WHEN session_commit_within_4h_flag IS NOT NULL THEN 1 END) AS s9_d".to_string());
+        select.push(
+            "COALESCE(SUM(CASE WHEN user_turn_count IS NOT NULL AND accepted_output_flag = 0 THEN 1 ELSE 0 END), 0) AS no_output_n"
+                .to_string(),
+        );
+        select.push("COUNT(CASE WHEN user_turn_count IS NOT NULL THEN 1 END) AS no_output_d".to_string());
     }
 
     let mut sql = format!("SELECT {} FROM {}", select.join(", "), source);
@@ -738,12 +823,15 @@ pub fn query_session_report(conn: &Connection, args: &ReportArgs) -> Result<Vec<
         sql.push_str(" WHERE ");
         sql.push_str(&conditions.join(" AND "));
     }
+    let apply_sql_limit = !group.is_empty() && !matches!(args.group_by, Some(GroupBy::Task));
     if !group.is_empty() {
         sql.push_str(" GROUP BY ");
         sql.push_str(&group.join(", "));
         sql.push_str(" ORDER BY ");
         sql.push_str(&group.join(", "));
-        sql.push_str(&format!(" LIMIT {}", args.limit.max(1)));
+        if apply_sql_limit {
+            sql.push_str(&format!(" LIMIT {}", args.limit.max(1)));
+        }
     }
 
     let mut stmt = conn.prepare(&sql)?;
@@ -754,9 +842,11 @@ pub fn query_session_report(conn: &Connection, args: &ReportArgs) -> Result<Vec<
             branch_name: row.get(2)?,
             session_count: row.get(3)?,
             s2_avg: row.get(4)?,
-            debug_loop_rate: ratio_metric(row.get(5)?, row.get(6)?),
-            s6_rate: ratio_metric(row.get(7)?, row.get(8)?),
-            s9_rate: ratio_metric(row.get(9)?, row.get(10)?),
+            avg_minutes_to_first_accepted_change: row.get(5)?,
+            debug_loop_rate: ratio_metric(row.get(6)?, row.get(7)?),
+            s6_rate: ratio_metric(row.get(8)?, row.get(9)?),
+            s9_rate: ratio_metric(row.get(10)?, row.get(11)?),
+            no_output_session_rate: ratio_metric(row.get(12)?, row.get(13)?),
         })
     })?;
     let mut out = Vec::new();
@@ -766,6 +856,9 @@ pub fn query_session_report(conn: &Connection, args: &ReportArgs) -> Result<Vec<
             continue;
         }
         out.push(row);
+        if matches!(args.group_by, Some(GroupBy::Task)) && out.len() >= args.limit.max(1) {
+            break;
+        }
     }
     Ok(out)
 }
@@ -833,12 +926,15 @@ pub fn query_change_report(conn: &Connection, args: &ReportArgs) -> Result<Vec<C
         sql.push_str(" WHERE ");
         sql.push_str(&conditions.join(" AND "));
     }
+    let apply_sql_limit = !group.is_empty() && !matches!(args.group_by, Some(GroupBy::Task));
     if !group.is_empty() {
         sql.push_str(" GROUP BY ");
         sql.push_str(&group.join(", "));
         sql.push_str(" ORDER BY ");
         sql.push_str(&group.join(", "));
-        sql.push_str(&format!(" LIMIT {}", args.limit.max(1)));
+        if apply_sql_limit {
+            sql.push_str(&format!(" LIMIT {}", args.limit.max(1)));
+        }
     }
 
     let mut stmt = conn.prepare(&sql)?;
@@ -860,6 +956,9 @@ pub fn query_change_report(conn: &Connection, args: &ReportArgs) -> Result<Vec<C
             continue;
         }
         out.push(row);
+        if matches!(args.group_by, Some(GroupBy::Task)) && out.len() >= args.limit.max(1) {
+            break;
+        }
     }
     Ok(out)
 }
@@ -923,12 +1022,15 @@ pub fn query_lifecycle_report(conn: &Connection, args: &ReportArgs) -> Result<Ve
         sql.push_str(" WHERE ");
         sql.push_str(&conditions.join(" AND "));
     }
+    let apply_sql_limit = !group.is_empty() && !matches!(args.group_by, Some(GroupBy::Task));
     if !group.is_empty() {
         sql.push_str(" GROUP BY ");
         sql.push_str(&group.join(", "));
         sql.push_str(" ORDER BY ");
         sql.push_str(&group.join(", "));
-        sql.push_str(&format!(" LIMIT {}", args.limit.max(1)));
+        if apply_sql_limit {
+            sql.push_str(&format!(" LIMIT {}", args.limit.max(1)));
+        }
     }
 
     let mut stmt = conn.prepare(&sql)?;
@@ -949,6 +1051,9 @@ pub fn query_lifecycle_report(conn: &Connection, args: &ReportArgs) -> Result<Ve
             continue;
         }
         out.push(row);
+        if matches!(args.group_by, Some(GroupBy::Task)) && out.len() >= args.limit.max(1) {
+            break;
+        }
     }
     Ok(out)
 }
@@ -2734,6 +2839,184 @@ mod tests {
         assert_eq!(row[0].s6_rate.denominator, 3);
         assert_eq!(row[0].s9_rate.numerator, 2);
         assert_eq!(row[0].s9_rate.denominator, 3);
+        assert_eq!(row[0].avg_minutes_to_first_accepted_change, None);
+        assert_eq!(row[0].no_output_session_rate.numerator, 3);
+        assert_eq!(row[0].no_output_session_rate.denominator, 3);
+        Ok(())
+    }
+
+    #[test]
+    fn task_grouped_change_and_lifecycle_reports_apply_limit_after_task_filtering() -> Result<()> {
+        let conn = open_test_db()?;
+        conn.execute(
+            "INSERT INTO event_task_commit (
+                repo_root, task_key, branch_name, commit_sha, fallback_flag, confidence, commit_time
+             ) VALUES
+                ('/tmp/repo', '(unknown)', '(unknown)', 'junk1', 1, 0.5, '2026-03-17T09:00:00Z'),
+                ('/tmp/repo', 'main', 'main', 'junk2', 1, 0.5, '2026-03-17T09:01:00Z'),
+                ('/tmp/repo', 'PAC-1', 'PAC-1-branch', 'good1', 0, 1.0, '2026-03-17T09:02:00Z')",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO event_commit_outcome (
+                repo_root, commit_sha, commit_time, heavy_ai_flag, merged_to_mainline_flag,
+                reverted_later_flag, total_matched_ai_lines, commit_total_changed_lines
+             ) VALUES
+                ('/tmp/repo', 'junk1', '2026-03-17T09:00:00Z', 0, 0, 0, 0, 10),
+                ('/tmp/repo', 'junk2', '2026-03-17T09:01:00Z', 0, 1, 0, 0, 12),
+                ('/tmp/repo', 'good1', '2026-03-17T09:02:00Z', 1, 1, 0, 8, 16)",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO event_commit_churn (
+                repo_root, commit_sha, ai_added_lines_reaching_mainline,
+                ai_added_lines_removed_within_window, churn_window_days
+             ) VALUES
+                ('/tmp/repo', 'junk1', 0, 0, 14),
+                ('/tmp/repo', 'junk2', 0, 0, 14),
+                ('/tmp/repo', 'good1', 10, 2, 14)",
+            [],
+        )?;
+
+        create_reporting_views(&conn)?;
+
+        let args = ReportArgs {
+            weekly: false,
+            group_by: Some(GroupBy::Task),
+            from: None,
+            to: None,
+            repo: None,
+            provider: None,
+            task: None,
+            model: None,
+            limit: 1,
+        };
+
+        let change_rows = query_change_report(&conn, &args)?;
+        assert_eq!(change_rows.len(), 1);
+        assert_eq!(change_rows[0].group_value.as_deref(), Some("PAC-1"));
+        assert_eq!(change_rows[0].branch_name.as_deref(), Some("PAC-1-branch"));
+
+        let lifecycle_rows = query_lifecycle_report(&conn, &args)?;
+        assert_eq!(lifecycle_rows.len(), 1);
+        assert_eq!(lifecycle_rows[0].group_value.as_deref(), Some("PAC-1"));
+        assert_eq!(lifecycle_rows[0].branch_name.as_deref(), Some("PAC-1-branch"));
+        Ok(())
+    }
+
+    #[test]
+    fn session_report_computes_time_to_first_accepted_change_and_no_output_rate() -> Result<()> {
+        let conn = open_test_db()?;
+        upsert_metadata_session_with_model(
+            &conn,
+            "codex",
+            "s1",
+            Some("/tmp/repo"),
+            Some("2026-03-17T09:00:00Z"),
+            Some("2026-03-17T09:30:00Z"),
+            None,
+            Some("openai"),
+            Some("gpt-5"),
+        )?;
+        upsert_metadata_session(
+            &conn,
+            "cursor",
+            "s2",
+            Some("/tmp/repo"),
+            Some("2026-03-17T09:10:00Z"),
+            Some("2026-03-17T09:45:00Z"),
+            None,
+        )?;
+        conn.execute(
+            "INSERT INTO event_session_quality (
+                provider, session_id, repo_root, started_at, ended_at, user_turn_count, debug_loop_flag, mid_session_error_paste_flag
+             ) VALUES
+                ('codex', 's1', '/tmp/repo', '2026-03-17T09:00:00Z', '2026-03-17T09:30:00Z', 4, 0, 0),
+                ('cursor', 's2', '/tmp/repo', '2026-03-17T09:10:00Z', '2026-03-17T09:45:00Z', 2, 0, 0)",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO fact_session_code_change (
+                provider, session_id, change_ts, repo_root, rel_path, lines_added, lines_removed, source_kind, call_id, op_index
+             ) VALUES
+                ('codex', 's1', '2026-03-17T09:05:00Z', '/tmp/repo', 'src/lib.rs', 5, 0, 'tool_write', 'call-1', 0)",
+            [],
+        )?;
+
+        create_reporting_views(&conn)?;
+        let rows = query_session_report(
+            &conn,
+            &ReportArgs {
+                weekly: false,
+                group_by: None,
+                from: None,
+                to: None,
+                repo: None,
+                provider: None,
+                task: None,
+                model: None,
+                limit: 50,
+            },
+        )?;
+
+        assert_eq!(rows.len(), 1);
+        assert!(
+            rows[0]
+                .avg_minutes_to_first_accepted_change
+                .map(|value| (value - 5.0).abs() < 0.001)
+                .unwrap_or(false)
+        );
+        assert_eq!(rows[0].no_output_session_rate.numerator, 1);
+        assert_eq!(rows[0].no_output_session_rate.denominator, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn session_report_excludes_missing_change_timestamps_from_first_change_average() -> Result<()> {
+        let conn = open_test_db()?;
+        upsert_metadata_session(
+            &conn,
+            "codex",
+            "s1",
+            Some("/tmp/repo"),
+            Some("2026-03-17T09:00:00Z"),
+            Some("2026-03-17T09:30:00Z"),
+            None,
+        )?;
+        conn.execute(
+            "INSERT INTO event_session_quality (
+                provider, session_id, repo_root, started_at, ended_at, user_turn_count, debug_loop_flag, mid_session_error_paste_flag
+             ) VALUES ('codex', 's1', '/tmp/repo', '2026-03-17T09:00:00Z', '2026-03-17T09:30:00Z', 4, 0, 0)",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO fact_session_code_change (
+                provider, session_id, change_ts, repo_root, rel_path, lines_added, lines_removed, source_kind, call_id, op_index
+             ) VALUES
+                ('codex', 's1', NULL, '/tmp/repo', 'src/lib.rs', 5, 0, 'tool_write', 'call-1', 0)",
+            [],
+        )?;
+
+        create_reporting_views(&conn)?;
+        let rows = query_session_report(
+            &conn,
+            &ReportArgs {
+                weekly: false,
+                group_by: None,
+                from: None,
+                to: None,
+                repo: None,
+                provider: None,
+                task: None,
+                model: None,
+                limit: 50,
+            },
+        )?;
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].avg_minutes_to_first_accepted_change, None);
+        assert_eq!(rows[0].no_output_session_rate.numerator, 0);
+        assert_eq!(rows[0].no_output_session_rate.denominator, 1);
         Ok(())
     }
 

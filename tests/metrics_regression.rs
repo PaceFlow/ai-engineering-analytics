@@ -23,10 +23,12 @@ struct TestEnv {
 #[derive(Debug, Serialize, PartialEq, Eq)]
 struct SessionSummarySnapshot {
     sessions: String,
-    s2_avg: String,
+    average_user_prompts: String,
+    avg_time_to_first_accepted_change_minutes: String,
     debug_loop_rate: String,
     s6_rate: String,
     s9_rate: String,
+    no_output_session_rate: String,
 }
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
@@ -378,10 +380,15 @@ fn run_command(cmd: &mut Command) -> anyhow::Result<()> {
 fn parse_session_summary(output: &str) -> anyhow::Result<SessionSummarySnapshot> {
     Ok(SessionSummarySnapshot {
         sessions: line_value(output, "Sessions: ")?,
-        s2_avg: line_value(output, "S2 Re-Prompt Avg: ")?,
-        debug_loop_rate: line_value(output, "S4 Debug Loop Rate: ")?,
-        s6_rate: line_value(output, "S6 Error Paste Rate: ")?,
-        s9_rate: line_value(output, "S9 Session-to-Commit Rate: ")?,
+        average_user_prompts: line_value(output, "Average User Prompts: ")?,
+        avg_time_to_first_accepted_change_minutes: line_value(
+            output,
+            "Avg Time to First Accepted Change (min): ",
+        )?,
+        debug_loop_rate: line_value(output, "Debug Loop Rate: ")?,
+        s6_rate: line_value(output, "Error Paste Rate: ")?,
+        s9_rate: line_value(output, "Session-to-Commit Rate: ")?,
+        no_output_session_rate: line_value(output, "No-Output Session Rate: ")?,
     })
 }
 

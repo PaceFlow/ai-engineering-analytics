@@ -3,13 +3,17 @@ source: tests/metrics_regression.rs
 expression: session
 ---
 Session Metrics
-S2 = average user prompts per session
-S4 = debug-loop session rate
-S6 = mid-session error-paste rate
-S9 = session-to-commit rate (session end + 4h)
+Average user prompts = average user prompts per session
+Avg time to first accepted change = minutes from session start to first accepted code change
+Debug loop rate = debug-loop session rate
+Error paste rate = mid-session error-paste rate
+Session-to-commit rate = session end + 4h commit rate
+No-output session rate = sessions with no accepted code changes
 
 Sessions: 3
-S2 Re-Prompt Avg: 44.33
-S4 Debug Loop Rate: 0.00% (0/3)
-S6 Error Paste Rate: 66.67% (2/3)
-S9 Session-to-Commit Rate: 66.67% (2/3)
+Average User Prompts: 44.33
+Avg Time to First Accepted Change (min): 213.58
+Debug Loop Rate: 0.00% (0/3)
+Error Paste Rate: 66.67% (2/3)
+Session-to-Commit Rate: 66.67% (2/3)
+No-Output Session Rate: 0.00% (0/3)

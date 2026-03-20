@@ -3,12 +3,14 @@ source: tests/metrics_regression.rs
 expression: session_weekly
 ---
 Session Metrics
-S2 = average user prompts per session
-S4 = debug-loop session rate
-S6 = mid-session error-paste rate
-S9 = session-to-commit rate (session end + 4h)
+Average user prompts = average user prompts per session
+Avg time to first accepted change = minutes from session start to first accepted code change
+Debug loop rate = debug-loop session rate
+Error paste rate = mid-session error-paste rate
+Session-to-commit rate = session end + 4h commit rate
+No-output session rate = sessions with no accepted code changes
 
-Week        Group                         Sessions     S2(avg)        S4(loop)       S6(error)          S9(4h)
-2026-03-02  codex                                1      117.00            0.0%          100.0%          100.0%
-2026-03-02  cursor                               1        1.00            0.0%            0.0%            0.0%
-2026-03-09  codex                                1       15.00            0.0%          100.0%          100.0%
+Week        Group                         Sessions     Prompts    First Chg            Loop           Error       To Commit       No Output
+2026-03-02  codex                                1      117.00        342.5            0.0%          100.0%          100.0%            0.0%
+2026-03-02  cursor                               1        1.00          0.0            0.0%            0.0%            0.0%            0.0%
+2026-03-09  codex                                1       15.00        298.3            0.0%          100.0%          100.0%            0.0%
