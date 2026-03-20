@@ -1,16 +1,18 @@
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use rusqlite::{Connection, params};
 use std::collections::HashMap;
 
-use super::types::{
-    CommitAttribution, CommitHashRow, ProviderAttributionRow, SessionAttributionRow,
-};
+use crate::change_intel::types::LineSide;
 
-pub const ALGO_VERSION: &str = "commit_assoc_v1";
+use super::types::{CommitAttribution, GitCommitDiff, SessionAttributionRow};
+
 const FALLBACK_STRICT_WEAK_RATIO: f64 = 0.20;
 const FALLBACK_MIN_RATIO: f64 = 0.80;
 const FALLBACK_MIN_MATCHED_LINES: i64 = 30;
 const FALLBACK_WINNER_MARGIN: f64 = 0.20;
+
+type SessionAvailabilityKey = (String, LineSide, String);
+type AliasCandidateKey = (LineSide, String);
 
 #[derive(Debug, Default)]
 struct PathMatch {
@@ -27,6 +29,13 @@ impl PathMatch {
 }
 
 #[derive(Debug)]
+struct CommitHashRow {
+    side: LineSide,
+    line_hash: String,
+    count: i64,
+}
+
+#[derive(Debug)]
 struct FileCommitRows {
     rel_path: String,
     rows: Vec<CommitHashRow>,
@@ -40,54 +49,56 @@ struct SessionAvailability {
     avail: i64,
 }
 
-pub fn compute_commit_attribution(
-    conn: &Connection,
-    repo_root: &str,
-    commit_id: i64,
-) -> Result<(
-    CommitAttribution,
-    Vec<ProviderAttributionRow>,
-    Vec<SessionAttributionRow>,
-)> {
-    let (total_added, total_removed) = load_commit_totals(conn, commit_id)?;
-    let commit_total = total_added + total_removed;
+#[derive(Debug, Default)]
+pub struct RepoMatchPreload {
+    session_availability: HashMap<SessionAvailabilityKey, Vec<SessionAvailability>>,
+    alias_candidates: HashMap<AliasCandidateKey, Vec<(String, i64)>>,
+}
 
-    let rows = load_commit_hash_rows(conn, commit_id)?;
-    let files = group_commit_rows_by_path(rows);
+impl RepoMatchPreload {
+    fn session_availability_for(
+        &self,
+        rel_path: &str,
+        side: LineSide,
+        line_hash: &str,
+    ) -> &[SessionAvailability] {
+        self.session_availability
+            .get(&(rel_path.to_string(), side, line_hash.to_string()))
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    fn alias_candidates_for(&self, side: LineSide, line_hash: &str) -> &[(String, i64)] {
+        self.alias_candidates
+            .get(&(side, line_hash.to_string()))
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+}
+
+pub fn preload_repo_match_data(conn: &Connection, repo_root: &str) -> Result<RepoMatchPreload> {
+    Ok(RepoMatchPreload {
+        session_availability: load_session_availability_map(conn, repo_root)?,
+        alias_candidates: load_alias_candidate_map(conn, repo_root)?,
+    })
+}
+
+pub fn compute_commit_attribution(
+    commit: &GitCommitDiff,
+    preload: &RepoMatchPreload,
+) -> Result<(CommitAttribution, Vec<SessionAttributionRow>)> {
+    let total_added: i64 = commit.file_diffs.iter().map(|file| file.added_lines).sum();
+    let total_removed: i64 = commit.file_diffs.iter().map(|file| file.removed_lines).sum();
+    let commit_total = total_added + total_removed;
+    let files = build_commit_files(commit);
+
     let mut matched_added = 0i64;
     let mut matched_removed = 0i64;
     let mut provider_matched: HashMap<String, f64> = HashMap::new();
     let mut session_matched: HashMap<(String, String), f64> = HashMap::new();
 
-    let mut availability_stmt = conn.prepare(
-        "SELECT co.provider, co.session_id, MAX(hol.count) AS avail
-         FROM change_ops co
-         JOIN change_op_line_hashes hol ON hol.op_id = co.id
-         WHERE co.repo_root = ?1
-           AND co.rel_path = ?2
-           AND hol.side = ?3
-           AND hol.line_hash = ?4
-         GROUP BY co.provider, co.session_id",
-    )?;
-    let mut fallback_candidates_stmt = conn.prepare(
-        "SELECT co.rel_path, MAX(hol.count) AS avail
-         FROM change_ops co
-         JOIN change_op_line_hashes hol ON hol.op_id = co.id
-         WHERE co.repo_root = ?1
-           AND co.rel_path IS NOT NULL
-           AND hol.side = ?2
-           AND hol.line_hash = ?3
-         GROUP BY co.rel_path",
-    )?;
-
     for file in files {
-        let strict_match = evaluate_file_match_for_path(
-            &mut availability_stmt,
-            repo_root,
-            &file.rel_path,
-            &file.rows,
-        )?;
-
+        let strict_match = evaluate_file_match_for_path(preload, &file.rel_path, &file.rows);
         let strict_ratio = if file.total_lines > 0 {
             strict_match.matched_total() as f64 / file.total_lines as f64
         } else {
@@ -95,20 +106,10 @@ pub fn compute_commit_attribution(
         };
 
         let selected = if strict_ratio < FALLBACK_STRICT_WEAK_RATIO {
-            if let Some(alias_path) = choose_fallback_alias_path(
-                &mut fallback_candidates_stmt,
-                repo_root,
-                &file.rel_path,
-                &file.rows,
-                file.total_lines,
-            )? {
-                let alias_match = evaluate_file_match_for_path(
-                    &mut availability_stmt,
-                    repo_root,
-                    &alias_path,
-                    &file.rows,
-                )?;
-
+            if let Some(alias_path) =
+                choose_fallback_alias_path(preload, &file.rel_path, &file.rows, file.total_lines)
+            {
+                let alias_match = evaluate_file_match_for_path(preload, &alias_path, &file.rows);
                 if alias_match.matched_total() > strict_match.matched_total() {
                     alias_match
                 } else {
@@ -139,25 +140,6 @@ pub fn compute_commit_attribution(
     };
     let heavy_ai = ai_share >= 0.5;
 
-    let mut provider_rows: Vec<ProviderAttributionRow> = provider_matched
-        .iter()
-        .map(|(provider, matched_lines)| ProviderAttributionRow {
-            provider: provider.clone(),
-            matched_lines: *matched_lines,
-            share_of_commit: if commit_total > 0 {
-                *matched_lines / commit_total as f64
-            } else {
-                0.0
-            },
-            share_of_ai: if matched_total > 0 {
-                *matched_lines / matched_total as f64
-            } else {
-                0.0
-            },
-        })
-        .collect();
-    provider_rows.sort_by(|a, b| a.provider.cmp(&b.provider));
-
     let mut session_rows: Vec<SessionAttributionRow> = session_matched
         .iter()
         .map(|((provider, session_id), matched_lines)| SessionAttributionRow {
@@ -184,63 +166,33 @@ pub fn compute_commit_attribution(
 
     Ok((
         CommitAttribution {
-            commit_total_lines: commit_total,
             matched_total_lines: matched_total,
             matched_added_lines: matched_added,
             matched_removed_lines: matched_removed,
             ai_share,
             heavy_ai,
         },
-        provider_rows,
         session_rows,
     ))
 }
 
-fn load_commit_totals(conn: &Connection, commit_id: i64) -> Result<(i64, i64)> {
-    let row = conn.query_row(
-        "SELECT total_added, total_removed FROM git_commits WHERE id = ?1",
-        params![commit_id],
-        |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
-    )?;
-    Ok(row)
-}
-
-fn load_commit_hash_rows(conn: &Connection, commit_id: i64) -> Result<Vec<CommitHashRow>> {
-    let mut stmt = conn.prepare(
-        "SELECT f.rel_path, h.side, h.line_hash, h.count
-         FROM git_commit_file_diffs f
-         JOIN git_commit_line_hashes h ON h.file_diff_id = f.id
-         WHERE f.commit_id = ?1",
-    )?;
-
-    let rows = stmt.query_map(params![commit_id], |r| {
-        Ok(CommitHashRow {
-            rel_path: r.get(0)?,
-            side: r.get(1)?,
-            line_hash: r.get(2)?,
-            count: r.get(3)?,
-        })
-    })?;
-
-    let mut out = Vec::new();
-    for row in rows {
-        out.push(row?);
-    }
-    Ok(out)
-}
-
-fn group_commit_rows_by_path(rows: Vec<CommitHashRow>) -> Vec<FileCommitRows> {
-    let mut grouped: HashMap<String, Vec<CommitHashRow>> = HashMap::new();
-    for row in rows {
-        grouped.entry(row.rel_path.clone()).or_default().push(row);
-    }
-
-    let mut files: Vec<FileCommitRows> = grouped
-        .into_iter()
-        .map(|(rel_path, rows)| {
-            let total_lines = rows.iter().map(|r| r.count).sum();
+fn build_commit_files(commit: &GitCommitDiff) -> Vec<FileCommitRows> {
+    let mut files: Vec<FileCommitRows> = commit
+        .file_diffs
+        .iter()
+        .map(|file| {
+            let rows: Vec<CommitHashRow> = file
+                .line_hashes
+                .iter()
+                .map(|line_hash| CommitHashRow {
+                    side: line_hash.side,
+                    line_hash: line_hash.line_hash.clone(),
+                    count: line_hash.count,
+                })
+                .collect();
+            let total_lines = rows.iter().map(|row| row.count).sum();
             FileCommitRows {
-                rel_path,
+                rel_path: file.rel_path.clone(),
                 rows,
                 total_lines,
             }
@@ -251,21 +203,14 @@ fn group_commit_rows_by_path(rows: Vec<CommitHashRow>) -> Vec<FileCommitRows> {
 }
 
 fn evaluate_file_match_for_path(
-    availability_stmt: &mut rusqlite::Statement<'_>,
-    repo_root: &str,
+    preload: &RepoMatchPreload,
     target_path: &str,
     rows: &[CommitHashRow],
-) -> Result<PathMatch> {
+) -> PathMatch {
     let mut out = PathMatch::default();
 
     for row in rows {
-        let avail = load_session_availability(
-            availability_stmt,
-            repo_root,
-            target_path,
-            &row.side,
-            &row.line_hash,
-        )?;
+        let avail = preload.session_availability_for(target_path, row.side, &row.line_hash);
         if avail.is_empty() {
             continue;
         }
@@ -280,10 +225,9 @@ fn evaluate_file_match_for_path(
             continue;
         }
 
-        if row.side == "+" {
-            out.matched_added += matched;
-        } else if row.side == "-" {
-            out.matched_removed += matched;
+        match row.side {
+            LineSide::Added => out.matched_added += matched,
+            LineSide::Removed => out.matched_removed += matched,
         }
 
         let matched_f = matched as f64;
@@ -294,47 +238,39 @@ fn evaluate_file_match_for_path(
                 .entry(availability.provider.clone())
                 .or_insert(0.0) += contribution;
             *out.session_matched
-                .entry((availability.provider, availability.session_id))
+                .entry((availability.provider.clone(), availability.session_id.clone()))
                 .or_insert(0.0) += contribution;
         }
     }
 
-    Ok(out)
+    out
 }
 
 fn choose_fallback_alias_path(
-    fallback_stmt: &mut rusqlite::Statement<'_>,
-    repo_root: &str,
+    preload: &RepoMatchPreload,
     strict_path: &str,
     rows: &[CommitHashRow],
     file_total_lines: i64,
-) -> Result<Option<String>> {
+) -> Option<String> {
     if file_total_lines <= 0 {
-        return Ok(None);
+        return None;
     }
 
     let mut scores: HashMap<String, i64> = HashMap::new();
     for row in rows {
-        let path_avail = load_path_availability_candidates(
-            fallback_stmt,
-            repo_root,
-            &row.side,
-            &row.line_hash,
-        )?;
-
-        for (path, avail) in path_avail {
+        for (path, avail) in preload.alias_candidates_for(row.side, &row.line_hash) {
             if path == strict_path {
                 continue;
             }
-            let matched = row.count.min(avail);
+            let matched = row.count.min(*avail);
             if matched > 0 {
-                *scores.entry(path).or_insert(0) += matched;
+                *scores.entry(path.clone()).or_insert(0) += matched;
             }
         }
     }
 
     if scores.is_empty() {
-        return Ok(None);
+        return None;
     }
 
     let strict_base = basename(strict_path).to_string();
@@ -349,14 +285,10 @@ fn choose_fallback_alias_path(
     filename_candidates.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
 
     if let Some(winner_path) = pick_confident_alias(&filename_candidates, file_total_lines) {
-        return Ok(Some(winner_path));
+        return Some(winner_path);
     }
 
-    if let Some(winner_path) = pick_confident_alias(&all_candidates, file_total_lines) {
-        return Ok(Some(winner_path));
-    }
-
-    Ok(None)
+    pick_confident_alias(&all_candidates, file_total_lines)
 }
 
 fn pick_confident_alias(candidates: &[(String, i64)], file_total_lines: i64) -> Option<String> {
@@ -365,7 +297,7 @@ fn pick_confident_alias(candidates: &[(String, i64)], file_total_lines: i64) -> 
     }
 
     let (winner_path, winner_matched) = &candidates[0];
-    let runner_matched = candidates.get(1).map(|(_, m)| *m).unwrap_or(0);
+    let runner_matched = candidates.get(1).map(|(_, matched)| *matched).unwrap_or(0);
 
     let winner_ratio = *winner_matched as f64 / file_total_lines as f64;
     let runner_ratio = runner_matched as f64 / file_total_lines as f64;
@@ -383,44 +315,81 @@ fn basename(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
 }
 
-fn load_session_availability(
-    stmt: &mut rusqlite::Statement<'_>,
+fn load_session_availability_map(
+    conn: &Connection,
     repo_root: &str,
-    rel_path: &str,
-    side: &str,
-    line_hash: &str,
-) -> Result<Vec<SessionAvailability>> {
-    let rows = stmt.query_map(
-        params![repo_root, rel_path, side, line_hash],
-        |r| {
-            Ok(SessionAvailability {
-                provider: r.get::<_, String>(0)?,
-                session_id: r.get::<_, String>(1)?,
-                avail: r.get::<_, i64>(2)?,
-            })
-        },
+) -> Result<HashMap<SessionAvailabilityKey, Vec<SessionAvailability>>> {
+    let mut stmt = conn.prepare(
+        "SELECT co.rel_path, hol.side, hol.line_hash, co.provider, co.session_id, MAX(hol.count) AS avail
+         FROM fact_session_code_change co
+         JOIN fact_session_code_change_line_hashes hol ON hol.code_change_id = co.id
+         WHERE co.repo_root = ?1
+           AND co.rel_path IS NOT NULL
+         GROUP BY co.rel_path, hol.side, hol.line_hash, co.provider, co.session_id",
     )?;
 
-    let mut out = Vec::new();
+    let rows = stmt.query_map(params![repo_root], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            SessionAvailability {
+                provider: row.get::<_, String>(3)?,
+                session_id: row.get::<_, String>(4)?,
+                avail: row.get::<_, i64>(5)?,
+            },
+        ))
+    })?;
+
+    let mut out: HashMap<SessionAvailabilityKey, Vec<SessionAvailability>> = HashMap::new();
     for row in rows {
-        out.push(row?);
+        let (rel_path, side_raw, line_hash, availability) = row?;
+        let side = parse_line_side(&side_raw)?;
+        out.entry((rel_path, side, line_hash))
+            .or_default()
+            .push(availability);
     }
     Ok(out)
 }
 
-fn load_path_availability_candidates(
-    stmt: &mut rusqlite::Statement<'_>,
+fn load_alias_candidate_map(
+    conn: &Connection,
     repo_root: &str,
-    side: &str,
-    line_hash: &str,
-) -> Result<Vec<(String, i64)>> {
-    let rows = stmt.query_map(params![repo_root, side, line_hash], |r| {
-        Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+) -> Result<HashMap<AliasCandidateKey, Vec<(String, i64)>>> {
+    let mut stmt = conn.prepare(
+        "SELECT co.rel_path, hol.side, hol.line_hash, MAX(hol.count) AS avail
+         FROM fact_session_code_change co
+         JOIN fact_session_code_change_line_hashes hol ON hol.code_change_id = co.id
+         WHERE co.repo_root = ?1
+           AND co.rel_path IS NOT NULL
+         GROUP BY co.rel_path, hol.side, hol.line_hash",
+    )?;
+
+    let rows = stmt.query_map(params![repo_root], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, i64>(3)?,
+        ))
     })?;
 
-    let mut out = Vec::new();
+    let mut out: HashMap<AliasCandidateKey, Vec<(String, i64)>> = HashMap::new();
     for row in rows {
-        out.push(row?);
+        let (rel_path, side_raw, line_hash, avail) = row?;
+        let side = parse_line_side(&side_raw)?;
+        out.entry((side, line_hash)).or_default().push((rel_path, avail));
+    }
+    for values in out.values_mut() {
+        values.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
     }
     Ok(out)
+}
+
+fn parse_line_side(raw: &str) -> Result<LineSide> {
+    match raw {
+        "+" => Ok(LineSide::Added),
+        "-" => Ok(LineSide::Removed),
+        other => Err(anyhow!("unsupported line side '{other}'")),
+    }
 }

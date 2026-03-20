@@ -1,0 +1,10 @@
+---
+source: tests/metrics_regression.rs
+expression: change
+---
+Change Metrics
+C2 = merge rate for heavy AI commits (git proxy)
+
+Commits: 9
+Heavy commits: 3
+C2 Merge Rate: 100.00% (3/3)

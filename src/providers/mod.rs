@@ -7,7 +7,7 @@ use rusqlite::Connection;
 
 pub trait Provider {
     fn name(&self) -> &str;
-    /// Ingest all sessions from this provider into `db`. Returns number of events written.
+    /// Ingest all sessions from this provider into `db`. Returns number of fact rows written.
     fn ingest(&self, db: &Connection, verbose: bool) -> Result<usize>;
 }
 

@@ -1,0 +1,7 @@
+---
+source: tests/metrics_regression.rs
+expression: structured_change
+---
+commits: "9"
+heavy_commits: "3"
+merge_rate: 100.00% (3/3)

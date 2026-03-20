@@ -1,0 +1,7 @@
+---
+source: tests/metrics_regression.rs
+expression: structured_lifecycle
+---
+heavy_commits: "3"
+code_churn_rate: 1.47% (59/4006)
+revert_rate: 0.00% (0/3)

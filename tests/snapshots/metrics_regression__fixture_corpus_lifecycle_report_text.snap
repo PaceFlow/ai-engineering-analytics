@@ -1,0 +1,11 @@
+---
+source: tests/metrics_regression.rs
+expression: lifecycle
+---
+Lifecycle Metrics
+L1 = code churn rate for heavy AI commits
+L4 = revert rate for heavy AI commits
+
+Heavy commits: 3
+L1 Code Churn Rate: 1.47% (59/4006)
+L4 Revert Rate: 0.00% (0/3)

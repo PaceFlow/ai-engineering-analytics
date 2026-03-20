@@ -1,5 +1,5 @@
 use anyhow::Result;
-use rusqlite::Connection;
+use rusqlite::{Connection, TransactionBehavior};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fs::File;
@@ -24,6 +24,11 @@ pub struct ProviderCodeChangeSummary {
     pub tool_calls_inspected: usize,
     pub ops_upserted: usize,
     pub parse_errors: usize,
+    pub legacy_sessions_considered: usize,
+    pub legacy_entries_inspected: usize,
+    pub legacy_diff_rows_found: usize,
+    pub legacy_ops_upserted: usize,
+    pub legacy_parse_errors: usize,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -33,7 +38,7 @@ struct ParsedSource {
 }
 
 pub fn ingest_provider_code_changes(
-    conn: &Connection,
+    conn: &mut Connection,
     provider_name: &str,
     verbose: bool,
 ) -> Result<ProviderCodeChangeSummary> {
@@ -52,7 +57,7 @@ pub fn ingest_provider_code_changes(
 }
 
 fn ingest_codex_sources(
-    conn: &Connection,
+    conn: &mut Connection,
     sources: Vec<PathBuf>,
     verbose: bool,
 ) -> Result<ProviderCodeChangeSummary> {
@@ -84,9 +89,10 @@ fn ingest_codex_sources(
 
         let parsed = parse_codex_source(&source)?;
         summary.tool_calls_inspected += parsed.events.len();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
 
         if let Some(session) = parsed.session {
-            storage::upsert_change_session(conn, &session)?;
+            storage::upsert_change_session(&tx, &session)?;
             let mut ctx = SessionContext::new(session.session_cwd.clone());
 
             for event in parsed.events {
@@ -106,13 +112,13 @@ fn ingest_codex_sources(
                                 err.error
                             );
                         }
-                        storage::insert_parse_error(conn, &err)?;
+                        storage::insert_parse_error(&tx, &err)?;
                         summary.parse_errors += 1;
                     }
 
                     for op in outcome.ops {
-                        let op_id = storage::upsert_change_op(conn, &op)?;
-                        storage::replace_line_hashes(conn, op_id, &op.line_hashes)?;
+                        let op_id = storage::upsert_change_op(&tx, &op)?;
+                        storage::replace_line_hashes(&tx, op_id, &op.line_hashes)?;
                         summary.ops_upserted += 1;
                     }
                 }
@@ -121,13 +127,15 @@ fn ingest_codex_sources(
 
         if let Some((mtime, size)) = sig {
             storage::upsert_ingest_cursor(
-                conn,
+                &tx,
                 CODEX_CURSOR_NAMESPACE,
                 &source_file,
                 mtime,
                 size,
             )?;
         }
+
+        tx.commit()?;
     }
 
     Ok(summary)
@@ -172,7 +180,6 @@ fn parse_codex_source(path: &Path) -> Result<ParsedSource> {
 
     let mut session_id: Option<String> = None;
     let mut session_cwd: Option<String> = None;
-    let mut started_at: Option<String> = None;
     let mut last_seen_at: Option<String> = None;
 
     let mut events: Vec<ToolCallEvent> = Vec::new();
@@ -210,11 +217,6 @@ fn parse_codex_source(path: &Path) -> Result<ParsedSource> {
                         .get("cwd")
                         .and_then(|v| v.as_str())
                         .map(ToOwned::to_owned);
-                    started_at = payload
-                        .get("timestamp")
-                        .and_then(|v| v.as_str())
-                        .map(ToOwned::to_owned)
-                        .or_else(|| timestamp.clone());
                 }
             }
             Some("response_item") => {
@@ -317,7 +319,6 @@ fn parse_codex_source(path: &Path) -> Result<ParsedSource> {
                 session_id: sid,
                 source_file,
                 session_cwd,
-                started_at,
                 last_seen_at,
             }),
             events,
@@ -419,9 +420,30 @@ mod tests {
         let _ = fs::remove_file(path);
     }
 
+    fn tool_write_count(conn: &Connection) -> Result<i64> {
+        conn.query_row(
+            "SELECT COUNT(*) FROM fact_session_code_change WHERE source_kind = 'tool_write'",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(Into::into)
+    }
+
+    fn load_tool_write_modes(conn: &Connection) -> Result<Vec<String>> {
+        let mut stmt = conn.prepare(
+            "SELECT write_mode
+             FROM fact_session_code_change
+             WHERE source_kind = 'tool_write'
+             ORDER BY id",
+        )?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
     #[test]
     fn ingest_is_idempotent_with_cursor_skip() -> Result<()> {
-        let conn = Connection::open_in_memory()?;
+        let mut conn = Connection::open_in_memory()?;
         init_change_intel_schema(&conn)?;
 
         let path = write_jsonl(vec![
@@ -430,14 +452,13 @@ mod tests {
             json!({"timestamp":"2026-03-04T10:00:02Z","type":"response_item","payload":{"type":"function_call_output","call_id":"c1","output":"Chunk ID: 1\nProcess exited with code 0\nOutput:\n"}}),
         ])?;
 
-        let summary1 = ingest_codex_sources(&conn, vec![path.clone()], false)?;
+        let summary1 = ingest_codex_sources(&mut conn, vec![path.clone()], false)?;
         assert_eq!(summary1.ops_upserted, 1);
 
-        let summary2 = ingest_codex_sources(&conn, vec![path.clone()], false)?;
+        let summary2 = ingest_codex_sources(&mut conn, vec![path.clone()], false)?;
         assert_eq!(summary2.sources_skipped, 1);
 
-        let count: i64 = conn.query_row("SELECT COUNT(*) FROM change_ops", [], |r| r.get(0))?;
-        assert_eq!(count, 1);
+        assert_eq!(tool_write_count(&conn)?, 1);
 
         cleanup(&path);
         Ok(())
@@ -445,7 +466,7 @@ mod tests {
 
     #[test]
     fn failed_exec_call_is_skipped() -> Result<()> {
-        let conn = Connection::open_in_memory()?;
+        let mut conn = Connection::open_in_memory()?;
         init_change_intel_schema(&conn)?;
 
         let path = write_jsonl(vec![
@@ -454,11 +475,10 @@ mod tests {
             json!({"timestamp":"2026-03-04T10:00:02Z","type":"response_item","payload":{"type":"function_call_output","call_id":"c1","output":"Chunk ID: 1\nProcess exited with code 1\nOutput:\n"}}),
         ])?;
 
-        let summary = ingest_codex_sources(&conn, vec![path.clone()], false)?;
+        let summary = ingest_codex_sources(&mut conn, vec![path.clone()], false)?;
         assert_eq!(summary.ops_upserted, 0);
 
-        let count: i64 = conn.query_row("SELECT COUNT(*) FROM change_ops", [], |r| r.get(0))?;
-        assert_eq!(count, 0);
+        assert_eq!(tool_write_count(&conn)?, 0);
 
         cleanup(&path);
         Ok(())
@@ -466,7 +486,7 @@ mod tests {
 
     #[test]
     fn apply_patch_success_and_failure_filtering() -> Result<()> {
-        let conn = Connection::open_in_memory()?;
+        let mut conn = Connection::open_in_memory()?;
         init_change_intel_schema(&conn)?;
 
         let success_output = json!({
@@ -489,14 +509,10 @@ mod tests {
             json!({"timestamp":"2026-03-04T10:00:04Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"p_fail","output": fail_output}}),
         ])?;
 
-        let summary = ingest_codex_sources(&conn, vec![path.clone()], false)?;
+        let summary = ingest_codex_sources(&mut conn, vec![path.clone()], false)?;
         assert_eq!(summary.ops_upserted, 1);
 
-        let modes: Vec<String> = {
-            let mut stmt = conn.prepare("SELECT write_mode FROM change_ops ORDER BY id")?;
-            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
-            rows.collect::<std::result::Result<Vec<_>, _>>()?
-        };
+        let modes = load_tool_write_modes(&conn)?;
         assert_eq!(modes, vec!["patch".to_string()]);
 
         cleanup(&path);
@@ -505,10 +521,10 @@ mod tests {
 
     #[test]
     fn non_codex_provider_returns_noop_summary() -> Result<()> {
-        let conn = Connection::open_in_memory()?;
+        let mut conn = Connection::open_in_memory()?;
         init_change_intel_schema(&conn)?;
 
-        let summary = ingest_provider_code_changes(&conn, "claude", false)?;
+        let summary = ingest_provider_code_changes(&mut conn, "claude", false)?;
         assert_eq!(summary.provider, "claude");
         assert_eq!(summary.sources_discovered, 0);
         assert_eq!(summary.ops_upserted, 0);

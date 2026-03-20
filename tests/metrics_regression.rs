@@ -17,71 +17,30 @@ struct TestEnv {
     _tempdir: TempDir,
     home: PathBuf,
     vca_repo: PathBuf,
+    cursor_dir: PathBuf,
 }
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
-struct MetricSnapshot {
-    name: String,
-    percent: String,
-    numerator: String,
-    denominator: String,
-    status: String,
-}
-
-#[derive(Debug, Serialize, PartialEq, Eq)]
-struct StatsRowSnapshot {
-    provider: String,
-    session: String,
-    project: String,
-    last_active: String,
-    loc: String,
-    added: String,
-    removed: String,
-    words_per_loc: String,
-}
-
-#[derive(Debug, Serialize, PartialEq, Eq)]
-struct RepoMetricSnapshot {
-    percent: String,
-    numerator: String,
-    denominator: String,
-    status: String,
-}
-
-#[derive(Debug, Serialize, PartialEq, Eq)]
-struct RepoBreakdownSnapshot {
-    repo: String,
-    heavy_commits: String,
-    l4: RepoMetricSnapshot,
-    c2: RepoMetricSnapshot,
-    l1: RepoMetricSnapshot,
-}
-
-#[derive(Debug, Serialize, PartialEq, Eq)]
-struct TaskRowSnapshot {
-    task: String,
-    branch: String,
-    commits: String,
-    sessions_with_signals: String,
-    sessions_total: String,
+struct SessionSummarySnapshot {
+    sessions: String,
     s2_avg: String,
-    s4_loop: String,
-    s6_mid_error: String,
-    s9_4h: String,
-    vs_staging: String,
-    grade: String,
+    debug_loop_rate: String,
+    s6_rate: String,
+    s9_rate: String,
 }
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
-struct StatsReportSnapshot {
-    metrics: Vec<MetricSnapshot>,
-    repo_rows: Vec<RepoBreakdownSnapshot>,
-    session_rows: Vec<StatsRowSnapshot>,
+struct ChangeSummarySnapshot {
+    commits: String,
+    heavy_commits: String,
+    merge_rate: String,
 }
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
-struct TaskStatsReportSnapshot {
-    task_rows: Vec<TaskRowSnapshot>,
+struct LifecycleSummarySnapshot {
+    heavy_commits: String,
+    code_churn_rate: String,
+    revert_rate: String,
 }
 
 impl TestEnv {
@@ -98,11 +57,7 @@ impl TestEnv {
         materialize_vca_repo(&vca_repo)?;
         copy_codex_sessions(
             &home,
-            &[
-                "__REPO_VCA__",
-                "__REPO_CURSOR__",
-                "__HOME__",
-            ],
+            &["__REPO_VCA__", "__REPO_CURSOR__", "__HOME__"],
             &[
                 &vca_repo.to_string_lossy(),
                 &cursor_dir.to_string_lossy(),
@@ -115,6 +70,7 @@ impl TestEnv {
             _tempdir: tempdir,
             home,
             vca_repo,
+            cursor_dir,
         })
     }
 
@@ -137,105 +93,154 @@ impl TestEnv {
         Ok(String::from_utf8(output.stdout)?)
     }
 
-    fn ingest_and_associate(&self) -> anyhow::Result<()> {
+    fn ingest(&self) -> anyhow::Result<()> {
         self.run_vca(&["ingest"])?;
-        self.associate_current_head()?;
-        self.checkout_repo_branch("codex/PAC-999-task-stats-demo")?;
-        self.associate_current_head()?;
-        self.checkout_repo_branch("main")?;
         Ok(())
     }
 
-    fn associate_current_head(&self) -> anyhow::Result<()> {
-        self.run_vca(&[
-            "associate-commits",
-            "--repo",
-            &self.vca_repo.to_string_lossy(),
-        ])?;
-        Ok(())
-    }
-
-    fn checkout_repo_branch(&self, branch: &str) -> anyhow::Result<()> {
-        run_command(
-            Command::new("git")
-                .arg("-C")
-                .arg(&self.vca_repo)
-                .arg("checkout")
-                .arg(branch),
-        )
+    fn normalize_stream_output(&self, output: String) -> String {
+        let mut normalized = output;
+        for (path, placeholder) in [
+            (&self.vca_repo, "__REPO_VCA__"),
+            (&self.cursor_dir, "__REPO_CURSOR__"),
+            (&self.home, "__HOME__"),
+        ] {
+            for variant in path_variants(path) {
+                normalized = normalized.replace(&variant, placeholder);
+            }
+        }
+        normalized
     }
 }
 
 #[test]
-fn stats_and_task_stats_match_snapshots() -> anyhow::Result<()> {
+fn category_reports_match_snapshots() -> anyhow::Result<()> {
     let env = TestEnv::new()?;
-    env.ingest_and_associate()?;
+    env.ingest()?;
 
-    let stats = env.run_vca(&["stats"])?;
-    let task_stats = env.run_vca(&["task-stats", "--limit", "20"])?;
-    let structured_stats = parse_stats_report(&stats)?;
-    let structured_task_stats = parse_task_stats_report(&task_stats)?;
+    let session = env.run_vca(&["session"])?;
+    let change = env.run_vca(&["change"])?;
+    let lifecycle = env.run_vca(&["lifecycle"])?;
 
-    assert!(stats.contains("AI Quality Metrics (heavy commits only)"));
-    assert!(stats.contains("codex"));
-    assert!(stats.contains("cursor"));
-    assert!(task_stats.contains("Task Stats (Execution Quality)"));
-    assert!(task_stats.contains("PAC-999"));
-    assert!(!task_stats.contains("No task rows found"));
-    assert_eq!(structured_stats.metrics[0].percent, "0.00%");
-    assert_eq!(structured_stats.metrics[1].percent, "80.00%");
-    assert_eq!(structured_stats.metrics[2].percent, "1.98%");
-    assert_eq!(structured_stats.metrics[3].percent, "0.00%");
-    assert_eq!(structured_task_stats.task_rows.len(), 1);
-    assert_eq!(structured_task_stats.task_rows[0].task, "PAC-999");
-    assert_eq!(structured_task_stats.task_rows[0].commits, "1");
-    assert_eq!(structured_task_stats.task_rows[0].s2_avg, "15.00");
-    assert_eq!(structured_task_stats.task_rows[0].s9_4h, "100.0%");
+    assert!(session.contains("Session Metrics"));
+    assert!(change.contains("Change Metrics"));
+    assert!(lifecycle.contains("Lifecycle Metrics"));
 
-    assert_snapshot!("fixture_corpus_stats_report_text", stats);
-    assert_snapshot!("fixture_corpus_task_stats_report_text", task_stats);
+    let structured_session = parse_session_summary(&session)?;
+    let structured_change = parse_change_summary(&change)?;
+    let structured_lifecycle = parse_lifecycle_summary(&lifecycle)?;
+
+    assert_snapshot!("fixture_corpus_session_report_text", session);
+    assert_snapshot!("fixture_corpus_change_report_text", change);
+    assert_snapshot!("fixture_corpus_lifecycle_report_text", lifecycle);
+    assert_yaml_snapshot!("fixture_corpus_session_report_structured", structured_session);
+    assert_yaml_snapshot!("fixture_corpus_change_report_structured", structured_change);
     assert_yaml_snapshot!(
-        "fixture_corpus_stats_report_structured",
-        structured_stats
-    );
-    assert_yaml_snapshot!(
-        "fixture_corpus_task_stats_report_structured",
-        structured_task_stats
+        "fixture_corpus_lifecycle_report_structured",
+        structured_lifecycle
     );
 
     Ok(())
 }
 
 #[test]
-fn ingest_and_associate_are_idempotent_for_fixture_corpus() -> anyhow::Result<()> {
+fn grouped_and_weekly_reports_match_snapshots() -> anyhow::Result<()> {
     let env = TestEnv::new()?;
-    env.ingest_and_associate()?;
+    env.ingest()?;
 
-    let stats_before = env.run_vca(&["stats"])?;
-    let task_stats_before = env.run_vca(&["task-stats", "--limit", "20"])?;
+    let session_grouped = env.run_vca(&["session", "--group-by", "provider"])?;
+    let change_grouped = env.run_vca(&["change", "--group-by", "repo"])?;
+    let lifecycle_grouped = env.run_vca(&["lifecycle", "--group-by", "repo"])?;
+    let session_weekly = env.run_vca(&["session", "--weekly", "--group-by", "provider"])?;
 
-    env.ingest_and_associate()?;
-
-    let stats_after = env.run_vca(&["stats"])?;
-    let task_stats_after = env.run_vca(&["task-stats", "--limit", "20"])?;
-
-    assert_eq!(stats_before, stats_after, "stats output drifted after rerun");
-    assert_eq!(
-        task_stats_before, task_stats_after,
-        "task-stats output drifted after rerun"
+    assert_snapshot!("fixture_corpus_session_grouped_by_provider_text", session_grouped);
+    assert_snapshot!("fixture_corpus_change_grouped_by_repo_text", change_grouped);
+    assert_snapshot!(
+        "fixture_corpus_lifecycle_grouped_by_repo_text",
+        lifecycle_grouped
     );
+    assert_snapshot!(
+        "fixture_corpus_session_weekly_by_provider_text",
+        session_weekly
+    );
+
+    Ok(())
+}
+
+#[test]
+fn event_stream_matches_snapshots() -> anyhow::Result<()> {
+    let env = TestEnv::new()?;
+    env.ingest()?;
+
+    let session_stream =
+        env.normalize_stream_output(env.run_vca(&["event-stream", "--stream", "session-base"])?);
+    let task_commit_stream = env
+        .normalize_stream_output(env.run_vca(&["event-stream", "--stream", "task-commit-base"])?);
+    let all_streams_smoke =
+        env.normalize_stream_output(env.run_vca(&["event-stream", "--limit", "5"])?);
+
+    assert_snapshot!("fixture_corpus_event_stream_session_base", session_stream);
+    assert_snapshot!(
+        "fixture_corpus_event_stream_task_commit_base",
+        task_commit_stream
+    );
+    assert_snapshot!("fixture_corpus_event_stream_all_smoke", all_streams_smoke);
+
+    Ok(())
+}
+
+fn path_variants(path: &Path) -> Vec<String> {
+    let mut variants = vec![path.to_string_lossy().into_owned()];
+    if let Ok(canonical) = fs::canonicalize(path) {
+        let canonical = canonical.to_string_lossy().into_owned();
+        if !variants.contains(&canonical) {
+            variants.push(canonical);
+        }
+    }
+    variants
+}
+
+#[test]
+fn ingest_is_idempotent_for_fixture_corpus() -> anyhow::Result<()> {
+    let env = TestEnv::new()?;
+    env.ingest()?;
+
+    let session_before = env.run_vca(&["session"])?;
+    let change_before = env.run_vca(&["change"])?;
+    let lifecycle_before = env.run_vca(&["lifecycle"])?;
+
+    env.ingest()?;
+
+    let session_after = env.run_vca(&["session"])?;
+    let change_after = env.run_vca(&["change"])?;
+    let lifecycle_after = env.run_vca(&["lifecycle"])?;
+
+    assert_eq!(session_before, session_after, "session output drifted after rerun");
+    assert_eq!(change_before, change_after, "change output drifted after rerun");
+    assert_eq!(
+        lifecycle_before, lifecycle_after,
+        "lifecycle output drifted after rerun"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn ingest_reports_commit_event_progress() -> anyhow::Result<()> {
+    let env = TestEnv::new()?;
+    let ingest_output = env.run_vca(&["ingest"])?;
+
+    assert!(ingest_output.contains("Materializing commit events ..."));
+    assert!(ingest_output.contains("repos="));
+    assert!(ingest_output.contains("[1/"));
+    assert!(ingest_output.contains("done "));
+    assert!(ingest_output.contains("Commit events materialized: repos="));
 
     Ok(())
 }
 
 fn materialize_vca_repo(repo_path: &Path) -> anyhow::Result<()> {
-    run_command(
-        Command::new("git")
-            .arg("clone")
-            .arg(VCA_BUNDLE)
-            .arg(repo_path),
-    )?;
-
+    run_command(Command::new("git").arg("clone").arg(VCA_BUNDLE).arg(repo_path))?;
     run_command(
         Command::new("git")
             .arg("-C")
@@ -259,12 +264,14 @@ fn materialize_vca_repo(repo_path: &Path) -> anyhow::Result<()> {
             .arg("checkout")
             .arg("main"),
     )?;
-
     Ok(())
 }
 
 fn copy_codex_sessions(home: &Path, from: &[&str], to: &[&str]) -> anyhow::Result<()> {
-    let src_root = Path::new(FIXTURE_ROOT).join("home_template").join(".codex").join("sessions");
+    let src_root = Path::new(FIXTURE_ROOT)
+        .join("home_template")
+        .join(".codex")
+        .join("sessions");
     let dst_root = home.join(".codex").join("sessions");
     copy_dir_recursive(&src_root, &dst_root)?;
 
@@ -297,7 +304,6 @@ fn install_cursor_fixture(home: &Path, vca_repo: &Path, cursor_dir: &Path) -> an
         fs::copy(HOME_TEMPLATE_CURSOR_DB, &db_path)?;
         rewrite_cursor_db(&db_path, home, vca_repo, cursor_dir)?;
     }
-
     Ok(())
 }
 
@@ -369,217 +375,35 @@ fn run_command(cmd: &mut Command) -> anyhow::Result<()> {
     );
 }
 
-fn parse_stats_report(output: &str) -> anyhow::Result<StatsReportSnapshot> {
-    let lines: Vec<&str> = output.lines().collect();
-    let mut metrics = Vec::new();
-    for prefix in [
-        "L4 Revert Rate",
-        "C2 Merge Rate (git proxy, squash-aware)",
-        "L1 Code Churn Rate (14d, mainline-only)",
-        "S4 Debug Loop Rate",
-    ] {
-        let line = lines
-            .iter()
-            .find(|line| line.starts_with(prefix))
-            .ok_or_else(|| anyhow::anyhow!("missing metric line for {}", prefix))?;
-        metrics.push(parse_metric_line(line)?);
-    }
-
-    let repo_start = lines
-        .iter()
-        .position(|line| *line == "Per-repo breakdown")
-        .ok_or_else(|| anyhow::anyhow!("missing repo section"))?
-        + 3;
-    let session_start = lines
-        .iter()
-        .position(|line| line.starts_with("Provider  Session"))
-        .ok_or_else(|| anyhow::anyhow!("missing session table"))?;
-
-    let mut repo_rows = Vec::new();
-    for line in &lines[repo_start..session_start - 1] {
-        if !line.trim().is_empty() {
-            let columns = split_columns(line);
-            if columns.len() != 5 {
-                anyhow::bail!("unexpected repo row format: {}", line);
-            }
-
-            repo_rows.push(RepoBreakdownSnapshot {
-                repo: columns[0].to_string(),
-                heavy_commits: columns[1].to_string(),
-                l4: parse_repo_metric(columns[2])?,
-                c2: parse_repo_metric(columns[3])?,
-                l1: parse_repo_metric(columns[4])?,
-            });
-        }
-    }
-
-    let mut session_rows = Vec::new();
-    for line in lines.iter().skip(session_start + 2) {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let columns = split_columns(line);
-        if columns.len() != 8 {
-            anyhow::bail!("unexpected stats row format: {}", line);
-        }
-        session_rows.push(StatsRowSnapshot {
-            provider: columns[0].to_string(),
-            session: columns[1].to_string(),
-            project: columns[2].to_string(),
-            last_active: columns[3].to_string(),
-            loc: columns[4].to_string(),
-            added: columns[5].to_string(),
-            removed: columns[6].to_string(),
-            words_per_loc: columns[7].to_string(),
-        });
-    }
-
-    Ok(StatsReportSnapshot {
-        metrics,
-        repo_rows,
-        session_rows,
+fn parse_session_summary(output: &str) -> anyhow::Result<SessionSummarySnapshot> {
+    Ok(SessionSummarySnapshot {
+        sessions: line_value(output, "Sessions: ")?,
+        s2_avg: line_value(output, "S2 Re-Prompt Avg: ")?,
+        debug_loop_rate: line_value(output, "S4 Debug Loop Rate: ")?,
+        s6_rate: line_value(output, "S6 Error Paste Rate: ")?,
+        s9_rate: line_value(output, "S9 Session-to-Commit Rate: ")?,
     })
 }
 
-fn parse_task_stats_report(output: &str) -> anyhow::Result<TaskStatsReportSnapshot> {
-    let lines: Vec<&str> = output.lines().collect();
-    let header_start = lines
-        .iter()
-        .position(|line| line.starts_with("Task                          Branch"))
-        .ok_or_else(|| anyhow::anyhow!("missing task table"))?;
-
-    let mut task_rows = Vec::new();
-    for line in lines.iter().skip(header_start + 2) {
-        if line.trim().is_empty() || line.starts_with('`') {
-            break;
-        }
-        let columns = split_columns(line);
-        if columns.len() != 10 {
-            anyhow::bail!("unexpected task row format: {}", line);
-        }
-
-        let mut sessions = columns[3].splitn(2, '/');
-        let sessions_with_signals = sessions.next().unwrap_or_default().to_string();
-        let sessions_total = sessions.next().unwrap_or_default().to_string();
-
-        task_rows.push(TaskRowSnapshot {
-            task: columns[0].to_string(),
-            branch: columns[1].to_string(),
-            commits: columns[2].to_string(),
-            sessions_with_signals,
-            sessions_total,
-            s2_avg: columns[4].to_string(),
-            s4_loop: columns[5].to_string(),
-            s6_mid_error: columns[6].to_string(),
-            s9_4h: columns[7].to_string(),
-            vs_staging: columns[8].to_string(),
-            grade: columns[9].to_string(),
-        });
-    }
-
-    Ok(TaskStatsReportSnapshot { task_rows })
-}
-
-fn parse_metric_line(line: &str) -> anyhow::Result<MetricSnapshot> {
-    let percent_end = line
-        .find('%')
-        .ok_or_else(|| anyhow::anyhow!("missing percent in metric line: {}", line))?;
-    let percent_start = line[..percent_end]
-        .rfind(char::is_whitespace)
-        .map(|idx| idx + 1)
-        .ok_or_else(|| anyhow::anyhow!("missing metric percent start: {}", line))?;
-
-    let name = line[..percent_start].trim().to_string();
-    let percent = line[percent_start..=percent_end].trim().to_string();
-
-    let ratio_start = line[percent_end + 1..]
-        .find('(')
-        .map(|idx| idx + percent_end + 1)
-        .ok_or_else(|| anyhow::anyhow!("missing ratio in metric line: {}", line))?;
-    let ratio_end = line[ratio_start..]
-        .find(')')
-        .map(|idx| idx + ratio_start)
-        .ok_or_else(|| anyhow::anyhow!("missing ratio end in metric line: {}", line))?;
-    let ratio = &line[ratio_start + 1..ratio_end];
-    let mut ratio_parts = ratio.splitn(2, '/');
-
-    let status_start = line[ratio_end + 1..]
-        .find('[')
-        .map(|idx| idx + ratio_end + 1)
-        .ok_or_else(|| anyhow::anyhow!("missing status in metric line: {}", line))?;
-    let status_end = line[status_start..]
-        .find(']')
-        .map(|idx| idx + status_start)
-        .ok_or_else(|| anyhow::anyhow!("missing status end in metric line: {}", line))?;
-
-    Ok(MetricSnapshot {
-        name,
-        percent,
-        numerator: ratio_parts.next().unwrap_or_default().to_string(),
-        denominator: ratio_parts.next().unwrap_or_default().to_string(),
-        status: line[status_start + 1..status_end].to_string(),
+fn parse_change_summary(output: &str) -> anyhow::Result<ChangeSummarySnapshot> {
+    Ok(ChangeSummarySnapshot {
+        commits: line_value(output, "Commits: ")?,
+        heavy_commits: line_value(output, "Heavy commits: ")?,
+        merge_rate: line_value(output, "C2 Merge Rate: ")?,
     })
 }
 
-fn parse_repo_metric(cell: &str) -> anyhow::Result<RepoMetricSnapshot> {
-    let percent_end = cell
-        .find('%')
-        .ok_or_else(|| anyhow::anyhow!("missing percent in repo metric: {}", cell))?;
-    let percent = cell[..=percent_end].trim().to_string();
-
-    let ratio_start = cell[percent_end + 1..]
-        .find('(')
-        .map(|idx| idx + percent_end + 1)
-        .ok_or_else(|| anyhow::anyhow!("missing ratio in repo metric: {}", cell))?;
-    let ratio_end = cell[ratio_start..]
-        .find(')')
-        .map(|idx| idx + ratio_start)
-        .ok_or_else(|| anyhow::anyhow!("missing ratio end in repo metric: {}", cell))?;
-    let ratio = &cell[ratio_start + 1..ratio_end];
-    let mut ratio_parts = ratio.splitn(2, '/');
-
-    Ok(RepoMetricSnapshot {
-        percent,
-        numerator: ratio_parts.next().unwrap_or_default().to_string(),
-        denominator: ratio_parts.next().unwrap_or_default().to_string(),
-        status: cell[ratio_end + 1..].trim().to_string(),
+fn parse_lifecycle_summary(output: &str) -> anyhow::Result<LifecycleSummarySnapshot> {
+    Ok(LifecycleSummarySnapshot {
+        heavy_commits: line_value(output, "Heavy commits: ")?,
+        code_churn_rate: line_value(output, "L1 Code Churn Rate: ")?,
+        revert_rate: line_value(output, "L4 Revert Rate: ")?,
     })
 }
 
-fn split_columns(line: &str) -> Vec<&str> {
-    let mut columns = Vec::new();
-    let mut start = 0usize;
-    let chars: Vec<(usize, char)> = line.char_indices().collect();
-    let mut idx = 0usize;
-
-    while idx < chars.len() {
-        if chars[idx].1 != ' ' {
-            idx += 1;
-            continue;
-        }
-
-        let run_start = chars[idx].0;
-        let mut run_end = run_start;
-        let mut run_len = 0usize;
-        while idx < chars.len() && chars[idx].1 == ' ' {
-            run_end = chars[idx].0 + chars[idx].1.len_utf8();
-            run_len += 1;
-            idx += 1;
-        }
-
-        if run_len >= 2 {
-            let cell = line[start..run_start].trim();
-            if !cell.is_empty() {
-                columns.push(cell);
-            }
-            start = run_end;
-        }
-    }
-
-    let tail = line[start..].trim();
-    if !tail.is_empty() {
-        columns.push(tail);
-    }
-
-    columns
+fn line_value(output: &str, prefix: &str) -> anyhow::Result<String> {
+    output
+        .lines()
+        .find_map(|line| line.strip_prefix(prefix).map(|value| value.trim().to_string()))
+        .ok_or_else(|| anyhow::anyhow!("missing line for prefix {}", prefix))
 }

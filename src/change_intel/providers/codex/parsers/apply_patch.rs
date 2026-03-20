@@ -21,7 +21,6 @@ pub struct ApplyPatchParser;
 
 impl ApplyPatchParser {
     pub const PARSER_NAME: &'static str = "apply_patch_v1";
-    pub const PARSER_VERSION: &'static str = "1";
 
     fn parse_input_text(input_json: &str) -> Option<String> {
         let trimmed = input_json.trim();
@@ -202,7 +201,6 @@ impl PatternParser for ApplyPatchParser {
                 added_lines: block.added_lines.len() as i64,
                 removed_lines: block.removed_lines.len() as i64,
                 parser_name: Self::PARSER_NAME.to_string(),
-                parser_version: Self::PARSER_VERSION.to_string(),
                 line_hashes,
             });
 

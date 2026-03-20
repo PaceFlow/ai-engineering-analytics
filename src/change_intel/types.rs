@@ -6,7 +6,6 @@ pub struct SessionInfo {
     pub session_id: String,
     pub source_file: String,
     pub session_cwd: Option<String>,
-    pub started_at: Option<String>,
     pub last_seen_at: Option<String>,
 }
 
@@ -76,7 +75,6 @@ pub struct ChangeOpCandidate {
     pub added_lines: i64,
     pub removed_lines: i64,
     pub parser_name: String,
-    pub parser_version: String,
     pub line_hashes: Vec<LineHashCount>,
 }
 

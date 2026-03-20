@@ -7,7 +7,6 @@ use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 
 use crate::db;
-use crate::events::Event;
 use super::Provider;
 use super::utils::diff_line_counts;
 
@@ -30,7 +29,7 @@ impl Provider for CodexProvider {
         let files = find_jsonl_files(&sessions_root);
         println!("  found {} session file(s)", files.len());
 
-        let mut total_events = 0;
+        let mut total_rows = 0;
         for session_file in &files {
             if verbose {
                 eprint!("  {:?} ... ", session_file);
@@ -43,16 +42,16 @@ impl Provider for CodexProvider {
                 }
                 Ok(n) => {
                     if verbose {
-                        eprintln!("wrote {} events", n);
+                        eprintln!("wrote {} rows", n);
                     }
-                    total_events += n;
+                    total_rows += n;
                 }
                 Err(e) => {
                     eprintln!("Warning: skipping {:?}: {}", session_file, e);
                 }
             }
         }
-        Ok(total_events)
+        Ok(total_rows)
     }
 }
 
@@ -94,6 +93,7 @@ struct SessionMetaPayload {
     id: String,
     timestamp: Option<String>,
     cwd: Option<String>,
+    model_provider: Option<String>,
 }
 
 // ── Session ingestion ───────────────────────────────────────────────────────
@@ -127,8 +127,9 @@ fn ingest_session(path: &PathBuf, db: &Connection) -> Result<usize> {
     };
 
     let session_id = &meta.id;
+    let source_path = path.to_string_lossy().to_string();
 
-    // Skip if already ingested
+    // Avoid duplicating provider-session rows when this session was already loaded.
     if db::session_exists(db, session_id)? {
         return Ok(0);
     }
@@ -140,16 +141,19 @@ fn ingest_session(path: &PathBuf, db: &Connection) -> Result<usize> {
     let mut pending_reads: HashMap<String, String> = HashMap::new();
     // file_path -> last known content (before-state for next write)
     let mut file_cache: HashMap<String, String> = HashMap::new();
+    let mut session_model: Option<String> = None;
 
-    let mut events: Vec<Event> = Vec::new();
-
-    events.push(Event::ChatStart {
-        session_id: session_id.clone(),
-        provider: "codex".into(),
-        project_path: meta.cwd.clone(),
-        timestamp: session_start_ts.clone(),
-        last_updated: None,
-    });
+    db::begin_session_with_model(
+        db,
+        "codex",
+        session_id,
+        meta.cwd.as_deref(),
+        session_start_ts.as_deref(),
+        session_start_ts.as_deref(),
+        meta.model_provider.as_deref(),
+        None,
+    )?;
+    let mut written = 1usize;
 
     // Parse remaining lines
     for line_result in lines {
@@ -167,6 +171,28 @@ fn ingest_session(path: &PathBuf, db: &Connection) -> Result<usize> {
         let ts = line.timestamp.clone().or_else(|| session_start_ts.clone());
 
         match line.kind.as_str() {
+            "turn_context" => {
+                if session_model.is_none() {
+                    session_model = line
+                        .payload
+                        .get("model")
+                        .and_then(|value| value.as_str())
+                        .map(ToOwned::to_owned);
+                    if session_model.is_some() {
+                        db::upsert_metadata_session_with_model(
+                            db,
+                            "codex",
+                            session_id,
+                            meta.cwd.as_deref(),
+                            session_start_ts.as_deref(),
+                            ts.as_deref().or(session_start_ts.as_deref()),
+                            Some(&source_path),
+                            meta.model_provider.as_deref(),
+                            session_model.as_deref(),
+                        )?;
+                    }
+                }
+            }
             "event_msg" => {
                 // Only handle user_message subtype
                 if line.payload.get("type").and_then(|v| v.as_str()) == Some("user_message") {
@@ -174,14 +200,16 @@ fn ingest_session(path: &PathBuf, db: &Connection) -> Result<usize> {
                         let content = msg.to_string();
                         let words = content.split_whitespace().count();
                         if words > 0 {
-                            events.push(Event::Message {
-                                session_id: session_id.clone(),
-                                provider: "codex".into(),
-                                role: "user".into(),
-                                content,
-                                content_words: words,
-                                timestamp: ts,
-                            });
+                            db::ingest_session_message(
+                                db,
+                                "codex",
+                                session_id,
+                                "user",
+                                &content,
+                                words as i64,
+                                ts.as_deref(),
+                            )?;
+                            written += 1;
                         }
                     }
                 }
@@ -203,14 +231,16 @@ fn ingest_session(path: &PathBuf, db: &Connection) -> Result<usize> {
                             .join("");
                         let words = text.split_whitespace().count();
                         if words > 0 {
-                            events.push(Event::Message {
-                                session_id: session_id.clone(),
-                                provider: "codex".into(),
-                                role: "assistant".into(),
-                                content: text,
-                                content_words: words,
-                                timestamp: ts.clone(),
-                            });
+                            db::ingest_session_message(
+                                db,
+                                "codex",
+                                session_id,
+                                "assistant",
+                                &text,
+                                words as i64,
+                                ts.as_deref(),
+                            )?;
+                            written += 1;
                         }
                     }
                 }
@@ -261,23 +291,30 @@ fn ingest_session(path: &PathBuf, db: &Connection) -> Result<usize> {
                         }
                     }
 
-                    parse_tool_call(&line.payload, session_id, ts.as_deref().unwrap_or(""), &mut events, &file_cache);
+                    written += parse_tool_call(
+                        &line.payload,
+                        db,
+                        session_id,
+                        ts.as_deref(),
+                        &file_cache,
+                    )?;
                 }
             }
             _ => {} // skip unknown line types
         }
     }
 
-    let count = events.len();
-    for event in &events {
-        db::insert_event(db, event)?;
-    }
-    Ok(count)
+    Ok(written)
 }
 
-/// Try to parse an `apply_patch` tool call from a JSON value and push
-/// `ChangesAccepted` events for each modified file found in the diff.
-fn parse_tool_call(value: &Value, session_id: &str, timestamp: &str, events: &mut Vec<Event>, file_cache: &HashMap<String, String>) {
+/// Parse a successful write-like tool call and persist accepted code changes.
+fn parse_tool_call(
+    value: &Value,
+    db: &Connection,
+    session_id: &str,
+    timestamp: Option<&str>,
+    file_cache: &HashMap<String, String>,
+) -> Result<usize> {
     let name = value
         .get("name")
         .and_then(|v| v.as_str())
@@ -298,22 +335,24 @@ fn parse_tool_call(value: &Value, session_id: &str, timestamp: &str, events: &mu
 
             if let Some(cmd) = cmd {
                 if let Some((file_path, lines_added, lines_removed)) = parse_exec_cmd_write(&cmd, file_cache) {
-                    events.push(Event::ChangesAccepted {
-                        session_id: session_id.to_string(),
-                        provider: "codex".into(),
-                        file_path,
+                    db::ingest_accepted_code_change(
+                        db,
+                        "codex",
+                        session_id,
+                        &file_path,
                         lines_added,
                         lines_removed,
-                        timestamp: Some(timestamp.to_string()),
-                    });
+                        timestamp,
+                    )?;
+                    return Ok(1);
                 }
             }
         }
-        return;
+        return Ok(0);
     }
 
     if name != "apply_patch" {
-        return;
+        return Ok(0);
     }
 
     // Arguments is a JSON string: {"patch": "...diff..."}
@@ -335,19 +374,23 @@ fn parse_tool_call(value: &Value, session_id: &str, timestamp: &str, events: &mu
                 s
             }
         }
-        None => return,
+        None => return Ok(0),
     };
 
+    let mut written = 0usize;
     for (file_path, added, removed) in parse_unified_diff(&patch) {
-        events.push(Event::ChangesAccepted {
-            session_id: session_id.to_string(),
-            provider: "codex".into(),
-            file_path,
-            lines_added: added,
-            lines_removed: removed,
-            timestamp: Some(timestamp.to_string()),
-        });
+        db::ingest_accepted_code_change(
+            db,
+            "codex",
+            session_id,
+            &file_path,
+            added,
+            removed,
+            timestamp,
+        )?;
+        written += 1;
     }
+    Ok(written)
 }
 
 /// Detect a `cat > file <<'EOF'` or `cat >> file <<'EOF'` write in a shell

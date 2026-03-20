@@ -38,40 +38,7 @@ pub fn validate_git_repo(repo_root: &str) -> Result<Option<String>> {
     Ok(Some(top))
 }
 
-pub fn current_head_sha(repo_root: &str) -> Result<String> {
-    let out = run_git_capture(repo_root, &["rev-parse".to_string(), "HEAD".to_string()])?;
-    let sha = out.trim().to_string();
-    if sha.is_empty() {
-        return Err(anyhow!("git rev-parse HEAD returned empty output"));
-    }
-    Ok(sha)
-}
-
-pub fn is_ancestor(repo_root: &str, ancestor: &str, descendant: &str) -> Result<bool> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(repo_root)
-        .arg("merge-base")
-        .arg("--is-ancestor")
-        .arg(ancestor)
-        .arg(descendant)
-        .output()?;
-
-    if output.status.success() {
-        return Ok(true);
-    }
-
-    if output.status.code() == Some(1) {
-        return Ok(false);
-    }
-
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    Err(anyhow!(
-        "git merge-base --is-ancestor failed for {ancestor}..{descendant}: {stderr}"
-    ))
-}
-
-pub fn list_commits_since(
+pub fn list_commits_since_all_local_branches(
     repo_root: &str,
     since_ts: &str,
     include_merges: bool,
@@ -85,26 +52,7 @@ pub fn list_commits_since(
         args.push(format!("--max-count={max}"));
     }
     args.push(format!("--since={since_ts}"));
-    args.push("HEAD".to_string());
-
-    list_from_rev_list(repo_root, &args)
-}
-
-pub fn list_commits_range(
-    repo_root: &str,
-    from_exclusive: &str,
-    to_inclusive: &str,
-    include_merges: bool,
-    max_commits: Option<usize>,
-) -> Result<Vec<String>> {
-    let mut args = vec!["rev-list".to_string(), "--reverse".to_string()];
-    if !include_merges {
-        args.push("--no-merges".to_string());
-    }
-    if let Some(max) = max_commits {
-        args.push(format!("--max-count={max}"));
-    }
-    args.push(format!("{from_exclusive}..{to_inclusive}"));
+    args.push("--branches".to_string());
 
     list_from_rev_list(repo_root, &args)
 }
@@ -126,39 +74,8 @@ pub fn list_local_head_branches(repo_root: &str) -> Result<Vec<String>> {
         .collect())
 }
 
-pub fn branches_containing_commit(repo_root: &str, commit_sha: &str) -> Result<Vec<String>> {
-    let out = run_git_capture(
-        repo_root,
-        &[
-            "for-each-ref".to_string(),
-            "--contains".to_string(),
-            commit_sha.to_string(),
-            "--format=%(refname:short)".to_string(),
-            "refs/heads".to_string(),
-        ],
-    )?;
-    Ok(out
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .map(ToOwned::to_owned)
-        .collect())
-}
-
-pub fn distance_to_branch_tip(repo_root: &str, commit_sha: &str, branch: &str) -> Result<i64> {
-    let out = run_git_capture(
-        repo_root,
-        &[
-            "rev-list".to_string(),
-            "--count".to_string(),
-            format!("{commit_sha}..{branch}"),
-        ],
-    )?;
-
-    let count_raw = out.trim();
-    count_raw
-        .parse::<i64>()
-        .map_err(|e| anyhow!("failed to parse rev-list count '{count_raw}': {e}"))
+pub fn list_commits_on_ref(repo_root: &str, ref_name: &str) -> Result<Vec<String>> {
+    list_from_rev_list(repo_root, &["rev-list".to_string(), ref_name.to_string()])
 }
 
 pub fn merge_base(repo_root: &str, left: &str, right: &str) -> Result<Option<String>> {
@@ -223,22 +140,7 @@ pub fn first_parent_commits_range(
         .collect())
 }
 
-pub fn load_commit_metadata(
-    repo_root: &str,
-    commit_sha: &str,
-) -> Result<(String, String, Option<String>)> {
-    let fmt = "--format=%cI%x1f%s%x1f%P".to_string();
-    let out = run_git_capture(
-        repo_root,
-        &[
-            "show".to_string(),
-            "-s".to_string(),
-            fmt,
-            commit_sha.to_string(),
-        ],
-    )?;
-
-    let line = out.trim_end_matches('\n').trim();
+fn parse_commit_metadata_line(commit_sha: &str, line: &str) -> Result<(String, String, Option<String>)> {
     let mut parts = line.splitn(3, '\u{1f}');
 
     let raw_time = parts
@@ -263,13 +165,11 @@ pub fn load_commit_metadata(
 }
 
 pub fn load_commit_diff(repo_root: &str, commit_sha: &str) -> Result<GitCommitDiff> {
-    let (commit_time, subject, parent_sha) = load_commit_metadata(repo_root, commit_sha)?;
-
-    let patch = run_git_capture(
+    let rendered = run_git_capture(
         repo_root,
         &[
             "show".to_string(),
-            "--format=".to_string(),
+            "--format=%cI%x1f%s%x1f%P".to_string(),
             "--patch".to_string(),
             "--unified=0".to_string(),
             "--no-color".to_string(),
@@ -279,6 +179,11 @@ pub fn load_commit_diff(repo_root: &str, commit_sha: &str) -> Result<GitCommitDi
             commit_sha.to_string(),
         ],
     )?;
+    let (meta_line, patch) = rendered
+        .split_once('\n')
+        .ok_or_else(|| anyhow!("missing commit metadata output for {commit_sha}"))?;
+    let (commit_time, subject, parent_sha) = parse_commit_metadata_line(commit_sha, meta_line.trim())?;
+    let patch = patch.trim_start_matches('\n');
 
     let file_diffs = parse_patch_file_diffs(&patch);
 

@@ -2,8 +2,8 @@ use anyhow::Result;
 use std::collections::{HashMap, HashSet};
 
 use super::git_scan::{
-    branches_containing_commit, distance_to_branch_tip, first_parent_commits_range,
-    first_parent_distance, list_local_head_branches, merge_base,
+    first_parent_commits_range, first_parent_distance, list_commits_on_ref,
+    list_local_head_branches, merge_base,
 };
 use super::types::CommitTaskAttribution;
 
@@ -15,6 +15,8 @@ const UNKNOWN_LABEL: &str = "(unknown)";
 pub struct RepoBranchContext {
     local_heads: HashSet<String>,
     branch_owned_commits: HashMap<String, HashSet<String>>,
+    branch_distance_to_tip: HashMap<String, HashMap<String, i64>>,
+    commit_containing_branches: HashMap<String, Vec<String>>,
 }
 
 #[derive(Debug, Clone)]
@@ -33,6 +35,8 @@ pub fn load_repo_branch_context(repo_root: &str) -> Result<RepoBranchContext> {
         .collect();
 
     let mut branch_owned_commits: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut branch_distance_to_tip: HashMap<String, HashMap<String, i64>> = HashMap::new();
+    let mut commit_containing_branches: HashMap<String, Vec<String>> = HashMap::new();
     for branch in heads.iter().filter(|b| !is_integration_branch(b)) {
         let Some(branch_point) = select_branch_point(repo_root, branch, &integration_heads)? else {
             continue;
@@ -40,15 +44,33 @@ pub fn load_repo_branch_context(repo_root: &str) -> Result<RepoBranchContext> {
         let commits = first_parent_commits_range(repo_root, &branch_point, branch)?;
         branch_owned_commits.insert(branch.clone(), commits.into_iter().collect());
     }
+    for branch in &heads {
+        let commits = list_commits_on_ref(repo_root, branch)?;
+        let mut distances = HashMap::with_capacity(commits.len());
+        for (distance, commit_sha) in commits.into_iter().enumerate() {
+            distances.insert(commit_sha.clone(), distance as i64);
+            commit_containing_branches
+                .entry(commit_sha)
+                .or_default()
+                .push(branch.clone());
+        }
+        branch_distance_to_tip.insert(branch.clone(), distances);
+    }
+    for branches in commit_containing_branches.values_mut() {
+        branches.sort();
+        branches.dedup();
+    }
 
     Ok(RepoBranchContext {
         local_heads,
         branch_owned_commits,
+        branch_distance_to_tip,
+        commit_containing_branches,
     })
 }
 
 pub fn attribute_commit_to_task(
-    repo_root: &str,
+    _repo_root: &str,
     commit_sha: &str,
     ctx: &RepoBranchContext,
 ) -> Result<CommitTaskAttribution> {
@@ -56,10 +78,11 @@ pub fn attribute_commit_to_task(
         return Ok(unknown_task_row());
     }
 
-    let mut containing = branches_containing_commit(repo_root, commit_sha)?;
-    containing.retain(|b| ctx.local_heads.contains(b));
-    containing.sort();
-    containing.dedup();
+    let containing = ctx
+        .commit_containing_branches
+        .get(commit_sha)
+        .cloned()
+        .unwrap_or_default();
 
     if containing.is_empty() {
         return Ok(unknown_task_row());
@@ -73,20 +96,22 @@ pub fn attribute_commit_to_task(
         .collect();
 
     if !primary.is_empty() {
-        return select_primary_candidate(repo_root, commit_sha, &primary);
+        return select_primary_candidate(ctx, commit_sha, &primary);
     }
 
-    Ok(select_fallback_candidate(repo_root, commit_sha, &containing))
+    Ok(select_fallback_candidate(ctx, commit_sha, &containing))
 }
 
 fn select_primary_candidate(
-    repo_root: &str,
+    ctx: &RepoBranchContext,
     commit_sha: &str,
     primary: &[String],
 ) -> Result<CommitTaskAttribution> {
     let mut ranked = Vec::with_capacity(primary.len());
     for branch in primary {
-        let distance = distance_to_branch_tip(repo_root, commit_sha, branch)?;
+        let distance = ctx
+            .branch_distance_to_tip(branch, commit_sha)
+            .unwrap_or_default();
         ranked.push(BranchCandidate {
             branch: branch.clone(),
             distance_to_tip: distance,
@@ -114,7 +139,7 @@ fn select_primary_candidate(
 }
 
 fn select_fallback_candidate(
-    repo_root: &str,
+    ctx: &RepoBranchContext,
     commit_sha: &str,
     containing: &[String],
 ) -> CommitTaskAttribution {
@@ -126,7 +151,7 @@ fn select_fallback_candidate(
                 source: "integration_fallback".to_string(),
                 is_fallback: true,
                 candidate_count: 0,
-                distance_to_tip: distance_to_branch_tip(repo_root, commit_sha, fallback).ok(),
+                distance_to_tip: ctx.branch_distance_to_tip(fallback, commit_sha),
                 confidence: 0.5,
             };
         }
@@ -173,6 +198,15 @@ fn commit_is_owned_by_branch(ctx: &RepoBranchContext, branch: &str, commit_sha: 
         .get(branch)
         .map(|set| set.contains(commit_sha))
         .unwrap_or(false)
+}
+
+impl RepoBranchContext {
+    fn branch_distance_to_tip(&self, branch: &str, commit_sha: &str) -> Option<i64> {
+        self.branch_distance_to_tip
+            .get(branch)
+            .and_then(|commits| commits.get(commit_sha))
+            .copied()
+    }
 }
 
 fn select_branch_point(

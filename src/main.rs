@@ -1,10 +1,9 @@
+mod analytics;
 mod cli;
 mod change_intel;
 mod commands;
 mod db;
 mod error;
-mod events;
-mod metrics;
 mod path_utils;
 mod providers;
 
@@ -15,9 +14,10 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Commands::Ingest => commands::ingest::run(cli.verbose)?,
-        Commands::AssociateCommits(args) => commands::associate_commits::run(args, cli.verbose)?,
-        Commands::Stats => commands::stats::run()?,
-        Commands::TaskStats(args) => commands::task_stats::run(args)?,
+        Commands::Session(args) => commands::session::run(args)?,
+        Commands::Change(args) => commands::change::run(args)?,
+        Commands::Lifecycle(args) => commands::lifecycle::run(args)?,
+        Commands::EventStream(args) => commands::event_stream::run(args)?,
     }
     Ok(())
 }

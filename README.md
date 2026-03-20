@@ -21,7 +21,7 @@ The repository also includes a [`Taskfile.yml`](/home/tadas/Work/paceflow/vibe-c
 task build-release
 task install-profiler
 task profile -- ingest
-task profile -- stats
+task profile -- session
 task install-live-profiler
 task profile-live PID=$(pgrep -n vca)
 ```
@@ -71,9 +71,10 @@ pgrep -n vca
 ```bash
 vca --help
 vca ingest --help
-vca associate-commits --help
-vca task-stats --help
-vca stats --help
+vca session --help
+vca change --help
+vca lifecycle --help
+vca event-stream --help
 ```
 
 ## Manager Test Flow
@@ -84,32 +85,39 @@ vca stats --help
 vca ingest
 ```
 
-2. Associate AI-attributed commits for the target repo.
+2. View session metrics and session rows.
 
 ```bash
-vca associate-commits --repo /absolute/path/to/repo
+vca session
+vca session --list-sessions
 ```
 
-3. View task-level quality metrics.
+3. View change and lifecycle quality metrics.
 
 ```bash
-vca task-stats --limit 20
+vca change
+vca lifecycle
 ```
 
-Optional single task:
+Optional grouped cuts:
 
 ```bash
-vca task-stats --task ABC-123
+vca session --weekly --group-by provider
+vca change --group-by repo
+vca lifecycle --group-by task --task ABC-123
 ```
 
-4. View global quality + session stats.
+Manual validation:
 
 ```bash
-vca stats
+vca event-stream --stream session-base
+vca event-stream --stream task-commit-base --task ABC-123
+vca event-stream --limit 10
 ```
 
 ## Notes
 
-- `task-stats` only shows task branches with ticket-style task keys (for example `ABC-123`).
-- Integration fallback branches (`main`, `staging`, `master`, `develop`) are excluded from task rows.
-- `vs Staging` uses `git diff staging...<branch>` for non-integration branches.
+- `session`, `change`, and `lifecycle` share the same filtering interface: `--weekly`, `--group-by`, `--from`, `--to`, `--repo`, `--provider`, `--task`, `--model`, and `--limit`.
+- `event-stream` is a read-only NDJSON export of the reporting base views for manual metric validation. It supports `--category`, `--stream`, `--from`, `--to`, `--repo`, `--provider`, `--task`, `--model`, and `--limit`.
+- Task-grouped rows only show ticket-style task keys (for example `ABC-123`) and exclude integration branches such as `main`, `staging`, `master`, and `develop`.
+- `change --group-by task` includes `vs Staging`, derived from `git diff staging...<branch>` for non-integration branches.

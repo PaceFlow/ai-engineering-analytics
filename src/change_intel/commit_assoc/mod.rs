@@ -1,8 +1,6 @@
 use anyhow::Result;
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
-use rusqlite::Connection;
-use std::collections::HashSet;
-use std::path::PathBuf;
+use rusqlite::{Connection, TransactionBehavior};
 
 pub mod git_scan;
 pub mod matcher;
@@ -10,28 +8,22 @@ pub mod task_matcher;
 pub mod storage;
 pub mod types;
 
-use git_scan::{
-    current_head_sha, is_ancestor, list_commits_range, list_commits_since, load_commit_diff,
-    load_commit_metadata, validate_git_repo,
-};
-use matcher::compute_commit_attribution;
+use git_scan::{list_commits_since_all_local_branches, load_commit_diff, validate_git_repo};
+use matcher::{compute_commit_attribution, preload_repo_match_data};
 use task_matcher::{RepoBranchContext, attribute_commit_to_task, load_repo_branch_context};
 use storage::{
-    branch_scope_head, get_commit_cursor, insert_commit_assoc_error, list_repo_roots_from_change_ops,
-    min_ai_timestamp, upsert_commit_attribution, upsert_commit_cursor,
-    upsert_commit_task_attribution, upsert_git_commit_with_diffs,
+    insert_commit_assoc_error, list_repo_roots_from_session_facts, min_ai_timestamp,
+    upsert_commit_attribution, upsert_commit_task_attribution, upsert_git_commit_with_diffs,
 };
-use types::{AssociationSummary, RepoSummary, RunOptions};
+use types::{AssociationSummary, RepoSummary};
 
-pub fn run(conn: &Connection, options: RunOptions, verbose: bool) -> Result<AssociationSummary> {
-    let discovered = list_repo_roots_from_change_ops(conn)?;
+pub fn run(conn: &mut Connection, verbose: bool) -> Result<AssociationSummary> {
+    let repos = list_repo_roots_from_session_facts(conn)?;
     let mut summary = AssociationSummary {
-        repos_considered: discovered.len(),
+        repos_considered: repos.len(),
+        repos_selected: repos.len(),
         ..AssociationSummary::default()
     };
-
-    let repos = select_scoped_repos(&discovered, &options.repos);
-    summary.repos_selected = repos.len();
 
     for repo_root in repos {
         let mut repo_summary = RepoSummary {
@@ -56,7 +48,7 @@ pub fn run(conn: &Connection, options: RunOptions, verbose: bool) -> Result<Asso
                 summary.repo_summaries.push(repo_summary);
                 continue;
             }
-            Err(e) => {
+            Err(err) => {
                 repo_summary.errors += 1;
                 summary.errors += 1;
                 insert_commit_assoc_error(
@@ -64,7 +56,7 @@ pub fn run(conn: &Connection, options: RunOptions, verbose: bool) -> Result<Asso
                     &repo_root,
                     None,
                     "validate_repo",
-                    &e.to_string(),
+                    &err.to_string(),
                 )?;
                 summary.repo_summaries.push(repo_summary);
                 continue;
@@ -73,14 +65,14 @@ pub fn run(conn: &Connection, options: RunOptions, verbose: bool) -> Result<Asso
 
         summary.repos_processed += 1;
         let branch_ctx = match load_repo_branch_context(&repo_root) {
-            Ok(v) => v,
-            Err(e) => {
+            Ok(value) => value,
+            Err(err) => {
                 insert_commit_assoc_error(
                     conn,
                     &repo_root,
                     None,
                     "load_repo_branches",
-                    &e.to_string(),
+                    &err.to_string(),
                 )?;
                 RepoBranchContext::default()
             }
@@ -91,171 +83,41 @@ pub fn run(conn: &Connection, options: RunOptions, verbose: bool) -> Result<Asso
             continue;
         };
 
-        let head_sha = match current_head_sha(&repo_root) {
-            Ok(v) => v,
-            Err(e) => {
-                repo_summary.errors += 1;
-                summary.errors += 1;
-                insert_commit_assoc_error(conn, &repo_root, None, "head_sha", &e.to_string())?;
-                summary.repo_summaries.push(repo_summary);
-                continue;
-            }
-        };
-
-        let cursor = get_commit_cursor(conn, &repo_root, branch_scope_head())?;
-        let commit_shas = determine_commit_scope(
-            &repo_root,
-            &head_sha,
-            cursor.as_ref(),
-            &ai_min_ts,
-            &options,
-            conn,
-        )?;
-
-        let mut last_commit_time: Option<String> = None;
-        for commit_sha in commit_shas {
-            repo_summary.commits_scanned += 1;
-            summary.commits_scanned += 1;
-
-            let commit = match load_commit_diff(&repo_root, &commit_sha) {
-                Ok(v) => v,
-                Err(e) => {
-                    repo_summary.errors += 1;
-                    summary.errors += 1;
-                    insert_commit_assoc_error(
-                        conn,
-                        &repo_root,
-                        Some(&commit_sha),
-                        "load_commit_diff",
-                        &e.to_string(),
-                    )?;
-                    continue;
-                }
-            };
-            last_commit_time = Some(commit.commit_time.clone());
-
-            let commit_id = match upsert_git_commit_with_diffs(conn, &repo_root, &commit) {
-                Ok(v) => v,
-                Err(e) => {
-                    repo_summary.errors += 1;
-                    summary.errors += 1;
-                    insert_commit_assoc_error(
-                        conn,
-                        &repo_root,
-                        Some(&commit_sha),
-                        "persist_commit_diff",
-                        &e.to_string(),
-                    )?;
-                    continue;
-                }
-            };
-
-            let (attribution, provider_rows, session_rows) =
-                match compute_commit_attribution(conn, &repo_root, commit_id) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        repo_summary.errors += 1;
-                        summary.errors += 1;
-                        insert_commit_assoc_error(
-                            conn,
-                            &repo_root,
-                            Some(&commit_sha),
-                            "compute_attribution",
-                            &e.to_string(),
-                        )?;
-                        continue;
-                    }
-                };
-
-            if let Err(e) = upsert_commit_attribution(
-                conn,
-                commit_id,
-                &attribution,
-                &provider_rows,
-                &session_rows,
-            )
-            {
+        let commit_shas = match determine_commit_scope(&repo_root, &ai_min_ts) {
+            Ok(value) => value,
+            Err(err) => {
                 repo_summary.errors += 1;
                 summary.errors += 1;
                 insert_commit_assoc_error(
                     conn,
                     &repo_root,
-                    Some(&commit_sha),
-                    "persist_attribution",
-                    &e.to_string(),
+                    None,
+                    "determine_commit_scope",
+                    &err.to_string(),
                 )?;
+                summary.repo_summaries.push(repo_summary);
                 continue;
             }
+        };
 
-            match attribute_commit_to_task(&repo_root, &commit.commit_sha, &branch_ctx) {
-                Ok(task_attr) => {
-                    if let Err(e) = upsert_commit_task_attribution(conn, commit_id, &task_attr) {
-                        repo_summary.errors += 1;
-                        summary.errors += 1;
-                        insert_commit_assoc_error(
-                            conn,
-                            &repo_root,
-                            Some(&commit_sha),
-                            "persist_task_attribution",
-                            &e.to_string(),
-                        )?;
-                    } else if verbose {
-                        eprintln!(
-                            "[commit-task] {} {} branch={} task={} fallback={} confidence={:.2}",
-                            repo_root,
-                            commit.commit_sha,
-                            task_attr.branch_name,
-                            task_attr.task_key,
-                            task_attr.is_fallback,
-                            task_attr.confidence
-                        );
-                    }
-                }
-                Err(e) => {
-                    repo_summary.errors += 1;
-                    summary.errors += 1;
-                    insert_commit_assoc_error(
-                        conn,
-                        &repo_root,
-                        Some(&commit_sha),
-                        "compute_task_attribution",
-                        &e.to_string(),
-                    )?;
-                }
-            }
-
-            if verbose {
-                eprintln!(
-                    "[commit-assoc] {} {} ai_share={:.3} heavy={}",
-                    repo_root, commit.commit_sha, attribution.ai_share, attribution.heavy_ai
-                );
-            }
-
-            repo_summary.commits_attributed += 1;
-            summary.commits_attributed += 1;
-            if attribution.heavy_ai {
-                repo_summary.heavy_commits += 1;
-                summary.heavy_commits += 1;
-            }
-        }
-
-        if last_commit_time.is_none() {
-            if let Ok((head_time, _, _)) = load_commit_metadata(&repo_root, &head_sha) {
-                last_commit_time = Some(head_time);
-            }
-        }
-
-        if let Err(e) = upsert_commit_cursor(
+        if let Err(err) = process_repo_commits(
             conn,
             &repo_root,
-            branch_scope_head(),
-            &head_sha,
-            last_commit_time.as_deref(),
-            Some(&ai_min_ts),
+            &branch_ctx,
+            &commit_shas,
+            &mut repo_summary,
+            &mut summary,
+            verbose,
         ) {
             repo_summary.errors += 1;
             summary.errors += 1;
-            insert_commit_assoc_error(conn, &repo_root, None, "upsert_cursor", &e.to_string())?;
+            insert_commit_assoc_error(
+                conn,
+                &repo_root,
+                None,
+                "commit_transaction",
+                &err.to_string(),
+            )?;
         }
 
         summary.repo_summaries.push(repo_summary);
@@ -264,110 +126,144 @@ pub fn run(conn: &Connection, options: RunOptions, verbose: bool) -> Result<Asso
     Ok(summary)
 }
 
-fn determine_commit_scope(
-    repo_root: &str,
-    head_sha: &str,
-    cursor: Option<&types::CommitCursor>,
-    ai_min_ts: &str,
-    options: &RunOptions,
-    conn: &Connection,
-) -> Result<Vec<String>> {
+fn determine_commit_scope(repo_root: &str, ai_min_ts: &str) -> Result<Vec<String>> {
     let ai_scan_from = loosen_scan_start(ai_min_ts, 1);
+    list_commits_since_all_local_branches(repo_root, &ai_scan_from, false, None)
+}
 
-    if options.recompute {
-        return list_commits_since(
-            repo_root,
-            &ai_scan_from,
-            options.include_merges,
-            options.max_commits,
-        );
-    }
+fn process_repo_commits(
+    conn: &mut Connection,
+    repo_root: &str,
+    branch_ctx: &RepoBranchContext,
+    commit_shas: &[String],
+    repo_summary: &mut RepoSummary,
+    summary: &mut AssociationSummary,
+    verbose: bool,
+) -> Result<()> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let match_preload = preload_repo_match_data(&tx, repo_root)?;
 
-    let Some(cursor) = cursor else {
-        return list_commits_since(
-            repo_root,
-            &ai_scan_from,
-            options.include_merges,
-            options.max_commits,
-        );
-    };
+    for commit_sha in commit_shas {
+        repo_summary.commits_scanned += 1;
+        summary.commits_scanned += 1;
 
-    if cursor.min_ai_ts_seen.as_deref() != Some(ai_min_ts) {
-        return list_commits_since(
-            repo_root,
-            &ai_scan_from,
-            options.include_merges,
-            options.max_commits,
-        );
-    }
-
-    if is_ancestor(repo_root, &cursor.last_head_sha, head_sha)? {
-        match list_commits_range(
-            repo_root,
-            &cursor.last_head_sha,
-            head_sha,
-            options.include_merges,
-            options.max_commits,
-        ) {
-            Ok(v) => return Ok(v),
-            Err(e) => {
+        let commit = match load_commit_diff(repo_root, commit_sha) {
+            Ok(value) => value,
+            Err(err) => {
+                repo_summary.errors += 1;
+                summary.errors += 1;
                 insert_commit_assoc_error(
-                    conn,
+                    &tx,
                     repo_root,
-                    None,
-                    "incremental_range",
-                    &e.to_string(),
+                    Some(commit_sha),
+                    "load_commit_diff",
+                    &err.to_string(),
                 )?;
-                return list_commits_since(
-                    repo_root,
-                    &ai_scan_from,
-                    options.include_merges,
-                    options.max_commits,
-                );
+                continue;
             }
+        };
+
+        if let Err(err) = upsert_git_commit_with_diffs(&tx, repo_root, &commit) {
+            repo_summary.errors += 1;
+            summary.errors += 1;
+            insert_commit_assoc_error(
+                &tx,
+                repo_root,
+                Some(commit_sha),
+                "persist_commit_diff",
+                &err.to_string(),
+            )?;
+            continue;
+        }
+
+        let (attribution, session_rows) =
+            match compute_commit_attribution(&commit, &match_preload) {
+                Ok(value) => value,
+                Err(err) => {
+                    repo_summary.errors += 1;
+                    summary.errors += 1;
+                    insert_commit_assoc_error(
+                        &tx,
+                        repo_root,
+                        Some(commit_sha),
+                        "compute_attribution",
+                        &err.to_string(),
+                    )?;
+                    continue;
+                }
+            };
+
+        if let Err(err) =
+            upsert_commit_attribution(&tx, repo_root, &commit.commit_sha, &attribution, &session_rows)
+        {
+            repo_summary.errors += 1;
+            summary.errors += 1;
+            insert_commit_assoc_error(
+                &tx,
+                repo_root,
+                Some(commit_sha),
+                "persist_attribution",
+                &err.to_string(),
+            )?;
+            continue;
+        }
+
+        match attribute_commit_to_task(repo_root, &commit.commit_sha, branch_ctx) {
+            Ok(task_attr) => {
+                if let Err(err) =
+                    upsert_commit_task_attribution(&tx, repo_root, &commit.commit_sha, &task_attr)
+                {
+                    repo_summary.errors += 1;
+                    summary.errors += 1;
+                    insert_commit_assoc_error(
+                        &tx,
+                        repo_root,
+                        Some(commit_sha),
+                        "persist_task_attribution",
+                        &err.to_string(),
+                    )?;
+                } else if verbose {
+                    eprintln!(
+                        "[commit-task] {} {} branch={} task={} fallback={} confidence={:.2}",
+                        repo_root,
+                        commit.commit_sha,
+                        task_attr.branch_name,
+                        task_attr.task_key,
+                        task_attr.is_fallback,
+                        task_attr.confidence
+                    );
+                }
+            }
+            Err(err) => {
+                repo_summary.errors += 1;
+                summary.errors += 1;
+                insert_commit_assoc_error(
+                    &tx,
+                    repo_root,
+                    Some(commit_sha),
+                    "compute_task_attribution",
+                    &err.to_string(),
+                )?;
+            }
+        }
+
+        if verbose {
+            eprintln!(
+                "[commit-assoc] {} {} ai_share={:.3} heavy={}",
+                repo_root, commit.commit_sha, attribution.ai_share, attribution.heavy_ai
+            );
+        }
+
+        repo_summary.commits_attributed += 1;
+        summary.commits_attributed += 1;
+        if attribution.heavy_ai {
+            repo_summary.heavy_commits += 1;
+            summary.heavy_commits += 1;
         }
     }
 
-    let _last_commit_time_hint = cursor.last_commit_time.as_deref();
-
-    list_commits_since(
-        repo_root,
-        &ai_scan_from,
-        options.include_merges,
-        options.max_commits,
-    )
-}
-
-fn select_scoped_repos(discovered: &[String], requested: &[String]) -> Vec<String> {
-    if requested.is_empty() {
-        return discovered.to_vec();
-    }
-
-    let requested_norm: HashSet<String> = requested.iter().map(|s| normalize_path(s)).collect();
-    discovered
-        .iter()
-        .filter(|repo| {
-            let norm = normalize_path(repo);
-            requested_norm.contains(repo.as_str()) || requested_norm.contains(&norm)
-        })
-        .cloned()
-        .collect()
-}
-
-fn normalize_path(path: &str) -> String {
-    let pb = PathBuf::from(path);
-    let abs = if pb.is_absolute() {
-        pb
-    } else if let Ok(cwd) = std::env::current_dir() {
-        cwd.join(pb)
-    } else {
-        PathBuf::from(path)
-    };
-
-    std::fs::canonicalize(&abs)
-        .unwrap_or(abs)
-        .to_string_lossy()
-        .to_string()
+    tx.commit()?;
+    Ok(())
 }
 
 fn loosen_scan_start(ai_min_ts: &str, days: i64) -> String {

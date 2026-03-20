@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::db;
-use crate::events::Event;
+use crate::path_utils::detect_repo_root;
 use super::Provider;
 use super::utils::diff_line_counts;
 
@@ -75,11 +75,11 @@ impl Provider for CursorProvider {
 
         println!("  found {} composer session(s)", rows.len());
 
-        let mut total_events = 0usize;
+        let mut total_rows = 0usize;
         for (_key, value) in rows {
             match ingest_composer(db, &vscdb, &value, &history_index, verbose) {
                 Ok(0) => {}
-                Ok(n) => total_events += n,
+                Ok(n) => total_rows += n,
                 Err(e) => {
                     if verbose {
                         eprintln!("[cursor] skipping session: {}", e);
@@ -87,7 +87,7 @@ impl Provider for CursorProvider {
                 }
             }
         }
-        Ok(total_events)
+        Ok(total_rows)
     }
 }
 
@@ -254,6 +254,10 @@ fn ingest_composer(
     history_index: &HistoryIndex,
     verbose: bool,
 ) -> Result<usize> {
+    let raw_json: JsonValue = match serde_json::from_str(json_text) {
+        Ok(value) => value,
+        Err(_) => return Ok(0),
+    };
     let data: ComposerData = match serde_json::from_str(json_text) {
         Ok(d) => d,
         Err(_) => return Ok(0), // binary blob or unrecognised format
@@ -274,6 +278,7 @@ fn ingest_composer(
     let timestamp = data.created_at.map(ms_to_iso);
     let last_updated = data.last_updated_at.map(ms_to_iso);
     let project_path = extract_project_path(&data);
+    let model_name = extract_model_name(&raw_json);
 
     if verbose {
         eprintln!(
@@ -283,15 +288,17 @@ fn ingest_composer(
         );
     }
 
-    let mut events: Vec<Event> = Vec::new();
-
-    events.push(Event::ChatStart {
-        session_id: session_id.clone(),
-        provider: "cursor".into(),
-        project_path,
-        timestamp: timestamp.clone(),
-        last_updated: last_updated.clone(),
-    });
+    db::begin_session_with_model(
+        db,
+        "cursor",
+        session_id,
+        project_path.as_deref(),
+        timestamp.as_deref(),
+        last_updated.as_deref().or(timestamp.as_deref()),
+        Some("cursor"),
+        model_name.as_deref(),
+    )?;
+    let mut written = 1usize;
 
     // Conversation messages (old schema)
     let mut events_from_conversation = 0usize;
@@ -306,15 +313,17 @@ fn ingest_composer(
             _ => continue,
         };
         let words = text.split_whitespace().count();
-        events.push(Event::Message {
-            session_id: session_id.clone(),
-            provider: "cursor".into(),
-            role: role.into(),
-            content: text,
-            content_words: words,
-            timestamp: timestamp.clone(),
-        });
+        db::ingest_session_message(
+            db,
+            "cursor",
+            session_id,
+            role,
+            &text,
+            words as i64,
+            timestamp.as_deref(),
+        )?;
         events_from_conversation += 1;
+        written += 1;
     }
 
     // New schema: bubbles stored separately in vscdb
@@ -336,14 +345,16 @@ fn ingest_composer(
                 _ => continue,
             };
             let words = text.split_whitespace().count();
-            events.push(Event::Message {
-                session_id: session_id.clone(),
-                provider: "cursor".into(),
-                role: role.into(),
-                content: text,
-                content_words: words,
-                timestamp: timestamp.clone(),
-            });
+            db::ingest_session_message(
+                db,
+                "cursor",
+                session_id,
+                role,
+                &text,
+                words as i64,
+                timestamp.as_deref(),
+            )?;
+            written += 1;
         }
     }
 
@@ -368,38 +379,38 @@ fn ingest_composer(
             history_index,
         );
 
-        events.push(Event::ChangesAccepted {
-            session_id: session_id.clone(),
-            provider: "cursor".into(),
-            file_path,
+        db::ingest_accepted_code_change(
+            db,
+            "cursor",
+            session_id,
+            &file_path,
             lines_added,
             lines_removed,
-            timestamp: timestamp.clone(),
-        });
+            timestamp.as_deref(),
+        )?;
         loc_events_pushed += 1;
+        written += 1;
     }
 
     // LOC fallback for new schema: aggregate counts on composerData object
     if loc_events_pushed == 0 {
         if let (Some(added), Some(removed)) = (data.total_lines_added, data.total_lines_removed) {
             if added > 0 || removed > 0 {
-                events.push(Event::ChangesAccepted {
-                    session_id: session_id.clone(),
-                    provider: "cursor".into(),
-                    file_path: "__total__".into(),
-                    lines_added: added,
-                    lines_removed: removed,
-                    timestamp: timestamp.clone(),
-                });
+                db::ingest_accepted_code_change(
+                    db,
+                    "cursor",
+                    session_id,
+                    "__total__",
+                    added,
+                    removed,
+                    timestamp.as_deref(),
+                )?;
+                written += 1;
             }
         }
     }
 
-    let count = events.len();
-    for event in &events {
-        db::insert_event(db, event)?;
-    }
-    Ok(count)
+    Ok(written)
 }
 
 // ── LOC from File History ─────────────────────────────────────────────────────
@@ -578,34 +589,16 @@ fn extract_project_path(data: &ComposerData) -> Option<String> {
     } else {
         common.join("/")
     };
-    Some(find_project_root(&raw))
-}
 
-fn find_project_root(path: &str) -> String {
-    const MARKERS: &[&str] = &[
-        ".git", "package.json", "Cargo.toml", "pyproject.toml", "go.mod",
-    ];
-    let p = std::path::Path::new(path);
-    // If the path has an extension treat it as a file; start from its parent
-    let mut dir = if p.extension().is_some() {
-        p.parent().unwrap_or(p)
-    } else {
-        p
-    };
-    loop {
-        if MARKERS.iter().any(|m| dir.join(m).exists()) {
-            return dir.to_string_lossy().into_owned();
-        }
-        match dir.parent() {
-            Some(parent) if parent != dir => dir = parent,
-            _ => break,
-        }
+    let path = Path::new(&raw);
+    if let Some(root) = detect_repo_root(path) {
+        return Some(root.to_string_lossy().into_owned());
     }
-    // Fallback: return the directory we started from
-    if p.extension().is_some() {
-        p.parent().unwrap_or(p).to_string_lossy().into_owned()
+
+    if path.extension().is_some() {
+        path.parent().map(|p| p.to_string_lossy().into_owned())
     } else {
-        path.to_string()
+        Some(raw)
     }
 }
 
@@ -617,4 +610,75 @@ fn strip_file_scheme(uri: &str) -> String {
     } else {
         uri.to_string()
     }
+}
+
+fn extract_model_name(raw: &JsonValue) -> Option<String> {
+    const MODEL_KEYS: &[&str] = &[
+        "model",
+        "modelName",
+        "currentModel",
+        "selectedModel",
+        "defaultModel",
+        "defaultModelSlug",
+        "chatModel",
+    ];
+
+    fn visit(value: &JsonValue) -> Option<String> {
+        match value {
+            JsonValue::Object(map) => {
+                for key in MODEL_KEYS {
+                    if let Some(candidate) = map.get(*key).and_then(model_string_from_value) {
+                        return Some(candidate);
+                    }
+                }
+                for value in map.values() {
+                    if let Some(candidate) = visit(value) {
+                        return Some(candidate);
+                    }
+                }
+                None
+            }
+            JsonValue::Array(values) => values.iter().find_map(visit),
+            _ => None,
+        }
+    }
+
+    visit(raw)
+}
+
+fn model_string_from_value(value: &JsonValue) -> Option<String> {
+    let candidate = match value {
+        JsonValue::String(value) => value.trim(),
+        JsonValue::Object(map) => {
+            for key in ["name", "slug", "id", "model"] {
+                if let Some(candidate) = map.get(key).and_then(model_string_from_value) {
+                    return Some(candidate);
+                }
+            }
+            return None;
+        }
+        _ => return None,
+    };
+
+    if candidate.is_empty() {
+        return None;
+    }
+
+    let lowered = candidate.to_ascii_lowercase();
+    if lowered.contains("gpt")
+        || lowered.contains("claude")
+        || lowered.contains("gemini")
+        || lowered.contains("sonnet")
+        || lowered.contains("haiku")
+        || lowered.contains("opus")
+        || lowered.contains("o1")
+        || lowered.contains("o3")
+        || lowered.contains("deepseek")
+        || lowered.contains("llama")
+        || lowered.contains("qwen")
+    {
+        return Some(candidate.to_string());
+    }
+
+    None
 }

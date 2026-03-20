@@ -1,12 +1,12 @@
 use anyhow::Result;
 use chrono::TimeZone;
-use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
-use crate::change_intel::line_hash::hash_line;
+use crate::change_intel::line_hash::{diff_with_hashes, hash_line};
 use crate::change_intel::path_resolver::{detect_repo_root, to_rel_path};
 use crate::change_intel::pipeline::ProviderCodeChangeSummary;
 use crate::change_intel::storage;
@@ -15,15 +15,16 @@ use crate::path_utils::strip_file_scheme;
 
 const CURSOR_CURSOR_NAMESPACE: &str = "cursor_core_v1";
 const INLINE_PARSER_NAME: &str = "cursor_inline_undo_v1";
-const INLINE_PARSER_VERSION: &str = "1";
 const PARTIAL_PARSER_NAME: &str = "cursor_partial_fates_v1";
-const PARTIAL_PARSER_VERSION: &str = "1";
+const LEGACY_DIFF_PARSER_NAME: &str = "cursor_legacy_code_block_diff_v1";
+const LEGACY_CONTENT_PARSER_NAME: &str = "cursor_legacy_code_block_content_v1";
 
 #[derive(Debug, Clone)]
 struct CandidateSession {
     info: SessionInfo,
     checkpoint_paths: HashSet<String>,
     partial_targets: Vec<PartialTarget>,
+    legacy_targets: Vec<LegacyTarget>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -32,8 +33,41 @@ struct PartialTarget {
     abs_path: String,
 }
 
+#[derive(Debug, Clone)]
+struct LegacyTarget {
+    diff_id: Option<String>,
+    abs_path: String,
+    version: i32,
+    code_block_idx: i32,
+    timestamp: Option<String>,
+    content: Option<String>,
+    bubble_id: Option<String>,
+}
+
+impl LegacyTarget {
+    fn call_id(&self) -> String {
+        self.diff_id
+            .clone()
+            .or_else(|| self.bubble_id.clone())
+            .unwrap_or_else(|| {
+                format!(
+                    "legacy-content:{}:{}:{}",
+                    self.abs_path,
+                    self.version,
+                    self.code_block_idx
+                )
+            })
+    }
+
+    fn op_index(&self) -> i32 {
+        self.version
+            .saturating_mul(1000)
+            .saturating_add(self.code_block_idx.max(0))
+    }
+}
+
 pub fn ingest_cursor_code_changes(
-    conn: &Connection,
+    conn: &mut Connection,
     verbose: bool,
 ) -> Result<ProviderCodeChangeSummary> {
     let Some(vscdb_path) = cursor_vscdb_path()? else {
@@ -47,7 +81,7 @@ pub fn ingest_cursor_code_changes(
 }
 
 pub(crate) fn ingest_cursor_code_changes_from_path(
-    conn: &Connection,
+    conn: &mut Connection,
     vscdb_path: &Path,
     verbose: bool,
 ) -> Result<ProviderCodeChangeSummary> {
@@ -74,18 +108,19 @@ pub(crate) fn ingest_cursor_code_changes_from_path(
         vscdb_path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
 
     let mut sessions = collect_candidate_sessions(&vscdb, &source_file)?;
     populate_checkpoint_paths(&vscdb, &mut sessions)?;
 
     for session in sessions.values() {
-        storage::upsert_change_session(conn, &session.info)?;
+        storage::upsert_change_session(&tx, &session.info)?;
     }
 
     let mut seen_paths_by_session: HashMap<String, HashSet<String>> = HashMap::new();
 
     ingest_inline_undo_rows(
-        conn,
+        &tx,
         &vscdb,
         &source_file,
         &sessions,
@@ -95,7 +130,17 @@ pub(crate) fn ingest_cursor_code_changes_from_path(
     )?;
 
     ingest_partial_fates_fallback(
-        conn,
+        &tx,
+        &vscdb,
+        &source_file,
+        &sessions,
+        &mut seen_paths_by_session,
+        &mut summary,
+        verbose,
+    )?;
+
+    ingest_legacy_code_block_fallback(
+        &tx,
         &vscdb,
         &source_file,
         &sessions,
@@ -105,8 +150,10 @@ pub(crate) fn ingest_cursor_code_changes_from_path(
     )?;
 
     if let Some((mtime, size)) = sig {
-        storage::upsert_ingest_cursor(conn, CURSOR_CURSOR_NAMESPACE, &source_file, mtime, size)?;
+        storage::upsert_ingest_cursor(&tx, CURSOR_CURSOR_NAMESPACE, &source_file, mtime, size)?;
     }
+
+    tx.commit()?;
 
     Ok(summary)
 }
@@ -148,16 +195,13 @@ fn collect_candidate_sessions(
             continue;
         }
 
-        let started_at = parsed
-            .get("createdAt")
-            .and_then(|v| v.as_i64())
-            .and_then(ms_to_iso);
         let last_seen_at = parsed
             .get("lastUpdatedAt")
             .and_then(|v| v.as_i64())
             .and_then(ms_to_iso);
 
         let partial_targets = extract_partial_targets(&parsed);
+        let legacy_targets = extract_legacy_targets(&parsed);
 
         out.insert(
             composer_id.clone(),
@@ -167,11 +211,11 @@ fn collect_candidate_sessions(
                     session_id: composer_id,
                     source_file: source_file.to_string(),
                     session_cwd: None,
-                    started_at,
                     last_seen_at,
                 },
                 checkpoint_paths: HashSet::new(),
                 partial_targets,
+                legacy_targets,
             },
         );
     }
@@ -424,6 +468,283 @@ fn ingest_partial_fates_fallback(
     Ok(())
 }
 
+fn ingest_legacy_code_block_fallback(
+    conn: &Connection,
+    vscdb: &Connection,
+    source_file: &str,
+    sessions: &HashMap<String, CandidateSession>,
+    seen_paths_by_session: &mut HashMap<String, HashSet<String>>,
+    summary: &mut ProviderCodeChangeSummary,
+    verbose: bool,
+) -> Result<()> {
+    for (composer_id, session) in sessions {
+        if session.legacy_targets.is_empty() {
+            continue;
+        }
+
+        summary.legacy_sessions_considered += 1;
+
+        let mut targets = session.legacy_targets.clone();
+        targets.sort_by(|a, b| {
+            a.abs_path
+                .cmp(&b.abs_path)
+                .then(a.version.cmp(&b.version))
+                .then(a.code_block_idx.cmp(&b.code_block_idx))
+                .then(a.diff_id.cmp(&b.diff_id))
+        });
+
+        let mut previous_content_by_path: HashMap<String, String> = HashMap::new();
+
+        for target in targets {
+            if seen_paths_by_session
+                .get(composer_id)
+                .is_some_and(|set| set.contains(&target.abs_path))
+            {
+                if let Some(content) = &target.content {
+                    previous_content_by_path.insert(target.abs_path.clone(), content.clone());
+                }
+                continue;
+            }
+
+            summary.tool_calls_inspected += 1;
+            summary.legacy_entries_inspected += 1;
+
+            let op = match build_legacy_diff_op(vscdb, composer_id, &target, session) {
+                Ok(Some(op)) => {
+                    summary.legacy_diff_rows_found += 1;
+                    Some(op)
+                }
+                Ok(None) => match build_legacy_content_fallback_op(
+                    previous_content_by_path.get(&target.abs_path).map(String::as_str),
+                    &target,
+                    session,
+                ) {
+                    Ok(op) => op,
+                    Err(content_err) => {
+                        insert_legacy_parse_error(
+                            conn,
+                            summary,
+                            &session.info.session_id,
+                            source_file,
+                            target
+                                .diff_id
+                                .as_deref()
+                                .or(target.bubble_id.as_deref())
+                                .unwrap_or("legacy-code-block"),
+                            target.timestamp.clone().or_else(|| session.info.last_seen_at.clone()),
+                            LEGACY_CONTENT_PARSER_NAME,
+                            content_err,
+                            verbose,
+                        )?;
+                        None
+                    }
+                },
+                Err(diff_err) => match build_legacy_content_fallback_op(
+                    previous_content_by_path.get(&target.abs_path).map(String::as_str),
+                    &target,
+                    session,
+                ) {
+                    Ok(Some(op)) => Some(op),
+                    Ok(None) => {
+                        insert_legacy_parse_error(
+                            conn,
+                            summary,
+                            &session.info.session_id,
+                            source_file,
+                            target
+                                .diff_id
+                                .as_deref()
+                                .or(target.bubble_id.as_deref())
+                                .unwrap_or("legacy-code-block"),
+                            target.timestamp.clone().or_else(|| session.info.last_seen_at.clone()),
+                            LEGACY_DIFF_PARSER_NAME,
+                            diff_err,
+                            verbose,
+                        )?;
+                        None
+                    }
+                    Err(content_err) => {
+                        insert_legacy_parse_error(
+                            conn,
+                            summary,
+                            &session.info.session_id,
+                            source_file,
+                            target
+                                .diff_id
+                                .as_deref()
+                                .or(target.bubble_id.as_deref())
+                                .unwrap_or("legacy-code-block"),
+                            target.timestamp.clone().or_else(|| session.info.last_seen_at.clone()),
+                            LEGACY_CONTENT_PARSER_NAME,
+                            format!("{}; fallback failed: {}", diff_err, content_err),
+                            verbose,
+                        )?;
+                        None
+                    }
+                },
+            };
+
+            if let Some(op) = op {
+                let op_id = storage::upsert_change_op(conn, &op)?;
+                storage::replace_line_hashes(conn, op_id, &op.line_hashes)?;
+                summary.ops_upserted += 1;
+                summary.legacy_ops_upserted += 1;
+            }
+
+            if let Some(content) = &target.content {
+                previous_content_by_path.insert(target.abs_path.clone(), content.clone());
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn build_legacy_diff_op(
+    vscdb: &Connection,
+    composer_id: &str,
+    target: &LegacyTarget,
+    session: &CandidateSession,
+) -> std::result::Result<Option<ChangeOpCandidate>, String> {
+    let Some(diff_id) = &target.diff_id else {
+        return Ok(None);
+    };
+
+    let diff_key = format!("codeBlockDiff:{}:{}", composer_id, diff_id);
+    let raw_payload: Option<String> = vscdb
+        .query_row(
+            "SELECT value FROM cursorDiskKV WHERE key = ?1",
+            params![diff_key],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+
+    let Some(raw_payload) = raw_payload else {
+        return Err("legacy codeBlockDiff row not found".to_string());
+    };
+
+    let payload: Value = serde_json::from_str(&raw_payload)
+        .map_err(|e| format!("invalid legacy codeBlockDiff JSON: {}", e))?;
+
+    let removed_lines = extract_legacy_diff_lines(&payload, "originalModelDiffWrtV0")?;
+    let added_lines = extract_legacy_diff_lines(&payload, "newModelDiffWrtV0")?;
+
+    if added_lines.is_empty() && removed_lines.is_empty() {
+        return Ok(None);
+    }
+
+    let mut line_hashes = hash_counts_for_lines(&added_lines, LineSide::Added);
+    line_hashes.extend(hash_counts_for_lines(&removed_lines, LineSide::Removed));
+
+    Ok(Some(build_change_op_candidate(
+        session,
+        diff_id.to_string(),
+        target.op_index(),
+        target.timestamp.clone(),
+        &target.abs_path,
+        WriteMode::Patch,
+        true,
+        added_lines.len() as i64,
+        removed_lines.len() as i64,
+        LEGACY_DIFF_PARSER_NAME,
+        line_hashes,
+    )))
+}
+
+fn build_legacy_content_fallback_op(
+    previous_content: Option<&str>,
+    target: &LegacyTarget,
+    session: &CandidateSession,
+) -> std::result::Result<Option<ChangeOpCandidate>, String> {
+    let Some(before_content) = previous_content else {
+        return Ok(None);
+    };
+    let Some(after_content) = target.content.as_deref() else {
+        return Ok(None);
+    };
+
+    let diff = diff_with_hashes(before_content, after_content);
+    if diff.added_lines == 0 && diff.removed_lines == 0 {
+        return Ok(None);
+    }
+
+    let call_id = target.call_id();
+    Ok(Some(build_change_op_candidate(
+        session,
+        call_id,
+        target.op_index(),
+        target.timestamp.clone(),
+        &target.abs_path,
+        WriteMode::Patch,
+        true,
+        diff.added_lines,
+        diff.removed_lines,
+        LEGACY_CONTENT_PARSER_NAME,
+        diff.line_hashes,
+    )))
+}
+
+fn extract_legacy_diff_lines(payload: &Value, field: &str) -> std::result::Result<Vec<String>, String> {
+    let hunks = payload
+        .get(field)
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| format!("legacy diff payload missing '{}' array", field))?;
+
+    let mut lines = Vec::new();
+    for hunk in hunks {
+        let Some(hunk_obj) = hunk.as_object() else {
+            continue;
+        };
+        let Some(modified) = hunk_obj.get("modified").and_then(|v| v.as_array()) else {
+            continue;
+        };
+        for line in modified {
+            let Some(line) = line.as_str() else {
+                return Err(format!("legacy diff '{}' modified entry was not a string", field));
+            };
+            lines.push(line.to_string());
+        }
+    }
+
+    Ok(lines)
+}
+
+fn build_change_op_candidate(
+    session: &CandidateSession,
+    call_id: String,
+    op_index: i32,
+    timestamp: Option<String>,
+    abs_path: &str,
+    write_mode: WriteMode,
+    before_known: bool,
+    added_lines: i64,
+    removed_lines: i64,
+    parser_name: &str,
+    line_hashes: Vec<LineHashCount>,
+) -> ChangeOpCandidate {
+    let abs_path_buf = PathBuf::from(abs_path);
+    let repo_root = detect_repo_root(&abs_path_buf);
+    let rel_path = to_rel_path(repo_root.as_deref(), &abs_path_buf);
+
+    ChangeOpCandidate {
+        provider: "cursor".to_string(),
+        session_id: session.info.session_id.clone(),
+        call_id,
+        op_index,
+        timestamp: timestamp.or_else(|| session.info.last_seen_at.clone()),
+        repo_root: repo_root.map(|p| p.to_string_lossy().to_string()),
+        abs_path: abs_path.to_string(),
+        rel_path,
+        write_mode,
+        before_known,
+        added_lines,
+        removed_lines,
+        parser_name: parser_name.to_string(),
+        line_hashes,
+    }
+}
+
 fn build_inline_change_op(
     call_id: &str,
     row: &Value,
@@ -518,7 +839,6 @@ fn build_inline_change_op(
         added_lines: added_lines.len() as i64,
         removed_lines: removed_lines.len() as i64,
         parser_name: INLINE_PARSER_NAME.to_string(),
-        parser_version: INLINE_PARSER_VERSION.to_string(),
         line_hashes,
     })
 }
@@ -578,7 +898,6 @@ fn build_partial_fates_op(
         added_lines: added_lines.len() as i64,
         removed_lines: removed_lines.len() as i64,
         parser_name: PARTIAL_PARSER_NAME.to_string(),
-        parser_version: PARTIAL_PARSER_VERSION.to_string(),
         line_hashes,
     }))
 }
@@ -616,6 +935,32 @@ fn insert_parse_error(
         },
     )?;
     summary.parse_errors += 1;
+    Ok(())
+}
+
+fn insert_legacy_parse_error(
+    conn: &Connection,
+    summary: &mut ProviderCodeChangeSummary,
+    session_id: &str,
+    source_file: &str,
+    call_id: &str,
+    timestamp: Option<String>,
+    parser_name: &str,
+    error: String,
+    verbose: bool,
+) -> Result<()> {
+    insert_parse_error(
+        conn,
+        summary,
+        session_id,
+        source_file,
+        call_id,
+        timestamp,
+        parser_name,
+        error,
+        verbose,
+    )?;
+    summary.legacy_parse_errors += 1;
     Ok(())
 }
 
@@ -668,6 +1013,87 @@ fn extract_partial_targets(parsed: &Value) -> Vec<PartialTarget> {
     }
 
     out.into_iter().collect()
+}
+
+fn extract_legacy_targets(parsed: &Value) -> Vec<LegacyTarget> {
+    let Some(code_block_data) = parsed.get("codeBlockData").and_then(|v| v.as_object()) else {
+        return Vec::new();
+    };
+
+    let default_timestamp = parsed
+        .get("lastUpdatedAt")
+        .and_then(|v| v.as_i64())
+        .and_then(ms_to_iso)
+        .or_else(|| parsed.get("createdAt").and_then(|v| v.as_i64()).and_then(ms_to_iso));
+
+    let mut targets = Vec::new();
+
+    for (file_key, value) in code_block_data {
+        let entries: Vec<&Value> = if let Some(list) = value.as_array() {
+            list.iter().collect()
+        } else if let Some(map) = value.as_object() {
+            map.values().collect()
+        } else {
+            Vec::new()
+        };
+
+        for entry in entries {
+            let Some(entry_obj) = entry.as_object() else {
+                continue;
+            };
+            if entry_obj.get("status").and_then(|v| v.as_str()) != Some("accepted") {
+                continue;
+            }
+            if entry_obj.get("isNotApplied").and_then(|v| v.as_bool()) == Some(true) {
+                continue;
+            }
+            if entry_obj.get("isNoOp").and_then(|v| v.as_bool()) == Some(true) {
+                continue;
+            }
+
+            let abs_path = entry_obj
+                .get("uri")
+                .and_then(extract_file_path_from_uri_value)
+                .or_else(|| extract_file_path_from_string(file_key));
+            let Some(abs_path) = abs_path else {
+                continue;
+            };
+
+            let diff_id = entry_obj
+                .get("diffId")
+                .and_then(|v| v.as_str())
+                .map(ToOwned::to_owned);
+            let content = entry_obj
+                .get("content")
+                .and_then(|v| v.as_str())
+                .map(ToOwned::to_owned);
+
+            if diff_id.is_none() && content.is_none() {
+                continue;
+            }
+
+            targets.push(LegacyTarget {
+                diff_id,
+                abs_path,
+                version: entry_obj
+                    .get("version")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0) as i32,
+                code_block_idx: entry_obj
+                    .get("codeBlockIdx")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0) as i32,
+                timestamp: default_timestamp.clone(),
+                content,
+                bubble_id: entry_obj
+                    .get("bubbleId")
+                    .and_then(|v| v.as_str())
+                    .map(ToOwned::to_owned),
+            });
+        }
+    }
+
+    targets
 }
 
 fn parse_string_array(value: Option<&Value>) -> Vec<String> {
@@ -724,6 +1150,7 @@ fn is_candidate_session(parsed: &Value) -> bool {
         || total_removed > 0
         || subtitle.contains("edited ")
         || subtitle.contains("updated ")
+        || !extract_legacy_targets(parsed).is_empty()
 }
 
 fn extract_file_path_from_uri_value(uri: &Value) -> Option<String> {
@@ -870,7 +1297,7 @@ mod tests {
 
     #[test]
     fn inline_diff_ingest_and_idempotent_skip() -> Result<()> {
-        let analytics = Connection::open_in_memory()?;
+        let mut analytics = Connection::open_in_memory()?;
         init_change_intel_schema(&analytics)?;
 
         let source = temp_db_path("inline_idempotent");
@@ -917,14 +1344,16 @@ mod tests {
 
         create_cursor_db(&source, &rows)?;
 
-        let summary1 = ingest_cursor_code_changes_from_path(&analytics, &source, false)?;
+        let summary1 = ingest_cursor_code_changes_from_path(&mut analytics, &source, false)?;
         assert_eq!(summary1.provider, "cursor");
         assert_eq!(summary1.sources_discovered, 1);
         assert_eq!(summary1.sources_skipped, 0);
         assert_eq!(summary1.ops_upserted, 1);
 
         let op_row: (String, i64, i64) = analytics.query_row(
-            "SELECT parser_name, added_lines, removed_lines FROM change_ops WHERE provider='cursor'",
+            "SELECT parser_name, lines_added, lines_removed
+             FROM fact_session_code_change
+             WHERE provider='cursor' AND source_kind = 'tool_write'",
             [],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )?;
@@ -932,11 +1361,13 @@ mod tests {
         assert_eq!(op_row.1, 1);
         assert_eq!(op_row.2, 1);
 
-        let summary2 = ingest_cursor_code_changes_from_path(&analytics, &source, false)?;
+        let summary2 = ingest_cursor_code_changes_from_path(&mut analytics, &source, false)?;
         assert_eq!(summary2.sources_skipped, 1);
 
         let count: i64 = analytics.query_row(
-            "SELECT COUNT(*) FROM change_ops WHERE provider='cursor'",
+            "SELECT COUNT(*)
+             FROM fact_session_code_change
+             WHERE provider='cursor' AND source_kind = 'tool_write'",
             [],
             |r| r.get(0),
         )?;
@@ -948,7 +1379,7 @@ mod tests {
 
     #[test]
     fn invalid_added_range_records_parse_error() -> Result<()> {
-        let analytics = Connection::open_in_memory()?;
+        let mut analytics = Connection::open_in_memory()?;
         init_change_intel_schema(&analytics)?;
 
         let source = temp_db_path("invalid_range");
@@ -984,7 +1415,7 @@ mod tests {
 
         create_cursor_db(&source, &rows)?;
 
-        let summary = ingest_cursor_code_changes_from_path(&analytics, &source, false)?;
+        let summary = ingest_cursor_code_changes_from_path(&mut analytics, &source, false)?;
         assert_eq!(summary.ops_upserted, 0);
         assert_eq!(summary.parse_errors, 1);
 
@@ -1001,7 +1432,7 @@ mod tests {
 
     #[test]
     fn partial_fallback_supports_list_and_dict_shapes() -> Result<()> {
-        let analytics = Connection::open_in_memory()?;
+        let mut analytics = Connection::open_in_memory()?;
         init_change_intel_schema(&analytics)?;
 
         let source = temp_db_path("partial_shapes");
@@ -1063,11 +1494,14 @@ mod tests {
 
         create_cursor_db(&source, &rows)?;
 
-        let summary = ingest_cursor_code_changes_from_path(&analytics, &source, false)?;
+        let summary = ingest_cursor_code_changes_from_path(&mut analytics, &source, false)?;
         assert_eq!(summary.ops_upserted, 2);
 
         let mut stmt = analytics.prepare(
-            "SELECT session_id, parser_name, added_lines, removed_lines FROM change_ops WHERE provider='cursor' ORDER BY session_id",
+            "SELECT session_id, parser_name, lines_added, lines_removed
+             FROM fact_session_code_change
+             WHERE provider='cursor' AND source_kind = 'tool_write'
+             ORDER BY session_id",
         )?;
         let rows = stmt.query_map([], |r| {
             Ok((
@@ -1089,7 +1523,7 @@ mod tests {
 
     #[test]
     fn inline_wins_over_partial_for_same_file() -> Result<()> {
-        let analytics = Connection::open_in_memory()?;
+        let mut analytics = Connection::open_in_memory()?;
         init_change_intel_schema(&analytics)?;
 
         let source = temp_db_path("inline_wins");
@@ -1151,17 +1585,317 @@ mod tests {
 
         create_cursor_db(&source, &rows)?;
 
-        let summary = ingest_cursor_code_changes_from_path(&analytics, &source, false)?;
+        let summary = ingest_cursor_code_changes_from_path(&mut analytics, &source, false)?;
         assert_eq!(summary.ops_upserted, 1);
 
         let op_row: (String, i64, i64) = analytics.query_row(
-            "SELECT parser_name, added_lines, removed_lines FROM change_ops WHERE provider='cursor' AND session_id='same_sess'",
+            "SELECT parser_name, lines_added, lines_removed
+             FROM fact_session_code_change
+             WHERE provider='cursor' AND source_kind = 'tool_write' AND session_id='same_sess'",
             [],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )?;
         assert_eq!(op_row.0, INLINE_PARSER_NAME);
         assert_eq!(op_row.1, 1);
         assert_eq!(op_row.2, 1);
+
+        cleanup(&source);
+        Ok(())
+    }
+
+    #[test]
+    fn old_cursor_sessions_with_accepted_code_blocks_are_candidates() {
+        let parsed = json!({
+            "composerId": "legacy_sess",
+            "createdAt": 1772694178155i64,
+            "lastUpdatedAt": 1772694194894i64,
+            "codeBlockData": {
+                "file:///tmp/repo/legacy.txt": [
+                    {
+                        "status": "accepted",
+                        "diffId": "legacy-diff",
+                        "version": 0,
+                        "codeBlockIdx": 0,
+                        "uri": {"scheme": "file", "fsPath": "/tmp/repo/legacy.txt"}
+                    }
+                ]
+            }
+        });
+
+        assert!(is_candidate_session(&parsed));
+
+        let targets = extract_legacy_targets(&parsed);
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].diff_id.as_deref(), Some("legacy-diff"));
+        assert_eq!(targets[0].abs_path, "/tmp/repo/legacy.txt");
+    }
+
+    #[test]
+    fn legacy_code_block_diff_ingest_creates_tool_write_hashes() -> Result<()> {
+        let mut analytics = Connection::open_in_memory()?;
+        init_change_intel_schema(&analytics)?;
+
+        let source = temp_db_path("legacy_diff");
+        let rows = vec![
+            (
+                "composerData:legacy_diff".to_string(),
+                json!({
+                    "composerId": "legacy_diff",
+                    "createdAt": 1772694178155i64,
+                    "lastUpdatedAt": 1772694194894i64,
+                    "codeBlockData": {
+                        "file:///tmp/repo/legacy.txt": [
+                            {
+                                "status": "accepted",
+                                "diffId": "legacy-d1",
+                                "version": 0,
+                                "codeBlockIdx": 0,
+                                "uri": {"scheme": "file", "fsPath": "/tmp/repo/legacy.txt"}
+                            }
+                        ]
+                    }
+                })
+                .to_string(),
+            ),
+            (
+                "codeBlockDiff:legacy_diff:legacy-d1".to_string(),
+                json!({
+                    "originalModelDiffWrtV0": [
+                        {
+                            "original": {"startLineNumber": 1, "endLineNumberExclusive": 2},
+                            "modified": ["old line"]
+                        }
+                    ],
+                    "newModelDiffWrtV0": [
+                        {
+                            "original": {"startLineNumber": 1, "endLineNumberExclusive": 2},
+                            "modified": ["new line 1", "new line 2"]
+                        }
+                    ]
+                })
+                .to_string(),
+            ),
+        ];
+
+        create_cursor_db(&source, &rows)?;
+
+        let summary = ingest_cursor_code_changes_from_path(&mut analytics, &source, false)?;
+        assert_eq!(summary.ops_upserted, 1);
+        assert_eq!(summary.legacy_sessions_considered, 1);
+        assert_eq!(summary.legacy_entries_inspected, 1);
+        assert_eq!(summary.legacy_diff_rows_found, 1);
+        assert_eq!(summary.legacy_ops_upserted, 1);
+        assert_eq!(summary.legacy_parse_errors, 0);
+
+        let op_row: (String, i64, i64) = analytics.query_row(
+            "SELECT parser_name, lines_added, lines_removed
+             FROM fact_session_code_change
+             WHERE provider='cursor' AND source_kind = 'tool_write' AND session_id='legacy_diff'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?;
+        assert_eq!(op_row.0, LEGACY_DIFF_PARSER_NAME);
+        assert_eq!(op_row.1, 2);
+        assert_eq!(op_row.2, 1);
+
+        let hash_count: i64 = analytics.query_row(
+            "SELECT COUNT(*)
+             FROM fact_session_code_change_line_hashes h
+             JOIN fact_session_code_change c ON c.id = h.code_change_id
+             WHERE c.provider='cursor' AND c.session_id='legacy_diff'",
+            [],
+            |r| r.get(0),
+        )?;
+        assert!(hash_count > 0);
+
+        cleanup(&source);
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_content_fallback_uses_previous_accepted_content() -> Result<()> {
+        let mut analytics = Connection::open_in_memory()?;
+        init_change_intel_schema(&analytics)?;
+
+        let source = temp_db_path("legacy_content");
+        let rows = vec![
+            (
+                "composerData:legacy_content".to_string(),
+                json!({
+                    "composerId": "legacy_content",
+                    "createdAt": 1772694178155i64,
+                    "lastUpdatedAt": 1772694194894i64,
+                    "codeBlockData": {
+                        "file:///tmp/repo/legacy.txt": [
+                            {
+                                "status": "accepted",
+                                "version": 0,
+                                "codeBlockIdx": 0,
+                                "bubbleId": "b0",
+                                "content": "old line\nsame line\n",
+                                "uri": {"scheme": "file", "fsPath": "/tmp/repo/legacy.txt"}
+                            },
+                            {
+                                "status": "accepted",
+                                "version": 1,
+                                "codeBlockIdx": 0,
+                                "bubbleId": "b1",
+                                "content": "new line\nsame line\n",
+                                "uri": {"scheme": "file", "fsPath": "/tmp/repo/legacy.txt"}
+                            }
+                        ]
+                    }
+                })
+                .to_string(),
+            ),
+        ];
+
+        create_cursor_db(&source, &rows)?;
+
+        let summary = ingest_cursor_code_changes_from_path(&mut analytics, &source, false)?;
+        assert_eq!(summary.ops_upserted, 1);
+        assert_eq!(summary.legacy_ops_upserted, 1);
+
+        let op_row: (String, i64, i64) = analytics.query_row(
+            "SELECT parser_name, lines_added, lines_removed
+             FROM fact_session_code_change
+             WHERE provider='cursor' AND source_kind = 'tool_write' AND session_id='legacy_content'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?;
+        assert_eq!(op_row.0, LEGACY_CONTENT_PARSER_NAME);
+        assert_eq!(op_row.1, 1);
+        assert_eq!(op_row.2, 1);
+
+        cleanup(&source);
+        Ok(())
+    }
+
+    #[test]
+    fn inline_wins_over_legacy_for_same_file() -> Result<()> {
+        let mut analytics = Connection::open_in_memory()?;
+        init_change_intel_schema(&analytics)?;
+
+        let source = temp_db_path("inline_wins_legacy");
+        let rows = vec![
+            (
+                "composerData:legacy_same".to_string(),
+                json!({
+                    "composerId": "legacy_same",
+                    "createdAt": 1772694178155i64,
+                    "lastUpdatedAt": 1772694194894i64,
+                    "filesChangedCount": 1,
+                    "codeBlockData": {
+                        "file:///tmp/repo/README.md": [
+                            {
+                                "status": "accepted",
+                                "diffId": "legacy-same-d1",
+                                "version": 0,
+                                "codeBlockIdx": 0,
+                                "uri": {"scheme": "file", "fsPath": "/tmp/repo/README.md"}
+                            }
+                        ]
+                    }
+                })
+                .to_string(),
+            ),
+            (
+                "inlineDiffUndoRedo-legacy-same".to_string(),
+                json!({
+                    "composerMetadata": {"composerId": "legacy_same"},
+                    "uri": {"scheme": "file", "fsPath": "/tmp/repo/README.md"},
+                    "createdAt": 1772694300812i64,
+                    "newTextLines": ["new inline"],
+                    "changes": [
+                        {
+                            "removedTextLines": ["old inline"],
+                            "addedRange": {"startLineNumber": 1, "endLineNumberExclusive": 2}
+                        }
+                    ]
+                })
+                .to_string(),
+            ),
+            (
+                "codeBlockDiff:legacy_same:legacy-same-d1".to_string(),
+                json!({
+                    "originalModelDiffWrtV0": [
+                        {
+                            "original": {"startLineNumber": 1, "endLineNumberExclusive": 2},
+                            "modified": ["old legacy"]
+                        }
+                    ],
+                    "newModelDiffWrtV0": [
+                        {
+                            "original": {"startLineNumber": 1, "endLineNumberExclusive": 2},
+                            "modified": ["new legacy"]
+                        }
+                    ]
+                })
+                .to_string(),
+            ),
+        ];
+
+        create_cursor_db(&source, &rows)?;
+
+        let summary = ingest_cursor_code_changes_from_path(&mut analytics, &source, false)?;
+        assert_eq!(summary.ops_upserted, 1);
+        assert_eq!(summary.legacy_ops_upserted, 0);
+
+        let op_row: String = analytics.query_row(
+            "SELECT parser_name
+             FROM fact_session_code_change
+             WHERE provider='cursor' AND source_kind='tool_write' AND session_id='legacy_same'",
+            [],
+            |r| r.get(0),
+        )?;
+        assert_eq!(op_row, INLINE_PARSER_NAME);
+
+        cleanup(&source);
+        Ok(())
+    }
+
+    #[test]
+    fn missing_legacy_diff_records_parse_error_when_no_content_fallback_exists() -> Result<()> {
+        let mut analytics = Connection::open_in_memory()?;
+        init_change_intel_schema(&analytics)?;
+
+        let source = temp_db_path("legacy_missing_diff");
+        let rows = vec![
+            (
+                "composerData:legacy_missing".to_string(),
+                json!({
+                    "composerId": "legacy_missing",
+                    "createdAt": 1772694178155i64,
+                    "lastUpdatedAt": 1772694194894i64,
+                    "codeBlockData": {
+                        "file:///tmp/repo/legacy.txt": [
+                            {
+                                "status": "accepted",
+                                "diffId": "missing-diff-row",
+                                "version": 0,
+                                "codeBlockIdx": 0,
+                                "uri": {"scheme": "file", "fsPath": "/tmp/repo/legacy.txt"}
+                            }
+                        ]
+                    }
+                })
+                .to_string(),
+            ),
+        ];
+
+        create_cursor_db(&source, &rows)?;
+
+        let summary = ingest_cursor_code_changes_from_path(&mut analytics, &source, false)?;
+        assert_eq!(summary.ops_upserted, 0);
+        assert_eq!(summary.parse_errors, 1);
+        assert_eq!(summary.legacy_parse_errors, 1);
+
+        let parse_errs: i64 = analytics.query_row(
+            "SELECT COUNT(*) FROM change_parse_errors WHERE parser_name = ?1",
+            params![LEGACY_DIFF_PARSER_NAME],
+            |r| r.get(0),
+        )?;
+        assert_eq!(parse_errs, 1);
 
         cleanup(&source);
         Ok(())

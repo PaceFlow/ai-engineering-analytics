@@ -1,0 +1,13 @@
+---
+source: tests/metrics_regression.rs
+expression: session_grouped
+---
+Session Metrics
+S2 = average user prompts per session
+S4 = debug-loop session rate
+S6 = mid-session error-paste rate
+S9 = session-to-commit rate (session end + 4h)
+
+Group                         Sessions     S2(avg)        S4(loop)       S6(error)          S9(4h)
+codex                                2       66.00            0.0%          100.0%          100.0%
+cursor                               1        1.00            0.0%            0.0%            0.0%

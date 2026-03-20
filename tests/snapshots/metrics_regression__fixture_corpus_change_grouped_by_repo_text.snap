@@ -1,0 +1,9 @@
+---
+source: tests/metrics_regression.rs
+expression: change_grouped
+---
+Change Metrics
+C2 = merge rate for heavy AI commits (git proxy)
+
+Group                          Commits     Heavy     C2(merge)
+/private/var/folders/7r/6...         9         3        100.0%

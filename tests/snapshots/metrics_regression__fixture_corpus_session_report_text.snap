@@ -1,0 +1,15 @@
+---
+source: tests/metrics_regression.rs
+expression: session
+---
+Session Metrics
+S2 = average user prompts per session
+S4 = debug-loop session rate
+S6 = mid-session error-paste rate
+S9 = session-to-commit rate (session end + 4h)
+
+Sessions: 3
+S2 Re-Prompt Avg: 44.33
+S4 Debug Loop Rate: 0.00% (0/3)
+S6 Error Paste Rate: 66.67% (2/3)
+S9 Session-to-Commit Rate: 66.67% (2/3)

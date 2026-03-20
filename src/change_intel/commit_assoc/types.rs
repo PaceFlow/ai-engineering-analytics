@@ -1,24 +1,5 @@
 use crate::change_intel::types::LineHashCount;
 
-#[derive(Debug, Clone)]
-pub struct RunOptions {
-    pub repos: Vec<String>,
-    pub recompute: bool,
-    pub max_commits: Option<usize>,
-    pub include_merges: bool,
-}
-
-impl Default for RunOptions {
-    fn default() -> Self {
-        Self {
-            repos: Vec::new(),
-            recompute: false,
-            max_commits: None,
-            include_merges: false,
-        }
-    }
-}
-
 #[derive(Debug, Clone, Default)]
 pub struct AssociationSummary {
     pub repos_considered: usize,
@@ -61,36 +42,12 @@ pub struct GitFileDiff {
 }
 
 #[derive(Debug, Clone)]
-pub struct CommitCursor {
-    pub last_head_sha: String,
-    pub last_commit_time: Option<String>,
-    pub min_ai_ts_seen: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-pub struct CommitHashRow {
-    pub rel_path: String,
-    pub side: String,
-    pub line_hash: String,
-    pub count: i64,
-}
-
-#[derive(Debug, Clone)]
 pub struct CommitAttribution {
-    pub commit_total_lines: i64,
     pub matched_total_lines: i64,
     pub matched_added_lines: i64,
     pub matched_removed_lines: i64,
     pub ai_share: f64,
     pub heavy_ai: bool,
-}
-
-#[derive(Debug, Clone)]
-pub struct ProviderAttributionRow {
-    pub provider: String,
-    pub matched_lines: f64,
-    pub share_of_commit: f64,
-    pub share_of_ai: f64,
 }
 
 #[derive(Debug, Clone)]

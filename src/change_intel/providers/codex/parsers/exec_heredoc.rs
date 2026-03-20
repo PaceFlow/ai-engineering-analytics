@@ -24,7 +24,6 @@ pub struct ExecHeredocWriteParser;
 
 impl ExecHeredocWriteParser {
     pub const PARSER_NAME: &'static str = "exec_heredoc_v1";
-    pub const PARSER_VERSION: &'static str = "1";
 
     fn parse_exec_args(input_json: &str) -> Option<ExecArgs> {
         let raw: Value = serde_json::from_str(input_json).ok()?;
@@ -329,7 +328,6 @@ impl PatternParser for ExecHeredocWriteParser {
                 added_lines,
                 removed_lines,
                 parser_name: Self::PARSER_NAME.to_string(),
-                parser_version: Self::PARSER_VERSION.to_string(),
                 line_hashes,
             });
         }
