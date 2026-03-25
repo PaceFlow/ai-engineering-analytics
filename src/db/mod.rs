@@ -130,6 +130,7 @@ pub(crate) fn init_metadata_schema(conn: &Connection) -> Result<()> {
             repo_root       TEXT,
             abs_path        TEXT,
             rel_path        TEXT,
+            source_file     TEXT,
             lines_added     INTEGER NOT NULL DEFAULT 0,
             lines_removed   INTEGER NOT NULL DEFAULT 0,
             source_kind     TEXT NOT NULL,
@@ -166,6 +167,7 @@ pub(crate) fn init_metadata_schema(conn: &Connection) -> Result<()> {
             matched_removed_lines INTEGER NOT NULL DEFAULT 0,
             ai_share             REAL NOT NULL DEFAULT 0.0,
             heavy_ai             INTEGER NOT NULL DEFAULT 0,
+            assoc_session_facts_version INTEGER NOT NULL DEFAULT 0,
             created_at           TEXT DEFAULT (datetime('now')),
             updated_at           TEXT DEFAULT (datetime('now')),
             UNIQUE(repo_root, commit_sha),
@@ -228,20 +230,34 @@ pub(crate) fn init_metadata_schema(conn: &Connection) -> Result<()> {
             provider                     TEXT NOT NULL,
             session_id                   TEXT NOT NULL,
             repo_root                    TEXT,
+            repo_key                     TEXT,
+            member_email                 TEXT NOT NULL DEFAULT '(unknown)',
+            device_id                    TEXT NOT NULL DEFAULT '(unknown)',
+            model_name                   TEXT,
             started_at                   TEXT,
             ended_at                     TEXT,
             user_turn_count              INTEGER NOT NULL DEFAULT 0,
             debug_loop_flag              INTEGER NOT NULL DEFAULT 0,
             mid_session_error_paste_flag INTEGER NOT NULL DEFAULT 0,
+            accepted_output_flag         INTEGER NOT NULL DEFAULT 0,
+            first_accepted_change_at     TEXT,
+            minutes_to_first_accepted_change REAL,
+            session_commit_within_4h_flag INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY(provider, session_id),
             CHECK (debug_loop_flag IN (0,1)),
-            CHECK (mid_session_error_paste_flag IN (0,1))
+            CHECK (mid_session_error_paste_flag IN (0,1)),
+            CHECK (accepted_output_flag IN (0,1)),
+            CHECK (session_commit_within_4h_flag IN (0,1))
         );
 
         CREATE TABLE IF NOT EXISTS event_session_productivity (
             provider                     TEXT NOT NULL,
             session_id                   TEXT NOT NULL,
             repo_root                    TEXT,
+            repo_key                     TEXT,
+            member_email                 TEXT NOT NULL DEFAULT '(unknown)',
+            device_id                    TEXT NOT NULL DEFAULT '(unknown)',
+            model_name                   TEXT,
             project_path                 TEXT,
             started_at                   TEXT,
             ended_at                     TEXT,
@@ -254,6 +270,7 @@ pub(crate) fn init_metadata_schema(conn: &Connection) -> Result<()> {
 
         CREATE TABLE IF NOT EXISTS event_commit_outcome (
             repo_root                 TEXT NOT NULL,
+            repo_key                  TEXT,
             commit_sha                TEXT NOT NULL,
             commit_time               TEXT NOT NULL,
             heavy_ai_flag             INTEGER NOT NULL DEFAULT 0,
@@ -269,6 +286,7 @@ pub(crate) fn init_metadata_schema(conn: &Connection) -> Result<()> {
 
         CREATE TABLE IF NOT EXISTS event_commit_churn (
             repo_root                         TEXT NOT NULL,
+            repo_key                          TEXT,
             commit_sha                        TEXT NOT NULL,
             ai_added_lines_reaching_mainline  INTEGER NOT NULL DEFAULT 0,
             ai_added_lines_removed_within_window INTEGER NOT NULL DEFAULT 0,
@@ -276,8 +294,25 @@ pub(crate) fn init_metadata_schema(conn: &Connection) -> Result<()> {
             PRIMARY KEY(repo_root, commit_sha)
         );
 
+        CREATE TABLE IF NOT EXISTS event_commit_session (
+            repo_root                 TEXT NOT NULL,
+            repo_key                  TEXT,
+            commit_sha                TEXT NOT NULL,
+            provider                  TEXT NOT NULL,
+            session_id                TEXT NOT NULL,
+            member_email              TEXT NOT NULL DEFAULT '(unknown)',
+            device_id                 TEXT NOT NULL DEFAULT '(unknown)',
+            commit_time               TEXT,
+            model_name                TEXT,
+            matched_lines             REAL NOT NULL DEFAULT 0.0,
+            share_of_commit           REAL NOT NULL DEFAULT 0.0,
+            share_of_ai               REAL NOT NULL DEFAULT 0.0,
+            PRIMARY KEY(repo_root, commit_sha, provider, session_id)
+        );
+
         CREATE TABLE IF NOT EXISTS event_task_commit (
             repo_root       TEXT NOT NULL,
+            repo_key        TEXT,
             task_key        TEXT NOT NULL,
             branch_name     TEXT NOT NULL,
             commit_sha      TEXT NOT NULL,
@@ -290,25 +325,36 @@ pub(crate) fn init_metadata_schema(conn: &Connection) -> Result<()> {
 
         CREATE TABLE IF NOT EXISTS event_task_session (
             repo_root                    TEXT NOT NULL,
+            repo_key                     TEXT,
             task_key                     TEXT NOT NULL,
             branch_name                  TEXT NOT NULL,
             provider                     TEXT NOT NULL,
             session_id                   TEXT NOT NULL,
+            member_email                 TEXT NOT NULL DEFAULT '(unknown)',
+            device_id                    TEXT NOT NULL DEFAULT '(unknown)',
+            model_name                   TEXT,
+            started_at                   TEXT,
             attribution_weight           REAL NOT NULL DEFAULT 0.0,
             commit_within_window_flag    INTEGER NOT NULL DEFAULT 0,
             user_turn_count              INTEGER,
             debug_loop_flag              INTEGER,
             mid_session_error_paste_flag INTEGER,
+            accepted_output_flag         INTEGER,
+            first_accepted_change_at     TEXT,
+            minutes_to_first_accepted_change REAL,
             PRIMARY KEY(repo_root, task_key, provider, session_id),
             CHECK (commit_within_window_flag IN (0,1)),
             CHECK (debug_loop_flag IN (0,1) OR debug_loop_flag IS NULL),
-            CHECK (mid_session_error_paste_flag IN (0,1) OR mid_session_error_paste_flag IS NULL)
+            CHECK (mid_session_error_paste_flag IN (0,1) OR mid_session_error_paste_flag IS NULL),
+            CHECK (accepted_output_flag IN (0,1) OR accepted_output_flag IS NULL)
         );
 
         CREATE INDEX IF NOT EXISTS idx_fact_session_message_session
             ON fact_session_message(provider, session_id, message_index);
         CREATE INDEX IF NOT EXISTS idx_fact_session_change_session
             ON fact_session_code_change(provider, session_id, source_kind);
+        CREATE INDEX IF NOT EXISTS idx_fact_session_change_source
+            ON fact_session_code_change(provider, source_file, source_kind);
         CREATE INDEX IF NOT EXISTS idx_fact_session_change_repo_path_provider
             ON fact_session_code_change(repo_root, rel_path, provider);
         CREATE INDEX IF NOT EXISTS idx_fact_session_change_hash
@@ -327,12 +373,62 @@ pub(crate) fn init_metadata_schema(conn: &Connection) -> Result<()> {
             ON fact_task_commit_assignment(task_key);
         CREATE INDEX IF NOT EXISTS idx_fact_task_commit_assignment_repo_commit
             ON fact_task_commit_assignment(repo_root, commit_sha);
+        CREATE INDEX IF NOT EXISTS idx_event_session_quality_sync
+            ON event_session_quality(repo_key, member_email, provider, session_id);
+        CREATE INDEX IF NOT EXISTS idx_event_session_productivity_sync
+            ON event_session_productivity(repo_key, member_email, provider, session_id);
+        CREATE INDEX IF NOT EXISTS idx_event_commit_outcome_repo_key
+            ON event_commit_outcome(repo_key, commit_sha);
+        CREATE INDEX IF NOT EXISTS idx_event_commit_churn_repo_key
+            ON event_commit_churn(repo_key, commit_sha);
+        CREATE INDEX IF NOT EXISTS idx_event_commit_session_session
+            ON event_commit_session(provider, session_id);
+        CREATE INDEX IF NOT EXISTS idx_event_commit_session_repo_commit
+            ON event_commit_session(repo_root, commit_sha);
+        CREATE INDEX IF NOT EXISTS idx_event_commit_session_sync
+            ON event_commit_session(repo_key, member_email, provider, session_id, commit_sha);
+        CREATE INDEX IF NOT EXISTS idx_event_task_commit_sync
+            ON event_task_commit(repo_key, task_key, commit_sha);
         CREATE INDEX IF NOT EXISTS idx_event_task_session_task
             ON event_task_session(task_key);
+        CREATE INDEX IF NOT EXISTS idx_event_task_session_sync
+            ON event_task_session(repo_key, task_key, member_email, provider, session_id);
         CREATE INDEX IF NOT EXISTS idx_event_commit_outcome_repo
             ON event_commit_outcome(repo_root, commit_time);",
     )?;
     let _ = conn.execute_batch("ALTER TABLE metadata_sessions ADD COLUMN model_id INTEGER;");
+    for statement in [
+        "ALTER TABLE fact_session_code_change ADD COLUMN source_file TEXT;",
+        "ALTER TABLE fact_commit ADD COLUMN assoc_session_facts_version INTEGER NOT NULL DEFAULT 0;",
+        "ALTER TABLE event_session_quality ADD COLUMN repo_key TEXT;",
+        "ALTER TABLE event_session_quality ADD COLUMN member_email TEXT NOT NULL DEFAULT '(unknown)';",
+        "ALTER TABLE event_session_quality ADD COLUMN device_id TEXT NOT NULL DEFAULT '(unknown)';",
+        "ALTER TABLE event_session_quality ADD COLUMN model_name TEXT;",
+        "ALTER TABLE event_session_quality ADD COLUMN accepted_output_flag INTEGER NOT NULL DEFAULT 0;",
+        "ALTER TABLE event_session_quality ADD COLUMN first_accepted_change_at TEXT;",
+        "ALTER TABLE event_session_quality ADD COLUMN minutes_to_first_accepted_change REAL;",
+        "ALTER TABLE event_session_quality ADD COLUMN session_commit_within_4h_flag INTEGER NOT NULL DEFAULT 0;",
+        "ALTER TABLE event_session_productivity ADD COLUMN repo_key TEXT;",
+        "ALTER TABLE event_session_productivity ADD COLUMN member_email TEXT NOT NULL DEFAULT '(unknown)';",
+        "ALTER TABLE event_session_productivity ADD COLUMN device_id TEXT NOT NULL DEFAULT '(unknown)';",
+        "ALTER TABLE event_session_productivity ADD COLUMN model_name TEXT;",
+        "ALTER TABLE event_commit_outcome ADD COLUMN repo_key TEXT;",
+        "ALTER TABLE event_commit_churn ADD COLUMN repo_key TEXT;",
+        "ALTER TABLE event_commit_session ADD COLUMN repo_key TEXT;",
+        "ALTER TABLE event_commit_session ADD COLUMN member_email TEXT NOT NULL DEFAULT '(unknown)';",
+        "ALTER TABLE event_commit_session ADD COLUMN device_id TEXT NOT NULL DEFAULT '(unknown)';",
+        "ALTER TABLE event_task_commit ADD COLUMN repo_key TEXT;",
+        "ALTER TABLE event_task_session ADD COLUMN repo_key TEXT;",
+        "ALTER TABLE event_task_session ADD COLUMN member_email TEXT NOT NULL DEFAULT '(unknown)';",
+        "ALTER TABLE event_task_session ADD COLUMN device_id TEXT NOT NULL DEFAULT '(unknown)';",
+        "ALTER TABLE event_task_session ADD COLUMN model_name TEXT;",
+        "ALTER TABLE event_task_session ADD COLUMN started_at TEXT;",
+        "ALTER TABLE event_task_session ADD COLUMN accepted_output_flag INTEGER;",
+        "ALTER TABLE event_task_session ADD COLUMN first_accepted_change_at TEXT;",
+        "ALTER TABLE event_task_session ADD COLUMN minutes_to_first_accepted_change REAL;",
+    ] {
+        let _ = conn.execute_batch(statement);
+    }
     conn.execute_batch(
         "CREATE INDEX IF NOT EXISTS idx_metadata_sessions_model
             ON metadata_sessions(model_id, provider);",
@@ -372,7 +468,10 @@ fn derive_repo_root(project_path: Option<&str>, file_path: Option<&str>) -> Opti
     None
 }
 
-fn derive_rel_and_file_name(repo_root: Option<&str>, file_path: &str) -> (Option<String>, Option<String>) {
+fn derive_rel_and_file_name(
+    repo_root: Option<&str>,
+    file_path: &str,
+) -> (Option<String>, Option<String>) {
     if file_path.trim().is_empty() || file_path == "__total__" {
         return (None, None);
     }
@@ -463,7 +562,18 @@ pub fn upsert_metadata_session(
     ended_at: Option<&str>,
     source_path: Option<&str>,
 ) -> Result<()> {
-    upsert_metadata_session_with_model(conn, provider, session_id, project_path, started_at, ended_at, source_path, None, None)
+    upsert_metadata_session_with_model_internal(
+        conn,
+        provider,
+        session_id,
+        project_path,
+        started_at,
+        ended_at,
+        source_path,
+        None,
+        None,
+        false,
+    )
 }
 
 pub fn upsert_metadata_model(
@@ -472,7 +582,7 @@ pub fn upsert_metadata_model(
     model_name: &str,
 ) -> Result<Option<i64>> {
     let provider = provider.trim();
-    let model_name = model_name.trim();
+    let model_name = normalize_provider_model_name(provider, model_name);
     if provider.is_empty() || model_name.is_empty() {
         return Ok(None);
     }
@@ -502,8 +612,34 @@ pub fn upsert_metadata_session_with_model(
     started_at: Option<&str>,
     ended_at: Option<&str>,
     source_path: Option<&str>,
-    model_provider: Option<&str>,
+    _model_provider: Option<&str>,
     model_name: Option<&str>,
+) -> Result<()> {
+    upsert_metadata_session_with_model_internal(
+        conn,
+        provider,
+        session_id,
+        project_path,
+        started_at,
+        ended_at,
+        source_path,
+        None,
+        model_name,
+        true,
+    )
+}
+
+fn upsert_metadata_session_with_model_internal(
+    conn: &Connection,
+    provider: &str,
+    session_id: &str,
+    project_path: Option<&str>,
+    started_at: Option<&str>,
+    ended_at: Option<&str>,
+    source_path: Option<&str>,
+    _model_provider: Option<&str>,
+    model_name: Option<&str>,
+    store_unknown_if_missing: bool,
 ) -> Result<()> {
     let repo_root = derive_repo_root(project_path, source_path);
     let repository_id = if let Some(repo_root) = repo_root.as_deref() {
@@ -511,11 +647,16 @@ pub fn upsert_metadata_session_with_model(
     } else {
         None
     };
-    let model_id = match model_name.and_then(|value| {
-        let trimmed = value.trim();
-        (!trimmed.is_empty()).then_some(trimmed)
-    }) {
-        Some(model_name) => upsert_metadata_model(conn, model_provider.unwrap_or(provider), model_name)?,
+    let normalized_model_name = model_name
+        .and_then(|value| {
+            let trimmed = value.trim();
+            (!trimmed.is_empty()).then(|| normalize_provider_model_name(provider, trimmed))
+        })
+        .or_else(|| {
+            store_unknown_if_missing.then(|| normalize_provider_model_name(provider, "(unknown)"))
+        });
+    let model_id = match normalized_model_name.as_deref() {
+        Some(model_name) => upsert_metadata_model(conn, provider, model_name)?,
         None => None,
     };
 
@@ -554,6 +695,21 @@ pub fn upsert_metadata_session_with_model(
     )?;
 
     Ok(())
+}
+
+fn normalize_provider_model_name(provider: &str, model_name: &str) -> String {
+    let provider = provider.trim();
+    let model_name = model_name.trim();
+    if provider.is_empty() || model_name.is_empty() {
+        return String::new();
+    }
+
+    let expected_prefix = format!("{provider}/");
+    if model_name.starts_with(&expected_prefix) {
+        return model_name.to_string();
+    }
+
+    format!("{provider}/{model_name}")
 }
 
 pub fn upsert_metadata_file(
@@ -751,7 +907,15 @@ pub fn ingest_session_message(
         timestamp.or(metadata.ended_at.as_deref()),
         None,
     )?;
-    insert_fact_session_message(conn, provider, session_id, timestamp, role, content, content_words)
+    insert_fact_session_message(
+        conn,
+        provider,
+        session_id,
+        timestamp,
+        role,
+        content,
+        content_words,
+    )
 }
 
 pub fn ingest_accepted_code_change(
@@ -860,9 +1024,9 @@ pub fn insert_fact_accepted_code_change(
     let change_index = next_accepted_change_index(conn, provider, session_id)?;
     conn.execute(
         "INSERT INTO fact_session_code_change (
-            provider, session_id, change_index, change_ts, repo_root, abs_path, rel_path,
+            provider, session_id, change_index, change_ts, repo_root, abs_path, rel_path, source_file,
             lines_added, lines_removed, source_kind
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'accepted_change')",
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, ?8, ?9, 'accepted_change')",
         params![
             provider,
             session_id,
@@ -884,14 +1048,15 @@ pub fn upsert_fact_tool_write(
 ) -> Result<i64> {
     conn.execute(
         "INSERT INTO fact_session_code_change (
-            provider, session_id, change_index, change_ts, repo_root, abs_path, rel_path,
+            provider, session_id, change_index, change_ts, repo_root, abs_path, rel_path, source_file,
             lines_added, lines_removed, source_kind, write_mode, parser_name, call_id, op_index, before_known
-         ) VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6, ?7, ?8, 'tool_write', ?9, ?10, ?11, ?12, ?13)
+         ) VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'tool_write', ?10, ?11, ?12, ?13, ?14)
          ON CONFLICT(provider, session_id, source_kind, call_id, op_index) DO UPDATE SET
             change_ts = excluded.change_ts,
             repo_root = excluded.repo_root,
             abs_path = excluded.abs_path,
             rel_path = excluded.rel_path,
+            source_file = excluded.source_file,
             lines_added = excluded.lines_added,
             lines_removed = excluded.lines_removed,
             write_mode = excluded.write_mode,
@@ -904,6 +1069,7 @@ pub fn upsert_fact_tool_write(
             op.repo_root,
             op.abs_path,
             op.rel_path,
+            op.source_file,
             op.added_lines,
             op.removed_lines,
             op.write_mode.as_str(),
@@ -928,6 +1094,109 @@ pub fn upsert_fact_tool_write(
     .map_err(Into::into)
 }
 
+#[derive(Debug, Clone)]
+pub struct ToolWriteSnapshot {
+    pub id: i64,
+    pub session_id: String,
+    pub call_id: String,
+    pub op_index: i32,
+    pub repo_root: Option<String>,
+    pub rel_path: Option<String>,
+    pub line_hashes: Vec<crate::change_intel::types::LineHashCount>,
+}
+
+pub fn list_fact_tool_writes_by_source(
+    conn: &Connection,
+    provider: &str,
+    source_file: &str,
+) -> Result<Vec<ToolWriteSnapshot>> {
+    let mut stmt = conn.prepare(
+        "SELECT
+            id, provider, session_id, source_file, call_id, op_index, change_ts, repo_root,
+            abs_path, rel_path, write_mode, parser_name, before_known, lines_added, lines_removed
+         FROM fact_session_code_change
+         WHERE provider = ?1
+           AND source_kind = 'tool_write'
+           AND source_file = ?2
+         ORDER BY session_id, call_id, op_index",
+    )?;
+
+    let rows = stmt.query_map(params![provider, source_file], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(4)?,
+            row.get::<_, i32>(5)?,
+            row.get::<_, Option<String>>(7)?,
+            row.get::<_, Option<String>>(9)?,
+        ))
+    })?;
+
+    let mut out = Vec::new();
+    for row in rows {
+        let (id, session_id, call_id, op_index, repo_root, rel_path) = row?;
+        out.push(ToolWriteSnapshot {
+            id,
+            session_id,
+            call_id,
+            op_index,
+            repo_root,
+            rel_path,
+            line_hashes: load_fact_session_code_change_line_hashes(conn, id)?,
+        });
+    }
+
+    Ok(out)
+}
+
+pub fn load_fact_session_code_change_line_hashes(
+    conn: &Connection,
+    code_change_id: i64,
+) -> Result<Vec<crate::change_intel::types::LineHashCount>> {
+    let mut stmt = conn.prepare(
+        "SELECT side, line_hash, count
+         FROM fact_session_code_change_line_hashes
+         WHERE code_change_id = ?1
+         ORDER BY side, line_hash",
+    )?;
+    let rows = stmt.query_map(params![code_change_id], |row| {
+        let side_raw: String = row.get(0)?;
+        let side = match side_raw.as_str() {
+            "+" => crate::change_intel::types::LineSide::Added,
+            "-" => crate::change_intel::types::LineSide::Removed,
+            other => {
+                return Err(rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Text,
+                    Box::new(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("unsupported line side '{other}'"),
+                    )),
+                ));
+            }
+        };
+        Ok(crate::change_intel::types::LineHashCount {
+            side,
+            line_hash: row.get(1)?,
+            count: row.get(2)?,
+        })
+    })?;
+
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+pub fn delete_fact_session_code_change_by_id(conn: &Connection, code_change_id: i64) -> Result<()> {
+    conn.execute(
+        "DELETE FROM fact_session_code_change WHERE id = ?1",
+        params![code_change_id],
+    )?;
+    Ok(())
+}
+
 pub fn upsert_fact_commit(
     conn: &Connection,
     repo_root: &str,
@@ -941,8 +1210,9 @@ pub fn upsert_fact_commit(
     upsert_metadata_repository(conn, repo_root)?;
     conn.execute(
         "INSERT INTO fact_commit (
-            repo_root, commit_sha, parent_sha, commit_time, subject, total_added, total_removed
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            repo_root, commit_sha, parent_sha, commit_time, subject, total_added, total_removed,
+            assoc_session_facts_version
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0)
          ON CONFLICT(repo_root, commit_sha) DO UPDATE SET
             parent_sha = excluded.parent_sha,
             commit_time = excluded.commit_time,
@@ -981,7 +1251,14 @@ pub fn replace_fact_commit_file_changes(
             "INSERT INTO fact_commit_file_change (
                 repo_root, commit_sha, rel_path, change_type, added_lines, removed_lines
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![repo_root, commit_sha, rel_path, change_type, added_lines, removed_lines],
+            params![
+                repo_root,
+                commit_sha,
+                rel_path,
+                change_type,
+                added_lines,
+                removed_lines
+            ],
         )?;
     }
 
@@ -1057,6 +1334,7 @@ pub fn update_fact_commit_attribution(
     matched_removed_lines: i64,
     ai_share: f64,
     heavy_ai: bool,
+    assoc_session_facts_version: i64,
 ) -> Result<()> {
     conn.execute(
         "UPDATE fact_commit
@@ -1065,6 +1343,7 @@ pub fn update_fact_commit_attribution(
              matched_removed_lines = ?5,
              ai_share = ?6,
              heavy_ai = ?7,
+             assoc_session_facts_version = ?8,
              updated_at = datetime('now')
          WHERE repo_root = ?1 AND commit_sha = ?2",
         params![
@@ -1074,7 +1353,8 @@ pub fn update_fact_commit_attribution(
             matched_added_lines,
             matched_removed_lines,
             ai_share,
-            heavy_ai as i64
+            heavy_ai as i64,
+            assoc_session_facts_version
         ],
     )?;
     Ok(())
@@ -1173,11 +1453,8 @@ mod tests {
         assert!(upsert_metadata_task(&conn, "main")?.is_none());
         assert!(upsert_metadata_task(&conn, "(unknown)")?.is_none());
 
-        let task_count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM metadata_tasks",
-            [],
-            |row| row.get(0),
-        )?;
+        let task_count: i64 =
+            conn.query_row("SELECT COUNT(*) FROM metadata_tasks", [], |row| row.get(0))?;
         assert_eq!(task_count, 1);
 
         Ok(())
@@ -1211,7 +1488,10 @@ mod tests {
             [],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
-        assert_eq!(repo_row.0, std::fs::canonicalize(&repo_root)?.to_string_lossy());
+        assert_eq!(
+            repo_row.0,
+            std::fs::canonicalize(&repo_root)?.to_string_lossy()
+        );
         assert_eq!(repo_row.1, "sample-repo");
 
         let session_row: (Option<i64>, Option<String>, Option<String>) = conn.query_row(
@@ -1233,6 +1513,103 @@ mod tests {
         assert_eq!(file_row.0, "src/lib.rs");
         assert_eq!(file_row.1, "lib.rs");
 
+        Ok(())
+    }
+
+    #[test]
+    fn metadata_sessions_store_provider_qualified_models_including_unknown() -> Result<()> {
+        let conn = open_test_db()?;
+
+        upsert_metadata_session_with_model(
+            &conn,
+            "codex",
+            "session-known",
+            Some("/tmp/repo"),
+            Some("2026-03-17T09:00:00Z"),
+            Some("2026-03-17T09:30:00Z"),
+            None,
+            Some("openai"),
+            Some("gpt-5"),
+        )?;
+        upsert_metadata_session_with_model(
+            &conn,
+            "cursor",
+            "session-unknown",
+            Some("/tmp/repo"),
+            Some("2026-03-17T10:00:00Z"),
+            Some("2026-03-17T10:30:00Z"),
+            None,
+            Some("cursor"),
+            None,
+        )?;
+
+        let known_model: String = conn.query_row(
+            "SELECT mm.model_name
+             FROM metadata_sessions ms
+             JOIN metadata_models mm ON mm.id = ms.model_id
+             WHERE ms.provider = 'codex' AND ms.session_id = 'session-known'",
+            [],
+            |row| row.get(0),
+        )?;
+        let unknown_model: String = conn.query_row(
+            "SELECT mm.model_name
+             FROM metadata_sessions ms
+             JOIN metadata_models mm ON mm.id = ms.model_id
+             WHERE ms.provider = 'cursor' AND ms.session_id = 'session-unknown'",
+            [],
+            |row| row.get(0),
+        )?;
+
+        assert_eq!(known_model, "codex/gpt-5");
+        assert_eq!(unknown_model, "cursor/(unknown)");
+        Ok(())
+    }
+
+    #[test]
+    fn session_updates_do_not_overwrite_detected_model_with_unknown() -> Result<()> {
+        let conn = open_test_db()?;
+
+        begin_session_with_model(
+            &conn,
+            "codex",
+            "session-1",
+            Some("/tmp/repo"),
+            Some("2026-03-17T09:00:00Z"),
+            Some("2026-03-17T09:30:00Z"),
+            None,
+            None,
+        )?;
+        upsert_metadata_session_with_model(
+            &conn,
+            "codex",
+            "session-1",
+            Some("/tmp/repo"),
+            Some("2026-03-17T09:00:00Z"),
+            Some("2026-03-17T09:35:00Z"),
+            None,
+            None,
+            Some("gpt-5"),
+        )?;
+        upsert_metadata_session(
+            &conn,
+            "codex",
+            "session-1",
+            Some("/tmp/repo"),
+            Some("2026-03-17T09:00:00Z"),
+            Some("2026-03-17T09:40:00Z"),
+            None,
+        )?;
+
+        let model_name: String = conn.query_row(
+            "SELECT mm.model_name
+             FROM metadata_sessions ms
+             JOIN metadata_models mm ON mm.id = ms.model_id
+             WHERE ms.provider = 'codex' AND ms.session_id = 'session-1'",
+            [],
+            |row| row.get(0),
+        )?;
+
+        assert_eq!(model_name, "codex/gpt-5");
         Ok(())
     }
 

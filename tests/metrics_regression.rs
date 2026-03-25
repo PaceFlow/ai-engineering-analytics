@@ -8,10 +8,14 @@ use std::process::Command;
 use tempfile::TempDir;
 
 const FIXTURE_ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/regression");
-const HOME_TEMPLATE_CURSOR_DB: &str =
-    concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/regression/home_template/cursor/state.vscdb");
-const VCA_BUNDLE: &str =
-    concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/regression/repos/vca.bundle");
+const HOME_TEMPLATE_CURSOR_DB: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/regression/home_template/cursor/state.vscdb"
+);
+const VCA_BUNDLE: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/regression/repos/vca.bundle"
+);
 
 struct TestEnv {
     _tempdir: TempDir,
@@ -79,6 +83,7 @@ impl TestEnv {
     fn run_vca(&self, args: &[&str]) -> anyhow::Result<String> {
         let output = Command::cargo_bin("vca")?
             .args(args)
+            .current_dir(&self.home)
             .env("HOME", &self.home)
             .env_remove("XDG_CONFIG_HOME")
             .output()?;
@@ -135,7 +140,10 @@ fn category_reports_match_snapshots() -> anyhow::Result<()> {
     assert_snapshot!("fixture_corpus_session_report_text", session);
     assert_snapshot!("fixture_corpus_change_report_text", change);
     assert_snapshot!("fixture_corpus_lifecycle_report_text", lifecycle);
-    assert_yaml_snapshot!("fixture_corpus_session_report_structured", structured_session);
+    assert_yaml_snapshot!(
+        "fixture_corpus_session_report_structured",
+        structured_session
+    );
     assert_yaml_snapshot!("fixture_corpus_change_report_structured", structured_change);
     assert_yaml_snapshot!(
         "fixture_corpus_lifecycle_report_structured",
@@ -155,7 +163,10 @@ fn grouped_and_weekly_reports_match_snapshots() -> anyhow::Result<()> {
     let lifecycle_grouped = env.run_vca(&["lifecycle", "--group-by", "repo"])?;
     let session_weekly = env.run_vca(&["session", "--weekly", "--group-by", "provider"])?;
 
-    assert_snapshot!("fixture_corpus_session_grouped_by_provider_text", session_grouped);
+    assert_snapshot!(
+        "fixture_corpus_session_grouped_by_provider_text",
+        session_grouped
+    );
     assert_snapshot!("fixture_corpus_change_grouped_by_repo_text", change_grouped);
     assert_snapshot!(
         "fixture_corpus_lifecycle_grouped_by_repo_text",
@@ -176,8 +187,11 @@ fn event_stream_matches_snapshots() -> anyhow::Result<()> {
 
     let session_stream =
         env.normalize_stream_output(env.run_vca(&["event-stream", "--stream", "session-base"])?);
-    let task_commit_stream = env
-        .normalize_stream_output(env.run_vca(&["event-stream", "--stream", "task-commit-base"])?);
+    let task_commit_stream = env.normalize_stream_output(env.run_vca(&[
+        "event-stream",
+        "--stream",
+        "task-commit-base",
+    ])?);
     let all_streams_smoke =
         env.normalize_stream_output(env.run_vca(&["event-stream", "--limit", "5"])?);
 
@@ -211,14 +225,21 @@ fn ingest_is_idempotent_for_fixture_corpus() -> anyhow::Result<()> {
     let change_before = env.run_vca(&["change"])?;
     let lifecycle_before = env.run_vca(&["lifecycle"])?;
 
-    env.ingest()?;
+    let second_ingest = env.run_vca(&["ingest"])?;
+    assert!(second_ingest.contains("Ingest progress: 100%"));
 
     let session_after = env.run_vca(&["session"])?;
     let change_after = env.run_vca(&["change"])?;
     let lifecycle_after = env.run_vca(&["lifecycle"])?;
 
-    assert_eq!(session_before, session_after, "session output drifted after rerun");
-    assert_eq!(change_before, change_after, "change output drifted after rerun");
+    assert_eq!(
+        session_before, session_after,
+        "session output drifted after rerun"
+    );
+    assert_eq!(
+        change_before, change_after,
+        "change output drifted after rerun"
+    );
     assert_eq!(
         lifecycle_before, lifecycle_after,
         "lifecycle output drifted after rerun"
@@ -232,17 +253,23 @@ fn ingest_reports_commit_event_progress() -> anyhow::Result<()> {
     let env = TestEnv::new()?;
     let ingest_output = env.run_vca(&["ingest"])?;
 
+    assert!(ingest_output.contains("Planning ingest..."));
+    assert!(ingest_output.contains("Stage: codex sessions"));
+    assert!(ingest_output.contains("Stage: commit association"));
+    assert!(ingest_output.contains("Ingest progress: 100%"));
     assert!(ingest_output.contains("Materializing commit events ..."));
-    assert!(ingest_output.contains("repos="));
-    assert!(ingest_output.contains("[1/"));
-    assert!(ingest_output.contains("done "));
     assert!(ingest_output.contains("Commit events materialized: repos="));
 
     Ok(())
 }
 
 fn materialize_vca_repo(repo_path: &Path) -> anyhow::Result<()> {
-    run_command(Command::new("git").arg("clone").arg(VCA_BUNDLE).arg(repo_path))?;
+    run_command(
+        Command::new("git")
+            .arg("clone")
+            .arg(VCA_BUNDLE)
+            .arg(repo_path),
+    )?;
     run_command(
         Command::new("git")
             .arg("-C")
@@ -411,6 +438,9 @@ fn parse_lifecycle_summary(output: &str) -> anyhow::Result<LifecycleSummarySnaps
 fn line_value(output: &str, prefix: &str) -> anyhow::Result<String> {
     output
         .lines()
-        .find_map(|line| line.strip_prefix(prefix).map(|value| value.trim().to_string()))
+        .find_map(|line| {
+            line.strip_prefix(prefix)
+                .map(|value| value.trim().to_string())
+        })
         .ok_or_else(|| anyhow::anyhow!("missing line for prefix {}", prefix))
 }

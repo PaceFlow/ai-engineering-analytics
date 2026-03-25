@@ -4,17 +4,75 @@ pub mod utils;
 
 use anyhow::Result;
 use rusqlite::Connection;
+use std::path::PathBuf;
 
-pub trait Provider {
-    fn name(&self) -> &str;
+use crate::ingest_progress::IngestProgressObserver;
+
+#[derive(Debug, Clone)]
+pub enum ProviderSessionPlan {
+    Codex {
+        session_files: Vec<PathBuf>,
+    },
+    Cursor {
+        composer_rows: Vec<(String, String)>,
+    },
+}
+
+impl ProviderSessionPlan {
+    pub fn item_count(&self) -> usize {
+        match self {
+            Self::Codex { session_files } => session_files.len(),
+            Self::Cursor { composer_rows } => composer_rows.len(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum Provider {
+    Codex,
+    Cursor,
+}
+
+impl Provider {
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Codex => "codex",
+            Self::Cursor => "cursor",
+        }
+    }
+
+    pub fn plan_session_work(&self) -> Result<ProviderSessionPlan> {
+        match self {
+            Self::Codex => Ok(ProviderSessionPlan::Codex {
+                session_files: codex::plan_session_files()?,
+            }),
+            Self::Cursor => Ok(ProviderSessionPlan::Cursor {
+                composer_rows: cursor::plan_composer_rows()?,
+            }),
+        }
+    }
+
     /// Ingest all sessions from this provider into `db`. Returns number of fact rows written.
-    fn ingest(&self, db: &Connection, verbose: bool) -> Result<usize>;
+    pub fn ingest(
+        &self,
+        db: &Connection,
+        plan: &ProviderSessionPlan,
+        verbose: bool,
+        progress: Option<&mut dyn IngestProgressObserver>,
+    ) -> Result<usize> {
+        match (self, plan) {
+            (Self::Codex, ProviderSessionPlan::Codex { session_files }) => {
+                codex::ingest_planned_sessions(db, session_files, verbose, progress)
+            }
+            (Self::Cursor, ProviderSessionPlan::Cursor { composer_rows }) => {
+                cursor::ingest_planned_sessions(db, composer_rows, verbose, progress)
+            }
+            _ => anyhow::bail!("provider plan mismatch for {}", self.name()),
+        }
+    }
 }
 
 /// Central registry — add one line here when a new provider is implemented.
-pub fn all_providers() -> Vec<Box<dyn Provider>> {
-    vec![
-        Box::new(codex::CodexProvider),
-        Box::new(cursor::CursorProvider),
-    ]
+pub fn all_providers() -> Vec<Provider> {
+    vec![Provider::Codex, Provider::Cursor]
 }

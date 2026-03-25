@@ -38,7 +38,7 @@ impl WriteMode {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum LineSide {
     Added,
     Removed,
@@ -53,7 +53,7 @@ impl LineSide {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LineHashCount {
     pub side: LineSide,
     pub line_hash: String,
@@ -64,6 +64,7 @@ pub struct LineHashCount {
 pub struct ChangeOpCandidate {
     pub provider: String,
     pub session_id: String,
+    pub source_file: String,
     pub call_id: String,
     pub op_index: i32,
     pub timestamp: Option<String>,

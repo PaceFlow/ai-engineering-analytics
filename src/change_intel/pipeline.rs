@@ -13,6 +13,7 @@ use crate::change_intel::providers::cursor;
 use crate::change_intel::session_context::SessionContext;
 use crate::change_intel::storage;
 use crate::change_intel::types::{PatternParser, SessionInfo, ToolCallEvent};
+use crate::ingest_progress::IngestProgressObserver;
 
 const CODEX_CURSOR_NAMESPACE: &str = "codex_core_v1";
 
@@ -32,25 +33,54 @@ pub struct ProviderCodeChangeSummary {
 }
 
 #[derive(Debug, Clone, Default)]
+pub struct ProviderCodeChangePlan {
+    pub provider: String,
+    pub sources: Vec<PathBuf>,
+}
+
+impl ProviderCodeChangePlan {
+    pub fn item_count(&self) -> usize {
+        self.sources.len()
+    }
+}
+
+#[derive(Debug, Clone, Default)]
 struct ParsedSource {
     session: Option<SessionInfo>,
     events: Vec<ToolCallEvent>,
 }
 
-pub fn ingest_provider_code_changes(
-    conn: &mut Connection,
-    provider_name: &str,
-    verbose: bool,
-) -> Result<ProviderCodeChangeSummary> {
+pub fn plan_provider_code_changes(provider_name: &str) -> Result<ProviderCodeChangePlan> {
     let provider = provider_name.to_ascii_lowercase();
     match provider.as_str() {
-        "codex" => {
-            let sources = discover_codex_sources()?;
-            ingest_codex_sources(conn, sources, verbose)
-        }
-        "cursor" => cursor::ingest_cursor_code_changes(conn, verbose),
-        _ => Ok(ProviderCodeChangeSummary {
+        "codex" => Ok(ProviderCodeChangePlan {
             provider,
+            sources: discover_codex_sources()?,
+        }),
+        "cursor" => Ok(ProviderCodeChangePlan {
+            provider,
+            sources: cursor::cursor_vscdb_path()?.into_iter().collect(),
+        }),
+        _ => Ok(ProviderCodeChangePlan {
+            provider,
+            ..ProviderCodeChangePlan::default()
+        }),
+    }
+}
+
+pub fn ingest_provider_code_changes(
+    conn: &mut Connection,
+    plan: &ProviderCodeChangePlan,
+    verbose: bool,
+    progress: Option<&mut dyn IngestProgressObserver>,
+) -> Result<ProviderCodeChangeSummary> {
+    match plan.provider.as_str() {
+        "codex" => ingest_codex_sources(conn, &plan.sources, verbose, progress),
+        "cursor" => {
+            cursor::ingest_cursor_code_changes_from_sources(conn, &plan.sources, verbose, progress)
+        }
+        _ => Ok(ProviderCodeChangeSummary {
+            provider: plan.provider.clone(),
             ..ProviderCodeChangeSummary::default()
         }),
     }
@@ -58,13 +88,12 @@ pub fn ingest_provider_code_changes(
 
 fn ingest_codex_sources(
     conn: &mut Connection,
-    sources: Vec<PathBuf>,
+    sources: &[PathBuf],
     verbose: bool,
+    mut progress: Option<&mut dyn IngestProgressObserver>,
 ) -> Result<ProviderCodeChangeSummary> {
-    let parsers: Vec<Box<dyn PatternParser>> = vec![
-        Box::new(ExecHeredocWriteParser),
-        Box::new(ApplyPatchParser),
-    ];
+    let parsers: Vec<Box<dyn PatternParser>> =
+        vec![Box::new(ExecHeredocWriteParser), Box::new(ApplyPatchParser)];
 
     let mut summary = ProviderCodeChangeSummary {
         provider: "codex".to_string(),
@@ -75,67 +104,80 @@ fn ingest_codex_sources(
         summary.sources_discovered += 1;
         let source_file = source.to_string_lossy().to_string();
 
-        let sig = file_signature(&source)?;
-        if let Some((mtime, size)) = sig {
-            let cursor =
-                storage::get_ingest_cursor(conn, CODEX_CURSOR_NAMESPACE, &source_file)?;
-            if let Some(cursor) = cursor {
-                if cursor.file_mtime == mtime && cursor.file_size == size {
-                    summary.sources_skipped += 1;
-                    continue;
+        let result = (|| -> Result<()> {
+            let sig = file_signature(source)?;
+            if let Some((mtime, size)) = sig {
+                let cursor =
+                    storage::get_ingest_cursor(conn, CODEX_CURSOR_NAMESPACE, &source_file)?;
+                if let Some(cursor) = cursor {
+                    if cursor.file_mtime == mtime && cursor.file_size == size {
+                        summary.sources_skipped += 1;
+                        return Ok(());
+                    }
                 }
             }
-        }
 
-        let parsed = parse_codex_source(&source)?;
-        summary.tool_calls_inspected += parsed.events.len();
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let parsed = parse_codex_source(source)?;
+            summary.tool_calls_inspected += parsed.events.len();
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
 
-        if let Some(session) = parsed.session {
-            storage::upsert_change_session(&tx, &session)?;
-            let mut ctx = SessionContext::new(session.session_cwd.clone());
+            if let Some(session) = parsed.session {
+                storage::upsert_change_session(&tx, &session)?;
+                let mut ctx = SessionContext::new(session.session_cwd.clone());
+                let mut ops = Vec::new();
 
-            for event in parsed.events {
-                if !tool_call_succeeded(&event) {
-                    continue;
-                }
+                for event in parsed.events {
+                    if !tool_call_succeeded(&event) {
+                        continue;
+                    }
 
-                for parser in &parsers {
-                    let outcome = parser.parse(&event, &mut ctx);
+                    for parser in &parsers {
+                        let outcome = parser.parse(&event, &mut ctx);
 
-                    for err in outcome.errors {
-                        if verbose {
-                            eprintln!(
-                                "[change-intel] {} {} {}",
-                                parser.name(),
-                                event.call_id,
-                                err.error
-                            );
+                        for err in outcome.errors {
+                            if verbose {
+                                eprintln!(
+                                    "[change-intel] {} {} {}",
+                                    parser.name(),
+                                    event.call_id,
+                                    err.error
+                                );
+                            }
+                            storage::insert_parse_error(&tx, &err)?;
+                            summary.parse_errors += 1;
                         }
-                        storage::insert_parse_error(&tx, &err)?;
-                        summary.parse_errors += 1;
-                    }
 
-                    for op in outcome.ops {
-                        let op_id = storage::upsert_change_op(&tx, &op)?;
-                        storage::replace_line_hashes(&tx, op_id, &op.line_hashes)?;
-                        summary.ops_upserted += 1;
+                        ops.extend(outcome.ops);
                     }
                 }
+
+                let reconcile = storage::reconcile_source_tool_writes(
+                    &tx,
+                    &session.provider,
+                    &session.source_file,
+                    &ops,
+                )?;
+                summary.ops_upserted += reconcile.ops_upserted;
             }
-        }
 
-        if let Some((mtime, size)) = sig {
-            storage::upsert_ingest_cursor(
-                &tx,
-                CODEX_CURSOR_NAMESPACE,
-                &source_file,
-                mtime,
-                size,
-            )?;
-        }
+            if let Some((mtime, size)) = sig {
+                storage::upsert_ingest_cursor(
+                    &tx,
+                    CODEX_CURSOR_NAMESPACE,
+                    &source_file,
+                    mtime,
+                    size,
+                )?;
+            }
 
-        tx.commit()?;
+            tx.commit()?;
+            Ok(())
+        })();
+
+        if let Some(observer) = progress.as_mut() {
+            observer.advance(&source_file);
+        }
+        result?;
     }
 
     Ok(summary)
@@ -452,10 +494,10 @@ mod tests {
             json!({"timestamp":"2026-03-04T10:00:02Z","type":"response_item","payload":{"type":"function_call_output","call_id":"c1","output":"Chunk ID: 1\nProcess exited with code 0\nOutput:\n"}}),
         ])?;
 
-        let summary1 = ingest_codex_sources(&mut conn, vec![path.clone()], false)?;
+        let summary1 = ingest_codex_sources(&mut conn, &[path.clone()], false, None)?;
         assert_eq!(summary1.ops_upserted, 1);
 
-        let summary2 = ingest_codex_sources(&mut conn, vec![path.clone()], false)?;
+        let summary2 = ingest_codex_sources(&mut conn, &[path.clone()], false, None)?;
         assert_eq!(summary2.sources_skipped, 1);
 
         assert_eq!(tool_write_count(&conn)?, 1);
@@ -475,7 +517,7 @@ mod tests {
             json!({"timestamp":"2026-03-04T10:00:02Z","type":"response_item","payload":{"type":"function_call_output","call_id":"c1","output":"Chunk ID: 1\nProcess exited with code 1\nOutput:\n"}}),
         ])?;
 
-        let summary = ingest_codex_sources(&mut conn, vec![path.clone()], false)?;
+        let summary = ingest_codex_sources(&mut conn, &[path.clone()], false, None)?;
         assert_eq!(summary.ops_upserted, 0);
 
         assert_eq!(tool_write_count(&conn)?, 0);
@@ -509,7 +551,7 @@ mod tests {
             json!({"timestamp":"2026-03-04T10:00:04Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"p_fail","output": fail_output}}),
         ])?;
 
-        let summary = ingest_codex_sources(&mut conn, vec![path.clone()], false)?;
+        let summary = ingest_codex_sources(&mut conn, &[path.clone()], false, None)?;
         assert_eq!(summary.ops_upserted, 1);
 
         let modes = load_tool_write_modes(&conn)?;
@@ -524,7 +566,15 @@ mod tests {
         let mut conn = Connection::open_in_memory()?;
         init_change_intel_schema(&conn)?;
 
-        let summary = ingest_provider_code_changes(&mut conn, "claude", false)?;
+        let summary = ingest_provider_code_changes(
+            &mut conn,
+            &ProviderCodeChangePlan {
+                provider: "claude".to_string(),
+                sources: Vec::new(),
+            },
+            false,
+            None,
+        )?;
         assert_eq!(summary.provider, "claude");
         assert_eq!(summary.sources_discovered, 0);
         assert_eq!(summary.ops_upserted, 0);

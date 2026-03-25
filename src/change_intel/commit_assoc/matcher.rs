@@ -10,6 +10,8 @@ const FALLBACK_STRICT_WEAK_RATIO: f64 = 0.20;
 const FALLBACK_MIN_RATIO: f64 = 0.80;
 const FALLBACK_MIN_MATCHED_LINES: i64 = 30;
 const FALLBACK_WINNER_MARGIN: f64 = 0.20;
+const HUMAN_PROVIDER: &str = "human";
+const HUMAN_SESSION_ID: &str = "__human__";
 
 type SessionAvailabilityKey = (String, LineSide, String);
 type AliasCandidateKey = (LineSide, String);
@@ -88,7 +90,11 @@ pub fn compute_commit_attribution(
     preload: &RepoMatchPreload,
 ) -> Result<(CommitAttribution, Vec<SessionAttributionRow>)> {
     let total_added: i64 = commit.file_diffs.iter().map(|file| file.added_lines).sum();
-    let total_removed: i64 = commit.file_diffs.iter().map(|file| file.removed_lines).sum();
+    let total_removed: i64 = commit
+        .file_diffs
+        .iter()
+        .map(|file| file.removed_lines)
+        .sum();
     let commit_total = total_added + total_removed;
     let files = build_commit_files(commit);
 
@@ -142,22 +148,33 @@ pub fn compute_commit_attribution(
 
     let mut session_rows: Vec<SessionAttributionRow> = session_matched
         .iter()
-        .map(|((provider, session_id), matched_lines)| SessionAttributionRow {
-            provider: provider.clone(),
-            session_id: session_id.clone(),
-            matched_lines: *matched_lines,
-            share_of_commit: if commit_total > 0 {
-                *matched_lines / commit_total as f64
-            } else {
-                0.0
+        .map(
+            |((provider, session_id), matched_lines)| SessionAttributionRow {
+                provider: provider.clone(),
+                session_id: session_id.clone(),
+                matched_lines: *matched_lines,
+                share_of_commit: if commit_total > 0 {
+                    *matched_lines / commit_total as f64
+                } else {
+                    0.0
+                },
+                share_of_ai: if matched_total > 0 {
+                    *matched_lines / matched_total as f64
+                } else {
+                    0.0
+                },
             },
-            share_of_ai: if matched_total > 0 {
-                *matched_lines / matched_total as f64
-            } else {
-                0.0
-            },
-        })
+        )
         .collect();
+    if matched_total == 0 && session_rows.is_empty() {
+        session_rows.push(SessionAttributionRow {
+            provider: HUMAN_PROVIDER.to_string(),
+            session_id: HUMAN_SESSION_ID.to_string(),
+            matched_lines: 0.0,
+            share_of_commit: 1.0,
+            share_of_ai: 0.0,
+        });
+    }
     session_rows.sort_by(|a, b| {
         a.provider
             .cmp(&b.provider)
@@ -238,7 +255,10 @@ fn evaluate_file_match_for_path(
                 .entry(availability.provider.clone())
                 .or_insert(0.0) += contribution;
             *out.session_matched
-                .entry((availability.provider.clone(), availability.session_id.clone()))
+                .entry((
+                    availability.provider.clone(),
+                    availability.session_id.clone(),
+                ))
                 .or_insert(0.0) += contribution;
         }
     }
@@ -378,7 +398,9 @@ fn load_alias_candidate_map(
     for row in rows {
         let (rel_path, side_raw, line_hash, avail) = row?;
         let side = parse_line_side(&side_raw)?;
-        out.entry((side, line_hash)).or_default().push((rel_path, avail));
+        out.entry((side, line_hash))
+            .or_default()
+            .push((rel_path, avail));
     }
     for values in out.values_mut() {
         values.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
@@ -391,5 +413,81 @@ fn parse_line_side(raw: &str) -> Result<LineSide> {
         "+" => Ok(LineSide::Added),
         "-" => Ok(LineSide::Removed),
         other => Err(anyhow!("unsupported line side '{other}'")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::change_intel::commit_assoc::types::GitFileDiff;
+    use crate::change_intel::types::LineHashCount;
+
+    fn sample_commit() -> GitCommitDiff {
+        GitCommitDiff {
+            commit_sha: "abc123".to_string(),
+            parent_sha: Some("def456".to_string()),
+            commit_time: "2026-03-18T10:00:00Z".to_string(),
+            subject: "sample".to_string(),
+            file_diffs: vec![GitFileDiff {
+                rel_path: "src/lib.rs".to_string(),
+                change_type: "M".to_string(),
+                added_lines: 10,
+                removed_lines: 0,
+                line_hashes: vec![LineHashCount {
+                    side: LineSide::Added,
+                    line_hash: "h1".to_string(),
+                    count: 10,
+                }],
+            }],
+        }
+    }
+
+    #[test]
+    fn fully_unmatched_commit_gets_human_provider_row() -> Result<()> {
+        let commit = sample_commit();
+        let preload = RepoMatchPreload::default();
+
+        let (attribution, session_rows) = compute_commit_attribution(&commit, &preload)?;
+
+        assert_eq!(attribution.matched_total_lines, 0);
+        assert_eq!(attribution.matched_added_lines, 0);
+        assert_eq!(attribution.matched_removed_lines, 0);
+        assert_eq!(attribution.ai_share, 0.0);
+        assert!(!attribution.heavy_ai);
+        assert_eq!(session_rows.len(), 1);
+        assert_eq!(session_rows[0].provider, HUMAN_PROVIDER);
+        assert_eq!(session_rows[0].session_id, HUMAN_SESSION_ID);
+        assert_eq!(session_rows[0].matched_lines, 0.0);
+        assert_eq!(session_rows[0].share_of_commit, 1.0);
+        assert_eq!(session_rows[0].share_of_ai, 0.0);
+        Ok(())
+    }
+
+    #[test]
+    fn partially_matched_commit_does_not_get_human_remainder() -> Result<()> {
+        let commit = sample_commit();
+        let mut preload = RepoMatchPreload::default();
+        preload.session_availability.insert(
+            ("src/lib.rs".to_string(), LineSide::Added, "h1".to_string()),
+            vec![SessionAvailability {
+                provider: "codex".to_string(),
+                session_id: "s1".to_string(),
+                avail: 4,
+            }],
+        );
+
+        let (attribution, session_rows) = compute_commit_attribution(&commit, &preload)?;
+
+        assert_eq!(attribution.matched_total_lines, 4);
+        assert_eq!(session_rows.len(), 1);
+        assert_eq!(session_rows[0].provider, "codex");
+        assert_eq!(session_rows[0].session_id, "s1");
+        assert_eq!(session_rows[0].matched_lines, 4.0);
+        assert!(
+            session_rows
+                .iter()
+                .all(|row| row.provider != HUMAN_PROVIDER)
+        );
+        Ok(())
     }
 }

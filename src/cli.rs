@@ -1,10 +1,14 @@
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
+const SESSION_AFTER_HELP: &str = "Examples:\n  vca session\n  vca session --group-by provider\n  vca session --list-sessions\n\nMetrics:\n  Average user prompts: average number of user prompts per session.\n  Avg time to first accepted change: minutes from session start to the first accepted code change.\n  Debug loop rate: share of sessions that look like repeated fix-retry cycles.\n  Error paste rate: share of sessions where an error message was pasted mid-session.\n  Session-to-commit rate: share of sessions followed by a commit within 4 hours.\n  No-output session rate: share of sessions with no accepted code changes.";
+const CHANGE_AFTER_HELP: &str = "Examples:\n  vca change\n  vca change --group-by provider\n  vca change --group-by task --task ABC-123\n\nMetrics:\n  Heavy commits: commits where matched AI-attributed lines are at least half of changed lines.\n  C2 merge rate: share of heavy AI commits that later reached mainline.";
+const LIFECYCLE_AFTER_HELP: &str = "Examples:\n  vca lifecycle\n  vca lifecycle --group-by provider\n  vca lifecycle --group-by task --task ABC-123\n\nMetrics:\n  L1 code churn rate: share of AI-added lines on heavy AI commits that were removed again within the churn window.\n  L4 revert rate: share of heavy AI commits that were later reverted.";
+
 #[derive(Parser)]
 #[command(
     name = "vca",
     about = "Vibe coding analytics for AI-assisted development sessions",
-    after_help = "Quick start:\n  vca ingest\n  vca session\n  vca change\n  vca lifecycle\n\nManual validation:\n  vca event-stream --stream session-base\n\nDiscover options:\n  vca --help\n  vca <command> --help"
+    after_help = "Quick start:\n  vca ingest\n  vca session\n  vca change\n  vca lifecycle\n\nStart here:\n  vca session          # session quality and throughput\n  vca change           # commit attribution and merge outcomes\n  vca lifecycle        # churn and revert follow-through\n\nManual validation:\n  vca event-stream --stream session-base\n\nDiscover options:\n  vca --help\n  vca <command> --help"
 )]
 pub struct Cli {
     #[arg(short, long, global = true)]
@@ -70,7 +74,10 @@ pub struct ReportArgs {
     /// Restrict to a specific repository root
     #[arg(long)]
     pub repo: Option<String>,
-    /// Restrict to a provider
+    /// Show results across all tracked projects instead of defaulting to the current repo
+    #[arg(long)]
+    pub all_projects: bool,
+    /// Restrict to a provider (for change/lifecycle this can include `human`)
     #[arg(long)]
     pub provider: Option<String>,
     /// Restrict to a specific task key (ticket format, e.g. ABC-123)
@@ -85,6 +92,7 @@ pub struct ReportArgs {
 }
 
 #[derive(Args, Debug, Clone)]
+#[command(after_help = SESSION_AFTER_HELP)]
 pub struct SessionReportArgs {
     #[command(flatten)]
     pub report: ReportArgs,
@@ -94,12 +102,14 @@ pub struct SessionReportArgs {
 }
 
 #[derive(Args, Debug, Clone)]
+#[command(after_help = CHANGE_AFTER_HELP)]
 pub struct ChangeReportArgs {
     #[command(flatten)]
     pub report: ReportArgs,
 }
 
 #[derive(Args, Debug, Clone)]
+#[command(after_help = LIFECYCLE_AFTER_HELP)]
 pub struct LifecycleReportArgs {
     #[command(flatten)]
     pub report: ReportArgs,
@@ -122,7 +132,7 @@ pub struct EventStreamArgs {
     /// Restrict to a specific repository root
     #[arg(long)]
     pub repo: Option<String>,
-    /// Restrict to a provider
+    /// Restrict to a provider (for commit-session streams this can include `human`)
     #[arg(long)]
     pub provider: Option<String>,
     /// Restrict to a specific task key (ticket format, e.g. ABC-123)
@@ -142,7 +152,7 @@ pub struct EventStreamArgs {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clap::Parser;
+    use clap::{CommandFactory, Parser};
 
     #[test]
     fn parses_session_group_by_repo() {
@@ -171,6 +181,15 @@ mod tests {
         match cli.command {
             Commands::Lifecycle(args) => assert_eq!(args.report.model.as_deref(), Some("gpt-5")),
             _ => panic!("expected lifecycle command"),
+        }
+    }
+
+    #[test]
+    fn parses_report_all_projects_flag() {
+        let cli = Cli::parse_from(["vca", "session", "--all-projects"]);
+        match cli.command {
+            Commands::Session(args) => assert!(args.report.all_projects),
+            _ => panic!("expected session command"),
         }
     }
 
@@ -222,5 +241,46 @@ mod tests {
             Commands::EventStream(args) => assert!(args.pretty),
             _ => panic!("expected event-stream command"),
         }
+    }
+
+    #[test]
+    fn session_help_explains_metrics() {
+        let mut command = Cli::command();
+        let mut buffer = Vec::new();
+        command
+            .find_subcommand_mut("session")
+            .expect("session subcommand")
+            .write_long_help(&mut buffer)
+            .expect("write session help");
+        let help = String::from_utf8(buffer).expect("utf8");
+
+        assert!(help.contains("Average user prompts"));
+        assert!(help.contains("Debug loop rate"));
+        assert!(help.contains("Session-to-commit rate"));
+    }
+
+    #[test]
+    fn change_and_lifecycle_help_explain_metrics_and_human_provider_context() {
+        let mut command = Cli::command();
+        let mut change_buffer = Vec::new();
+        command
+            .find_subcommand_mut("change")
+            .expect("change subcommand")
+            .write_long_help(&mut change_buffer)
+            .expect("write change help");
+        let change_help = String::from_utf8(change_buffer).expect("utf8");
+        assert!(change_help.contains("Heavy commits"));
+        assert!(change_help.contains("C2 merge rate"));
+
+        let mut command = Cli::command();
+        let mut lifecycle_buffer = Vec::new();
+        command
+            .find_subcommand_mut("lifecycle")
+            .expect("lifecycle subcommand")
+            .write_long_help(&mut lifecycle_buffer)
+            .expect("write lifecycle help");
+        let lifecycle_help = String::from_utf8(lifecycle_buffer).expect("utf8");
+        assert!(lifecycle_help.contains("L1 code churn rate"));
+        assert!(lifecycle_help.contains("L4 revert rate"));
     }
 }

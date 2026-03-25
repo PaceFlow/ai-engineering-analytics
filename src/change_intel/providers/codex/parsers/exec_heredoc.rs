@@ -61,7 +61,11 @@ impl ExecHeredocWriteParser {
         if trimmed.contains('\n') {
             return None;
         }
-        if trimmed.contains('|') || trimmed.contains(';') || trimmed.contains("&&") || trimmed.contains("||") {
+        if trimmed.contains('|')
+            || trimmed.contains(';')
+            || trimmed.contains("&&")
+            || trimmed.contains("||")
+        {
             return None;
         }
         if !trimmed.starts_with("cat ") {
@@ -73,7 +77,9 @@ impl ExecHeredocWriteParser {
             return None;
         }
 
-        if (rest.starts_with('\'') && rest.ends_with('\'')) || (rest.starts_with('"') && rest.ends_with('"')) {
+        if (rest.starts_with('\'') && rest.ends_with('\''))
+            || (rest.starts_with('"') && rest.ends_with('"'))
+        {
             return Some(rest[1..rest.len() - 1].to_string());
         }
 
@@ -253,8 +259,13 @@ impl PatternParser for ExecHeredocWriteParser {
         if let Some(read_path) = Self::parse_plain_cat_read(&args.cmd) {
             if let Some(output_json) = &event.output_json {
                 if let Some(content) = Self::parse_output_text(output_json) {
-                    let abs_path = resolve_path(&read_path, args.workdir.as_deref(), ctx.session_cwd.as_deref());
-                    ctx.file_cache.insert(abs_path.to_string_lossy().to_string(), content);
+                    let abs_path = resolve_path(
+                        &read_path,
+                        args.workdir.as_deref(),
+                        ctx.session_cwd.as_deref(),
+                    );
+                    ctx.file_cache
+                        .insert(abs_path.to_string_lossy().to_string(), content);
                 }
             }
         }
@@ -276,30 +287,35 @@ impl PatternParser for ExecHeredocWriteParser {
         };
 
         for (idx, segment) in segments.into_iter().enumerate() {
-            let abs_path = resolve_path(&segment.raw_path, args.workdir.as_deref(), ctx.session_cwd.as_deref());
+            let abs_path = resolve_path(
+                &segment.raw_path,
+                args.workdir.as_deref(),
+                ctx.session_cwd.as_deref(),
+            );
             let abs_path_s = abs_path.to_string_lossy().to_string();
             let repo_root = detect_repo_root(&abs_path);
             let rel_path = to_rel_path(repo_root.as_deref(), &abs_path);
 
             let before = ctx.file_cache.get(&abs_path_s).cloned();
 
-            let (before_known, added_lines, removed_lines, line_hashes) = match (segment.write_mode, before.as_deref()) {
-                (WriteMode::Append, _) => {
-                    let hashes = hashes_for_text(&segment.body, LineSide::Added);
-                    (before.is_some(), line_count(&segment.body), 0, hashes)
-                }
-                (WriteMode::Overwrite, Some(before_text)) => {
-                    let diff = diff_with_hashes(before_text, &segment.body);
-                    (true, diff.added_lines, diff.removed_lines, diff.line_hashes)
-                }
-                (WriteMode::Overwrite, None) => {
-                    let hashes = hashes_for_text(&segment.body, LineSide::Added);
-                    (false, line_count(&segment.body), 0, hashes)
-                }
-                (WriteMode::Patch, _) => {
-                    continue;
-                }
-            };
+            let (before_known, added_lines, removed_lines, line_hashes) =
+                match (segment.write_mode, before.as_deref()) {
+                    (WriteMode::Append, _) => {
+                        let hashes = hashes_for_text(&segment.body, LineSide::Added);
+                        (before.is_some(), line_count(&segment.body), 0, hashes)
+                    }
+                    (WriteMode::Overwrite, Some(before_text)) => {
+                        let diff = diff_with_hashes(before_text, &segment.body);
+                        (true, diff.added_lines, diff.removed_lines, diff.line_hashes)
+                    }
+                    (WriteMode::Overwrite, None) => {
+                        let hashes = hashes_for_text(&segment.body, LineSide::Added);
+                        (false, line_count(&segment.body), 0, hashes)
+                    }
+                    (WriteMode::Patch, _) => {
+                        continue;
+                    }
+                };
 
             let new_cache_value = match segment.write_mode {
                 WriteMode::Overwrite => segment.body.clone(),
@@ -317,6 +333,7 @@ impl PatternParser for ExecHeredocWriteParser {
             out.ops.push(ChangeOpCandidate {
                 provider: event.provider.clone(),
                 session_id: event.session_id.clone(),
+                source_file: event.source_file.clone(),
                 call_id: event.call_id.clone(),
                 op_index: idx as i32,
                 timestamp: event.timestamp.clone(),

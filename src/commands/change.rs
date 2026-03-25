@@ -4,6 +4,7 @@ use std::process::Command;
 
 use crate::analytics;
 use crate::cli::{ChangeReportArgs, GroupBy};
+use crate::commands::report_scope;
 use crate::db;
 
 #[derive(Debug, Clone, Copy)]
@@ -15,7 +16,8 @@ struct DiffStat {
 pub fn run(args: ChangeReportArgs) -> Result<()> {
     let db = db::open()?;
     analytics::create_reporting_views(&db)?;
-    let rows = analytics::query_change_report(&db, &args.report)?;
+    let report = report_scope::resolve_report_args(&args.report);
+    let rows = analytics::query_change_report(&db, &report)?;
     print!("{}", render_change_report(&rows, &args));
     Ok(())
 }
@@ -23,7 +25,8 @@ pub fn run(args: ChangeReportArgs) -> Result<()> {
 fn render_change_report(rows: &[analytics::ChangeReportRow], args: &ChangeReportArgs) -> String {
     let mut out = String::new();
     out.push_str("Change Metrics\n");
-    out.push_str("C2 = merge rate for heavy AI commits (git proxy)\n\n");
+    out.push_str("Heavy commits = commits where matched AI-attributed lines are at least half of changed lines\n");
+    out.push_str("C2 merge rate = share of heavy AI commits that later reached mainline\n\n");
 
     if rows.is_empty() {
         out.push_str("No change rows found. Run `vca ingest` first.\n");
@@ -70,10 +73,16 @@ fn render_change_report(rows: &[analytics::ChangeReportRow], args: &ChangeReport
             cols.push(format!("{:<10}", row.week_start.as_deref().unwrap_or("-")));
         }
         if show_group {
-            cols.push(format!("{:<28}", truncate(row.group_value.as_deref().unwrap_or("(all)"), 28)));
+            cols.push(format!(
+                "{:<28}",
+                truncate(row.group_value.as_deref().unwrap_or("(all)"), 28)
+            ));
         }
         if show_branch {
-            cols.push(format!("{:<26}", truncate(row.branch_name.as_deref().unwrap_or("-"), 26)));
+            cols.push(format!(
+                "{:<26}",
+                truncate(row.branch_name.as_deref().unwrap_or("-"), 26)
+            ));
         }
         cols.push(format!("{:>8}", row.commit_count));
         cols.push(format!("{:>8}", row.heavy_commit_count));
@@ -81,7 +90,11 @@ fn render_change_report(rows: &[analytics::ChangeReportRow], args: &ChangeReport
         if show_branch {
             cols.push(format!(
                 "{:>12}",
-                fmt_diff(row.repo_root.as_deref(), row.branch_name.as_deref(), &mut cache)
+                fmt_diff(
+                    row.repo_root.as_deref(),
+                    row.branch_name.as_deref(),
+                    &mut cache
+                )
             ));
         }
         out.push_str(&format!("{}\n", cols.join("  ")));
@@ -92,7 +105,10 @@ fn render_change_report(rows: &[analytics::ChangeReportRow], args: &ChangeReport
 
 fn fmt_ratio(metric: &analytics::RatioMetric, precision: usize) -> String {
     match metric.percent() {
-        Some(value) => format!("{:.*}% ({}/{})", precision, value, metric.numerator, metric.denominator),
+        Some(value) => format!(
+            "{:.*}% ({}/{})",
+            precision, value, metric.numerator, metric.denominator
+        ),
         None => "N/A".to_string(),
     }
 }
@@ -119,7 +135,11 @@ fn truncate(input: &str, max_len: usize) -> String {
     out
 }
 
-fn fmt_diff(repo_root: Option<&str>, branch_name: Option<&str>, cache: &mut HashMap<(String, String), Option<DiffStat>>) -> String {
+fn fmt_diff(
+    repo_root: Option<&str>,
+    branch_name: Option<&str>,
+    cache: &mut HashMap<(String, String), Option<DiffStat>>,
+) -> String {
     let (Some(repo_root), Some(branch_name)) = (repo_root, branch_name) else {
         return "N/A".to_string();
     };
@@ -144,7 +164,10 @@ fn diff_vs_staging_for_branch(
         return *cached;
     }
 
-    let staging_ref = resolve_ref(repo_root, &["refs/heads/staging", "refs/remotes/origin/staging"]);
+    let staging_ref = resolve_ref(
+        repo_root,
+        &["refs/heads/staging", "refs/remotes/origin/staging"],
+    );
     let branch_ref = resolve_ref(
         repo_root,
         &[

@@ -2,21 +2,26 @@ use anyhow::Result;
 
 use crate::analytics;
 use crate::cli::{GroupBy, LifecycleReportArgs};
+use crate::commands::report_scope;
 use crate::db;
 
 pub fn run(args: LifecycleReportArgs) -> Result<()> {
     let db = db::open()?;
     analytics::create_reporting_views(&db)?;
-    let rows = analytics::query_lifecycle_report(&db, &args.report)?;
+    let report = report_scope::resolve_report_args(&args.report);
+    let rows = analytics::query_lifecycle_report(&db, &report)?;
     print!("{}", render_lifecycle_report(&rows, &args));
     Ok(())
 }
 
-fn render_lifecycle_report(rows: &[analytics::LifecycleReportRow], args: &LifecycleReportArgs) -> String {
+fn render_lifecycle_report(
+    rows: &[analytics::LifecycleReportRow],
+    args: &LifecycleReportArgs,
+) -> String {
     let mut out = String::new();
     out.push_str("Lifecycle Metrics\n");
-    out.push_str("L1 = code churn rate for heavy AI commits\n");
-    out.push_str("L4 = revert rate for heavy AI commits\n\n");
+    out.push_str("L1 code churn rate = share of AI-added lines on heavy AI commits that were later removed within the churn window\n");
+    out.push_str("L4 revert rate = share of heavy AI commits that were later reverted\n\n");
 
     if rows.is_empty() {
         out.push_str("No lifecycle rows found. Run `vca ingest` first.\n");
@@ -62,20 +67,23 @@ fn render_lifecycle_report(rows: &[analytics::LifecycleReportRow], args: &Lifecy
             cols.push(format!("{:<10}", row.week_start.as_deref().unwrap_or("-")));
         }
         if show_group {
-            cols.push(format!("{:<28}", truncate(row.group_value.as_deref().unwrap_or("(all)"), 28)));
+            cols.push(format!(
+                "{:<28}",
+                truncate(row.group_value.as_deref().unwrap_or("(all)"), 28)
+            ));
         }
         if show_branch {
-            cols.push(format!("{:<26}", truncate(row.branch_name.as_deref().unwrap_or("-"), 26)));
+            cols.push(format!(
+                "{:<26}",
+                truncate(row.branch_name.as_deref().unwrap_or("-"), 26)
+            ));
         }
         cols.push(format!("{:>8}", row.heavy_commit_count));
         cols.push(format!(
             "{:>12}",
             fmt_ratio_percent(&row.code_churn_rate, 1)
         ));
-        cols.push(format!(
-            "{:>12}",
-            fmt_ratio_percent(&row.revert_rate, 1)
-        ));
+        cols.push(format!("{:>12}", fmt_ratio_percent(&row.revert_rate, 1)));
         out.push_str(&format!("{}\n", cols.join("  ")));
     }
 
@@ -84,7 +92,10 @@ fn render_lifecycle_report(rows: &[analytics::LifecycleReportRow], args: &Lifecy
 
 fn fmt_ratio(metric: &analytics::RatioMetric, precision: usize) -> String {
     match metric.percent() {
-        Some(value) => format!("{:.*}% ({}/{})", precision, value, metric.numerator, metric.denominator),
+        Some(value) => format!(
+            "{:.*}% ({}/{})",
+            precision, value, metric.numerator, metric.denominator
+        ),
         None => "N/A".to_string(),
     }
 }

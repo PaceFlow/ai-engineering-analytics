@@ -1,20 +1,57 @@
 use anyhow::Result;
+use rusqlite::Connection;
 
 use crate::analytics;
 use crate::change_intel::commit_assoc;
 use crate::change_intel::pipeline;
 use crate::db;
+use crate::ingest_progress::{
+    IngestExecutionPlan, IngestProgress, IngestProgressObserver, ProviderWorkPlan,
+};
 use crate::providers;
 
 pub fn run(verbose: bool) -> Result<()> {
     let mut db = db::open()?;
     let providers = providers::all_providers();
+    println!("Planning ingest...");
+
+    let mut provider_plans = Vec::with_capacity(providers.len());
+    for provider in &providers {
+        provider_plans.push(ProviderWorkPlan {
+            provider_name: provider.name().to_string(),
+            session_plan: provider.plan_session_work()?,
+            code_change_plan: pipeline::plan_provider_code_changes(provider.name())?,
+        });
+    }
+    let association_units_estimate = estimate_association_units(&db, &provider_plans)?;
+    let execution_plan = IngestExecutionPlan::new(provider_plans, association_units_estimate);
+    let mut progress = IngestProgress::new(&execution_plan);
 
     let mut grand_total = 0usize;
     for provider in &providers {
         let provider_name = provider.name();
+        let provider_plan = execution_plan
+            .provider_plan(provider_name)
+            .ok_or_else(|| anyhow::anyhow!("missing provider plan for {}", provider_name))?;
+
         println!("Ingesting {} ...", provider_name);
-        match provider.ingest(&db, verbose) {
+        let session_result = {
+            let result = {
+                let mut observer = progress.stage(
+                    format!("{} sessions", provider_name),
+                    provider_plan.session_units(),
+                );
+                provider.ingest(
+                    &db,
+                    &provider_plan.session_plan,
+                    verbose,
+                    Some(&mut observer),
+                )
+            };
+            progress.finish_stage();
+            result
+        };
+        match session_result {
             Ok(n) => {
                 println!("  {} rows written", n);
                 grand_total += n;
@@ -22,7 +59,23 @@ pub fn run(verbose: bool) -> Result<()> {
             Err(e) => println!("  error: {}", e),
         }
 
-        match pipeline::ingest_provider_code_changes(&mut db, provider_name, verbose) {
+        let change_result = {
+            let result = {
+                let mut observer = progress.stage(
+                    format!("{} code changes", provider_name),
+                    provider_plan.code_change_units(),
+                );
+                pipeline::ingest_provider_code_changes(
+                    &mut db,
+                    &provider_plan.code_change_plan,
+                    verbose,
+                    Some(&mut observer),
+                )
+            };
+            progress.finish_stage();
+            result
+        };
+        match change_result {
             Ok(summary) => {
                 let mut line = format!(
                     "  code changes [{}]: sources={} skipped={} calls={} ops={} parse_errors={}",
@@ -56,10 +109,29 @@ pub fn run(verbose: bool) -> Result<()> {
         }
     }
 
-    analytics::refresh_session_events(&db)?;
+    {
+        {
+            let mut observer = progress.stage("refresh session events", 1);
+            analytics::refresh_session_events(&db)?;
+            observer.advance("session events refreshed");
+        }
+        progress.finish_stage();
+    }
 
     println!("\nAssociating commits ...");
-    let assoc_summary = commit_assoc::run(&mut db, verbose)?;
+    let association_plan = commit_assoc::plan(&db)?;
+    progress.replace_future_units(
+        execution_plan.association_units_estimate,
+        association_plan.total_units(),
+    );
+    let assoc_summary = {
+        let result = {
+            let mut observer = progress.stage("commit association", association_plan.total_units());
+            commit_assoc::run_with_plan(&mut db, &association_plan, verbose, Some(&mut observer))
+        };
+        progress.finish_stage();
+        result?
+    };
     for repo in &assoc_summary.repo_summaries {
         if repo.skipped_non_git {
             println!("  {} skipped (not a git repo)", repo.repo_root);
@@ -88,16 +160,48 @@ pub fn run(verbose: bool) -> Result<()> {
         assoc_summary.errors
     );
 
+    analytics::refresh_session_events(&db)?;
+
+    progress.finish();
+
     println!("\nMaterializing commit events ...");
     let commit_refresh = analytics::refresh_commit_events(&mut db, verbose)?;
     println!(
-        "Commit events materialized: repos={}/{} commits={}/{} elapsed={}",
+        "Commit events materialized: repos={}/{} commits={}/{} elapsed={:.1}s",
         commit_refresh.repos_processed,
         commit_refresh.repos_total,
         commit_refresh.commits_processed,
         commit_refresh.commits_total,
-        format!("{:.1}s", commit_refresh.elapsed_ms as f64 / 1000.0)
+        commit_refresh.elapsed_ms as f64 / 1000.0
     );
     println!("\nTotal rows written: {}", grand_total);
     Ok(())
+}
+
+fn estimate_association_units(
+    db: &Connection,
+    provider_plans: &[ProviderWorkPlan],
+) -> Result<usize> {
+    let existing_repo_count: i64 = db.query_row(
+        "SELECT COUNT(DISTINCT repo_root)
+         FROM fact_session_code_change
+         WHERE repo_root IS NOT NULL AND TRIM(repo_root) != ''",
+        [],
+        |row| row.get(0),
+    )?;
+    let existing_commit_count: i64 =
+        db.query_row("SELECT COUNT(*) FROM fact_commit", [], |row| row.get(0))?;
+    let existing_repo_count = existing_repo_count.max(0) as usize;
+    let existing_commit_count = existing_commit_count.max(0) as usize;
+
+    let planned_work_units = provider_plans
+        .iter()
+        .map(|plan| plan.session_units() + plan.code_change_units())
+        .sum::<usize>();
+    let estimated_repo_count = existing_repo_count.max(usize::from(planned_work_units > 0));
+    let estimated_commit_count = existing_commit_count
+        .max(planned_work_units)
+        .max(estimated_repo_count * 25);
+
+    Ok(estimated_repo_count + estimated_commit_count)
 }

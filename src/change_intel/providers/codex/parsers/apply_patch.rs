@@ -39,7 +39,11 @@ impl ApplyPatchParser {
                 .get("patch")
                 .and_then(|v| v.as_str())
                 .map(ToOwned::to_owned)
-                .or_else(|| map.get("input").and_then(|v| v.as_str()).map(ToOwned::to_owned)),
+                .or_else(|| {
+                    map.get("input")
+                        .and_then(|v| v.as_str())
+                        .map(ToOwned::to_owned)
+                }),
             _ => None,
         }
     }
@@ -190,6 +194,7 @@ impl PatternParser for ApplyPatchParser {
             out.ops.push(ChangeOpCandidate {
                 provider: event.provider.clone(),
                 session_id: event.session_id.clone(),
+                source_file: event.source_file.clone(),
                 call_id: event.call_id.clone(),
                 op_index: idx as i32,
                 timestamp: event.timestamp.clone(),
@@ -266,7 +271,10 @@ mod tests {
         let parser = ApplyPatchParser;
         let mut ctx = SessionContext::new(Some("/tmp/repo".to_string()));
 
-        let out = parser.parse(&event("*** Begin Patch\n@@\n+no file header\n*** End Patch\n"), &mut ctx);
+        let out = parser.parse(
+            &event("*** Begin Patch\n@@\n+no file header\n*** End Patch\n"),
+            &mut ctx,
+        );
         assert!(out.ops.is_empty());
         assert_eq!(out.errors.len(), 1);
     }

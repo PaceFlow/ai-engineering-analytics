@@ -6,53 +6,55 @@ use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 
-use crate::db;
-use super::Provider;
 use super::utils::diff_line_counts;
+use crate::db;
+use crate::ingest_progress::IngestProgressObserver;
 
-pub struct CodexProvider;
-
-impl Provider for CodexProvider {
-    fn name(&self) -> &str {
-        "codex"
+pub fn plan_session_files() -> Result<Vec<PathBuf>> {
+    let sessions_root = codex_sessions_dir()?;
+    if !sessions_root.exists() {
+        return Ok(Vec::new());
     }
 
-    fn ingest(&self, db: &Connection, verbose: bool) -> Result<usize> {
-        let sessions_root = codex_sessions_dir()?;
-        if !sessions_root.exists() {
-            if verbose {
-                eprintln!("[codex] sessions dir not found: {:?}", sessions_root);
+    let mut files = find_jsonl_files(&sessions_root);
+    files.sort();
+    Ok(files)
+}
+
+pub fn ingest_planned_sessions(
+    db: &Connection,
+    session_files: &[PathBuf],
+    verbose: bool,
+    mut progress: Option<&mut dyn IngestProgressObserver>,
+) -> Result<usize> {
+    let mut total_rows = 0;
+    for session_file in session_files {
+        if verbose {
+            eprint!("  {:?} ... ", session_file);
+        }
+        match ingest_session(session_file, db) {
+            Ok(0) => {
+                if verbose {
+                    eprintln!("skipped (already ingested or empty)");
+                }
             }
-            return Ok(0);
+            Ok(n) => {
+                if verbose {
+                    eprintln!("wrote {} rows", n);
+                }
+                total_rows += n;
+            }
+            Err(e) => {
+                eprintln!("Warning: skipping {:?}: {}", session_file, e);
+            }
         }
 
-        let files = find_jsonl_files(&sessions_root);
-        println!("  found {} session file(s)", files.len());
-
-        let mut total_rows = 0;
-        for session_file in &files {
-            if verbose {
-                eprint!("  {:?} ... ", session_file);
-            }
-            match ingest_session(session_file, db) {
-                Ok(0) => {
-                    if verbose {
-                        eprintln!("skipped (already ingested or empty)");
-                    }
-                }
-                Ok(n) => {
-                    if verbose {
-                        eprintln!("wrote {} rows", n);
-                    }
-                    total_rows += n;
-                }
-                Err(e) => {
-                    eprintln!("Warning: skipping {:?}: {}", session_file, e);
-                }
-            }
+        if let Some(observer) = progress.as_mut() {
+            observer.advance(&session_file.to_string_lossy());
         }
-        Ok(total_rows)
     }
+
+    Ok(total_rows)
 }
 
 fn codex_sessions_dir() -> Result<PathBuf> {
@@ -215,12 +217,22 @@ fn ingest_session(path: &PathBuf, db: &Connection) -> Result<usize> {
                 }
             }
             "response_item" => {
-                let role = line.payload.get("role").and_then(|v| v.as_str()).unwrap_or("");
-                let item_type = line.payload.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                let role = line
+                    .payload
+                    .get("role")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let item_type = line
+                    .payload
+                    .get("type")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
 
                 if role == "assistant" {
                     // Extract text from the content array (output_text items)
-                    if let Some(content_arr) = line.payload.get("content").and_then(|v| v.as_array()) {
+                    if let Some(content_arr) =
+                        line.payload.get("content").and_then(|v| v.as_array())
+                    {
                         let text: String = content_arr
                             .iter()
                             .filter(|item| {
@@ -246,12 +258,18 @@ fn ingest_session(path: &PathBuf, db: &Connection) -> Result<usize> {
                 }
 
                 if item_type == "function_call_output" {
-                    let call_id = line.payload
-                        .get("call_id").and_then(|v| v.as_str()).unwrap_or("");
+                    let call_id = line
+                        .payload
+                        .get("call_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
                     if let Some(file_path) = pending_reads.remove(call_id) {
                         // Extract file content: everything after "\nOutput:\n"
-                        let raw_output = line.payload
-                            .get("output").and_then(|v| v.as_str()).unwrap_or("");
+                        let raw_output = line
+                            .payload
+                            .get("output")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
                         let content = if let Some(pos) = raw_output.find("\nOutput:\n") {
                             raw_output[pos + "\nOutput:\n".len()..].to_string()
                         } else {
@@ -263,26 +281,33 @@ fn ingest_session(path: &PathBuf, db: &Connection) -> Result<usize> {
 
                 if item_type == "function_call" {
                     // Detect plain reads: `cat <path>` with no redirect, record for before-state
-                    let name = line.payload.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                    let name = line
+                        .payload
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
                     if name == "exec_command" {
-                        let args_str: Option<String> = line.payload
-                            .get("arguments")
-                            .map(|v| match v {
+                        let args_str: Option<String> =
+                            line.payload.get("arguments").map(|v| match v {
                                 Value::String(s) => s.clone(),
                                 other => other.to_string(),
                             });
                         let parsed_cmd: Option<String> = args_str.as_ref().and_then(|args| {
-                            serde_json::from_str::<Value>(args)
-                                .ok()
-                                .and_then(|obj| obj.get("cmd").and_then(|v| v.as_str()).map(String::from))
+                            serde_json::from_str::<Value>(args).ok().and_then(|obj| {
+                                obj.get("cmd").and_then(|v| v.as_str()).map(String::from)
+                            })
                         });
                         if let Some(cmd) = &parsed_cmd {
                             let trimmed = cmd.trim();
                             if trimmed.starts_with("cat ") && !trimmed.contains('>') {
                                 let path = trimmed[4..].trim().to_string();
                                 if !path.is_empty() {
-                                    let call_id = line.payload
-                                        .get("call_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                    let call_id = line
+                                        .payload
+                                        .get("call_id")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("")
+                                        .to_string();
                                     if !call_id.is_empty() {
                                         pending_reads.insert(call_id, path);
                                     }
@@ -291,13 +316,8 @@ fn ingest_session(path: &PathBuf, db: &Connection) -> Result<usize> {
                         }
                     }
 
-                    written += parse_tool_call(
-                        &line.payload,
-                        db,
-                        session_id,
-                        ts.as_deref(),
-                        &file_cache,
-                    )?;
+                    written +=
+                        parse_tool_call(&line.payload, db, session_id, ts.as_deref(), &file_cache)?;
                 }
             }
             _ => {} // skip unknown line types
@@ -315,18 +335,13 @@ fn parse_tool_call(
     timestamp: Option<&str>,
     file_cache: &HashMap<String, String>,
 ) -> Result<usize> {
-    let name = value
-        .get("name")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let name = value.get("name").and_then(|v| v.as_str()).unwrap_or("");
 
     if name == "exec_command" {
-        let args_str: Option<String> = value
-            .get("arguments")
-            .map(|v| match v {
-                Value::String(s) => s.clone(),
-                other => other.to_string(),
-            });
+        let args_str: Option<String> = value.get("arguments").map(|v| match v {
+            Value::String(s) => s.clone(),
+            other => other.to_string(),
+        });
 
         if let Some(args) = args_str {
             let cmd: Option<String> = serde_json::from_str::<Value>(&args)
@@ -334,7 +349,9 @@ fn parse_tool_call(
                 .and_then(|obj| obj.get("cmd").and_then(|v| v.as_str()).map(String::from));
 
             if let Some(cmd) = cmd {
-                if let Some((file_path, lines_added, lines_removed)) = parse_exec_cmd_write(&cmd, file_cache) {
+                if let Some((file_path, lines_added, lines_removed)) =
+                    parse_exec_cmd_write(&cmd, file_cache)
+                {
                     db::ingest_accepted_code_change(
                         db,
                         "codex",
@@ -356,12 +373,10 @@ fn parse_tool_call(
     }
 
     // Arguments is a JSON string: {"patch": "...diff..."}
-    let args_str: Option<String> = value
-        .get("arguments")
-        .map(|v| match v {
-            Value::String(s) => s.clone(),
-            other => other.to_string(),
-        });
+    let args_str: Option<String> = value.get("arguments").map(|v| match v {
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
+    });
 
     let patch = match args_str {
         Some(s) => {
@@ -380,13 +395,7 @@ fn parse_tool_call(
     let mut written = 0usize;
     for (file_path, added, removed) in parse_unified_diff(&patch) {
         db::ingest_accepted_code_change(
-            db,
-            "codex",
-            session_id,
-            &file_path,
-            added,
-            removed,
-            timestamp,
+            db, "codex", session_id, &file_path, added, removed, timestamp,
         )?;
         written += 1;
     }
@@ -395,7 +404,10 @@ fn parse_tool_call(
 
 /// Detect a `cat > file <<'EOF'` or `cat >> file <<'EOF'` write in a shell
 /// command string. Returns `(file_path, lines_added, lines_removed)` on success.
-fn parse_exec_cmd_write(cmd: &str, file_cache: &HashMap<String, String>) -> Option<(String, i64, i64)> {
+fn parse_exec_cmd_write(
+    cmd: &str,
+    file_cache: &HashMap<String, String>,
+) -> Option<(String, i64, i64)> {
     let cmd = cmd.trim();
     if !cmd.starts_with("cat ") {
         return None;

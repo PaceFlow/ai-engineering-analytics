@@ -4,17 +4,19 @@ use std::process::{Command, Stdio};
 
 use crate::analytics;
 use crate::cli::SessionReportArgs;
+use crate::commands::report_scope;
 use crate::db;
 
 pub fn run(args: SessionReportArgs) -> Result<()> {
     let db = db::open()?;
     analytics::create_reporting_views(&db)?;
+    let report = report_scope::resolve_report_args(&args.report);
 
     let output = if args.list_sessions {
-        let rows = analytics::query_session_list_rows(&db, &args.report)?;
+        let rows = analytics::query_session_list_rows(&db, &report)?;
         render_session_list(&rows)
     } else {
-        let rows = analytics::query_session_report(&db, &args.report)?;
+        let rows = analytics::query_session_report(&db, &report)?;
         render_session_report(&rows, &args)
     };
 
@@ -29,12 +31,18 @@ pub fn run(args: SessionReportArgs) -> Result<()> {
 fn render_session_report(rows: &[analytics::SessionReportRow], args: &SessionReportArgs) -> String {
     let mut out = String::new();
     out.push_str("Session Metrics\n");
-    out.push_str("Average user prompts = average user prompts per session\n");
-    out.push_str("Avg time to first accepted change = minutes from session start to first accepted code change\n");
-    out.push_str("Debug loop rate = debug-loop session rate\n");
-    out.push_str("Error paste rate = mid-session error-paste rate\n");
-    out.push_str("Session-to-commit rate = session end + 4h commit rate\n");
-    out.push_str("No-output session rate = sessions with no accepted code changes\n\n");
+    out.push_str("Average user prompts = average number of user prompts per session\n");
+    out.push_str(
+        "Avg time to first accepted change = minutes from session start to the first accepted code change\n",
+    );
+    out.push_str("Debug loop rate = share of sessions that look like repeated fix-retry loops\n");
+    out.push_str(
+        "Error paste rate = share of sessions where an error message was pasted mid-session\n",
+    );
+    out.push_str(
+        "Session-to-commit rate = share of sessions followed by a commit within 4 hours\n",
+    );
+    out.push_str("No-output session rate = share of sessions with no accepted code changes\n\n");
 
     if rows.is_empty() {
         out.push_str("No session rows found. Run `vca ingest` first.\n");
@@ -56,7 +64,10 @@ fn render_session_report(rows: &[analytics::SessionReportRow], args: &SessionRep
             "Debug Loop Rate: {}\n",
             fmt_ratio(&row.debug_loop_rate, 2)
         ));
-        out.push_str(&format!("Error Paste Rate: {}\n", fmt_ratio(&row.s6_rate, 2)));
+        out.push_str(&format!(
+            "Error Paste Rate: {}\n",
+            fmt_ratio(&row.s6_rate, 2)
+        ));
         out.push_str(&format!(
             "Session-to-Commit Rate: {}\n",
             fmt_ratio(&row.s9_rate, 2)
@@ -96,10 +107,16 @@ fn render_session_report(rows: &[analytics::SessionReportRow], args: &SessionRep
             cols.push(format!("{:<10}", row.week_start.as_deref().unwrap_or("-")));
         }
         if show_group {
-            cols.push(format!("{:<28}", truncate(row.group_value.as_deref().unwrap_or("(all)"), 28)));
+            cols.push(format!(
+                "{:<28}",
+                truncate(row.group_value.as_deref().unwrap_or("(all)"), 28)
+            ));
         }
         if show_branch {
-            cols.push(format!("{:<26}", truncate(row.branch_name.as_deref().unwrap_or("-"), 26)));
+            cols.push(format!(
+                "{:<26}",
+                truncate(row.branch_name.as_deref().unwrap_or("-"), 26)
+            ));
         }
         cols.push(format!("{:>8}", row.session_count));
         cols.push(format!("{:>10}", fmt_opt_decimal(row.s2_avg, 2)));
@@ -131,9 +148,14 @@ fn render_session_list(rows: &[analytics::SessionListRow]) -> String {
         return out;
     }
 
+    let display_paths = rows
+        .iter()
+        .map(|row| display_project_path(&row.project_path))
+        .collect::<Vec<_>>();
     let project_width = rows
         .iter()
-        .map(|row| shorten_path(&row.project_path).len())
+        .zip(display_paths.iter())
+        .map(|(_, path)| path.chars().count())
         .max()
         .unwrap_or(7)
         .max(7);
@@ -152,7 +174,7 @@ fn render_session_list(rows: &[analytics::SessionListRow]) -> String {
         width = project_width
     ));
 
-    for row in rows {
+    for (row, project_path) in rows.iter().zip(display_paths.iter()) {
         let words_per_loc = if row.total_loc > 0 {
             format!("{:.1}", row.total_words as f64 / row.total_loc as f64)
         } else {
@@ -166,7 +188,7 @@ fn render_session_list(rows: &[analytics::SessionListRow]) -> String {
             row.provider,
             truncate(&row.model, 14),
             session_short,
-            shorten_path(&row.project_path),
+            project_path,
             last_active,
             row.total_loc,
             row.total_added,
@@ -181,7 +203,10 @@ fn render_session_list(rows: &[analytics::SessionListRow]) -> String {
 
 fn fmt_ratio(metric: &analytics::RatioMetric, precision: usize) -> String {
     match metric.percent() {
-        Some(value) => format!("{:.*}% ({}/{})", precision, value, metric.numerator, metric.denominator),
+        Some(value) => format!(
+            "{:.*}% ({}/{})",
+            precision, value, metric.numerator, metric.denominator
+        ),
         None => "N/A".to_string(),
     }
 }
@@ -224,6 +249,74 @@ fn shorten_path(path: &str) -> String {
     path.to_string()
 }
 
+fn display_project_path(path: &str) -> String {
+    const MAX_PROJECT_PATH_LEN: usize = 36;
+    shorten_path_tail(&shorten_path(path), MAX_PROJECT_PATH_LEN)
+}
+
+fn shorten_path_tail(path: &str, max_len: usize) -> String {
+    if path.chars().count() <= max_len {
+        return path.to_string();
+    }
+
+    let (prefix, remainder) = if let Some(stripped) = path.strip_prefix("~/") {
+        ("~/", stripped)
+    } else if let Some(stripped) = path.strip_prefix('/') {
+        ("/", stripped)
+    } else {
+        ("", path)
+    };
+
+    let segments = remainder
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+    if segments.is_empty() {
+        return truncate_tail(path, max_len);
+    }
+
+    let tail_one = segments.last().copied().unwrap_or_default().to_string();
+    let tail_two = if segments.len() >= 2 {
+        format!(
+            "{}/{}",
+            segments[segments.len() - 2],
+            segments[segments.len() - 1]
+        )
+    } else {
+        tail_one.clone()
+    };
+
+    let mut candidates = Vec::new();
+    if let Some(first) = segments.first() {
+        candidates.push(format!("{prefix}{first}/.../{tail_two}"));
+    }
+    candidates.push(format!("{prefix}.../{tail_two}"));
+    candidates.push(format!("{prefix}.../{tail_one}"));
+
+    for candidate in candidates {
+        if candidate.chars().count() <= max_len {
+            return candidate;
+        }
+    }
+
+    truncate_tail(&tail_one, max_len)
+}
+
+fn truncate_tail(value: &str, max_len: usize) -> String {
+    let value_chars = value.chars().collect::<Vec<_>>();
+    if value_chars.len() <= max_len {
+        return value.to_string();
+    }
+    if max_len <= 3 {
+        return "...".to_string();
+    }
+
+    let tail = value_chars[value_chars.len() - (max_len - 3)..]
+        .iter()
+        .collect::<String>();
+    format!("...{tail}")
+}
+
 fn terminal_height() -> usize {
     terminal_size::terminal_size()
         .map(|(_, terminal_size::Height(height))| height as usize)
@@ -248,4 +341,47 @@ fn pipe_to_pager(output: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{display_project_path, render_session_list};
+    use crate::analytics::SessionListRow;
+
+    fn row(project_path: &str) -> SessionListRow {
+        SessionListRow {
+            provider: "cursor".to_string(),
+            model: "cursor/claude-3.5-sonnet".to_string(),
+            session_id: "12345678-session".to_string(),
+            project_path: project_path.to_string(),
+            last_active: Some("2026-03-17T09:30:00Z".to_string()),
+            total_words: 100,
+            total_loc: 20,
+            total_added: 10,
+            total_removed: 5,
+        }
+    }
+
+    #[test]
+    fn display_project_path_preserves_distinguishing_tail() {
+        let rendered =
+            display_project_path("/Users/daniel/work/company/apps/mobile/customer-portal");
+        assert!(
+            rendered.ends_with("apps/mobile/customer-portal")
+                || rendered.ends_with("mobile/customer-portal")
+        );
+        assert!(rendered.contains("..."));
+    }
+
+    #[test]
+    fn render_session_list_shows_distinct_project_tails() {
+        let output = render_session_list(&[
+            row("/Users/daniel/work/company/apps/mobile/customer-portal"),
+            row("/Users/daniel/work/company/apps/mobile/admin-portal"),
+        ]);
+
+        assert!(output.contains("customer-portal"));
+        assert!(output.contains("admin-portal"));
+        assert!(!output.contains("/Users/daniel/work/company/apps/mobile/customer-portal"));
+    }
 }

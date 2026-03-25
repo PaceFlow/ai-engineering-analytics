@@ -6,89 +6,98 @@ use serde_json::Value as JsonValue;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use crate::db;
-use crate::path_utils::detect_repo_root;
-use super::Provider;
 use super::utils::diff_line_counts;
+use crate::cursor_paths::{cursor_history_path, cursor_state_path};
+use crate::db;
+use crate::ingest_progress::IngestProgressObserver;
+use crate::path_utils::{detect_repo_root, strip_file_scheme};
 
-// ── Provider struct ─────────────────────────────────────────────────────────
+pub fn plan_composer_rows() -> Result<Vec<(String, String)>> {
+    let vscdb_path = match cursor_vscdb_path()? {
+        Some(path) => path,
+        None => return Ok(Vec::new()),
+    };
 
-pub struct CursorProvider;
+    let vscdb = Connection::open_with_flags(
+        &vscdb_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .with_context(|| format!("Failed to open {:?} — is Cursor running?", vscdb_path))?;
 
-impl Provider for CursorProvider {
-    fn name(&self) -> &str {
-        "cursor"
+    let mut stmt =
+        vscdb.prepare("SELECT key, value FROM cursorDiskKV WHERE key LIKE 'composerData:%'")?;
+
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    Ok(rows)
+}
+
+pub fn ingest_planned_sessions(
+    db: &Connection,
+    composer_rows: &[(String, String)],
+    verbose: bool,
+    mut progress: Option<&mut dyn IngestProgressObserver>,
+) -> Result<usize> {
+    if composer_rows.is_empty() {
+        return Ok(0);
     }
 
-    fn ingest(&self, db: &Connection, verbose: bool) -> Result<usize> {
-        let vscdb_path = match cursor_vscdb_path() {
-            Ok(p) => p,
-            Err(_) => {
-                if verbose {
-                    eprintln!("[cursor] state.vscdb not found (Cursor not installed?)");
-                }
-                return Ok(0);
+    let vscdb_path = cursor_vscdb_path()?.with_context(|| {
+        "Cursor state.vscdb disappeared between planning and ingest".to_string()
+    })?;
+    let history_root = match cursor_history_root()? {
+        Some(path) => path,
+        None => {
+            if verbose {
+                eprintln!("[cursor] History directory not found");
             }
-        };
-
-        let history_root = match cursor_history_root() {
-            Ok(p) => p,
-            Err(_) => {
-                if verbose {
-                    eprintln!("[cursor] History directory not found");
-                }
-                // Still proceed — we'll just get (0,0) LOC for every file
-                PathBuf::new()
-            }
-        };
-
-        if verbose {
-            eprintln!("[cursor] opening {:?}", vscdb_path);
+            PathBuf::new()
         }
+    };
 
-        let vscdb = Connection::open_with_flags(
-            &vscdb_path,
-            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )
-        .with_context(|| format!("Failed to open {:?} — is Cursor running?", vscdb_path))?;
-
-        let history_index = if history_root.as_os_str().is_empty() {
-            HashMap::new()
-        } else {
-            build_history_index(&history_root)
-        };
-
-        if verbose {
-            eprintln!("[cursor] history index: {} file(s)", history_index.len());
-        }
-
-        let mut stmt = vscdb.prepare(
-            "SELECT key, value FROM cursorDiskKV WHERE key LIKE 'composerData:%'",
-        )?;
-
-        let rows: Vec<(String, String)> = stmt
-            .query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })?
-            .filter_map(|r| r.ok())
-            .collect();
-
-        println!("  found {} composer session(s)", rows.len());
-
-        let mut total_rows = 0usize;
-        for (_key, value) in rows {
-            match ingest_composer(db, &vscdb, &value, &history_index, verbose) {
-                Ok(0) => {}
-                Ok(n) => total_rows += n,
-                Err(e) => {
-                    if verbose {
-                        eprintln!("[cursor] skipping session: {}", e);
-                    }
-                }
-            }
-        }
-        Ok(total_rows)
+    if verbose {
+        eprintln!("[cursor] opening {:?}", vscdb_path);
     }
+
+    let vscdb = Connection::open_with_flags(
+        &vscdb_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .with_context(|| format!("Failed to open {:?} — is Cursor running?", vscdb_path))?;
+
+    let history_index = if history_root.as_os_str().is_empty() {
+        HashMap::new()
+    } else {
+        build_history_index(&history_root)
+    };
+
+    if verbose {
+        eprintln!("[cursor] history index: {} file(s)", history_index.len());
+    }
+
+    let mut total_rows = 0usize;
+    for (key, value) in composer_rows {
+        match ingest_composer(db, &vscdb, value, &history_index, verbose) {
+            Ok(0) => {}
+            Ok(n) => total_rows += n,
+            Err(e) => {
+                if verbose {
+                    eprintln!("[cursor] skipping session: {}", e);
+                }
+            }
+        }
+
+        if let Some(observer) = progress.as_mut() {
+            observer.advance(key);
+        }
+    }
+
+    Ok(total_rows)
 }
 
 // ── Serde types ──────────────────────────────────────────────────────────────
@@ -208,11 +217,7 @@ fn build_history_index(history_root: &Path) -> HistoryIndex {
         };
 
         // Strip "file://" prefix to get a plain absolute path
-        let file_path = if let Some(p) = resource.strip_prefix("file://") {
-            p.to_string()
-        } else {
-            resource
-        };
+        let file_path = strip_file_scheme(&resource);
 
         let mut entries: Vec<HistoryEntry> = parsed
             .entries
@@ -230,10 +235,7 @@ fn build_history_index(history_root: &Path) -> HistoryIndex {
         // Sort ascending by timestamp so we can find the "next" entry easily
         entries.sort_by_key(|e| e.timestamp);
 
-        index
-            .entry(file_path)
-            .or_default()
-            .extend(entries);
+        index.entry(file_path).or_default().extend(entries);
     }
 
     // Sort each file's entries by timestamp after merging (shouldn't have multiple
@@ -268,17 +270,37 @@ fn ingest_composer(
     }
 
     let session_id = &data.composer_id;
+    let timestamp = data.created_at.map(ms_to_iso);
+    let last_updated = data.last_updated_at.map(ms_to_iso);
+    let project_path = extract_project_path(&data);
+    let mut model_name = extract_model_name(&raw_json);
+    if matches!(model_name.as_deref(), None | Some("default")) {
+        if let Some(bubble_model_name) =
+            extract_model_name_from_bubbles(vscdb, session_id, &data.full_conversation_headers_only)
+        {
+            if model_name.is_none() || bubble_model_name != "default" {
+                model_name = Some(bubble_model_name);
+            }
+        }
+    }
 
     if db::session_exists(db, session_id)? {
+        db::upsert_metadata_session_with_model(
+            db,
+            "cursor",
+            session_id,
+            project_path.as_deref(),
+            timestamp.as_deref(),
+            last_updated.as_deref().or(timestamp.as_deref()),
+            Some("cursor"),
+            Some("cursor"),
+            model_name.as_deref(),
+        )?;
         return Ok(0);
     }
 
     let session_start_ms = data.created_at.unwrap_or(0);
     let session_end_ms = data.last_updated_at.unwrap_or(i64::MAX);
-    let timestamp = data.created_at.map(ms_to_iso);
-    let last_updated = data.last_updated_at.map(ms_to_iso);
-    let project_path = extract_project_path(&data);
-    let model_name = extract_model_name(&raw_json);
 
     if verbose {
         eprintln!(
@@ -335,11 +357,14 @@ fn ingest_composer(
                 _ => continue,
             };
             let key = format!("bubbleId:{}:{}", session_id, header.bubble_id);
-            let text: Option<String> = vscdb.query_row(
-                "SELECT json_extract(value, '$.text') FROM cursorDiskKV WHERE key = ?1",
-                params![key],
-                |row| row.get(0),
-            ).ok().flatten();
+            let text: Option<String> = vscdb
+                .query_row(
+                    "SELECT json_extract(value, '$.text') FROM cursorDiskKV WHERE key = ?1",
+                    params![key],
+                    |row| row.get(0),
+                )
+                .ok()
+                .flatten();
             let text = match text {
                 Some(t) if !t.is_empty() => t,
                 _ => continue,
@@ -372,12 +397,8 @@ fn ingest_composer(
         // Strip "file:///" or "file://" prefix
         let file_path = strip_file_scheme(file_uri);
 
-        let (lines_added, lines_removed) = loc_from_history(
-            &file_path,
-            session_start_ms,
-            session_end_ms,
-            history_index,
-        );
+        let (lines_added, lines_removed) =
+            loc_from_history(&file_path, session_start_ms, session_end_ms, history_index);
 
         db::ingest_accepted_code_change(
             db,
@@ -460,66 +481,12 @@ fn loc_from_history(
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-fn cursor_vscdb_path() -> Result<PathBuf> {
-    // macOS
-    #[cfg(target_os = "macos")]
-    {
-        let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Home directory not found"))?;
-        let p = home
-            .join("Library")
-            .join("Application Support")
-            .join("Cursor")
-            .join("User")
-            .join("globalStorage")
-            .join("state.vscdb");
-        if p.exists() {
-            return Ok(p);
-        }
-    }
-
-    // Linux
-    let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Home directory not found"))?;
-    let p = home
-        .join(".config")
-        .join("Cursor")
-        .join("User")
-        .join("globalStorage")
-        .join("state.vscdb");
-    if p.exists() {
-        return Ok(p);
-    }
-
-    anyhow::bail!("Cursor state.vscdb not found on macOS or Linux paths")
+fn cursor_vscdb_path() -> Result<Option<PathBuf>> {
+    cursor_state_path()
 }
 
-fn cursor_history_root() -> Result<PathBuf> {
-    // macOS
-    #[cfg(target_os = "macos")]
-    {
-        let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Home directory not found"))?;
-        let p = home
-            .join("Library")
-            .join("Application Support")
-            .join("Cursor")
-            .join("User")
-            .join("History");
-        if p.exists() {
-            return Ok(p);
-        }
-    }
-
-    // Linux
-    let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Home directory not found"))?;
-    let p = home
-        .join(".config")
-        .join("Cursor")
-        .join("User")
-        .join("History");
-    if p.exists() {
-        return Ok(p);
-    }
-
-    anyhow::bail!("Cursor History directory not found on macOS or Linux paths")
+fn cursor_history_root() -> Result<Option<PathBuf>> {
+    cursor_history_path()
 }
 
 /// Convert millisecond epoch to ISO-8601 string.
@@ -571,26 +538,8 @@ fn extract_project_path(data: &ComposerData) -> Option<String> {
         return None;
     }
 
-    // Find common ancestor by splitting on '/'
-    let split: Vec<Vec<&str>> = paths.iter().map(|p| p.split('/').collect()).collect();
-    let min_len = split.iter().map(|s| s.len()).min().unwrap_or(0);
-    let mut common: Vec<&str> = Vec::new();
-    for i in 0..min_len {
-        let seg = split[0][i];
-        if split.iter().all(|s| s[i] == seg) {
-            common.push(seg);
-        } else {
-            break;
-        }
-    }
-
-    let raw = if common.is_empty() {
-        paths[0].clone()
-    } else {
-        common.join("/")
-    };
-
-    let path = Path::new(&raw);
+    let raw_path = common_ancestor_path(&paths).unwrap_or_else(|| PathBuf::from(&paths[0]));
+    let path = raw_path.as_path();
     if let Some(root) = detect_repo_root(path) {
         return Some(root.to_string_lossy().into_owned());
     }
@@ -598,18 +547,36 @@ fn extract_project_path(data: &ComposerData) -> Option<String> {
     if path.extension().is_some() {
         path.parent().map(|p| p.to_string_lossy().into_owned())
     } else {
-        Some(raw)
+        Some(raw_path.to_string_lossy().into_owned())
     }
 }
 
-fn strip_file_scheme(uri: &str) -> String {
-    if let Some(p) = uri.strip_prefix("file:///") {
-        format!("/{}", p)
-    } else if let Some(p) = uri.strip_prefix("file://") {
-        p.to_string()
-    } else {
-        uri.to_string()
+fn common_ancestor_path(paths: &[String]) -> Option<PathBuf> {
+    let mut common: Vec<_> = Path::new(paths.first()?).components().collect();
+
+    for raw_path in paths.iter().skip(1) {
+        let components: Vec<_> = Path::new(raw_path).components().collect();
+        let shared_len = common
+            .iter()
+            .zip(components.iter())
+            .take_while(|(left, right)| left == right)
+            .count();
+        common.truncate(shared_len);
+        if common.is_empty() {
+            break;
+        }
     }
+
+    if common.is_empty() {
+        return None;
+    }
+
+    let mut out = PathBuf::new();
+    for component in common {
+        out.push(component.as_os_str());
+    }
+
+    Some(out)
 }
 
 fn extract_model_name(raw: &JsonValue) -> Option<String> {
@@ -623,48 +590,110 @@ fn extract_model_name(raw: &JsonValue) -> Option<String> {
         "chatModel",
     ];
 
-    fn visit(value: &JsonValue) -> Option<String> {
+    fn visit(value: &JsonValue, include_default: bool) -> Option<String> {
         match value {
             JsonValue::Object(map) => {
+                if let Some(candidate) = usage_data_model_key(map, include_default) {
+                    return Some(candidate);
+                }
                 for key in MODEL_KEYS {
-                    if let Some(candidate) = map.get(*key).and_then(model_string_from_value) {
+                    if let Some(candidate) = map
+                        .get(*key)
+                        .and_then(|value| model_string_from_value(value, include_default))
+                    {
                         return Some(candidate);
                     }
                 }
                 for value in map.values() {
-                    if let Some(candidate) = visit(value) {
+                    if let Some(candidate) = visit(value, include_default) {
                         return Some(candidate);
                     }
                 }
                 None
             }
-            JsonValue::Array(values) => values.iter().find_map(visit),
+            JsonValue::Array(values) => values
+                .iter()
+                .find_map(|value| visit(value, include_default)),
             _ => None,
         }
     }
 
-    visit(raw)
+    visit(raw, false).or_else(|| visit(raw, true))
 }
 
-fn model_string_from_value(value: &JsonValue) -> Option<String> {
-    let candidate = match value {
-        JsonValue::String(value) => value.trim(),
+fn extract_model_name_from_bubbles(
+    vscdb: &Connection,
+    session_id: &str,
+    headers: &[ConversationHeader],
+) -> Option<String> {
+    headers
+        .iter()
+        .filter(|header| header.bubble_type == 2)
+        .find_map(|header| {
+            let key = format!("bubbleId:{}:{}", session_id, header.bubble_id);
+            let raw: String = vscdb
+                .query_row(
+                    "SELECT value FROM cursorDiskKV WHERE key = ?1",
+                    params![key],
+                    |row| row.get(0),
+                )
+                .ok()?;
+            let bubble: JsonValue = serde_json::from_str(&raw).ok()?;
+            extract_bubble_model_name(&bubble)
+        })
+}
+
+fn extract_bubble_model_name(raw: &JsonValue) -> Option<String> {
+    raw.get("modelInfo")
+        .and_then(|value| value.get("modelName"))
+        .and_then(|value| value.as_str())
+        .and_then(|value| {
+            let trimmed = value.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        })
+}
+
+fn usage_data_model_key(
+    map: &serde_json::Map<String, JsonValue>,
+    include_default: bool,
+) -> Option<String> {
+    map.get("usageData")
+        .and_then(|value| value.as_object())
+        .and_then(|usage_data| {
+            usage_data
+                .keys()
+                .find_map(|key| model_string_from_candidate(key, include_default))
+        })
+}
+
+fn model_string_from_value(value: &JsonValue, include_default: bool) -> Option<String> {
+    match value {
+        JsonValue::String(value) => model_string_from_candidate(value.trim(), include_default),
         JsonValue::Object(map) => {
             for key in ["name", "slug", "id", "model"] {
-                if let Some(candidate) = map.get(key).and_then(model_string_from_value) {
+                if let Some(candidate) = map
+                    .get(key)
+                    .and_then(|value| model_string_from_value(value, include_default))
+                {
                     return Some(candidate);
                 }
             }
-            return None;
+            None
         }
-        _ => return None,
-    };
+        _ => None,
+    }
+}
 
+fn model_string_from_candidate(candidate: &str, include_default: bool) -> Option<String> {
     if candidate.is_empty() {
         return None;
     }
 
     let lowered = candidate.to_ascii_lowercase();
+    if lowered == "default" {
+        return include_default.then(|| "default".to_string());
+    }
+
     if lowered.contains("gpt")
         || lowered.contains("claude")
         || lowered.contains("gemini")
@@ -681,4 +710,73 @@ fn model_string_from_value(value: &JsonValue) -> Option<String> {
     }
 
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{extract_bubble_model_name, extract_model_name};
+    use serde_json::json;
+
+    #[test]
+    fn extracts_default_when_it_is_the_only_model_hint() {
+        let raw = json!({
+            "modelConfig": {
+                "modelName": "default"
+            }
+        });
+
+        assert_eq!(extract_model_name(&raw).as_deref(), Some("default"));
+    }
+
+    #[test]
+    fn prefers_usage_data_model_key_over_default_literal() {
+        let raw = json!({
+            "modelConfig": {
+                "modelName": "default"
+            },
+            "usageData": {
+                "claude-3.5-sonnet": {
+                    "costInCents": 4,
+                    "amount": 1
+                }
+            }
+        });
+
+        assert_eq!(
+            extract_model_name(&raw).as_deref(),
+            Some("claude-3.5-sonnet")
+        );
+    }
+
+    #[test]
+    fn extracts_model_from_nested_usage_data_keys() {
+        let raw = json!({
+            "nested": {
+                "usageData": {
+                    "claude-3.7-sonnet-thinking": {
+                        "costInCents": 12
+                    }
+                }
+            }
+        });
+
+        assert_eq!(
+            extract_model_name(&raw).as_deref(),
+            Some("claude-3.7-sonnet-thinking")
+        );
+    }
+
+    #[test]
+    fn extracts_model_from_bubble_model_info() {
+        let raw = json!({
+            "modelInfo": {
+                "modelName": "gpt-5.2-codex-xhigh"
+            }
+        });
+
+        assert_eq!(
+            extract_bubble_model_name(&raw).as_deref(),
+            Some("gpt-5.2-codex-xhigh")
+        );
+    }
 }

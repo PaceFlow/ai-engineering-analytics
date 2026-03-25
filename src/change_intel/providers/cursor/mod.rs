@@ -10,7 +10,11 @@ use crate::change_intel::line_hash::{diff_with_hashes, hash_line};
 use crate::change_intel::path_resolver::{detect_repo_root, to_rel_path};
 use crate::change_intel::pipeline::ProviderCodeChangeSummary;
 use crate::change_intel::storage;
-use crate::change_intel::types::{ChangeOpCandidate, LineHashCount, LineSide, ParseError, SessionInfo, WriteMode};
+use crate::change_intel::types::{
+    ChangeOpCandidate, LineHashCount, LineSide, ParseError, SessionInfo, WriteMode,
+};
+use crate::cursor_paths::cursor_state_path;
+use crate::ingest_progress::IngestProgressObserver;
 use crate::path_utils::strip_file_scheme;
 
 const CURSOR_CURSOR_NAMESPACE: &str = "cursor_core_v1";
@@ -52,9 +56,7 @@ impl LegacyTarget {
             .unwrap_or_else(|| {
                 format!(
                     "legacy-content:{}:{}:{}",
-                    self.abs_path,
-                    self.version,
-                    self.code_block_idx
+                    self.abs_path, self.version, self.code_block_idx
                 )
             })
     }
@@ -66,6 +68,7 @@ impl LegacyTarget {
     }
 }
 
+#[allow(dead_code)]
 pub fn ingest_cursor_code_changes(
     conn: &mut Connection,
     verbose: bool,
@@ -78,6 +81,38 @@ pub fn ingest_cursor_code_changes(
     };
 
     ingest_cursor_code_changes_from_path(conn, &vscdb_path, verbose)
+}
+
+pub fn ingest_cursor_code_changes_from_sources(
+    conn: &mut Connection,
+    sources: &[PathBuf],
+    verbose: bool,
+    mut progress: Option<&mut dyn IngestProgressObserver>,
+) -> Result<ProviderCodeChangeSummary> {
+    let mut combined = ProviderCodeChangeSummary {
+        provider: "cursor".to_string(),
+        ..ProviderCodeChangeSummary::default()
+    };
+
+    for source in sources {
+        let summary = ingest_cursor_code_changes_from_path(conn, source, verbose)?;
+        combined.sources_discovered += summary.sources_discovered;
+        combined.sources_skipped += summary.sources_skipped;
+        combined.tool_calls_inspected += summary.tool_calls_inspected;
+        combined.ops_upserted += summary.ops_upserted;
+        combined.parse_errors += summary.parse_errors;
+        combined.legacy_sessions_considered += summary.legacy_sessions_considered;
+        combined.legacy_entries_inspected += summary.legacy_entries_inspected;
+        combined.legacy_diff_rows_found += summary.legacy_diff_rows_found;
+        combined.legacy_ops_upserted += summary.legacy_ops_upserted;
+        combined.legacy_parse_errors += summary.legacy_parse_errors;
+
+        if let Some(observer) = progress.as_mut() {
+            observer.advance(&source.to_string_lossy());
+        }
+    }
+
+    Ok(combined)
 }
 
 pub(crate) fn ingest_cursor_code_changes_from_path(
@@ -118,6 +153,7 @@ pub(crate) fn ingest_cursor_code_changes_from_path(
     }
 
     let mut seen_paths_by_session: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut ops = Vec::new();
 
     ingest_inline_undo_rows(
         &tx,
@@ -125,6 +161,7 @@ pub(crate) fn ingest_cursor_code_changes_from_path(
         &source_file,
         &sessions,
         &mut seen_paths_by_session,
+        &mut ops,
         &mut summary,
         verbose,
     )?;
@@ -135,6 +172,7 @@ pub(crate) fn ingest_cursor_code_changes_from_path(
         &source_file,
         &sessions,
         &mut seen_paths_by_session,
+        &mut ops,
         &mut summary,
         verbose,
     )?;
@@ -145,9 +183,13 @@ pub(crate) fn ingest_cursor_code_changes_from_path(
         &source_file,
         &sessions,
         &mut seen_paths_by_session,
+        &mut ops,
         &mut summary,
         verbose,
     )?;
+
+    let reconcile = storage::reconcile_source_tool_writes(&tx, "cursor", &source_file, &ops)?;
+    summary.ops_upserted += reconcile.ops_upserted;
 
     if let Some((mtime, size)) = sig {
         storage::upsert_ingest_cursor(&tx, CURSOR_CURSOR_NAMESPACE, &source_file, mtime, size)?;
@@ -164,9 +206,8 @@ fn collect_candidate_sessions(
 ) -> Result<HashMap<String, CandidateSession>> {
     let mut out = HashMap::new();
 
-    let mut stmt = vscdb.prepare(
-        "SELECT key, value FROM cursorDiskKV WHERE key LIKE 'composerData:%'",
-    )?;
+    let mut stmt =
+        vscdb.prepare("SELECT key, value FROM cursorDiskKV WHERE key LIKE 'composerData:%'")?;
 
     let rows = stmt.query_map([], |row| {
         Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
@@ -231,9 +272,8 @@ fn populate_checkpoint_paths(
         return Ok(());
     }
 
-    let mut stmt = vscdb.prepare(
-        "SELECT key, value FROM cursorDiskKV WHERE key LIKE 'checkpointId:%'",
-    )?;
+    let mut stmt =
+        vscdb.prepare("SELECT key, value FROM cursorDiskKV WHERE key LIKE 'checkpointId:%'")?;
 
     let rows = stmt.query_map([], |row| {
         Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
@@ -263,9 +303,7 @@ fn populate_checkpoint_paths(
         };
 
         for file in files {
-            let abs_path = file
-                .get("uri")
-                .and_then(extract_file_path_from_uri_value);
+            let abs_path = file.get("uri").and_then(extract_file_path_from_uri_value);
             if let Some(path) = abs_path {
                 session.checkpoint_paths.insert(path);
             }
@@ -281,12 +319,12 @@ fn ingest_inline_undo_rows(
     source_file: &str,
     sessions: &HashMap<String, CandidateSession>,
     seen_paths_by_session: &mut HashMap<String, HashSet<String>>,
+    ops: &mut Vec<ChangeOpCandidate>,
     summary: &mut ProviderCodeChangeSummary,
     verbose: bool,
 ) -> Result<()> {
-    let mut stmt = vscdb.prepare(
-        "SELECT key, value FROM cursorDiskKV WHERE key LIKE 'inlineDiffUndoRedo-%'",
-    )?;
+    let mut stmt = vscdb
+        .prepare("SELECT key, value FROM cursorDiskKV WHERE key LIKE 'inlineDiffUndoRedo-%'")?;
 
     let rows = stmt.query_map([], |row| {
         Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
@@ -348,9 +386,7 @@ fn ingest_inline_undo_rows(
             }
         };
 
-        let op_id = storage::upsert_change_op(conn, &op)?;
-        storage::replace_line_hashes(conn, op_id, &op.line_hashes)?;
-        summary.ops_upserted += 1;
+        ops.push(op);
 
         seen_paths_by_session
             .entry(composer_id)
@@ -367,6 +403,7 @@ fn ingest_partial_fates_fallback(
     source_file: &str,
     sessions: &HashMap<String, CandidateSession>,
     seen_paths_by_session: &mut HashMap<String, HashSet<String>>,
+    ops: &mut Vec<ChangeOpCandidate>,
     summary: &mut ProviderCodeChangeSummary,
     verbose: bool,
 ) -> Result<()> {
@@ -432,7 +469,8 @@ fn ingest_partial_fates_fallback(
                 }
             };
 
-            let op = match build_partial_fates_op(&partial_key, &parsed, &target.abs_path, session) {
+            let op = match build_partial_fates_op(&partial_key, &parsed, &target.abs_path, session)
+            {
                 Ok(op) => op,
                 Err(err) => {
                     insert_parse_error(
@@ -454,9 +492,7 @@ fn ingest_partial_fates_fallback(
                 continue;
             };
 
-            let op_id = storage::upsert_change_op(conn, &op)?;
-            storage::replace_line_hashes(conn, op_id, &op.line_hashes)?;
-            summary.ops_upserted += 1;
+            ops.push(op);
 
             seen_paths_by_session
                 .entry(composer_id.clone())
@@ -474,6 +510,7 @@ fn ingest_legacy_code_block_fallback(
     source_file: &str,
     sessions: &HashMap<String, CandidateSession>,
     seen_paths_by_session: &mut HashMap<String, HashSet<String>>,
+    ops: &mut Vec<ChangeOpCandidate>,
     summary: &mut ProviderCodeChangeSummary,
     verbose: bool,
 ) -> Result<()> {
@@ -515,7 +552,9 @@ fn ingest_legacy_code_block_fallback(
                     Some(op)
                 }
                 Ok(None) => match build_legacy_content_fallback_op(
-                    previous_content_by_path.get(&target.abs_path).map(String::as_str),
+                    previous_content_by_path
+                        .get(&target.abs_path)
+                        .map(String::as_str),
                     &target,
                     session,
                 ) {
@@ -531,7 +570,10 @@ fn ingest_legacy_code_block_fallback(
                                 .as_deref()
                                 .or(target.bubble_id.as_deref())
                                 .unwrap_or("legacy-code-block"),
-                            target.timestamp.clone().or_else(|| session.info.last_seen_at.clone()),
+                            target
+                                .timestamp
+                                .clone()
+                                .or_else(|| session.info.last_seen_at.clone()),
                             LEGACY_CONTENT_PARSER_NAME,
                             content_err,
                             verbose,
@@ -540,7 +582,9 @@ fn ingest_legacy_code_block_fallback(
                     }
                 },
                 Err(diff_err) => match build_legacy_content_fallback_op(
-                    previous_content_by_path.get(&target.abs_path).map(String::as_str),
+                    previous_content_by_path
+                        .get(&target.abs_path)
+                        .map(String::as_str),
                     &target,
                     session,
                 ) {
@@ -556,7 +600,10 @@ fn ingest_legacy_code_block_fallback(
                                 .as_deref()
                                 .or(target.bubble_id.as_deref())
                                 .unwrap_or("legacy-code-block"),
-                            target.timestamp.clone().or_else(|| session.info.last_seen_at.clone()),
+                            target
+                                .timestamp
+                                .clone()
+                                .or_else(|| session.info.last_seen_at.clone()),
                             LEGACY_DIFF_PARSER_NAME,
                             diff_err,
                             verbose,
@@ -574,7 +621,10 @@ fn ingest_legacy_code_block_fallback(
                                 .as_deref()
                                 .or(target.bubble_id.as_deref())
                                 .unwrap_or("legacy-code-block"),
-                            target.timestamp.clone().or_else(|| session.info.last_seen_at.clone()),
+                            target
+                                .timestamp
+                                .clone()
+                                .or_else(|| session.info.last_seen_at.clone()),
                             LEGACY_CONTENT_PARSER_NAME,
                             format!("{}; fallback failed: {}", diff_err, content_err),
                             verbose,
@@ -585,9 +635,7 @@ fn ingest_legacy_code_block_fallback(
             };
 
             if let Some(op) = op {
-                let op_id = storage::upsert_change_op(conn, &op)?;
-                storage::replace_line_hashes(conn, op_id, &op.line_hashes)?;
-                summary.ops_upserted += 1;
+                ops.push(op);
                 summary.legacy_ops_upserted += 1;
             }
 
@@ -685,7 +733,10 @@ fn build_legacy_content_fallback_op(
     )))
 }
 
-fn extract_legacy_diff_lines(payload: &Value, field: &str) -> std::result::Result<Vec<String>, String> {
+fn extract_legacy_diff_lines(
+    payload: &Value,
+    field: &str,
+) -> std::result::Result<Vec<String>, String> {
     let hunks = payload
         .get(field)
         .and_then(|v| v.as_array())
@@ -701,7 +752,10 @@ fn extract_legacy_diff_lines(payload: &Value, field: &str) -> std::result::Resul
         };
         for line in modified {
             let Some(line) = line.as_str() else {
-                return Err(format!("legacy diff '{}' modified entry was not a string", field));
+                return Err(format!(
+                    "legacy diff '{}' modified entry was not a string",
+                    field
+                ));
             };
             lines.push(line.to_string());
         }
@@ -730,6 +784,7 @@ fn build_change_op_candidate(
     ChangeOpCandidate {
         provider: "cursor".to_string(),
         session_id: session.info.session_id.clone(),
+        source_file: session.info.source_file.clone(),
         call_id,
         op_index,
         timestamp: timestamp.or_else(|| session.info.last_seen_at.clone()),
@@ -824,6 +879,7 @@ fn build_inline_change_op(
     Ok(ChangeOpCandidate {
         provider: "cursor".to_string(),
         session_id: session.info.session_id.clone(),
+        source_file: session.info.source_file.clone(),
         call_id: call_id.to_string(),
         op_index: 0,
         timestamp: row
@@ -887,6 +943,7 @@ fn build_partial_fates_op(
     Ok(Some(ChangeOpCandidate {
         provider: "cursor".to_string(),
         session_id: session.info.session_id.clone(),
+        source_file: session.info.source_file.clone(),
         call_id: call_id.to_string(),
         op_index: 0,
         timestamp: session.info.last_seen_at.clone(),
@@ -914,12 +971,7 @@ fn insert_parse_error(
     verbose: bool,
 ) -> Result<()> {
     if verbose {
-        eprintln!(
-            "[change-intel] {} {} {}",
-            parser_name,
-            call_id,
-            error
-        );
+        eprintln!("[change-intel] {} {} {}", parser_name, call_id, error);
     }
 
     storage::insert_parse_error(
@@ -1024,7 +1076,12 @@ fn extract_legacy_targets(parsed: &Value) -> Vec<LegacyTarget> {
         .get("lastUpdatedAt")
         .and_then(|v| v.as_i64())
         .and_then(ms_to_iso)
-        .or_else(|| parsed.get("createdAt").and_then(|v| v.as_i64()).and_then(ms_to_iso));
+        .or_else(|| {
+            parsed
+                .get("createdAt")
+                .and_then(|v| v.as_i64())
+                .and_then(ms_to_iso)
+        });
 
     let mut targets = Vec::new();
 
@@ -1225,34 +1282,8 @@ fn ms_to_iso(ms: i64) -> Option<String> {
         .map(|dt| dt.to_rfc3339())
 }
 
-fn cursor_vscdb_path() -> Result<Option<PathBuf>> {
-    #[cfg(target_os = "macos")]
-    {
-        let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Home directory not found"))?;
-        let p = home
-            .join("Library")
-            .join("Application Support")
-            .join("Cursor")
-            .join("User")
-            .join("globalStorage")
-            .join("state.vscdb");
-        if p.exists() {
-            return Ok(Some(p));
-        }
-    }
-
-    let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Home directory not found"))?;
-    let p = home
-        .join(".config")
-        .join("Cursor")
-        .join("User")
-        .join("globalStorage")
-        .join("state.vscdb");
-    if p.exists() {
-        return Ok(Some(p));
-    }
-
-    Ok(None)
+pub(crate) fn cursor_vscdb_path() -> Result<Option<PathBuf>> {
+    cursor_state_path()
 }
 
 #[cfg(test)]
@@ -1514,8 +1545,24 @@ mod tests {
         let collected = rows.collect::<std::result::Result<Vec<_>, _>>()?;
 
         assert_eq!(collected.len(), 2);
-        assert_eq!(collected[0], ("dict_sess".to_string(), PARTIAL_PARSER_NAME.to_string(), 2, 1));
-        assert_eq!(collected[1], ("list_sess".to_string(), PARTIAL_PARSER_NAME.to_string(), 1, 1));
+        assert_eq!(
+            collected[0],
+            (
+                "dict_sess".to_string(),
+                PARTIAL_PARSER_NAME.to_string(),
+                2,
+                1
+            )
+        );
+        assert_eq!(
+            collected[1],
+            (
+                "list_sess".to_string(),
+                PARTIAL_PARSER_NAME.to_string(),
+                1,
+                1
+            )
+        );
 
         cleanup(&source);
         Ok(())
@@ -1718,37 +1765,35 @@ mod tests {
         init_change_intel_schema(&analytics)?;
 
         let source = temp_db_path("legacy_content");
-        let rows = vec![
-            (
-                "composerData:legacy_content".to_string(),
-                json!({
-                    "composerId": "legacy_content",
-                    "createdAt": 1772694178155i64,
-                    "lastUpdatedAt": 1772694194894i64,
-                    "codeBlockData": {
-                        "file:///tmp/repo/legacy.txt": [
-                            {
-                                "status": "accepted",
-                                "version": 0,
-                                "codeBlockIdx": 0,
-                                "bubbleId": "b0",
-                                "content": "old line\nsame line\n",
-                                "uri": {"scheme": "file", "fsPath": "/tmp/repo/legacy.txt"}
-                            },
-                            {
-                                "status": "accepted",
-                                "version": 1,
-                                "codeBlockIdx": 0,
-                                "bubbleId": "b1",
-                                "content": "new line\nsame line\n",
-                                "uri": {"scheme": "file", "fsPath": "/tmp/repo/legacy.txt"}
-                            }
-                        ]
-                    }
-                })
-                .to_string(),
-            ),
-        ];
+        let rows = vec![(
+            "composerData:legacy_content".to_string(),
+            json!({
+                "composerId": "legacy_content",
+                "createdAt": 1772694178155i64,
+                "lastUpdatedAt": 1772694194894i64,
+                "codeBlockData": {
+                    "file:///tmp/repo/legacy.txt": [
+                        {
+                            "status": "accepted",
+                            "version": 0,
+                            "codeBlockIdx": 0,
+                            "bubbleId": "b0",
+                            "content": "old line\nsame line\n",
+                            "uri": {"scheme": "file", "fsPath": "/tmp/repo/legacy.txt"}
+                        },
+                        {
+                            "status": "accepted",
+                            "version": 1,
+                            "codeBlockIdx": 0,
+                            "bubbleId": "b1",
+                            "content": "new line\nsame line\n",
+                            "uri": {"scheme": "file", "fsPath": "/tmp/repo/legacy.txt"}
+                        }
+                    ]
+                }
+            })
+            .to_string(),
+        )];
 
         create_cursor_db(&source, &rows)?;
 
@@ -1860,28 +1905,26 @@ mod tests {
         init_change_intel_schema(&analytics)?;
 
         let source = temp_db_path("legacy_missing_diff");
-        let rows = vec![
-            (
-                "composerData:legacy_missing".to_string(),
-                json!({
-                    "composerId": "legacy_missing",
-                    "createdAt": 1772694178155i64,
-                    "lastUpdatedAt": 1772694194894i64,
-                    "codeBlockData": {
-                        "file:///tmp/repo/legacy.txt": [
-                            {
-                                "status": "accepted",
-                                "diffId": "missing-diff-row",
-                                "version": 0,
-                                "codeBlockIdx": 0,
-                                "uri": {"scheme": "file", "fsPath": "/tmp/repo/legacy.txt"}
-                            }
-                        ]
-                    }
-                })
-                .to_string(),
-            ),
-        ];
+        let rows = vec![(
+            "composerData:legacy_missing".to_string(),
+            json!({
+                "composerId": "legacy_missing",
+                "createdAt": 1772694178155i64,
+                "lastUpdatedAt": 1772694194894i64,
+                "codeBlockData": {
+                    "file:///tmp/repo/legacy.txt": [
+                        {
+                            "status": "accepted",
+                            "diffId": "missing-diff-row",
+                            "version": 0,
+                            "codeBlockIdx": 0,
+                            "uri": {"scheme": "file", "fsPath": "/tmp/repo/legacy.txt"}
+                        }
+                    ]
+                }
+            })
+            .to_string(),
+        )];
 
         create_cursor_db(&source, &rows)?;
 

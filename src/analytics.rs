@@ -1,6 +1,6 @@
 use anyhow::{Result, anyhow};
-use chrono::{DateTime, Duration, NaiveDateTime, SecondsFormat, Utc};
-use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params, types::ValueRef};
+use chrono::{DateTime, Duration, SecondsFormat, Utc};
+use rusqlite::{Connection, Row, TransactionBehavior, params, types::ValueRef};
 use serde::Serialize;
 use serde_json::{Map as JsonMap, Value as JsonValue};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -11,12 +11,176 @@ use std::time::Instant;
 use crate::change_intel::commit_assoc::git_scan::load_commit_diff;
 use crate::change_intel::types::LineSide;
 use crate::cli::{EventCategory, EventStreamArgs, EventStreamKind, GroupBy, ReportArgs};
+use crate::sync_identity;
 
 const C2_STRICT_WEAK_RATIO: f64 = 0.20;
 const C2_MIN_RATIO: f64 = 0.80;
 const C2_MIN_MATCHED_LINES: i64 = 30;
 const C2_WINNER_MARGIN: f64 = 0.20;
 const CHURN_WINDOW_DAYS: i64 = 14;
+const REPORTING_VIEWS_SQL: &str = r#"
+DROP VIEW IF EXISTS view_session_metrics_base;
+DROP VIEW IF EXISTS view_task_session_metrics_base;
+DROP VIEW IF EXISTS view_change_metrics_base;
+DROP VIEW IF EXISTS view_commit_session_metrics_base;
+DROP VIEW IF EXISTS view_task_commit_metrics_base;
+DROP VIEW IF EXISTS view_session_productivity;
+
+CREATE VIEW view_session_metrics_base AS
+SELECT
+    sq.provider,
+    sq.session_id,
+    COALESCE(sq.repo_root, ep.repo_root, '(unknown)') AS repo_root,
+    CASE
+        WHEN COALESCE(NULLIF(TRIM(sq.model_name), ''), NULLIF(TRIM(ep.model_name), '')) IS NULL
+            THEN sq.provider || '/(unknown)'
+        WHEN COALESCE(NULLIF(TRIM(sq.model_name), ''), NULLIF(TRIM(ep.model_name), '')) LIKE sq.provider || '/%'
+            THEN COALESCE(NULLIF(TRIM(sq.model_name), ''), NULLIF(TRIM(ep.model_name), ''))
+        ELSE sq.provider || '/' || COALESCE(NULLIF(TRIM(sq.model_name), ''), NULLIF(TRIM(ep.model_name), ''))
+    END AS model_name,
+    COALESCE(sq.started_at, ep.started_at) AS started_at,
+    date(
+        COALESCE(sq.started_at, ep.started_at),
+        '-' || ((CAST(strftime('%w', COALESCE(sq.started_at, ep.started_at)) AS INTEGER) + 6) % 7) || ' days'
+    ) AS week_start,
+    sq.user_turn_count,
+    sq.debug_loop_flag,
+    sq.mid_session_error_paste_flag,
+    COALESCE(sq.accepted_output_flag, 0) AS accepted_output_flag,
+    sq.first_accepted_change_at,
+    sq.minutes_to_first_accepted_change,
+    COALESCE(sq.session_commit_within_4h_flag, 0) AS session_commit_within_4h_flag
+FROM event_session_quality sq
+LEFT JOIN event_session_productivity ep
+  ON ep.provider = sq.provider
+ AND ep.session_id = sq.session_id;
+
+CREATE VIEW view_task_session_metrics_base AS
+SELECT
+    ts.repo_root,
+    ts.task_key,
+    ts.branch_name,
+    ts.provider,
+    ts.session_id,
+    CASE
+        WHEN NULLIF(TRIM(ts.model_name), '') IS NULL THEN ts.provider || '/(unknown)'
+        WHEN ts.model_name LIKE ts.provider || '/%' THEN ts.model_name
+        ELSE ts.provider || '/' || ts.model_name
+    END AS model_name,
+    ts.started_at AS started_at,
+    date(
+        ts.started_at,
+        '-' || ((CAST(strftime('%w', ts.started_at) AS INTEGER) + 6) % 7) || ' days'
+    ) AS week_start,
+    ts.attribution_weight,
+    ts.user_turn_count,
+    ts.debug_loop_flag,
+    ts.mid_session_error_paste_flag,
+    COALESCE(ts.accepted_output_flag, 0) AS accepted_output_flag,
+    ts.first_accepted_change_at,
+    ts.minutes_to_first_accepted_change,
+    ts.commit_within_window_flag
+FROM event_task_session ts;
+
+CREATE VIEW view_change_metrics_base AS
+SELECT
+    o.repo_root,
+    o.commit_sha,
+    o.commit_time,
+    date(
+        o.commit_time,
+        '-' || ((CAST(strftime('%w', o.commit_time) AS INTEGER) + 6) % 7) || ' days'
+    ) AS week_start,
+    o.heavy_ai_flag,
+    o.merged_to_mainline_flag,
+    o.reverted_later_flag,
+    o.commit_total_changed_lines,
+    c.ai_added_lines_reaching_mainline,
+    c.ai_added_lines_removed_within_window
+FROM event_commit_outcome o
+JOIN event_commit_churn c
+  ON c.repo_root = o.repo_root
+ AND c.commit_sha = o.commit_sha;
+
+CREATE VIEW view_commit_session_metrics_base AS
+SELECT
+    cs.repo_root,
+    cs.commit_sha,
+    cs.provider,
+    cs.session_id,
+    CASE
+        WHEN NULLIF(TRIM(cs.model_name), '') IS NULL THEN cs.provider || '/(unknown)'
+        WHEN cs.model_name LIKE cs.provider || '/%' THEN cs.model_name
+        ELSE cs.provider || '/' || cs.model_name
+    END AS model_name,
+    cs.commit_time,
+    date(
+        cs.commit_time,
+        '-' || ((CAST(strftime('%w', cs.commit_time) AS INTEGER) + 6) % 7) || ' days'
+    ) AS week_start,
+    cs.matched_lines,
+    cs.share_of_commit,
+    cs.share_of_ai,
+    o.heavy_ai_flag,
+    o.merged_to_mainline_flag,
+    o.reverted_later_flag,
+    o.commit_total_changed_lines,
+    c.ai_added_lines_reaching_mainline,
+    c.ai_added_lines_removed_within_window
+FROM event_commit_session cs
+JOIN event_commit_outcome o
+  ON o.repo_root = cs.repo_root
+ AND o.commit_sha = cs.commit_sha
+JOIN event_commit_churn c
+  ON c.repo_root = cs.repo_root
+ AND c.commit_sha = cs.commit_sha;
+
+CREATE VIEW view_task_commit_metrics_base AS
+SELECT
+    tc.repo_root,
+    tc.task_key,
+    tc.branch_name,
+    tc.commit_sha,
+    tc.fallback_flag,
+    tc.confidence,
+    tc.commit_time,
+    date(
+        tc.commit_time,
+        '-' || ((CAST(strftime('%w', tc.commit_time) AS INTEGER) + 6) % 7) || ' days'
+    ) AS week_start,
+    o.heavy_ai_flag,
+    o.merged_to_mainline_flag,
+    o.reverted_later_flag,
+    o.commit_total_changed_lines,
+    c.ai_added_lines_reaching_mainline,
+    c.ai_added_lines_removed_within_window
+FROM event_task_commit tc
+LEFT JOIN event_commit_outcome o
+  ON o.repo_root = tc.repo_root
+ AND o.commit_sha = tc.commit_sha
+LEFT JOIN event_commit_churn c
+  ON c.repo_root = tc.repo_root
+ AND c.commit_sha = tc.commit_sha;
+
+CREATE VIEW view_session_productivity AS
+SELECT
+    ep.provider,
+    CASE
+        WHEN NULLIF(TRIM(ep.model_name), '') IS NULL THEN ep.provider || '/(unknown)'
+        WHEN ep.model_name LIKE ep.provider || '/%' THEN ep.model_name
+        ELSE ep.provider || '/' || ep.model_name
+    END AS model_name,
+    ep.session_id,
+    COALESCE(ep.repo_root, '(unknown)') AS repo_root,
+    COALESCE(NULLIF(TRIM(ep.project_path), ''), '(unknown)') AS project_path,
+    COALESCE(ep.ended_at, ep.started_at) AS last_active,
+    ep.user_word_count,
+    ep.accepted_total_changed_lines AS total_loc,
+    ep.accepted_lines_added AS total_added,
+    ep.accepted_lines_removed AS total_removed
+FROM event_session_productivity ep
+ORDER BY last_active DESC;
+"#;
 
 #[derive(Debug, Clone)]
 pub struct RatioMetric {
@@ -109,6 +273,13 @@ struct SessionTurn {
     assistant_text: String,
 }
 
+#[derive(Debug, Clone, Default)]
+struct SessionConversationSummary {
+    user_turn_count: i64,
+    debug_loop_flag: i64,
+    mid_session_error_paste_flag: i64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct SessionKey {
     provider: String,
@@ -199,8 +370,8 @@ pub fn refresh_session_events(conn: &Connection) -> Result<()> {
     conn.execute("DELETE FROM event_session_productivity", [])?;
 
     let messages = load_session_messages(conn)?;
-    let session_context = load_session_context(conn)?;
-
+    let device_id = sync_identity::device_id();
+    let mut conversation_by_session = BTreeMap::new();
     for (session, messages) in messages {
         let turns = build_session_turns(&messages);
         let user_turns = turns
@@ -211,23 +382,14 @@ pub fn refresh_session_events(conn: &Connection) -> Result<()> {
             continue;
         }
 
-        let ctx = session_context.get(&session);
-        conn.execute(
-            "INSERT INTO event_session_quality (
-                provider, session_id, repo_root, started_at, ended_at, user_turn_count,
-                debug_loop_flag, mid_session_error_paste_flag
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![
-                session.provider,
-                session.session_id,
-                ctx.and_then(|v| v.repo_root.as_deref()),
-                ctx.and_then(|v| v.started_at.as_deref()),
-                ctx.and_then(|v| v.ended_at.as_deref()),
-                user_turns,
-                is_debug_loop_session(&turns) as i64,
-                has_mid_session_error_paste(&messages) as i64
-            ],
-        )?;
+        conversation_by_session.insert(
+            session,
+            SessionConversationSummary {
+                user_turn_count: user_turns,
+                debug_loop_flag: is_debug_loop_session(&turns) as i64,
+                mid_session_error_paste_flag: has_mid_session_error_paste(&messages) as i64,
+            },
+        );
     }
 
     let mut stmt = conn.prepare(
@@ -235,17 +397,55 @@ pub fn refresh_session_events(conn: &Connection) -> Result<()> {
              s.provider,
              s.session_id,
              r.repo_root,
+             CASE
+                 WHEN mm.model_name IS NULL OR TRIM(mm.model_name) = '' THEN s.provider || '/(unknown)'
+                 WHEN mm.model_name LIKE s.provider || '/%' THEN mm.model_name
+                 ELSE s.provider || '/' || mm.model_name
+             END AS model_name,
              COALESCE(NULLIF(TRIM(s.project_path), ''), '(unknown)') AS project_path,
-             COALESCE(sig.min_signal_ts, s.started_at) AS started_at,
+             s.started_at AS session_started_at,
+             s.ended_at AS session_ended_at,
+             COALESCE(sig.min_signal_ts, s.started_at) AS productivity_started_at,
              CASE
                  WHEN s.provider = 'cursor' THEN COALESCE(sig.max_signal_ts, s.ended_at, s.started_at)
                  ELSE COALESCE(sig.max_signal_ts, s.started_at)
-             END AS ended_at,
+             END AS productivity_ended_at,
              COALESCE(msg.user_word_count, 0) AS user_word_count,
              COALESCE(ch.added_lines, 0) AS added_lines,
-             COALESCE(ch.removed_lines, 0) AS removed_lines
+             COALESCE(ch.removed_lines, 0) AS removed_lines,
+             COALESCE(out.accepted_output_flag, 0) AS accepted_output_flag,
+             out.first_accepted_change_at,
+             CASE
+                 WHEN COALESCE(s.started_at, sig.min_signal_ts) IS NOT NULL
+                  AND out.first_accepted_change_at IS NOT NULL
+                 THEN (julianday(out.first_accepted_change_at) - julianday(COALESCE(s.started_at, sig.min_signal_ts))) * 24.0 * 60.0
+             END AS minutes_to_first_accepted_change,
+             CASE
+                 WHEN EXISTS (
+                     SELECT 1
+                     FROM fact_commit_session_match sm
+                     JOIN fact_commit c
+                       ON c.repo_root = sm.repo_root
+                      AND c.commit_sha = sm.commit_sha
+                     WHERE sm.provider = s.provider
+                       AND sm.session_id = s.session_id
+                       AND COALESCE(s.started_at, sig.min_signal_ts) IS NOT NULL
+                       AND julianday(c.commit_time) >= julianday(COALESCE(s.started_at, sig.min_signal_ts))
+                       AND julianday(c.commit_time) <= julianday(COALESCE(
+                           s.ended_at,
+                           s.started_at,
+                           CASE
+                               WHEN s.provider = 'cursor' THEN COALESCE(sig.max_signal_ts, s.ended_at, s.started_at)
+                               ELSE COALESCE(sig.max_signal_ts, s.started_at)
+                           END,
+                           COALESCE(sig.min_signal_ts, s.started_at)
+                       ), '+4 hours')
+                 )
+                 THEN 1 ELSE 0
+             END AS session_commit_within_4h_flag
          FROM metadata_sessions s
          LEFT JOIN metadata_repositories r ON r.id = s.repository_id
+         LEFT JOIN metadata_models mm ON mm.id = s.model_id
          LEFT JOIN (
              SELECT provider, session_id, SUM(content_words) AS user_word_count
              FROM fact_session_message
@@ -264,6 +464,30 @@ pub fn refresh_session_events(conn: &Connection) -> Result<()> {
          ) ch
            ON ch.provider = s.provider
           AND ch.session_id = s.session_id
+         LEFT JOIN (
+             SELECT
+                 provider,
+                 session_id,
+                 MIN(
+                     CASE
+                         WHEN change_ts IS NOT NULL
+                          AND source_kind IN ('accepted_change', 'tool_write')
+                          AND (lines_added > 0 OR lines_removed > 0)
+                         THEN change_ts
+                     END
+                 ) AS first_accepted_change_at,
+                 MAX(
+                     CASE
+                         WHEN source_kind IN ('accepted_change', 'tool_write')
+                          AND (lines_added > 0 OR lines_removed > 0)
+                         THEN 1 ELSE 0
+                     END
+                 ) AS accepted_output_flag
+             FROM fact_session_code_change
+             GROUP BY provider, session_id
+         ) out
+           ON out.provider = s.provider
+          AND out.session_id = s.session_id
          LEFT JOIN (
              SELECT provider, session_id,
                     MIN(ts) AS min_signal_ts,
@@ -285,7 +509,8 @@ pub fn refresh_session_events(conn: &Connection) -> Result<()> {
             OR msg.user_word_count IS NOT NULL
             OR ch.added_lines IS NOT NULL
             OR ch.removed_lines IS NOT NULL
-         ORDER BY ended_at DESC NULLS LAST",
+            OR out.accepted_output_flag IS NOT NULL
+         ORDER BY productivity_ended_at DESC NULLS LAST",
     )?;
 
     let rows = stmt.query_map([], |row| {
@@ -293,30 +518,89 @@ pub fn refresh_session_events(conn: &Connection) -> Result<()> {
             row.get::<_, String>(0)?,
             row.get::<_, String>(1)?,
             row.get::<_, Option<String>>(2)?,
-            row.get::<_, Option<String>>(3)?,
+            row.get::<_, String>(3)?,
             row.get::<_, Option<String>>(4)?,
             row.get::<_, Option<String>>(5)?,
-            row.get::<_, i64>(6)?,
-            row.get::<_, i64>(7)?,
-            row.get::<_, i64>(8)?,
+            row.get::<_, Option<String>>(6)?,
+            row.get::<_, Option<String>>(7)?,
+            row.get::<_, Option<String>>(8)?,
+            row.get::<_, i64>(9)?,
+            row.get::<_, i64>(10)?,
+            row.get::<_, i64>(11)?,
+            row.get::<_, i64>(12)?,
+            row.get::<_, Option<String>>(13)?,
+            row.get::<_, Option<f64>>(14)?,
+            row.get::<_, i64>(15)?,
         ))
     })?;
 
     for row in rows {
-        let (provider, session_id, repo_root, project_path, started_at, ended_at, user_word_count, added, removed) =
-            row?;
+        let (
+            provider,
+            session_id,
+            repo_root,
+            model_name,
+            project_path,
+            session_started_at,
+            session_ended_at,
+            productivity_started_at,
+            productivity_ended_at,
+            user_word_count,
+            added,
+            removed,
+            accepted_output_flag,
+            first_accepted_change_at,
+            minutes_to_first_accepted_change,
+            session_commit_within_4h_flag,
+        ) = row?;
+        let repo_key = sync_identity::repo_key_for_repo_root(repo_root.as_deref());
+        let member_email = sync_identity::member_email_for_repo(repo_root.as_deref());
+        if let Some(summary) = conversation_by_session.get(&SessionKey {
+            provider: provider.clone(),
+            session_id: session_id.clone(),
+        }) {
+            conn.execute(
+                "INSERT INTO event_session_quality (
+                    provider, session_id, repo_root, repo_key, member_email, device_id, model_name, started_at, ended_at, user_turn_count,
+                    debug_loop_flag, mid_session_error_paste_flag, accepted_output_flag,
+                    first_accepted_change_at, minutes_to_first_accepted_change, session_commit_within_4h_flag
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+                params![
+                    provider,
+                    session_id,
+                    repo_root,
+                    repo_key,
+                    member_email,
+                    device_id,
+                    model_name,
+                    session_started_at,
+                    session_ended_at,
+                    summary.user_turn_count,
+                    summary.debug_loop_flag,
+                    summary.mid_session_error_paste_flag,
+                    accepted_output_flag,
+                    first_accepted_change_at,
+                    minutes_to_first_accepted_change,
+                    session_commit_within_4h_flag
+                ],
+            )?;
+        }
         conn.execute(
             "INSERT INTO event_session_productivity (
-                provider, session_id, repo_root, project_path, started_at, ended_at,
+                provider, session_id, repo_root, repo_key, member_email, device_id, model_name, project_path, started_at, ended_at,
                 accepted_lines_added, accepted_lines_removed, accepted_total_changed_lines, user_word_count
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             params![
                 provider,
                 session_id,
                 repo_root,
+                repo_key,
+                member_email,
+                device_id,
+                model_name,
                 project_path,
-                started_at,
-                ended_at,
+                productivity_started_at,
+                productivity_ended_at,
                 added,
                 removed,
                 added + removed,
@@ -334,7 +618,10 @@ pub fn refresh_commit_events(conn: &mut Connection, verbose: bool) -> Result<Com
     let commits_total = commits.len();
     let mut by_repo: BTreeMap<String, Vec<CandidateCommit>> = BTreeMap::new();
     for commit in commits {
-        by_repo.entry(commit.repo_root.clone()).or_default().push(commit);
+        by_repo
+            .entry(commit.repo_root.clone())
+            .or_default()
+            .push(commit);
     }
 
     let repos_total = by_repo.len();
@@ -343,6 +630,7 @@ pub fn refresh_commit_events(conn: &mut Connection, verbose: bool) -> Result<Com
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     tx.execute("DELETE FROM event_commit_outcome", [])?;
     tx.execute("DELETE FROM event_commit_churn", [])?;
+    tx.execute("DELETE FROM event_commit_session", [])?;
     tx.execute("DELETE FROM event_task_commit", [])?;
     tx.execute("DELETE FROM event_task_session", [])?;
 
@@ -350,24 +638,34 @@ pub fn refresh_commit_events(conn: &mut Connection, verbose: bool) -> Result<Com
     let mut repos_processed = 0usize;
     let mut insert_outcome = tx.prepare_cached(
         "INSERT INTO event_commit_outcome (
-            repo_root, commit_sha, commit_time, heavy_ai_flag, merged_to_mainline_flag,
+            repo_root, repo_key, commit_sha, commit_time, heavy_ai_flag, merged_to_mainline_flag,
             reverted_later_flag, total_matched_ai_lines, commit_total_changed_lines
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
     )?;
     let mut insert_churn = tx.prepare_cached(
         "INSERT INTO event_commit_churn (
-            repo_root, commit_sha, ai_added_lines_reaching_mainline,
+            repo_root, repo_key, commit_sha, ai_added_lines_reaching_mainline,
             ai_added_lines_removed_within_window, churn_window_days
-         ) VALUES (?1, ?2, ?3, ?4, ?5)",
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
     )?;
 
     for (repo_index, (repo_root, mut repo_commits)) in by_repo.into_iter().enumerate() {
         if !Path::new(&repo_root).join(".git").exists() {
-            println!("  [{}/{}] {} skipped (not a git repo)", repo_index + 1, repos_total, shorten_repo(&repo_root));
+            println!(
+                "  [{}/{}] {} skipped (not a git repo)",
+                repo_index + 1,
+                repos_total,
+                shorten_repo(&repo_root)
+            );
             continue;
         }
+        let repo_key = sync_identity::repo_key_for_repo_root(Some(&repo_root));
 
-        repo_commits.sort_by(|a, b| a.commit_time.cmp(&b.commit_time).then_with(|| a.commit_sha.cmp(&b.commit_sha)));
+        repo_commits.sort_by(|a, b| {
+            a.commit_time
+                .cmp(&b.commit_time)
+                .then_with(|| a.commit_sha.cmp(&b.commit_sha))
+        });
         let repo_started = Instant::now();
         println!(
             "  [{}/{}] {} commits={}",
@@ -387,8 +685,11 @@ pub fn refresh_commit_events(conn: &mut Connection, verbose: bool) -> Result<Com
 
             insert_outcome.execute(params![
                 repo_root,
+                repo_key,
                 commit.commit_sha,
-                commit.commit_time.to_rfc3339_opts(SecondsFormat::Millis, true),
+                commit
+                    .commit_time
+                    .to_rfc3339_opts(SecondsFormat::Millis, true),
                 commit.heavy_ai as i64,
                 event.merged_to_mainline as i64,
                 event.reverted_later as i64,
@@ -398,6 +699,7 @@ pub fn refresh_commit_events(conn: &mut Connection, verbose: bool) -> Result<Com
 
             insert_churn.execute(params![
                 repo_root,
+                repo_key,
                 commit.commit_sha,
                 event.ai_added_lines_reaching_mainline,
                 event.ai_added_lines_removed_within_window,
@@ -426,11 +728,67 @@ pub fn refresh_commit_events(conn: &mut Connection, verbose: bool) -> Result<Com
     drop(insert_churn);
 
     tx.execute(
+        "INSERT INTO event_commit_session (
+            repo_root, repo_key, commit_sha, provider, session_id, member_email, device_id, commit_time, model_name,
+            matched_lines, share_of_commit, share_of_ai
+         )
+         SELECT
+            sm.repo_root,
+            NULL,
+            sm.commit_sha,
+            sm.provider,
+            sm.session_id,
+            '(unknown)',
+            '(unknown)',
+            c.commit_time,
+            CASE
+                WHEN mm.model_name IS NULL OR TRIM(mm.model_name) = '' THEN sm.provider || '/(unknown)'
+                WHEN mm.model_name LIKE sm.provider || '/%' THEN mm.model_name
+                ELSE sm.provider || '/' || mm.model_name
+            END AS model_name,
+            sm.matched_lines,
+           sm.share_of_commit,
+            sm.share_of_ai
+         FROM fact_commit_session_match sm
+         LEFT JOIN fact_commit c
+           ON c.repo_root = sm.repo_root
+          AND c.commit_sha = sm.commit_sha
+         LEFT JOIN metadata_sessions ms
+           ON ms.provider = sm.provider
+          AND ms.session_id = sm.session_id
+         LEFT JOIN metadata_models mm
+           ON mm.id = ms.model_id",
+        [],
+    )?;
+    {
+        let mut stmt = tx.prepare(
+            "SELECT rowid, repo_root
+             FROM event_commit_session",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (rowid, repo_root) = row?;
+            let repo_key = sync_identity::repo_key_for_repo_root(Some(&repo_root));
+            let member_email = sync_identity::member_email_for_repo(Some(&repo_root));
+            let device_id = sync_identity::device_id();
+            tx.execute(
+                "UPDATE event_commit_session
+                 SET repo_key = ?1, member_email = ?2, device_id = ?3
+                 WHERE rowid = ?4",
+                params![repo_key, member_email, device_id, rowid],
+            )?;
+        }
+    }
+
+    tx.execute(
         "INSERT INTO event_task_commit (
-            repo_root, task_key, branch_name, commit_sha, fallback_flag, confidence, commit_time
+            repo_root, repo_key, task_key, branch_name, commit_sha, fallback_flag, confidence, commit_time
          )
          SELECT
             a.repo_root,
+            NULL,
             a.task_key,
             a.branch_name,
             a.commit_sha,
@@ -443,6 +801,25 @@ pub fn refresh_commit_events(conn: &mut Connection, verbose: bool) -> Result<Com
           AND c.commit_sha = a.commit_sha",
         [],
     )?;
+    {
+        let mut stmt = tx.prepare(
+            "SELECT rowid, repo_root
+             FROM event_task_commit",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (rowid, repo_root) = row?;
+            let repo_key = sync_identity::repo_key_for_repo_root(Some(&repo_root));
+            tx.execute(
+                "UPDATE event_task_commit
+                 SET repo_key = ?1
+                 WHERE rowid = ?2",
+                params![repo_key, rowid],
+            )?;
+        }
+    }
 
     refresh_task_session_events(&tx)?;
     tx.commit()?;
@@ -457,245 +834,14 @@ pub fn refresh_commit_events(conn: &mut Connection, verbose: bool) -> Result<Com
 }
 
 pub fn create_reporting_views(conn: &Connection) -> Result<()> {
-    conn.execute_batch(
-        "DROP VIEW IF EXISTS view_session_metrics_base;
-         DROP VIEW IF EXISTS view_task_session_metrics_base;
-         DROP VIEW IF EXISTS view_change_metrics_base;
-         DROP VIEW IF EXISTS view_commit_session_metrics_base;
-         DROP VIEW IF EXISTS view_task_commit_metrics_base;
-         DROP VIEW IF EXISTS view_session_productivity;
-         
-         CREATE VIEW view_session_metrics_base AS
-         WITH session_change_summary AS (
-             SELECT
-                 provider,
-                 session_id,
-                 MIN(
-                     CASE
-                         WHEN change_ts IS NOT NULL
-                          AND source_kind IN ('accepted_change', 'tool_write')
-                          AND (lines_added > 0 OR lines_removed > 0)
-                         THEN change_ts
-                     END
-                 ) AS first_accepted_change_at,
-                 MAX(
-                     CASE
-                         WHEN source_kind IN ('accepted_change', 'tool_write')
-                          AND (lines_added > 0 OR lines_removed > 0)
-                         THEN 1 ELSE 0
-                     END
-                 ) AS accepted_output_flag
-             FROM fact_session_code_change
-             GROUP BY provider, session_id
-         )
-         SELECT
-             sq.provider,
-             sq.session_id,
-             COALESCE(sq.repo_root, ep.repo_root, '(unknown)') AS repo_root,
-             COALESCE(mm.model_name, '(unknown)') AS model_name,
-             COALESCE(sq.started_at, ep.started_at) AS started_at,
-             date(
-                 COALESCE(sq.started_at, ep.started_at),
-                 '-' || ((CAST(strftime('%w', COALESCE(sq.started_at, ep.started_at)) AS INTEGER) + 6) % 7) || ' days'
-             ) AS week_start,
-             sq.user_turn_count,
-             sq.debug_loop_flag,
-             sq.mid_session_error_paste_flag,
-             COALESCE(scs.accepted_output_flag, 0) AS accepted_output_flag,
-             scs.first_accepted_change_at,
-             CASE
-                 WHEN COALESCE(sq.started_at, ep.started_at) IS NOT NULL
-                  AND scs.first_accepted_change_at IS NOT NULL
-                 THEN (julianday(scs.first_accepted_change_at) - julianday(COALESCE(sq.started_at, ep.started_at))) * 24.0 * 60.0
-             END AS minutes_to_first_accepted_change,
-             CASE
-                 WHEN EXISTS (
-                     SELECT 1
-                     FROM fact_commit_session_match sm
-                     JOIN fact_commit c
-                       ON c.repo_root = sm.repo_root
-                      AND c.commit_sha = sm.commit_sha
-                     WHERE sm.provider = sq.provider
-                       AND sm.session_id = sq.session_id
-                       AND COALESCE(sq.started_at, ep.started_at) IS NOT NULL
-                       AND julianday(c.commit_time) >= julianday(COALESCE(sq.started_at, ep.started_at))
-                       AND julianday(c.commit_time) <= julianday(COALESCE(sq.ended_at, sq.started_at, ep.ended_at, ep.started_at), '+4 hours')
-                 )
-                 THEN 1 ELSE 0
-             END AS session_commit_within_4h_flag
-         FROM event_session_quality sq
-         LEFT JOIN event_session_productivity ep
-           ON ep.provider = sq.provider
-          AND ep.session_id = sq.session_id
-         LEFT JOIN session_change_summary scs
-           ON scs.provider = sq.provider
-          AND scs.session_id = sq.session_id
-         LEFT JOIN metadata_sessions ms
-           ON ms.provider = sq.provider
-          AND ms.session_id = sq.session_id
-         LEFT JOIN metadata_models mm
-           ON mm.id = ms.model_id;
-
-         CREATE VIEW view_task_session_metrics_base AS
-         WITH session_change_summary AS (
-             SELECT
-                 provider,
-                 session_id,
-                 MIN(
-                     CASE
-                         WHEN change_ts IS NOT NULL
-                          AND source_kind IN ('accepted_change', 'tool_write')
-                          AND (lines_added > 0 OR lines_removed > 0)
-                         THEN change_ts
-                     END
-                 ) AS first_accepted_change_at,
-                 MAX(
-                     CASE
-                         WHEN source_kind IN ('accepted_change', 'tool_write')
-                          AND (lines_added > 0 OR lines_removed > 0)
-                         THEN 1 ELSE 0
-                     END
-                 ) AS accepted_output_flag
-             FROM fact_session_code_change
-             GROUP BY provider, session_id
-         )
-         SELECT
-             ts.repo_root,
-             ts.task_key,
-             ts.branch_name,
-             ts.provider,
-             ts.session_id,
-             COALESCE(mm.model_name, '(unknown)') AS model_name,
-             ms.started_at AS started_at,
-             date(
-                 ms.started_at,
-                 '-' || ((CAST(strftime('%w', ms.started_at) AS INTEGER) + 6) % 7) || ' days'
-             ) AS week_start,
-             ts.attribution_weight,
-             ts.user_turn_count,
-             ts.debug_loop_flag,
-             ts.mid_session_error_paste_flag,
-             COALESCE(scs.accepted_output_flag, 0) AS accepted_output_flag,
-             scs.first_accepted_change_at,
-             CASE
-                 WHEN ms.started_at IS NOT NULL
-                  AND scs.first_accepted_change_at IS NOT NULL
-                 THEN (julianday(scs.first_accepted_change_at) - julianday(ms.started_at)) * 24.0 * 60.0
-             END AS minutes_to_first_accepted_change,
-             ts.commit_within_window_flag
-         FROM event_task_session ts
-         LEFT JOIN metadata_sessions ms
-           ON ms.provider = ts.provider
-          AND ms.session_id = ts.session_id
-         LEFT JOIN session_change_summary scs
-           ON scs.provider = ts.provider
-          AND scs.session_id = ts.session_id
-         LEFT JOIN metadata_models mm
-           ON mm.id = ms.model_id;
-
-         CREATE VIEW view_change_metrics_base AS
-         SELECT
-             o.repo_root,
-             o.commit_sha,
-             o.commit_time,
-             date(
-                 o.commit_time,
-                 '-' || ((CAST(strftime('%w', o.commit_time) AS INTEGER) + 6) % 7) || ' days'
-             ) AS week_start,
-             o.heavy_ai_flag,
-             o.merged_to_mainline_flag,
-             o.reverted_later_flag,
-             o.commit_total_changed_lines,
-             c.ai_added_lines_reaching_mainline,
-             c.ai_added_lines_removed_within_window
-         FROM event_commit_outcome o
-         JOIN event_commit_churn c
-           ON c.repo_root = o.repo_root
-          AND c.commit_sha = o.commit_sha;
-
-         CREATE VIEW view_commit_session_metrics_base AS
-         SELECT
-             sm.repo_root,
-             sm.commit_sha,
-             sm.provider,
-             COALESCE(mm.model_name, '(unknown)') AS model_name,
-             o.commit_time,
-             date(
-                 o.commit_time,
-                 '-' || ((CAST(strftime('%w', o.commit_time) AS INTEGER) + 6) % 7) || ' days'
-             ) AS week_start,
-             sm.share_of_commit,
-             sm.share_of_ai,
-             o.heavy_ai_flag,
-             o.merged_to_mainline_flag,
-             o.reverted_later_flag,
-             o.commit_total_changed_lines,
-             c.ai_added_lines_reaching_mainline,
-             c.ai_added_lines_removed_within_window
-         FROM fact_commit_session_match sm
-         JOIN event_commit_outcome o
-           ON o.repo_root = sm.repo_root
-          AND o.commit_sha = sm.commit_sha
-         JOIN event_commit_churn c
-           ON c.repo_root = sm.repo_root
-          AND c.commit_sha = sm.commit_sha
-         LEFT JOIN metadata_sessions ms
-           ON ms.provider = sm.provider
-          AND ms.session_id = sm.session_id
-         LEFT JOIN metadata_models mm
-           ON mm.id = ms.model_id;
-
-         CREATE VIEW view_task_commit_metrics_base AS
-         SELECT
-             tc.repo_root,
-             tc.task_key,
-             tc.branch_name,
-             tc.commit_sha,
-             tc.fallback_flag,
-             tc.confidence,
-             tc.commit_time,
-             date(
-                 tc.commit_time,
-                 '-' || ((CAST(strftime('%w', tc.commit_time) AS INTEGER) + 6) % 7) || ' days'
-             ) AS week_start,
-             o.heavy_ai_flag,
-             o.merged_to_mainline_flag,
-             o.reverted_later_flag,
-             o.commit_total_changed_lines,
-             c.ai_added_lines_reaching_mainline,
-             c.ai_added_lines_removed_within_window
-         FROM event_task_commit tc
-         LEFT JOIN event_commit_outcome o
-           ON o.repo_root = tc.repo_root
-          AND o.commit_sha = tc.commit_sha
-         LEFT JOIN event_commit_churn c
-           ON c.repo_root = tc.repo_root
-          AND c.commit_sha = tc.commit_sha;
-
-         CREATE VIEW view_session_productivity AS
-         SELECT
-             ep.provider,
-             COALESCE(mm.model_name, '(unknown)') AS model_name,
-             ep.session_id,
-             COALESCE(ep.repo_root, '(unknown)') AS repo_root,
-             COALESCE(NULLIF(TRIM(ms.project_path), ''), '(unknown)') AS project_path,
-             COALESCE(ep.ended_at, ep.started_at) AS last_active,
-             ep.user_word_count,
-             ep.accepted_total_changed_lines AS total_loc,
-             ep.accepted_lines_added AS total_added,
-             ep.accepted_lines_removed AS total_removed
-         FROM event_session_productivity ep
-         LEFT JOIN metadata_sessions ms
-           ON ms.provider = ep.provider
-          AND ms.session_id = ep.session_id
-         LEFT JOIN metadata_models mm
-           ON mm.id = ms.model_id
-         ORDER BY last_active DESC;",
-    )?;
+    conn.execute_batch(REPORTING_VIEWS_SQL)?;
     Ok(())
 }
 
-pub fn query_session_list_rows(conn: &Connection, args: &ReportArgs) -> Result<Vec<SessionListRow>> {
+pub fn query_session_list_rows(
+    conn: &Connection,
+    args: &ReportArgs,
+) -> Result<Vec<SessionListRow>> {
     let mut sql = String::from(
         "SELECT provider, model_name, session_id, project_path, last_active, user_word_count, total_loc, total_added, total_removed
          FROM view_session_productivity",
@@ -722,7 +868,8 @@ pub fn query_session_list_rows(conn: &Connection, args: &ReportArgs) -> Result<V
             total_removed: row.get(8)?,
         })
     })?;
-    rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(Into::into)
 }
 
 pub fn query_session_report(conn: &Connection, args: &ReportArgs) -> Result<Vec<SessionReportRow>> {
@@ -804,17 +951,27 @@ pub fn query_session_report(conn: &Connection, args: &ReportArgs) -> Result<Vec<
             "AVG(CASE WHEN minutes_to_first_accepted_change IS NOT NULL THEN CAST(minutes_to_first_accepted_change AS REAL) END) AS time_to_first_accept_avg"
                 .to_string(),
         );
-        select.push("COALESCE(SUM(CASE WHEN debug_loop_flag = 1 THEN 1 ELSE 0 END), 0) AS s4_n".to_string());
+        select.push(
+            "COALESCE(SUM(CASE WHEN debug_loop_flag = 1 THEN 1 ELSE 0 END), 0) AS s4_n".to_string(),
+        );
         select.push("COUNT(CASE WHEN debug_loop_flag IS NOT NULL THEN 1 END) AS s4_d".to_string());
         select.push("COALESCE(SUM(CASE WHEN mid_session_error_paste_flag = 1 THEN 1 ELSE 0 END), 0) AS s6_n".to_string());
-        select.push("COUNT(CASE WHEN mid_session_error_paste_flag IS NOT NULL THEN 1 END) AS s6_d".to_string());
+        select.push(
+            "COUNT(CASE WHEN mid_session_error_paste_flag IS NOT NULL THEN 1 END) AS s6_d"
+                .to_string(),
+        );
         select.push("COALESCE(SUM(CASE WHEN session_commit_within_4h_flag = 1 THEN 1 ELSE 0 END), 0) AS s9_n".to_string());
-        select.push("COUNT(CASE WHEN session_commit_within_4h_flag IS NOT NULL THEN 1 END) AS s9_d".to_string());
+        select.push(
+            "COUNT(CASE WHEN session_commit_within_4h_flag IS NOT NULL THEN 1 END) AS s9_d"
+                .to_string(),
+        );
         select.push(
             "COALESCE(SUM(CASE WHEN user_turn_count IS NOT NULL AND accepted_output_flag = 0 THEN 1 ELSE 0 END), 0) AS no_output_n"
                 .to_string(),
         );
-        select.push("COUNT(CASE WHEN user_turn_count IS NOT NULL THEN 1 END) AS no_output_d".to_string());
+        select.push(
+            "COUNT(CASE WHEN user_turn_count IS NOT NULL THEN 1 END) AS no_output_d".to_string(),
+        );
     }
 
     let mut sql = format!("SELECT {} FROM {}", select.join(", "), source);
@@ -852,7 +1009,12 @@ pub fn query_session_report(conn: &Connection, args: &ReportArgs) -> Result<Vec<
     let mut out = Vec::new();
     for row in rows {
         let row = row?;
-        if matches!(args.group_by, Some(GroupBy::Task)) && !is_reportable_task(&row.group_value, row.branch_name.as_deref()) {
+        if row.session_count == 0 {
+            continue;
+        }
+        if matches!(args.group_by, Some(GroupBy::Task))
+            && !is_reportable_task(&row.group_value, row.branch_name.as_deref())
+        {
             continue;
         }
         out.push(row);
@@ -904,14 +1066,24 @@ pub fn query_change_report(conn: &Connection, args: &ReportArgs) -> Result<Vec<C
 
     if use_commit_session_base {
         select.push("COUNT(DISTINCT commit_sha) AS commit_count".to_string());
-        select.push("COUNT(DISTINCT CASE WHEN heavy_ai_flag = 1 THEN commit_sha END) AS heavy_commit_count".to_string());
+        select.push(
+            "COUNT(DISTINCT CASE WHEN heavy_ai_flag = 1 THEN commit_sha END) AS heavy_commit_count"
+                .to_string(),
+        );
         select.push("COUNT(DISTINCT CASE WHEN heavy_ai_flag = 1 AND merged_to_mainline_flag = 1 THEN commit_sha END) AS c2_n".to_string());
-        select.push("COUNT(DISTINCT CASE WHEN heavy_ai_flag = 1 THEN commit_sha END) AS c2_d".to_string());
+        select.push(
+            "COUNT(DISTINCT CASE WHEN heavy_ai_flag = 1 THEN commit_sha END) AS c2_d".to_string(),
+        );
     } else {
         select.push("COUNT(*) AS commit_count".to_string());
-        select.push("COALESCE(SUM(CASE WHEN heavy_ai_flag = 1 THEN 1 ELSE 0 END), 0) AS heavy_commit_count".to_string());
+        select.push(
+            "COALESCE(SUM(CASE WHEN heavy_ai_flag = 1 THEN 1 ELSE 0 END), 0) AS heavy_commit_count"
+                .to_string(),
+        );
         select.push("COALESCE(SUM(CASE WHEN heavy_ai_flag = 1 AND merged_to_mainline_flag = 1 THEN 1 ELSE 0 END), 0) AS c2_n".to_string());
-        select.push("COALESCE(SUM(CASE WHEN heavy_ai_flag = 1 THEN 1 ELSE 0 END), 0) AS c2_d".to_string());
+        select.push(
+            "COALESCE(SUM(CASE WHEN heavy_ai_flag = 1 THEN 1 ELSE 0 END), 0) AS c2_d".to_string(),
+        );
     }
 
     let mut sql = format!("SELECT {} FROM {}", select.join(", "), source);
@@ -952,7 +1124,9 @@ pub fn query_change_report(conn: &Connection, args: &ReportArgs) -> Result<Vec<C
     let mut out = Vec::new();
     for row in rows {
         let row = row?;
-        if matches!(args.group_by, Some(GroupBy::Task)) && !is_reportable_task(&row.group_value, row.branch_name.as_deref()) {
+        if matches!(args.group_by, Some(GroupBy::Task))
+            && !is_reportable_task(&row.group_value, row.branch_name.as_deref())
+        {
             continue;
         }
         out.push(row);
@@ -963,7 +1137,10 @@ pub fn query_change_report(conn: &Connection, args: &ReportArgs) -> Result<Vec<C
     Ok(out)
 }
 
-pub fn query_lifecycle_report(conn: &Connection, args: &ReportArgs) -> Result<Vec<LifecycleReportRow>> {
+pub fn query_lifecycle_report(
+    conn: &Connection,
+    args: &ReportArgs,
+) -> Result<Vec<LifecycleReportRow>> {
     let source = change_lifecycle_source(args);
     let use_commit_session_base = source == "view_commit_session_metrics_base";
     let timestamp_col = "commit_time";
@@ -997,15 +1174,23 @@ pub fn query_lifecycle_report(conn: &Connection, args: &ReportArgs) -> Result<Ve
     }
 
     if use_commit_session_base {
-        select.push("COUNT(DISTINCT CASE WHEN heavy_ai_flag = 1 THEN commit_sha END) AS heavy_commit_count".to_string());
+        select.push(
+            "COUNT(DISTINCT CASE WHEN heavy_ai_flag = 1 THEN commit_sha END) AS heavy_commit_count"
+                .to_string(),
+        );
         select.push("CAST(ROUND(SUM(CASE WHEN heavy_ai_flag = 1 AND reverted_later_flag = 1 THEN share_of_ai ELSE 0 END), 0) AS INTEGER) AS l4_n".to_string());
         select.push("CAST(ROUND(SUM(CASE WHEN heavy_ai_flag = 1 THEN share_of_ai ELSE 0 END), 0) AS INTEGER) AS l4_d".to_string());
         select.push("CAST(ROUND(SUM(CASE WHEN heavy_ai_flag = 1 THEN share_of_ai * ai_added_lines_removed_within_window ELSE 0 END), 0) AS INTEGER) AS l1_n".to_string());
         select.push("CAST(ROUND(SUM(CASE WHEN heavy_ai_flag = 1 THEN share_of_ai * ai_added_lines_reaching_mainline ELSE 0 END), 0) AS INTEGER) AS l1_d".to_string());
     } else {
-        select.push("COALESCE(SUM(CASE WHEN heavy_ai_flag = 1 THEN 1 ELSE 0 END), 0) AS heavy_commit_count".to_string());
+        select.push(
+            "COALESCE(SUM(CASE WHEN heavy_ai_flag = 1 THEN 1 ELSE 0 END), 0) AS heavy_commit_count"
+                .to_string(),
+        );
         select.push("COALESCE(SUM(CASE WHEN heavy_ai_flag = 1 THEN reverted_later_flag ELSE 0 END), 0) AS l4_n".to_string());
-        select.push("COALESCE(SUM(CASE WHEN heavy_ai_flag = 1 THEN 1 ELSE 0 END), 0) AS l4_d".to_string());
+        select.push(
+            "COALESCE(SUM(CASE WHEN heavy_ai_flag = 1 THEN 1 ELSE 0 END), 0) AS l4_d".to_string(),
+        );
         select.push("COALESCE(SUM(CASE WHEN heavy_ai_flag = 1 THEN ai_added_lines_removed_within_window ELSE 0 END), 0) AS l1_n".to_string());
         select.push("COALESCE(SUM(CASE WHEN heavy_ai_flag = 1 THEN ai_added_lines_reaching_mainline ELSE 0 END), 0) AS l1_d".to_string());
     }
@@ -1047,7 +1232,9 @@ pub fn query_lifecycle_report(conn: &Connection, args: &ReportArgs) -> Result<Ve
     let mut out = Vec::new();
     for row in rows {
         let row = row?;
-        if matches!(args.group_by, Some(GroupBy::Task)) && !is_reportable_task(&row.group_value, row.branch_name.as_deref()) {
+        if matches!(args.group_by, Some(GroupBy::Task))
+            && !is_reportable_task(&row.group_value, row.branch_name.as_deref())
+        {
             continue;
         }
         out.push(row);
@@ -1058,7 +1245,10 @@ pub fn query_lifecycle_report(conn: &Connection, args: &ReportArgs) -> Result<Ve
     Ok(out)
 }
 
-pub fn query_event_stream(conn: &Connection, args: &EventStreamArgs) -> Result<Vec<EventStreamRow>> {
+pub fn query_event_stream(
+    conn: &Connection,
+    args: &EventStreamArgs,
+) -> Result<Vec<EventStreamRow>> {
     let mut rows = Vec::new();
     for stream in selected_event_streams(args) {
         rows.extend(load_event_stream_rows(
@@ -1088,7 +1278,10 @@ pub fn query_event_stream(conn: &Connection, args: &EventStreamArgs) -> Result<V
 }
 
 fn ratio_metric(numerator: i64, denominator: i64) -> RatioMetric {
-    RatioMetric { numerator, denominator }
+    RatioMetric {
+        numerator,
+        denominator,
+    }
 }
 
 fn selected_event_streams(args: &EventStreamArgs) -> Vec<EventStreamKind> {
@@ -1097,7 +1290,10 @@ fn selected_event_streams(args: &EventStreamArgs) -> Vec<EventStreamKind> {
     }
 
     match args.category {
-        EventCategory::Session => vec![EventStreamKind::SessionBase, EventStreamKind::TaskSessionBase],
+        EventCategory::Session => vec![
+            EventStreamKind::SessionBase,
+            EventStreamKind::TaskSessionBase,
+        ],
         EventCategory::Change | EventCategory::Lifecycle => vec![
             EventStreamKind::ChangeBase,
             EventStreamKind::CommitSessionBase,
@@ -1172,7 +1368,10 @@ fn build_event_stream_row(
     }
 }
 
-fn row_to_json_object(row: &Row<'_>, column_names: &[String]) -> Result<JsonMap<String, JsonValue>> {
+fn row_to_json_object(
+    row: &Row<'_>,
+    column_names: &[String],
+) -> Result<JsonMap<String, JsonValue>> {
     let mut fields = JsonMap::new();
     for (index, column_name) in column_names.iter().enumerate() {
         let value = row.get_ref(index)?;
@@ -1187,7 +1386,9 @@ fn sqlite_value_to_json(value: ValueRef<'_>) -> JsonValue {
         ValueRef::Integer(value) => JsonValue::from(value),
         ValueRef::Real(value) => JsonValue::from(value),
         ValueRef::Text(value) => JsonValue::String(String::from_utf8_lossy(value).into_owned()),
-        ValueRef::Blob(value) => JsonValue::String(value.iter().map(|byte| format!("{byte:02x}")).collect()),
+        ValueRef::Blob(value) => {
+            JsonValue::String(value.iter().map(|byte| format!("{byte:02x}")).collect())
+        }
     }
 }
 
@@ -1198,7 +1399,10 @@ fn event_stream_field_string(fields: &JsonMap<String, JsonValue>, key: &str) -> 
         .map(ToOwned::to_owned)
 }
 
-fn event_stream_sort_identity(stream: EventStreamKind, fields: &JsonMap<String, JsonValue>) -> Vec<String> {
+fn event_stream_sort_identity(
+    stream: EventStreamKind,
+    fields: &JsonMap<String, JsonValue>,
+) -> Vec<String> {
     match stream {
         EventStreamKind::SessionBase => vec![
             event_stream_field_string(fields, "provider").unwrap_or_default(),
@@ -1218,6 +1422,7 @@ fn event_stream_sort_identity(stream: EventStreamKind, fields: &JsonMap<String, 
             event_stream_field_string(fields, "repo_root").unwrap_or_default(),
             event_stream_field_string(fields, "commit_sha").unwrap_or_default(),
             event_stream_field_string(fields, "provider").unwrap_or_default(),
+            event_stream_field_string(fields, "session_id").unwrap_or_default(),
         ],
         EventStreamKind::TaskCommitBase => vec![
             event_stream_field_string(fields, "repo_root").unwrap_or_default(),
@@ -1256,7 +1461,9 @@ fn effective_event_stream_category(
 ) -> EventCategory {
     match requested {
         EventCategory::All => match stream {
-            EventStreamKind::SessionBase | EventStreamKind::TaskSessionBase => EventCategory::Session,
+            EventStreamKind::SessionBase | EventStreamKind::TaskSessionBase => {
+                EventCategory::Session
+            }
             EventStreamKind::ChangeBase
             | EventStreamKind::CommitSessionBase
             | EventStreamKind::TaskCommitBase => EventCategory::Change,
@@ -1295,7 +1502,10 @@ fn build_event_stream_conditions(
             | EventStreamKind::TaskSessionBase
             | EventStreamKind::CommitSessionBase
     );
-    let task_capable = matches!(stream, EventStreamKind::TaskSessionBase | EventStreamKind::TaskCommitBase);
+    let task_capable = matches!(
+        stream,
+        EventStreamKind::TaskSessionBase | EventStreamKind::TaskCommitBase
+    );
     let model_capable = matches!(
         stream,
         EventStreamKind::SessionBase
@@ -1396,14 +1606,23 @@ fn build_conditions(
     }
     if let Some(model) = args.model.as_deref() {
         if model_capable {
-            conditions.push(format!("COALESCE(model_name, '(unknown)') = {}", sql_literal(model)));
+            conditions.push(format!(
+                "COALESCE(model_name, '(unknown)') = {}",
+                sql_literal(model)
+            ));
         }
     }
     if let Some(from) = args.from.as_deref() {
-        conditions.push(format!("date({timestamp_col}) >= date({})", sql_literal(from)));
+        conditions.push(format!(
+            "date({timestamp_col}) >= date({})",
+            sql_literal(from)
+        ));
     }
     if let Some(to) = args.to.as_deref() {
-        conditions.push(format!("date({timestamp_col}) <= date({})", sql_literal(to)));
+        conditions.push(format!(
+            "date({timestamp_col}) <= date({})",
+            sql_literal(to)
+        ));
     }
     conditions
 }
@@ -1445,10 +1664,7 @@ fn sql_literal(value: &str) -> String {
 }
 
 fn is_reportable_task(task_key: &Option<String>, branch_name: Option<&str>) -> bool {
-    task_key
-        .as_deref()
-        .map(looks_like_task_id)
-        .unwrap_or(false)
+    task_key.as_deref().map(looks_like_task_id).unwrap_or(false)
         && !branch_name.map(is_integration_branch).unwrap_or(false)
 }
 
@@ -1456,127 +1672,116 @@ fn refresh_task_session_events(conn: &Connection) -> Result<()> {
     let mut stmt = conn.prepare(
         "SELECT
             tc.repo_root,
+            MAX(COALESCE(tc.repo_key, cs.repo_key, sq.repo_key)) AS repo_key,
             tc.task_key,
             tc.branch_name,
-            sm.provider,
-            sm.session_id,
-            SUM(sm.matched_lines) AS attribution_weight,
+            cs.provider,
+            cs.session_id,
+            MAX(COALESCE(cs.member_email, sq.member_email, '(unknown)')) AS member_email,
+            MAX(COALESCE(cs.device_id, sq.device_id, '(unknown)')) AS device_id,
+            MAX(cs.model_name) AS model_name,
+            MAX(sq.started_at) AS started_at,
+            SUM(cs.matched_lines) AS attribution_weight,
+            MAX(
+                CASE
+                    WHEN sq.started_at IS NOT NULL
+                     AND cs.commit_time IS NOT NULL
+                     AND julianday(cs.commit_time) >= julianday(sq.started_at)
+                     AND julianday(cs.commit_time) <= julianday(COALESCE(sq.ended_at, sq.started_at), '+4 hours')
+                    THEN 1 ELSE 0
+                END
+            ) AS commit_within_window_flag,
             MAX(sq.user_turn_count) AS user_turn_count,
             MAX(sq.debug_loop_flag) AS debug_loop_flag,
-            MAX(sq.mid_session_error_paste_flag) AS mid_session_error_paste_flag
+            MAX(sq.mid_session_error_paste_flag) AS mid_session_error_paste_flag,
+            MAX(sq.accepted_output_flag) AS accepted_output_flag,
+            MAX(sq.first_accepted_change_at) AS first_accepted_change_at,
+            MAX(sq.minutes_to_first_accepted_change) AS minutes_to_first_accepted_change
          FROM event_task_commit tc
-         JOIN fact_commit_session_match sm
-           ON sm.repo_root = tc.repo_root
-          AND sm.commit_sha = tc.commit_sha
+         JOIN event_commit_session cs
+           ON cs.repo_root = tc.repo_root
+          AND cs.commit_sha = tc.commit_sha
          LEFT JOIN event_session_quality sq
-           ON sq.provider = sm.provider
-          AND sq.session_id = sm.session_id
-         GROUP BY tc.repo_root, tc.task_key, tc.branch_name, sm.provider, sm.session_id",
+           ON sq.provider = cs.provider
+          AND sq.session_id = cs.session_id
+         GROUP BY tc.repo_root, tc.task_key, tc.branch_name, cs.provider, cs.session_id",
     )?;
     let rows = stmt.query_map([], |row| {
         Ok((
             row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
+            row.get::<_, Option<String>>(1)?,
             row.get::<_, String>(2)?,
             row.get::<_, String>(3)?,
             row.get::<_, String>(4)?,
-            row.get::<_, f64>(5)?,
-            row.get::<_, Option<i64>>(6)?,
-            row.get::<_, Option<i64>>(7)?,
-            row.get::<_, Option<i64>>(8)?,
+            row.get::<_, String>(5)?,
+            row.get::<_, String>(6)?,
+            row.get::<_, String>(7)?,
+            row.get::<_, Option<String>>(8)?,
+            row.get::<_, Option<String>>(9)?,
+            row.get::<_, f64>(10)?,
+            row.get::<_, i64>(11)?,
+            row.get::<_, Option<i64>>(12)?,
+            row.get::<_, Option<i64>>(13)?,
+            row.get::<_, Option<i64>>(14)?,
+            row.get::<_, Option<i64>>(15)?,
+            row.get::<_, Option<String>>(16)?,
+            row.get::<_, Option<f64>>(17)?,
         ))
     })?;
 
     for row in rows {
         let (
             repo_root,
+            repo_key,
             task_key,
             branch_name,
             provider,
             session_id,
+            member_email,
+            device_id,
+            model_name,
+            started_at,
             attribution_weight,
+            commit_within_window_flag,
             user_turn_count,
             debug_loop_flag,
             mid_session_error_paste_flag,
+            accepted_output_flag,
+            first_accepted_change_at,
+            minutes_to_first_accepted_change,
         ) = row?;
-
-        let commit_within_window_flag = match load_legacy_session_window(conn, &provider, &session_id)? {
-            Some((started_at, ended_at)) => any_commit_within_window(
-                conn,
-                &repo_root,
-                &task_key,
-                &branch_name,
-                &provider,
-                &session_id,
-                &started_at,
-                &ended_at,
-            )? as i64,
-            _ => 0,
-        };
 
         conn.execute(
             "INSERT INTO event_task_session (
-                repo_root, task_key, branch_name, provider, session_id, attribution_weight,
-                commit_within_window_flag, user_turn_count, debug_loop_flag, mid_session_error_paste_flag
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                repo_root, repo_key, task_key, branch_name, provider, session_id, member_email, device_id, model_name, started_at,
+                attribution_weight, commit_within_window_flag, user_turn_count, debug_loop_flag,
+                mid_session_error_paste_flag, accepted_output_flag, first_accepted_change_at,
+                minutes_to_first_accepted_change
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
             params![
                 repo_root,
+                repo_key,
                 task_key,
                 branch_name,
                 provider,
                 session_id,
+                member_email,
+                device_id,
+                model_name,
+                started_at,
                 attribution_weight,
                 commit_within_window_flag,
                 user_turn_count,
                 debug_loop_flag,
-                mid_session_error_paste_flag
+                mid_session_error_paste_flag,
+                accepted_output_flag,
+                first_accepted_change_at,
+                minutes_to_first_accepted_change
             ],
         )?;
     }
 
     Ok(())
-}
-
-#[derive(Debug, Clone)]
-struct SessionContextRow {
-    repo_root: Option<String>,
-    started_at: Option<String>,
-    ended_at: Option<String>,
-}
-
-fn load_session_context(conn: &Connection) -> Result<BTreeMap<SessionKey, SessionContextRow>> {
-    let mut stmt = conn.prepare(
-        "SELECT
-            s.provider,
-            s.session_id,
-            r.repo_root,
-            s.started_at,
-            s.ended_at
-         FROM metadata_sessions s
-         LEFT JOIN metadata_repositories r ON r.id = s.repository_id",
-    )?;
-    let rows = stmt.query_map([], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, Option<String>>(2)?,
-            row.get::<_, Option<String>>(3)?,
-            row.get::<_, Option<String>>(4)?,
-        ))
-    })?;
-    let mut out = BTreeMap::new();
-    for row in rows {
-        let (provider, session_id, repo_root, started_at, ended_at) = row?;
-        out.insert(
-            SessionKey { provider, session_id },
-            SessionContextRow {
-                repo_root,
-                started_at,
-                ended_at,
-            },
-        );
-    }
-    Ok(out)
 }
 
 fn load_session_messages(conn: &Connection) -> Result<BTreeMap<SessionKey, Vec<SessionMessage>>> {
@@ -1599,9 +1804,12 @@ fn load_session_messages(conn: &Connection) -> Result<BTreeMap<SessionKey, Vec<S
     let mut out = BTreeMap::new();
     for row in rows {
         let (provider, session_id, role, content) = row?;
-        out.entry(SessionKey { provider, session_id })
-            .or_insert_with(Vec::new)
-            .push(SessionMessage { role, content });
+        out.entry(SessionKey {
+            provider,
+            session_id,
+        })
+        .or_insert_with(Vec::new)
+        .push(SessionMessage { role, content });
     }
     Ok(out)
 }
@@ -1624,7 +1832,8 @@ fn load_fact_commits(conn: &Connection) -> Result<Vec<CandidateCommit>> {
     })?;
     let mut out = Vec::new();
     for row in rows {
-        let (repo_root, commit_sha, commit_time_raw, heavy_ai, matched_total_lines, total_lines) = row?;
+        let (repo_root, commit_sha, commit_time_raw, heavy_ai, matched_total_lines, total_lines) =
+            row?;
         let commit_time = DateTime::parse_from_rfc3339(&commit_time_raw)
             .map_err(|e| anyhow!("invalid commit_time '{}': {}", commit_time_raw, e))?
             .with_timezone(&Utc);
@@ -1673,7 +1882,8 @@ fn derive_repo_commit_events(
         .max()
         .ok_or_else(|| anyhow!("missing latest commit time"))?;
 
-    let (mainline_added_events, mainline_removed_events) = if let Some(ref_name) = main_ref.as_ref() {
+    let (mainline_added_events, mainline_removed_events) = if let Some(ref_name) = main_ref.as_ref()
+    {
         load_mainline_hash_events(
             repo_root,
             ref_name,
@@ -1720,7 +1930,11 @@ fn derive_commit_events_from_preloaded(
 ) -> Result<HashMap<String, DerivedCommitEvent>> {
     let mut out = HashMap::new();
     let mut descending_commits = commits.to_vec();
-    descending_commits.sort_by(|a, b| b.commit_time.cmp(&a.commit_time).then_with(|| b.commit_sha.cmp(&a.commit_sha)));
+    descending_commits.sort_by(|a, b| {
+        b.commit_time
+            .cmp(&a.commit_time)
+            .then_with(|| b.commit_sha.cmp(&a.commit_sha))
+    });
 
     let mut added_index = MainlineIndex::new();
     let mut added_event_index = 0usize;
@@ -1925,7 +2139,9 @@ fn is_debug_loop_session(turns: &[SessionTurn]) -> bool {
         if turn.user_text.trim().is_empty() || turn.assistant_text.trim().is_empty() {
             continue;
         }
-        if let Some(signature) = extract_error_signature(&turn.user_text, previous_signature.as_deref()) {
+        if let Some(signature) =
+            extract_error_signature(&turn.user_text, previous_signature.as_deref())
+        {
             let count = signature_counts.entry(signature.clone()).or_insert(0);
             *count += 1;
             if *count >= LOOP_THRESHOLD {
@@ -2208,7 +2424,10 @@ fn extract_reverted_shas(body: &str) -> Vec<String> {
             continue;
         };
         let suffix = &line[start + needle.len()..];
-        let sha: String = suffix.chars().take_while(|ch| ch.is_ascii_hexdigit()).collect();
+        let sha: String = suffix
+            .chars()
+            .take_while(|ch| ch.is_ascii_hexdigit())
+            .collect();
         if sha.len() == 40 {
             out.push(sha.to_lowercase());
         }
@@ -2306,7 +2525,11 @@ fn build_ai_added_budget_from_preloaded(
 }
 
 fn budget_total(budget: &HashMap<String, HashMap<String, i64>>) -> i64 {
-    budget.values().flat_map(|inner| inner.values()).copied().sum()
+    budget
+        .values()
+        .flat_map(|inner| inner.values())
+        .copied()
+        .sum()
 }
 
 fn is_content_merged_in_index(budget: &PathHashCounts, index: &MainlineIndex) -> bool {
@@ -2350,8 +2573,16 @@ fn load_mainline_hash_events(
             }
         }
     }
-    added.sort_by(|a, b| b.commit_time.cmp(&a.commit_time).then_with(|| b.rel_path.cmp(&a.rel_path)));
-    removed.sort_by(|a, b| a.commit_time.cmp(&b.commit_time).then_with(|| a.rel_path.cmp(&b.rel_path)));
+    added.sort_by(|a, b| {
+        b.commit_time
+            .cmp(&a.commit_time)
+            .then_with(|| b.rel_path.cmp(&a.rel_path))
+    });
+    removed.sort_by(|a, b| {
+        a.commit_time
+            .cmp(&b.commit_time)
+            .then_with(|| a.rel_path.cmp(&b.rel_path))
+    });
     Ok((added, removed))
 }
 
@@ -2512,91 +2743,6 @@ fn run_git_capture(repo_root: &str, args: &[String]) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
-fn commit_within_window(started_at: &str, ended_at: &str, commit_time: &str) -> bool {
-    let (Some(start), Some(end), Some(commit_time)) = (
-        parse_timestamp_utc(started_at),
-        parse_timestamp_utc(ended_at),
-        parse_timestamp_utc(commit_time),
-    ) else {
-        return false;
-    };
-    commit_time >= start && commit_time <= end + Duration::hours(4)
-}
-
-fn any_commit_within_window(
-    conn: &Connection,
-    repo_root: &str,
-    task_key: &str,
-    branch_name: &str,
-    provider: &str,
-    session_id: &str,
-    started_at: &str,
-    ended_at: &str,
-) -> Result<bool> {
-    let mut stmt = conn.prepare(
-        "SELECT c.commit_time
-         FROM event_task_commit tc
-         JOIN fact_commit_session_match sm
-           ON sm.repo_root = tc.repo_root
-          AND sm.commit_sha = tc.commit_sha
-         JOIN fact_commit c
-           ON c.repo_root = tc.repo_root
-          AND c.commit_sha = tc.commit_sha
-         WHERE tc.repo_root = ?1
-           AND tc.task_key = ?2
-           AND tc.branch_name = ?3
-           AND sm.provider = ?4
-           AND sm.session_id = ?5",
-    )?;
-    let rows = stmt.query_map(params![repo_root, task_key, branch_name, provider, session_id], |row| {
-        row.get::<_, String>(0)
-    })?;
-
-    for row in rows {
-        if commit_within_window(started_at, ended_at, &row?) {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
-fn load_legacy_session_window(
-    conn: &Connection,
-    provider: &str,
-    session_id: &str,
-) -> Result<Option<(String, String)>> {
-    conn.query_row(
-        "SELECT started_at, ended_at
-         FROM metadata_sessions
-         WHERE provider = ?1 AND session_id = ?2",
-        params![provider, session_id],
-        |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, Option<String>>(1)?)),
-    )
-    .optional()
-    .map(|row| match row {
-        Some((Some(started_at), Some(ended_at))) => Some((started_at, ended_at)),
-        _ => None,
-    })
-    .map_err(Into::into)
-}
-
-fn parse_timestamp_utc(raw: &str) -> Option<DateTime<Utc>> {
-    let value = raw.trim();
-    if value.is_empty() {
-        return None;
-    }
-    if let Ok(ts) = DateTime::parse_from_rfc3339(value) {
-        return Some(ts.with_timezone(&Utc));
-    }
-    if let Ok(ts) = NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S") {
-        return Some(DateTime::<Utc>::from_naive_utc_and_offset(ts, Utc));
-    }
-    if let Ok(ts) = NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S%.f") {
-        return Some(DateTime::<Utc>::from_naive_utc_and_offset(ts, Utc));
-    }
-    None
-}
-
 fn looks_like_task_id(task_key: &str) -> bool {
     let bytes = task_key.as_bytes();
     if bytes.is_empty() {
@@ -2620,7 +2766,10 @@ fn looks_like_task_id(task_key: &str) -> bool {
 }
 
 fn is_integration_branch(branch_name: &str) -> bool {
-    matches!(branch_name, "staging" | "main" | "master" | "develop" | "(unknown)")
+    matches!(
+        branch_name,
+        "staging" | "main" | "master" | "develop" | "(unknown)"
+    )
 }
 
 #[cfg(test)]
@@ -2632,6 +2781,19 @@ mod tests {
         let conn = Connection::open_in_memory()?;
         crate::db::init_app_schema(&conn)?;
         Ok(conn)
+    }
+
+    #[test]
+    fn reporting_view_sql_depends_only_on_event_tables() {
+        let sql = REPORTING_VIEWS_SQL.to_lowercase();
+        assert!(
+            !sql.contains("fact_"),
+            "reporting views should not reference fact tables"
+        );
+        assert!(
+            !sql.contains("metadata_"),
+            "reporting views should not reference metadata tables"
+        );
     }
 
     fn insert_commit_file_hashes(
@@ -2716,8 +2878,10 @@ mod tests {
         let mut out = PathHashCounts::new();
         for row in rows {
             let (rel_path, line_hash, commit_count) = row?;
-            let avail_rows =
-                avail_stmt.query_map(params![repo_root, rel_path, line_hash], |r| r.get::<_, i64>(0))?;
+            let avail_rows = avail_stmt
+                .query_map(params![repo_root, rel_path, line_hash], |r| {
+                    r.get::<_, i64>(0)
+                })?;
             let mut avail_total = 0i64;
             for avail in avail_rows {
                 avail_total += avail?;
@@ -2735,7 +2899,9 @@ mod tests {
     }
 
     fn parse_ts(raw: &str) -> DateTime<Utc> {
-        DateTime::parse_from_rfc3339(raw).unwrap().with_timezone(&Utc)
+        DateTime::parse_from_rfc3339(raw)
+            .unwrap()
+            .with_timezone(&Utc)
     }
 
     #[test]
@@ -2799,7 +2965,15 @@ mod tests {
             Some("openai"),
             Some("gpt-5"),
         )?;
-        upsert_metadata_session(&conn, "cursor", "s2", Some("/tmp/repo"), Some("2026-03-17T09:10:00Z"), Some("2026-03-17T09:45:00Z"), None)?;
+        upsert_metadata_session(
+            &conn,
+            "cursor",
+            "s2",
+            Some("/tmp/repo"),
+            Some("2026-03-17T09:10:00Z"),
+            Some("2026-03-17T09:45:00Z"),
+            None,
+        )?;
         conn.execute(
             "INSERT INTO event_task_session (
                 repo_root, task_key, branch_name, provider, session_id, attribution_weight,
@@ -2824,6 +2998,7 @@ mod tests {
                 from: None,
                 to: None,
                 repo: None,
+                all_projects: false,
                 provider: None,
                 task: Some("PAC-1".to_string()),
                 model: None,
@@ -2886,6 +3061,7 @@ mod tests {
             from: None,
             to: None,
             repo: None,
+            all_projects: false,
             provider: None,
             task: None,
             model: None,
@@ -2900,7 +3076,10 @@ mod tests {
         let lifecycle_rows = query_lifecycle_report(&conn, &args)?;
         assert_eq!(lifecycle_rows.len(), 1);
         assert_eq!(lifecycle_rows[0].group_value.as_deref(), Some("PAC-1"));
-        assert_eq!(lifecycle_rows[0].branch_name.as_deref(), Some("PAC-1-branch"));
+        assert_eq!(
+            lifecycle_rows[0].branch_name.as_deref(),
+            Some("PAC-1-branch")
+        );
         Ok(())
     }
 
@@ -2929,17 +3108,12 @@ mod tests {
         )?;
         conn.execute(
             "INSERT INTO event_session_quality (
-                provider, session_id, repo_root, started_at, ended_at, user_turn_count, debug_loop_flag, mid_session_error_paste_flag
+                provider, session_id, repo_root, model_name, started_at, ended_at, user_turn_count,
+                debug_loop_flag, mid_session_error_paste_flag, accepted_output_flag,
+                first_accepted_change_at, minutes_to_first_accepted_change, session_commit_within_4h_flag
              ) VALUES
-                ('codex', 's1', '/tmp/repo', '2026-03-17T09:00:00Z', '2026-03-17T09:30:00Z', 4, 0, 0),
-                ('cursor', 's2', '/tmp/repo', '2026-03-17T09:10:00Z', '2026-03-17T09:45:00Z', 2, 0, 0)",
-            [],
-        )?;
-        conn.execute(
-            "INSERT INTO fact_session_code_change (
-                provider, session_id, change_ts, repo_root, rel_path, lines_added, lines_removed, source_kind, call_id, op_index
-             ) VALUES
-                ('codex', 's1', '2026-03-17T09:05:00Z', '/tmp/repo', 'src/lib.rs', 5, 0, 'tool_write', 'call-1', 0)",
+                ('codex', 's1', '/tmp/repo', 'codex/gpt-5', '2026-03-17T09:00:00Z', '2026-03-17T09:30:00Z', 4, 0, 0, 1, '2026-03-17T09:05:00Z', 5.0, 0),
+                ('cursor', 's2', '/tmp/repo', 'cursor/(unknown)', '2026-03-17T09:10:00Z', '2026-03-17T09:45:00Z', 2, 0, 0, 0, NULL, NULL, 0)",
             [],
         )?;
 
@@ -2952,6 +3126,7 @@ mod tests {
                 from: None,
                 to: None,
                 repo: None,
+                all_projects: false,
                 provider: None,
                 task: None,
                 model: None,
@@ -2985,15 +3160,10 @@ mod tests {
         )?;
         conn.execute(
             "INSERT INTO event_session_quality (
-                provider, session_id, repo_root, started_at, ended_at, user_turn_count, debug_loop_flag, mid_session_error_paste_flag
-             ) VALUES ('codex', 's1', '/tmp/repo', '2026-03-17T09:00:00Z', '2026-03-17T09:30:00Z', 4, 0, 0)",
-            [],
-        )?;
-        conn.execute(
-            "INSERT INTO fact_session_code_change (
-                provider, session_id, change_ts, repo_root, rel_path, lines_added, lines_removed, source_kind, call_id, op_index
-             ) VALUES
-                ('codex', 's1', NULL, '/tmp/repo', 'src/lib.rs', 5, 0, 'tool_write', 'call-1', 0)",
+                provider, session_id, repo_root, model_name, started_at, ended_at, user_turn_count,
+                debug_loop_flag, mid_session_error_paste_flag, accepted_output_flag,
+                first_accepted_change_at, minutes_to_first_accepted_change, session_commit_within_4h_flag
+             ) VALUES ('codex', 's1', '/tmp/repo', 'codex/(unknown)', '2026-03-17T09:00:00Z', '2026-03-17T09:30:00Z', 4, 0, 0, 1, NULL, NULL, 0)",
             [],
         )?;
 
@@ -3006,6 +3176,7 @@ mod tests {
                 from: None,
                 to: None,
                 repo: None,
+                all_projects: false,
                 provider: None,
                 task: None,
                 model: None,
@@ -3051,6 +3222,7 @@ mod tests {
                 from: None,
                 to: None,
                 repo: None,
+                all_projects: false,
                 provider: None,
                 task: None,
                 model: None,
@@ -3068,14 +3240,35 @@ mod tests {
     fn preloaded_budget_matches_reference_semantics() -> Result<()> {
         let conn = open_test_db()?;
         let repo_root = "/tmp/repo";
-        insert_commit_file_hashes(&conn, repo_root, "c1", "src/lib.rs", &[("h1", 3), ("h2", 2)])?;
-        insert_session_change_hashes(&conn, "codex", "s1", repo_root, "src/lib.rs", &[("h1", 5), ("h2", 1)])?;
+        insert_commit_file_hashes(
+            &conn,
+            repo_root,
+            "c1",
+            "src/lib.rs",
+            &[("h1", 3), ("h2", 2)],
+        )?;
+        insert_session_change_hashes(
+            &conn,
+            "codex",
+            "s1",
+            repo_root,
+            "src/lib.rs",
+            &[("h1", 5), ("h2", 1)],
+        )?;
         insert_session_change_hashes(&conn, "cursor", "s2", repo_root, "src/lib.rs", &[("h1", 2)])?;
-        insert_session_change_hashes(&conn, "cursor", "s3", repo_root, "src/lib.rs", &[("h1", 1), ("h2", 4)])?;
+        insert_session_change_hashes(
+            &conn,
+            "cursor",
+            "s3",
+            repo_root,
+            "src/lib.rs",
+            &[("h1", 1), ("h2", 4)],
+        )?;
 
         let commit_added_hashes = load_commit_added_hashes(&conn, repo_root)?;
         let availability = load_session_added_availability(&conn, repo_root)?;
-        let optimized = build_ai_added_budget_from_preloaded(&commit_added_hashes, &availability, "c1");
+        let optimized =
+            build_ai_added_budget_from_preloaded(&commit_added_hashes, &availability, "c1");
         let reference = budget_reference(&conn, repo_root, "c1")?;
 
         assert_eq!(optimized, reference);
@@ -3195,23 +3388,26 @@ mod tests {
         )?;
         conn.execute(
             "INSERT INTO event_session_quality (
-                provider, session_id, repo_root, started_at, ended_at, user_turn_count,
-                debug_loop_flag, mid_session_error_paste_flag
-             ) VALUES ('codex', 's1', '/tmp/repo', '2026-03-17T09:00:00Z', '2026-03-17T09:30:00Z', 3, 1, 0)",
+                provider, session_id, repo_root, model_name, started_at, ended_at, user_turn_count,
+                debug_loop_flag, mid_session_error_paste_flag, accepted_output_flag,
+                first_accepted_change_at, minutes_to_first_accepted_change, session_commit_within_4h_flag
+             ) VALUES ('codex', 's1', '/tmp/repo', 'codex/gpt-5', '2026-03-17T09:00:00Z', '2026-03-17T09:30:00Z', 3, 1, 0, 1, '2026-03-17T09:05:00Z', 5.0, 1)",
             [],
         )?;
         conn.execute(
             "INSERT INTO event_session_productivity (
-                provider, session_id, repo_root, project_path, started_at, ended_at,
+                provider, session_id, repo_root, model_name, project_path, started_at, ended_at,
                 accepted_lines_added, accepted_lines_removed, accepted_total_changed_lines, user_word_count
-             ) VALUES ('codex', 's1', '/tmp/repo', '/tmp/repo', '2026-03-17T09:00:00Z', '2026-03-17T09:30:00Z', 10, 2, 12, 100)",
+             ) VALUES ('codex', 's1', '/tmp/repo', 'codex/gpt-5', '/tmp/repo', '2026-03-17T09:00:00Z', '2026-03-17T09:30:00Z', 10, 2, 12, 100)",
             [],
         )?;
         conn.execute(
             "INSERT INTO event_task_session (
-                repo_root, task_key, branch_name, provider, session_id, attribution_weight,
-                commit_within_window_flag, user_turn_count, debug_loop_flag, mid_session_error_paste_flag
-             ) VALUES ('/tmp/repo', 'PAC-1', 'PAC-1-branch', 'codex', 's1', 1.0, 1, 3, 1, 0)",
+                repo_root, task_key, branch_name, provider, session_id, model_name, started_at,
+                attribution_weight, commit_within_window_flag, user_turn_count, debug_loop_flag,
+                mid_session_error_paste_flag, accepted_output_flag, first_accepted_change_at,
+                minutes_to_first_accepted_change
+             ) VALUES ('/tmp/repo', 'PAC-1', 'PAC-1-branch', 'codex', 's1', 'codex/gpt-5', '2026-03-17T09:00:00Z', 1.0, 1, 3, 1, 0, 1, '2026-03-17T09:05:00Z', 5.0)",
             [],
         )?;
         conn.execute(
@@ -3229,9 +3425,10 @@ mod tests {
             [],
         )?;
         conn.execute(
-            "INSERT INTO fact_commit_session_match (
-                repo_root, commit_sha, provider, session_id, matched_lines, share_of_commit, share_of_ai
-             ) VALUES ('/tmp/repo', 'abc123', 'codex', 's1', 42, 0.80, 1.0)",
+            "INSERT INTO event_commit_session (
+                repo_root, commit_sha, provider, session_id, commit_time, model_name,
+                matched_lines, share_of_commit, share_of_ai
+             ) VALUES ('/tmp/repo', 'abc123', 'codex', 's1', '2026-03-18T10:00:00Z', 'codex/gpt-5', 42, 0.80, 1.0)",
             [],
         )?;
         conn.execute(
@@ -3273,8 +3470,196 @@ mod tests {
             ]
         );
         assert_eq!(rows[0].provider.as_deref(), Some("codex"));
-        assert_eq!(rows[0].model.as_deref(), Some("gpt-5"));
+        assert_eq!(rows[0].model.as_deref(), Some("codex/gpt-5"));
         assert_eq!(rows[2].event_time.as_deref(), Some("2026-03-18T10:00:00Z"));
+        Ok(())
+    }
+
+    #[test]
+    fn session_list_rows_prefix_unknown_models_with_provider() -> Result<()> {
+        let conn = open_test_db()?;
+        upsert_metadata_session(
+            &conn,
+            "cursor",
+            "s1",
+            Some("/tmp/repo"),
+            Some("2026-03-17T09:00:00Z"),
+            Some("2026-03-17T09:30:00Z"),
+            None,
+        )?;
+        conn.execute(
+            "INSERT INTO event_session_productivity (
+                provider, session_id, repo_root, project_path, started_at, ended_at,
+                accepted_lines_added, accepted_lines_removed, accepted_total_changed_lines, user_word_count
+             ) VALUES ('cursor', 's1', '/tmp/repo', '/tmp/repo', '2026-03-17T09:00:00Z', '2026-03-17T09:30:00Z', 10, 2, 12, 100)",
+            [],
+        )?;
+
+        create_reporting_views(&conn)?;
+        let rows = query_session_list_rows(
+            &conn,
+            &ReportArgs {
+                weekly: false,
+                group_by: None,
+                from: None,
+                to: None,
+                repo: None,
+                all_projects: false,
+                provider: None,
+                task: None,
+                model: None,
+                limit: 10,
+            },
+        )?;
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].model, "cursor/(unknown)");
+        Ok(())
+    }
+
+    #[test]
+    fn provider_grouped_change_and_lifecycle_reports_include_human_for_unmatched_commits()
+    -> Result<()> {
+        let conn = open_test_db()?;
+        conn.execute(
+            "INSERT INTO event_commit_outcome (
+                repo_root, commit_sha, commit_time, heavy_ai_flag, merged_to_mainline_flag,
+                reverted_later_flag, total_matched_ai_lines, commit_total_changed_lines
+             ) VALUES ('/tmp/repo', 'abc123', '2026-03-18T10:00:00Z', 0, 1, 0, 0, 52)",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO event_commit_churn (
+                repo_root, commit_sha, ai_added_lines_reaching_mainline,
+                ai_added_lines_removed_within_window, churn_window_days
+             ) VALUES ('/tmp/repo', 'abc123', 0, 0, 14)",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO event_commit_session (
+                repo_root, commit_sha, provider, session_id, commit_time, model_name,
+                matched_lines, share_of_commit, share_of_ai
+             ) VALUES ('/tmp/repo', 'abc123', 'human', '__human__', '2026-03-18T10:00:00Z', NULL, 0.0, 1.0, 0.0)",
+            [],
+        )?;
+
+        create_reporting_views(&conn)?;
+
+        let args = ReportArgs {
+            weekly: false,
+            group_by: Some(GroupBy::Provider),
+            from: None,
+            to: None,
+            repo: None,
+            all_projects: false,
+            provider: None,
+            task: None,
+            model: None,
+            limit: 10,
+        };
+
+        let change_rows = query_change_report(&conn, &args)?;
+        assert_eq!(change_rows.len(), 1);
+        assert_eq!(change_rows[0].group_value.as_deref(), Some("human"));
+        assert_eq!(change_rows[0].commit_count, 1);
+
+        let lifecycle_rows = query_lifecycle_report(&conn, &args)?;
+        assert_eq!(lifecycle_rows.len(), 1);
+        assert_eq!(lifecycle_rows[0].group_value.as_deref(), Some("human"));
+        assert_eq!(lifecycle_rows[0].heavy_commit_count, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn event_stream_can_filter_commit_session_rows_to_human_provider() -> Result<()> {
+        let conn = open_test_db()?;
+        conn.execute(
+            "INSERT INTO event_commit_outcome (
+                repo_root, commit_sha, commit_time, heavy_ai_flag, merged_to_mainline_flag,
+                reverted_later_flag, total_matched_ai_lines, commit_total_changed_lines
+             ) VALUES ('/tmp/repo', 'abc123', '2026-03-18T10:00:00Z', 0, 1, 0, 0, 52)",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO event_commit_churn (
+                repo_root, commit_sha, ai_added_lines_reaching_mainline,
+                ai_added_lines_removed_within_window, churn_window_days
+             ) VALUES ('/tmp/repo', 'abc123', 0, 0, 14)",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO event_commit_session (
+                repo_root, commit_sha, provider, session_id, commit_time, model_name,
+                matched_lines, share_of_commit, share_of_ai
+             ) VALUES ('/tmp/repo', 'abc123', 'human', '__human__', '2026-03-18T10:00:00Z', NULL, 0.0, 1.0, 0.0)",
+            [],
+        )?;
+
+        create_reporting_views(&conn)?;
+        let rows = query_event_stream(
+            &conn,
+            &EventStreamArgs {
+                category: EventCategory::All,
+                stream: EventStreamKind::CommitSessionBase,
+                from: None,
+                to: None,
+                repo: None,
+                provider: Some("human".to_string()),
+                task: None,
+                model: None,
+                limit: None,
+                pretty: false,
+            },
+        )?;
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].stream_type, "commit-session-base");
+        assert_eq!(rows[0].provider.as_deref(), Some("human"));
+        assert_eq!(rows[0].model.as_deref(), Some("human/(unknown)"));
+        Ok(())
+    }
+
+    #[test]
+    fn session_report_returns_no_rows_for_human_provider_filter() -> Result<()> {
+        let conn = open_test_db()?;
+        upsert_metadata_session_with_model(
+            &conn,
+            "codex",
+            "s1",
+            Some("/tmp/repo"),
+            Some("2026-03-17T09:00:00Z"),
+            Some("2026-03-17T09:30:00Z"),
+            None,
+            Some("openai"),
+            Some("gpt-5"),
+        )?;
+        conn.execute(
+            "INSERT INTO event_session_quality (
+                provider, session_id, repo_root, model_name, started_at, ended_at, user_turn_count,
+                debug_loop_flag, mid_session_error_paste_flag, accepted_output_flag,
+                first_accepted_change_at, minutes_to_first_accepted_change, session_commit_within_4h_flag
+             ) VALUES ('codex', 's1', '/tmp/repo', 'codex/gpt-5', '2026-03-17T09:00:00Z', '2026-03-17T09:30:00Z', 3, 0, 0, 1, '2026-03-17T09:05:00Z', 5.0, 1)",
+            [],
+        )?;
+
+        create_reporting_views(&conn)?;
+        let rows = query_session_report(
+            &conn,
+            &ReportArgs {
+                weekly: false,
+                group_by: None,
+                from: None,
+                to: None,
+                repo: None,
+                all_projects: false,
+                provider: Some("human".to_string()),
+                task: None,
+                model: None,
+                limit: 10,
+            },
+        )?;
+
+        assert!(rows.is_empty());
         Ok(())
     }
 
@@ -3294,9 +3679,10 @@ mod tests {
         )?;
         conn.execute(
             "INSERT INTO event_session_quality (
-                provider, session_id, repo_root, started_at, ended_at, user_turn_count,
-                debug_loop_flag, mid_session_error_paste_flag
-             ) VALUES ('cursor', 's1', '/tmp/repo', '2026-03-17T09:00:00Z', '2026-03-17T09:30:00Z', 3, 0, 0)",
+                provider, session_id, repo_root, model_name, started_at, ended_at, user_turn_count,
+                debug_loop_flag, mid_session_error_paste_flag, accepted_output_flag,
+                first_accepted_change_at, minutes_to_first_accepted_change, session_commit_within_4h_flag
+             ) VALUES ('cursor', 's1', '/tmp/repo', 'cursor/gpt-5', '2026-03-17T09:00:00Z', '2026-03-17T09:30:00Z', 3, 0, 0, 0, NULL, NULL, 0)",
             [],
         )?;
         conn.execute(
@@ -3314,9 +3700,10 @@ mod tests {
             [],
         )?;
         conn.execute(
-            "INSERT INTO fact_commit_session_match (
-                repo_root, commit_sha, provider, session_id, matched_lines, share_of_commit, share_of_ai
-             ) VALUES ('/tmp/repo', 'abc123', 'cursor', 's1', 42, 0.80, 1.0)",
+            "INSERT INTO event_commit_session (
+                repo_root, commit_sha, provider, session_id, commit_time, model_name,
+                matched_lines, share_of_commit, share_of_ai
+             ) VALUES ('/tmp/repo', 'abc123', 'cursor', 's1', '2026-03-18T10:00:00Z', 'cursor/gpt-5', 42, 0.80, 1.0)",
             [],
         )?;
 
@@ -3331,7 +3718,7 @@ mod tests {
                 repo: None,
                 provider: Some("cursor".to_string()),
                 task: None,
-                model: Some("gpt-5".to_string()),
+                model: Some("cursor/gpt-5".to_string()),
                 limit: None,
                 pretty: false,
             },

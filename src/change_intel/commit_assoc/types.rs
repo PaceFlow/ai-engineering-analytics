@@ -1,6 +1,51 @@
 use crate::change_intel::types::LineHashCount;
 
 #[derive(Debug, Clone, Default)]
+pub struct AssociationWorkPlan {
+    pub repo_plans: Vec<RepoAssociationPlan>,
+}
+
+impl AssociationWorkPlan {
+    pub fn total_units(&self) -> usize {
+        self.repo_plans.len()
+            + self
+                .repo_plans
+                .iter()
+                .map(|repo| repo.commits.len())
+                .sum::<usize>()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CommitDiffSource {
+    #[default]
+    None,
+    Git,
+    Cache,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct CommitAssociationWorkItem {
+    pub commit_sha: String,
+    pub needs_match_refresh: bool,
+    pub needs_task_refresh: bool,
+    pub diff_source: CommitDiffSource,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct RepoAssociationPlan {
+    pub repo_root: String,
+    pub commits: Vec<CommitAssociationWorkItem>,
+    pub session_facts_version: i64,
+    pub branch_fingerprint: Option<String>,
+    pub branch_fingerprint_changed: bool,
+    pub has_dirty_hashes: bool,
+    pub skipped_non_git: bool,
+    pub planning_error_stage: Option<String>,
+    pub planning_error_message: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
 pub struct AssociationSummary {
     pub repos_considered: usize,
     pub repos_selected: usize,
@@ -9,6 +54,10 @@ pub struct AssociationSummary {
     pub commits_scanned: usize,
     pub commits_attributed: usize,
     pub heavy_commits: usize,
+    pub new_commits: usize,
+    pub dirty_recomputed_commits: usize,
+    pub task_only_commits: usize,
+    pub cached_diff_reuses: usize,
     pub errors: usize,
     pub repo_summaries: Vec<RepoSummary>,
 }
@@ -19,6 +68,10 @@ pub struct RepoSummary {
     pub commits_scanned: usize,
     pub commits_attributed: usize,
     pub heavy_commits: usize,
+    pub new_commits: usize,
+    pub dirty_recomputed_commits: usize,
+    pub task_only_commits: usize,
+    pub cached_diff_reuses: usize,
     pub errors: usize,
     pub skipped_non_git: bool,
 }

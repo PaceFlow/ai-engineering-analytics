@@ -37,11 +37,30 @@ pub fn init_change_intel_schema(conn: &Connection) -> Result<()> {
             created_at TEXT DEFAULT (datetime('now'))
         );
 
+        CREATE TABLE IF NOT EXISTS commit_assoc_repo_state (
+            repo_root               TEXT PRIMARY KEY,
+            session_facts_version   INTEGER NOT NULL DEFAULT 0,
+            task_branch_fingerprint TEXT,
+            created_at              TEXT DEFAULT (datetime('now')),
+            updated_at              TEXT DEFAULT (datetime('now'))
+        );
+
+        CREATE TABLE IF NOT EXISTS commit_assoc_dirty_hash (
+            repo_root  TEXT NOT NULL,
+            side       TEXT NOT NULL,
+            line_hash  TEXT NOT NULL,
+            created_at TEXT DEFAULT (datetime('now')),
+            PRIMARY KEY(repo_root, side, line_hash)
+        );
+
         CREATE INDEX IF NOT EXISTS idx_ingest_cursors_provider_source
             ON ingest_cursors(provider, source_file);
 
         CREATE INDEX IF NOT EXISTS idx_parse_errors_provider_session
-            ON change_parse_errors(provider, session_id);",
+            ON change_parse_errors(provider, session_id);
+
+        CREATE INDEX IF NOT EXISTS idx_commit_assoc_dirty_hash_repo
+            ON commit_assoc_dirty_hash(repo_root);",
     )?;
 
     Ok(())

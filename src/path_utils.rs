@@ -20,7 +20,7 @@ pub fn resolve_path(raw_path: &str, workdir: Option<&str>, session_cwd: Option<&
     let cleaned = unquote(raw_path);
     let path = Path::new(cleaned);
 
-    if path.is_absolute() {
+    if path.is_absolute() || looks_like_windows_drive_path(cleaned) {
         return path.to_path_buf();
     }
 
@@ -64,20 +64,40 @@ pub fn to_rel_path(repo_root: Option<&Path>, abs_path: &Path) -> Option<String> 
         return Some(rel.to_string_lossy().to_string());
     }
 
-    let normalized_root = std::fs::canonicalize(root).ok().unwrap_or_else(|| root.to_path_buf());
+    let normalized_root = std::fs::canonicalize(root)
+        .ok()
+        .unwrap_or_else(|| root.to_path_buf());
     let normalized_path = std::fs::canonicalize(abs_path).ok()?;
     let rel = normalized_path.strip_prefix(&normalized_root).ok()?;
     Some(rel.to_string_lossy().to_string())
 }
 
 pub fn strip_file_scheme(uri: &str) -> String {
-    if let Some(p) = uri.strip_prefix("file:///") {
-        format!("/{}", p)
+    if let Some(p) = uri.strip_prefix("file://localhost/") {
+        normalize_file_uri_path(p)
+    } else if let Some(p) = uri.strip_prefix("file:///") {
+        normalize_file_uri_path(p)
     } else if let Some(p) = uri.strip_prefix("file://") {
-        p.to_string()
+        normalize_file_uri_path(p)
     } else {
         uri.to_string()
     }
+}
+
+fn normalize_file_uri_path(path: &str) -> String {
+    if path.starts_with('/') || looks_like_windows_drive_path(path) {
+        path.to_string()
+    } else {
+        format!("/{}", path)
+    }
+}
+
+fn looks_like_windows_drive_path(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes[2] == b'/' || bytes[2] == b'\\')
 }
 
 fn path_query_dir(abs_path: &Path) -> PathBuf {
@@ -137,7 +157,12 @@ mod tests {
 
     fn git(args: &[&str], cwd: &Path) -> Result<()> {
         let status = Command::new("git").current_dir(cwd).args(args).status()?;
-        anyhow::ensure!(status.success(), "git {:?} failed in {}", args, cwd.display());
+        anyhow::ensure!(
+            status.success(),
+            "git {:?} failed in {}",
+            args,
+            cwd.display()
+        );
         Ok(())
     }
 
@@ -146,8 +171,14 @@ mod tests {
         let tempdir = tempdir()?;
         let repo_root = tempdir.path().join("sample-repo");
         std::fs::create_dir_all(repo_root.join("profile_app/src/app"))?;
-        std::fs::write(repo_root.join("profile_app/package.json"), "{\"name\":\"profile-app\"}")?;
-        std::fs::write(repo_root.join("profile_app/src/app/page.tsx"), "export default function Page() {}\n")?;
+        std::fs::write(
+            repo_root.join("profile_app/package.json"),
+            "{\"name\":\"profile-app\"}",
+        )?;
+        std::fs::write(
+            repo_root.join("profile_app/src/app/page.tsx"),
+            "export default function Page() {}\n",
+        )?;
 
         git(&["init", "-q"], &repo_root)?;
 
@@ -167,11 +198,55 @@ mod tests {
         let tempdir = tempdir()?;
         let project_root = tempdir.path().join("manifest-only");
         std::fs::create_dir_all(project_root.join("src"))?;
-        std::fs::write(project_root.join("package.json"), "{\"name\":\"manifest-only\"}")?;
+        std::fs::write(
+            project_root.join("package.json"),
+            "{\"name\":\"manifest-only\"}",
+        )?;
         std::fs::write(project_root.join("src/index.ts"), "console.log('hi');\n")?;
 
         let detected = detect_repo_root(&project_root.join("src/index.ts"));
         assert!(detected.is_none());
+
+        Ok(())
+    }
+
+    #[test]
+    fn strip_file_scheme_keeps_windows_drive_letter_paths() {
+        assert_eq!(
+            strip_file_scheme("file:///C:/Users/alice/code/src/main.rs"),
+            "C:/Users/alice/code/src/main.rs"
+        );
+        assert_eq!(
+            strip_file_scheme("file://localhost/C:/Users/alice/code/src/main.rs"),
+            "C:/Users/alice/code/src/main.rs"
+        );
+    }
+
+    #[test]
+    fn resolve_path_does_not_join_windows_drive_paths() {
+        let resolved = resolve_path("C:/Users/alice/code/src/main.rs", Some("/tmp/work"), None);
+        assert_eq!(resolved, PathBuf::from("C:/Users/alice/code/src/main.rs"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn detect_repo_root_and_rel_path_work_on_windows_paths() -> Result<()> {
+        let tempdir = tempdir()?;
+        let repo_root = tempdir.path().join("windows-repo");
+        std::fs::create_dir_all(repo_root.join("src"))?;
+        std::fs::write(repo_root.join("src").join("lib.rs"), "pub fn demo() {}\n")?;
+
+        git(&["init", "-q"], &repo_root)?;
+
+        let file_path = repo_root.join("src").join("lib.rs");
+        let detected = detect_repo_root(&file_path).expect("git repo should be detected");
+        let expected_rel = Path::new("src").join("lib.rs");
+
+        assert_eq!(detected, std::fs::canonicalize(&repo_root)?);
+        assert_eq!(
+            to_rel_path(Some(&detected), &file_path).as_deref(),
+            Some(expected_rel.to_string_lossy().as_ref())
+        );
 
         Ok(())
     }

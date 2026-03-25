@@ -1,11 +1,14 @@
 mod analytics;
-mod cli;
 mod change_intel;
+mod cli;
 mod commands;
+mod cursor_paths;
 mod db;
 mod error;
+mod ingest_progress;
 mod path_utils;
 mod providers;
+mod sync_identity;
 
 use clap::Parser;
 use cli::{Cli, Commands};

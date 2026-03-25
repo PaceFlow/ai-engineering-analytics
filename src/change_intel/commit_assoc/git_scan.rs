@@ -74,6 +74,33 @@ pub fn list_local_head_branches(repo_root: &str) -> Result<Vec<String>> {
         .collect())
 }
 
+pub fn list_local_head_branch_tips(repo_root: &str) -> Result<Vec<(String, String)>> {
+    let out = run_git_capture(
+        repo_root,
+        &[
+            "for-each-ref".to_string(),
+            "--format=%(refname:short)%00%(objectname)".to_string(),
+            "refs/heads".to_string(),
+        ],
+    )?;
+    let mut tips = Vec::new();
+    for line in out.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Some((branch, sha)) = line.split_once('\0') else {
+            continue;
+        };
+        if branch.is_empty() || sha.is_empty() {
+            continue;
+        }
+        tips.push((branch.to_string(), sha.to_string()));
+    }
+    tips.sort();
+    Ok(tips)
+}
+
 pub fn list_commits_on_ref(repo_root: &str, ref_name: &str) -> Result<Vec<String>> {
     list_from_rev_list(repo_root, &["rev-list".to_string(), ref_name.to_string()])
 }
@@ -103,7 +130,11 @@ pub fn merge_base(repo_root: &str, left: &str, right: &str) -> Result<Option<Str
     Err(anyhow!("git merge-base {left} {right} failed: {stderr}"))
 }
 
-pub fn first_parent_distance(repo_root: &str, from_exclusive: &str, to_inclusive: &str) -> Result<i64> {
+pub fn first_parent_distance(
+    repo_root: &str,
+    from_exclusive: &str,
+    to_inclusive: &str,
+) -> Result<i64> {
     let out = run_git_capture(
         repo_root,
         &[
@@ -140,7 +171,10 @@ pub fn first_parent_commits_range(
         .collect())
 }
 
-fn parse_commit_metadata_line(commit_sha: &str, line: &str) -> Result<(String, String, Option<String>)> {
+fn parse_commit_metadata_line(
+    commit_sha: &str,
+    line: &str,
+) -> Result<(String, String, Option<String>)> {
     let mut parts = line.splitn(3, '\u{1f}');
 
     let raw_time = parts
@@ -182,7 +216,8 @@ pub fn load_commit_diff(repo_root: &str, commit_sha: &str) -> Result<GitCommitDi
     let (meta_line, patch) = rendered
         .split_once('\n')
         .ok_or_else(|| anyhow!("missing commit metadata output for {commit_sha}"))?;
-    let (commit_time, subject, parent_sha) = parse_commit_metadata_line(commit_sha, meta_line.trim())?;
+    let (commit_time, subject, parent_sha) =
+        parse_commit_metadata_line(commit_sha, meta_line.trim())?;
     let patch = patch.trim_start_matches('\n');
 
     let file_diffs = parse_patch_file_diffs(&patch);
