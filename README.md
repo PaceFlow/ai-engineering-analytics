@@ -27,7 +27,15 @@ It is useful when you want to spot patterns like:
 
 ## Quick Start
 
-Install `vca`, ingest your local history, then open the three report views:
+Get the CLI installed from source:
+
+```bash
+git clone https://github.com/PaceFlow/vibe-coding-analytics.git
+cd vibe-coding-analytics
+cargo install --path . --force
+```
+
+Then ingest your local history and open the three report views:
 
 ```bash
 vca ingest
@@ -45,9 +53,9 @@ Useful follow-ups:
 
 ## What You Get
 
-- `vca session` shows session quality and throughput metrics such as prompts per session, time to first accepted change, debug loops, error-paste sessions, commit follow-through, and no-output sessions.
-- `vca change` shows commit-level attribution and merge outcomes. When grouped by provider, unmatched commits appear as provider `human`.
-- `vca lifecycle` shows post-commit follow-through for heavy AI commits, especially churn and reverts.
+- `vca session` helps you decide whether your sessions were actually productive or just noisy. It makes reprompt churn, slow starts, debug loops, error-paste sessions, weak follow-through, and no-output sessions visible quickly.
+- `vca change` helps you decide whether AI-assisted work turned into meaningful shipped changes. It shows where AI had real influence on commits and whether those commits reached mainline.
+- `vca lifecycle` helps you decide whether accepted AI-generated code held up after landing. It surfaces churn and reverts so you can tell the difference between short-term output and durable value.
 
 ## Example: `vca session`
 
@@ -86,9 +94,9 @@ What to do with it:
 ```text
 Change Metrics
 Heavy commits = commits where matched AI-attributed lines are at least half of changed lines
-C2 merge rate = share of heavy AI commits that later reached mainline
+Merge rate = share of heavy AI commits that later reached mainline
 
-Group                         Branch                      Commits     Heavy     C2(merge)   vs Staging
+Group                         Branch                      Commits     Heavy   Merge Rate   vs Staging
 API-142                       API-142-agent-auth               7         5         80.0%     +184/-41
 WEB-203                       WEB-203-checkout-fixes           5         4         50.0%      +96/-88
 OPS-88                        OPS-88-deploy-cleanup            4         3         33.3%      +41/-73
@@ -97,30 +105,30 @@ OPS-88                        OPS-88-deploy-cleanup            4         3      
 Why this matters:
 
 - Heavy commits tell you where AI meaningfully influenced the shipped diff instead of just assisting around the edges.
-- `C2 merge rate` tells you whether that work made it into mainline.
+- Merge rate tells you whether that work made it into mainline.
 - `vs Staging` gives a quick sense of branch size and cleanup cost.
 
 What to do with it:
 
-- If `C2` is low, the AI-heavy work is not consistently surviving review or integration.
+- If merge rate is low, the AI-heavy work is not consistently surviving review or integration.
 - If a task shows large diffs with weak merge outcomes, reduce branch size and tighten review before accepting generated code.
 
 ## Example: `vca lifecycle`
 
 ```text
 Lifecycle Metrics
-L1 code churn rate = share of AI-added lines on heavy AI commits that were later removed within the churn window
-L4 revert rate = share of heavy AI commits that were later reverted
+Code churn rate = share of AI-added lines on heavy AI commits that were later removed within the churn window
+Revert rate = share of heavy AI commits that were later reverted
 
 Heavy commits: 52
-L1 Code Churn Rate: 12.40% (98/790)
-L4 Revert Rate: 1.92% (1/52)
+Code Churn Rate: 12.40% (98/790)
+Revert Rate: 1.92% (1/52)
 ```
 
 Why this matters:
 
-- `L1` shows whether accepted AI-generated code actually lasted.
-- `L4` shows the most obvious failures: heavy AI commits that had to be reverted.
+- Code churn rate shows whether accepted AI-generated code actually lasted.
+- Revert rate shows the most obvious failures: heavy AI commits that had to be reverted.
 
 What to do with it:
 
@@ -144,21 +152,60 @@ These are workflow-quality signals, not just activity counters.
 ### 2. Did the work turn into shipped changes?
 
 - Heavy commits
-- C2 merge rate
+- Merge rate
 - Session-to-commit rate
 
 These tell you whether session effort turned into commits and whether those commits made it into mainline history.
 
 ### 3. Did the code hold up?
 
-- L1 code churn rate
-- L4 revert rate
+- Code churn rate
+- Revert rate
 
 These are the strongest signals for whether AI-assisted work created durable value or follow-up cleanup.
 
-## Install
+## How Metrics Are Calculated
 
-The easiest install path is a prebuilt release from [GitHub Releases](https://github.com/PaceFlow/vibe-coding-analytics/releases).
+The reports are built from normalized session events, matched commit/session attribution, and live git history. These are the current calculations used by the CLI.
+
+### Session Metrics
+
+- `Average User Prompts` - Average `user_turn_count` across included sessions. A session only counts if it has at least one non-empty user turn.
+- `Avg Time to First Accepted Change` - Average minutes between session start and the first accepted code change timestamp. Sessions without an accepted change timestamp are excluded from this average.
+- `Debug Loop Rate` - *Numerator* = sessions flagged as repeated error-fix loops. *Denominator* = sessions with a known debug-loop flag. A session is flagged when the same normalized error signature appears in 5 or more user turns with assistant replies in between.
+- `Error Paste Rate` - *Numerator* = sessions where a user pasted an error-like message after the first user message. *Denominator* = sessions with a known mid-session error-paste flag. Detection looks for signals such as stack traces, `error:`, `traceback`, numbered error counts, build/test failure phrases, and similar markers.
+- `Session-to-Commit Rate` - *Numerator* = sessions with at least one matched commit whose timestamp falls between session start and session end plus 4 hours. *Denominator* = sessions with enough timing data to evaluate that window.
+- `No-Output Session Rate` - *Numerator* = sessions with user turns but no accepted code-change output. *Denominator* = sessions with user turns.
+
+### Session List Fields
+
+- `LOC` - Total accepted changed lines for the session. This is `accepted_lines_added + accepted_lines_removed`.
+- `+Lines` - Accepted added lines for the session.
+- `-Lines` - Accepted removed lines for the session.
+- `Words/LOC` - User-word count divided by accepted changed lines. If accepted changed lines are zero, this is shown as `N/A`.
+
+### Change Metrics
+
+- `Commits` - Count of included commits in the current filter or group.
+- `Heavy Commits` - Count of commits where the AI-attributed share of changed lines is at least 50%. Internally this is derived from matched AI lines divided by total changed lines in the commit.
+- `Merge Rate` - *Numerator* = heavy commits marked as having reached mainline. *Denominator* = heavy commits. A commit counts as merged if either it is directly present on the repo's mainline ref (`main`, `master`, or remote equivalent), or at least 30 matched AI-added lines can be found on mainline with at least 80% content match after line-hash normalization. This makes the metric squash-aware instead of relying only on commit ancestry.
+- `vs Staging` - Live diff size from `git diff staging...<branch>` for task-grouped rows. It is not stored in the analytics tables; it is computed at render time.
+
+### Lifecycle Metrics
+
+- `Code Churn Rate` - *Numerator* = AI-added lines from heavy commits that reached mainline and were later removed from mainline within a 14-day window. *Denominator* = AI-added lines from heavy commits that reached mainline. Matching is line-hash based, not full-file snapshot based.
+- `Revert Rate` - *Numerator* = heavy commits later reverted. *Denominator* = heavy commits. Reverts are detected from git history by scanning commit bodies for `This reverts commit <sha>`.
+
+### Grouped Report Weighting
+
+- `Repo and Weekly Rollups` - Use ordinary counts and averages over included sessions or commits.
+- `Provider/Model Grouped Change and Lifecycle Reports` - Work from commit-session attribution rows so unmatched commits can appear as `human`.
+- `Task-Grouped Session Reports` - Use attribution-weighted averages and rates. The weight for a session-task row is the total matched lines linking that session to commits on the task; if that weight is zero, it falls back to `1`.
+- `Task-Grouped Change and Lifecycle Reports` - Use task-attributed commit rows and exclude non-ticket task keys plus integration branches such as `main`, `staging`, `master`, and `develop`.
+
+## Prebuilt Binaries
+
+Prefer not to build from source? Download a prebuilt release from [GitHub Releases](https://github.com/PaceFlow/vibe-coding-analytics/releases).
 
 Supported release targets:
 
@@ -197,12 +244,6 @@ Requirements:
 - `vca` reads local Codex sessions from `~/.codex/sessions`
 - `vca` reads local Cursor state/history from the OS config directory under `Cursor/User`
 - If Cursor data lives elsewhere, set `VCA_CURSOR_STATE_PATH` and/or `VCA_CURSOR_HISTORY_PATH`
-
-Source install:
-
-```bash
-cargo install --path . --force
-```
 
 ## Notes
 
