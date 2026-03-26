@@ -7,8 +7,8 @@ const LIFECYCLE_AFTER_HELP: &str = "Examples:\n  vca lifecycle\n  vca lifecycle 
 #[derive(Parser)]
 #[command(
     name = "vca",
-    about = "Vibe coding analytics for AI-assisted development sessions",
-    after_help = "Quick start:\n  vca ingest\n  vca session\n  vca change\n  vca lifecycle\n\nStart here:\n  vca session          # session quality and throughput\n  vca change           # commit attribution and merge outcomes\n  vca lifecycle        # churn and revert follow-through\n\nManual validation:\n  vca event-stream --stream session-base\n\nDiscover options:\n  vca --help\n  vca <command> --help"
+    about = "Local-first analytics for improving AI-assisted development workflows",
+    after_help = "Quick start:\n  vca ingest\n  vca session\n  vca change\n  vca lifecycle\n\nStart here:\n  vca session          # session efficiency and delivery signals\n  vca change           # commit attribution and merge outcomes\n  vca lifecycle        # churn and revert follow-through\n\nManual validation:\n  vca event-stream --stream session-base\n\nDiscover options:\n  vca --help\n  vca <command> --help"
 )]
 pub struct Cli {
     #[arg(short, long, global = true)]
@@ -19,13 +19,13 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Commands {
-    /// Build the full analytics data model from local sessions, code changes, and git history
+    /// Build the analytics data model from local sessions, code changes, and git history
     Ingest,
-    /// Show session KPIs and session-level breakdowns
+    /// Show session efficiency and delivery metrics
     Session(SessionReportArgs),
-    /// Show change KPIs and change-level breakdowns
+    /// Show commit attribution and merge outcome metrics
     Change(ChangeReportArgs),
-    /// Show lifecycle KPIs and lifecycle-level breakdowns
+    /// Show churn and revert follow-through for heavy AI commits
     Lifecycle(LifecycleReportArgs),
     /// Print analytics-ready base-view rows as NDJSON for manual validation
     EventStream(EventStreamArgs),
