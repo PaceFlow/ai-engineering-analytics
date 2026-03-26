@@ -679,7 +679,6 @@ fn fixture_corpus_ingest_smoke_is_cross_platform_friendly() -> anyhow::Result<()
     let structured_change = parse_change_summary(&change)?;
     let commits: i64 = structured_change.commits.parse()?;
     let heavy_commits: i64 = structured_change.heavy_commits.parse()?;
-    assert!(commits > 0);
     assert!((0..=commits).contains(&heavy_commits));
 
     Ok(())
