@@ -219,6 +219,7 @@ impl PatternParser for ApplyPatchParser {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     fn event(input: &str) -> ToolCallEvent {
         ToolCallEvent {
@@ -231,6 +232,10 @@ mod tests {
             input_json: input.to_string(),
             output_json: None,
         }
+    }
+
+    fn expected_abs(path: &str) -> PathBuf {
+        resolve_path(path, None, Some("/tmp/repo"))
     }
 
     #[test]
@@ -247,7 +252,7 @@ mod tests {
         assert_eq!(op.write_mode, WriteMode::Patch);
         assert_eq!(op.added_lines, 1);
         assert_eq!(op.removed_lines, 1);
-        assert!(op.abs_path.ends_with("/tmp/repo/src/a.txt"));
+        assert_eq!(PathBuf::from(&op.abs_path), expected_abs("src/a.txt"));
     }
 
     #[test]
@@ -283,12 +288,12 @@ mod tests {
     fn touched_file_cache_is_invalidated() {
         let parser = ApplyPatchParser;
         let mut ctx = SessionContext::new(Some("/tmp/repo".to_string()));
-        ctx.file_cache
-            .insert("/tmp/repo/src/a.txt".to_string(), "old".to_string());
+        let abs_path = expected_abs("src/a.txt").to_string_lossy().to_string();
+        ctx.file_cache.insert(abs_path.clone(), "old".to_string());
 
         let patch = "*** Begin Patch\n*** Update File: src/a.txt\n@@\n-old\n+new\n*** End Patch\n";
         let _ = parser.parse(&event(patch), &mut ctx);
 
-        assert!(!ctx.file_cache.contains_key("/tmp/repo/src/a.txt"));
+        assert!(!ctx.file_cache.contains_key(&abs_path));
     }
 }

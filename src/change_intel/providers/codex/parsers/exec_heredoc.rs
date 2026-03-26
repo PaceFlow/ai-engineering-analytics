@@ -357,6 +357,7 @@ impl PatternParser for ExecHeredocWriteParser {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::path::PathBuf;
 
     fn mk_event(cmd: &str, output: Option<&str>) -> ToolCallEvent {
         ToolCallEvent {
@@ -369,6 +370,10 @@ mod tests {
             input_json: json!({ "cmd": cmd, "workdir": "/tmp/repo" }).to_string(),
             output_json: output.map(ToOwned::to_owned),
         }
+    }
+
+    fn expected_abs(path: &str) -> PathBuf {
+        resolve_path(path, Some("/tmp/repo"), Some("/tmp/repo"))
     }
 
     #[test]
@@ -385,7 +390,7 @@ mod tests {
         assert!(!op.before_known);
         assert_eq!(op.added_lines, 2);
         assert_eq!(op.removed_lines, 0);
-        assert!(op.abs_path.ends_with("/tmp/repo/src/a.txt"));
+        assert_eq!(PathBuf::from(&op.abs_path), expected_abs("src/a.txt"));
     }
 
     #[test]
@@ -401,7 +406,10 @@ mod tests {
         assert!(outcome.errors.is_empty());
         assert_eq!(outcome.ops.len(), 1);
         assert_eq!(outcome.ops[0].added_lines, 1);
-        assert!(outcome.ops[0].abs_path.ends_with("/tmp/repo/src/index.ts"));
+        assert_eq!(
+            PathBuf::from(&outcome.ops[0].abs_path),
+            expected_abs("src/index.ts")
+        );
     }
 
     #[test]
