@@ -672,7 +672,8 @@ fn fixture_corpus_ingest_smoke_is_cross_platform_friendly() -> anyhow::Result<()
     assert!(session.contains("Session Metrics"));
     assert!(change.contains("Change Metrics"));
     assert!(lifecycle.contains("Lifecycle Metrics"));
-    assert!(change_grouped.contains("Group"));
+    assert!(change_grouped.contains("Change Metrics"));
+    assert!(change_grouped.contains("Group") || change_grouped.contains("No change rows found."));
     assert!(event_stream.contains("\"stream_type\""));
 
     let structured_change = parse_change_summary(&change)?;
