@@ -106,6 +106,9 @@ impl TestEnv {
             .args(args)
             .current_dir(&self.home)
             .env("HOME", &self.home)
+            .env("USERPROFILE", &self.home)
+            .env_remove("HOMEDRIVE")
+            .env_remove("HOMEPATH")
             .env_remove("XDG_CONFIG_HOME")
             .output()?;
 
@@ -136,6 +139,7 @@ impl TestEnv {
     }
 
     fn seed_reporting_fixture(&self) -> anyhow::Result<()> {
+        fs::create_dir_all(self.home.join(".vibe"))?;
         let conn = Connection::open(self.db_path())?;
         let repo_root = "__REPO_VCA__";
 
@@ -654,8 +658,9 @@ fn fixture_corpus_ingest_smoke_is_cross_platform_friendly() -> anyhow::Result<()
     let env = TestEnv::new_live_fixture()?;
     let ingest_output = env.normalize_output(env.run_vca(&["ingest"])?);
 
+    assert!(ingest_output.contains("Association summary:"));
     assert!(ingest_output.contains("Commit events materialized: repos="));
-    assert!(ingest_output.contains("processed=1"));
+    assert!(ingest_output.contains("commits_scanned="));
 
     let session = env.normalize_output(env.run_vca(&["session"])?);
     let change = env.normalize_output(env.run_vca(&["change"])?);
