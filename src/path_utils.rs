@@ -61,7 +61,7 @@ pub fn detect_repo_root(abs_path: &Path) -> Option<PathBuf> {
 pub fn to_rel_path(repo_root: Option<&Path>, abs_path: &Path) -> Option<String> {
     let root = repo_root?;
     if let Ok(rel) = abs_path.strip_prefix(root) {
-        return Some(rel.to_string_lossy().to_string());
+        return Some(normalize_rel_path(rel));
     }
 
     let normalized_root = std::fs::canonicalize(root)
@@ -69,7 +69,7 @@ pub fn to_rel_path(repo_root: Option<&Path>, abs_path: &Path) -> Option<String> 
         .unwrap_or_else(|| root.to_path_buf());
     let normalized_path = std::fs::canonicalize(abs_path).ok()?;
     let rel = normalized_path.strip_prefix(&normalized_root).ok()?;
-    Some(rel.to_string_lossy().to_string())
+    Some(normalize_rel_path(rel))
 }
 
 pub fn strip_file_scheme(uri: &str) -> String {
@@ -98,6 +98,10 @@ fn looks_like_windows_drive_path(path: &str) -> bool {
         && bytes[0].is_ascii_alphabetic()
         && bytes[1] == b':'
         && (bytes[2] == b'/' || bytes[2] == b'\\')
+}
+
+fn normalize_rel_path(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
 }
 
 fn path_query_dir(abs_path: &Path) -> PathBuf {
@@ -240,12 +244,11 @@ mod tests {
 
         let file_path = repo_root.join("src").join("lib.rs");
         let detected = detect_repo_root(&file_path).expect("git repo should be detected");
-        let expected_rel = Path::new("src").join("lib.rs");
 
         assert_eq!(detected, std::fs::canonicalize(&repo_root)?);
         assert_eq!(
             to_rel_path(Some(&detected), &file_path).as_deref(),
-            Some(expected_rel.to_string_lossy().as_ref())
+            Some("src/lib.rs")
         );
 
         Ok(())

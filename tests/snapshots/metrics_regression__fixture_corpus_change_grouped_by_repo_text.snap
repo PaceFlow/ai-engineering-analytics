@@ -7,4 +7,4 @@ Heavy commits = commits where matched AI-attributed lines are at least half of c
 C2 merge rate = share of heavy AI commits that later reached mainline
 
 Group                          Commits     Heavy     C2(merge)
-/private/var/folders/7r/6...         9         3        100.0%
+__REPO_VCA__                         9         3        100.0%
