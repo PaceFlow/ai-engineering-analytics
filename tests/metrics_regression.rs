@@ -105,6 +105,7 @@ impl TestEnv {
         let output = Command::cargo_bin("vca")?
             .args(args)
             .current_dir(&self.home)
+            .env("VCA_HOME", &self.home)
             .env("HOME", &self.home)
             .env("USERPROFILE", &self.home)
             .env_remove("HOMEDRIVE")

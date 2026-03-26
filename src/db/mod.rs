@@ -1,12 +1,16 @@
 use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension, params};
+use std::env;
 use std::path::Path;
 
 use crate::change_intel::schema::init_change_intel_schema;
 use crate::path_utils::{detect_repo_root, to_rel_path};
 
 pub fn open() -> Result<Connection> {
-    let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Home directory not found"))?;
+    let home = env::var_os("VCA_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(dirs::home_dir)
+        .ok_or_else(|| anyhow::anyhow!("Home directory not found"))?;
     let vibe_dir = home.join(".vibe");
     std::fs::create_dir_all(&vibe_dir)?;
     let db_path = vibe_dir.join("vca.db");
