@@ -29,7 +29,7 @@ fn render_change_report(rows: &[analytics::ChangeReportRow], args: &ChangeReport
     out.push_str("C2 merge rate = share of heavy AI commits that later reached mainline\n\n");
 
     if rows.is_empty() {
-        out.push_str("No change rows found. Run `vca ingest` first.\n");
+        out.push_str("No change rows found. Run `aea ingest` first.\n");
         return out;
     }
 

@@ -1,145 +1,183 @@
-# vibe-coding-analytics
+# AI Engineering Analytics
 
-Local-first CLI for understanding whether your AI-assisted development sessions are actually helping you ship useful code.
+Local-first CLI for answering the questions that matter after you use coding agents:
 
-`vca` reads local Codex/Cursor history plus git metadata and turns that evidence into three user-facing views:
-
-- `session`: were your sessions efficient or stuck in loops?
-- `change`: did AI-heavy work turn into real commits and reach mainline?
-- `lifecycle`: did that code stick, or was it churned out and reverted later?
-
-The point is not just to count prompts or accepted lines. The point is to help you answer:
-
-- Was this AI-assisted work useful?
-- Where did it break down?
+- Was this work actually useful?
+- Did it ship?
+- Did it hold up?
 - What should I do differently next time?
 
-## Who It's For
+`aea` reads local Codex/Cursor history plus git metadata and turns that evidence into three practical views:
 
-This is primarily for individual developers who want to improve how they work with coding agents and editor assistants.
+- `session`: were you getting leverage, or just steering and retrying?
+- `change`: did AI-heavy work turn into real commits that reached mainline?
+- `lifecycle`: did accepted AI-generated code stick, or did it get churned out later?
 
-It is useful when you want to spot patterns like:
+The point is not to count prompts or accepted lines for their own sake. The point is to help an individual engineer improve how they work with coding agents.
 
-- lots of prompting but little accepted output
-- sessions that turned into repeated fix-retry loops
-- heavy AI commits that never reached mainline
-- code that landed but was quickly removed again
+## Why You Should Care
 
-## Quick Start
+Most AI coding workflows feel productive in the moment. That does not mean they were useful.
 
-Get the CLI installed from source:
+AI Engineering Analytics gives you a local evidence trail for three failure modes that are easy to miss:
 
-```bash
-git clone https://github.com/PaceFlow/vibe-coding-analytics.git
-cd vibe-coding-analytics
-cargo install --path . --force
-```
+- sessions that felt busy but produced little accepted output
+- AI-heavy work that never made it to mainline
+- accepted code that landed quickly and was removed soon after
 
-Then ingest your local history and open the three report views:
+If those patterns show up repeatedly, you usually need tighter task slicing, better upfront constraints, earlier validation, or stricter review before accepting generated code.
 
-```bash
-vca ingest
-vca session
-vca change
-vca lifecycle
-```
+## What You Learn Quickly
 
-Useful follow-ups:
+- `aea session` tells you whether your sessions were efficient, noisy, or stuck in loops.
+- `aea change` tells you whether AI-assisted work actually turned into shipped change.
+- `aea lifecycle` tells you whether accepted code created durable value or follow-up cleanup.
 
-- `vca session --list-sessions`
-- `vca session --group-by provider`
-- `vca change --group-by task`
-- `vca lifecycle --group-by provider`
-
-## What You Get
-
-- `vca session` helps you decide whether your sessions were actually productive or just noisy. It makes reprompt churn, slow starts, debug loops, error-paste sessions, weak follow-through, and no-output sessions visible quickly.
-- `vca change` helps you decide whether AI-assisted work turned into meaningful shipped changes. It shows where AI had real influence on commits and whether those commits reached mainline.
-- `vca lifecycle` helps you decide whether accepted AI-generated code held up after landing. It surfaces churn and reverts so you can tell the difference between short-term output and durable value.
-
-## Example: `vca session`
+## Example: Session Report
 
 ```text
 Session Metrics
-Average user prompts = average number of user prompts per session
-Avg time to first accepted change = minutes from session start to the first accepted code change
-Debug loop rate = share of sessions that look like repeated fix-retry loops
-Error paste rate = share of sessions where an error message was pasted mid-session
-Session-to-commit rate = share of sessions followed by a commit within 4 hours
-No-output session rate = share of sessions with no accepted code changes
-
 Sessions: 43
 Average User Prompts: 4.21
 Avg Time to First Accepted Change (min): 8.30
 Debug Loop Rate: 18.60% (8/43)
-Error Paste Rate: 11.63% (5/43)
-Session-to-Commit Rate: 67.44% (29/43)
 No-Output Session Rate: 13.95% (6/43)
 ```
 
-Why this matters:
+Why it matters:
 
-- High prompt counts and long time-to-first-change usually mean you are spending too much effort steering the model.
-- High debug-loop and error-paste rates usually mean missing context, weak constraints, or bad initial task slicing.
-- Low session-to-commit rate means a lot of session activity did not turn into delivery.
+- High prompt counts and slow first changes usually mean you are spending too much effort steering the model.
+- High debug-loop or no-output rates usually mean the task was underspecified, too broad, or missing key repo context.
 
-What to do with it:
+What to do differently:
 
-- If prompts are high, narrow the task and front-load more concrete constraints.
-- If loops are high, stop earlier and verify assumptions before another retry cycle.
-- If no-output sessions are common, split exploration from implementation more explicitly.
+- Narrow the task before you prompt.
+- Put constraints and acceptance criteria in the first request.
+- Stop a failing retry cycle earlier and verify assumptions manually.
 
-## Example: `vca change --group-by task`
+## Example: Change Report
 
 ```text
 Change Metrics
-Heavy commits = commits where matched AI-attributed lines are at least half of changed lines
-Merge rate = share of heavy AI commits that later reached mainline
 
-Group                         Branch                      Commits     Heavy   Merge Rate   vs Staging
-API-142                       API-142-agent-auth               7         5         80.0%     +184/-41
-WEB-203                       WEB-203-checkout-fixes           5         4         50.0%      +96/-88
-OPS-88                        OPS-88-deploy-cleanup            4         3         33.3%      +41/-73
+Group                         Branch                      Commits     Heavy   C2(merge)   vs Staging
+API-142                       API-142-agent-auth               7         5       80.0%     +184/-41
+WEB-203                       WEB-203-checkout-fixes           5         4       50.0%      +96/-88
+OPS-88                        OPS-88-deploy-cleanup            4         3       33.3%      +41/-73
 ```
 
-Why this matters:
+Why it matters:
 
-- Heavy commits tell you where AI meaningfully influenced the shipped diff instead of just assisting around the edges.
-- Merge rate tells you whether that work made it into mainline.
-- `vs Staging` gives a quick sense of branch size and cleanup cost.
+- Heavy commits tell you where AI materially influenced the diff instead of just assisting around the edges.
+- Merge rate tells you whether that work survived review and integration.
 
-What to do with it:
+What to do differently:
 
-- If merge rate is low, the AI-heavy work is not consistently surviving review or integration.
-- If a task shows large diffs with weak merge outcomes, reduce branch size and tighten review before accepting generated code.
+- If AI-heavy tasks have weak merge rates, reduce branch size and tighten review before accepting generated code.
+- If a task has large diffs and weak outcomes, split it into smaller units with clearer verification points.
 
-## Example: `vca lifecycle`
+## Example: Lifecycle Report
 
 ```text
 Lifecycle Metrics
-Code churn rate = share of AI-added lines on heavy AI commits that were later removed within the churn window
-Revert rate = share of heavy AI commits that were later reverted
-
 Heavy commits: 52
-Code Churn Rate: 12.40% (98/790)
-Revert Rate: 1.92% (1/52)
+L1 Code Churn Rate: 12.40% (98/790)
+L4 Revert Rate: 1.92% (1/52)
 ```
 
-Why this matters:
+Why it matters:
 
-- Code churn rate shows whether accepted AI-generated code actually lasted.
-- Revert rate shows the most obvious failures: heavy AI commits that had to be reverted.
+- Churn means accepted code landed, but was the wrong fit or needed cleanup soon after.
+- Reverts are the clearest signal that the workflow created cost, not leverage.
 
-What to do with it:
+What to do differently:
 
-- High churn usually means the code landed but was the wrong solution, poor fit, or too lightly reviewed.
-- Reverts are the strongest signal that the workflow produced costly mistakes rather than leverage.
+- Review AI-heavy code more aggressively before merge.
+- Treat generated code as a draft when the surrounding system constraints are unclear.
+
+## Quick Start
+
+Once `aea` is installed, ingest your local history and open the three report views:
+
+```bash
+aea ingest
+aea session
+aea change
+aea lifecycle
+```
+
+Useful follow-ups:
+
+- `aea session --list-sessions`
+- `aea session --group-by provider`
+- `aea change --group-by task`
+- `aea lifecycle --group-by provider`
+
+## Installation
+
+Build and install from source:
+
+```bash
+git clone https://github.com/PaceFlow/ai-engineering-analytics.git
+cd ai-engineering-analytics
+cargo install --path . --force
+```
+
+Prefer not to build from source? Download a prebuilt release from [GitHub Releases](https://github.com/PaceFlow/ai-engineering-analytics/releases).
+
+Supported release targets:
+
+| Platform | Asset |
+| --- | --- |
+| Windows x86_64 | `aea-x86_64-pc-windows-msvc.zip` |
+| Linux x86_64 (glibc) | `aea-x86_64-unknown-linux-gnu.tar.gz` |
+| macOS Intel | `aea-x86_64-apple-darwin.tar.gz` |
+| macOS Apple Silicon | `aea-aarch64-apple-darwin.tar.gz` |
+
+Windows (PowerShell):
+
+```powershell
+$version = "v0.1.0"
+$asset = "aea-x86_64-pc-windows-msvc.zip"
+Invoke-WebRequest `
+  -Uri "https://github.com/PaceFlow/ai-engineering-analytics/releases/download/$version/$asset" `
+  -OutFile $asset
+Expand-Archive .\$asset -DestinationPath .\aea
+.\aea\aea.exe --help
+```
+
+macOS/Linux:
+
+```bash
+version="v0.1.0"
+asset="aea-x86_64-unknown-linux-gnu.tar.gz"
+curl -L "https://github.com/PaceFlow/ai-engineering-analytics/releases/download/${version}/${asset}" -o "${asset}"
+tar -xzf "${asset}"
+./aea-x86_64-unknown-linux-gnu/aea --help
+```
+
+Requirements:
+
+- `git` must be installed and available on `PATH`
+- `aea` reads local Codex sessions from `~/.codex/sessions`
+- `aea` reads local Cursor state/history from the OS config directory under `Cursor/User`
+- If Cursor data lives elsewhere, set `AEA_CURSOR_STATE_PATH` and/or `AEA_CURSOR_HISTORY_PATH`
+
+## Who It's For
+
+This tool is primarily for individual engineers who want to improve how they work with coding agents and editor assistants.
+
+It can also support team or manager conversations later, but the default framing is personal workflow improvement:
+
+- where am I wasting time steering the model?
+- where is AI help actually turning into shipped code?
+- where am I accepting code that does not last?
 
 ## How To Read The Reports
 
 Use the reports to answer three practical questions:
 
-### 1. Were my sessions efficient?
+### 1. Were my sessions actually useful?
 
 - Average user prompts
 - Avg time to first accepted change
@@ -149,7 +187,7 @@ Use the reports to answer three practical questions:
 
 These are workflow-quality signals, not just activity counters.
 
-### 2. Did the work turn into shipped changes?
+### 2. Did the work turn into shipped change?
 
 - Heavy commits
 - Merge rate
@@ -164,92 +202,51 @@ These tell you whether session effort turned into commits and whether those comm
 
 These are the strongest signals for whether AI-assisted work created durable value or follow-up cleanup.
 
-## How Metrics Are Calculated
+## Metric Reference
 
-The reports are built from normalized session events, matched commit/session attribution, and live git history. These are the current calculations used by the CLI.
+The reports are built from normalized session events, matched commit/session attribution, and live git history.
 
 ### Session Metrics
 
-- `Average User Prompts` - Average `user_turn_count` across included sessions. A session only counts if it has at least one non-empty user turn.
-- `Avg Time to First Accepted Change` - Average minutes between session start and the first accepted code change timestamp. Sessions without an accepted change timestamp are excluded from this average.
-- `Debug Loop Rate` - *Numerator* = sessions flagged as repeated error-fix loops. *Denominator* = sessions with a known debug-loop flag. A session is flagged when the same normalized error signature appears in 5 or more user turns with assistant replies in between.
-- `Error Paste Rate` - *Numerator* = sessions where a user pasted an error-like message after the first user message. *Denominator* = sessions with a known mid-session error-paste flag. Detection looks for signals such as stack traces, `error:`, `traceback`, numbered error counts, build/test failure phrases, and similar markers.
-- `Session-to-Commit Rate` - *Numerator* = sessions with at least one matched commit whose timestamp falls between session start and session end plus 4 hours. *Denominator* = sessions with enough timing data to evaluate that window.
-- `No-Output Session Rate` - *Numerator* = sessions with user turns but no accepted code-change output. *Denominator* = sessions with user turns.
+- `Average User Prompts`: average `user_turn_count` across included sessions with at least one non-empty user turn
+- `Avg Time to First Accepted Change`: average minutes between session start and the first accepted code change; sessions without an accepted change are excluded
+- `Debug Loop Rate`: share of sessions flagged as repeated error-fix loops; a session is flagged when the same normalized error signature appears in 5 or more user turns with assistant replies in between
+- `Error Paste Rate`: share of sessions where a user pasted an error-like message after the first user message
+- `Session-to-Commit Rate`: share of sessions with at least one matched commit between session start and session end plus 4 hours
+- `No-Output Session Rate`: share of sessions with user turns but no accepted code-change output
 
 ### Session List Fields
 
-- `LOC` - Total accepted changed lines for the session. This is `accepted_lines_added + accepted_lines_removed`.
-- `+Lines` - Accepted added lines for the session.
-- `-Lines` - Accepted removed lines for the session.
-- `Words/LOC` - User-word count divided by accepted changed lines. If accepted changed lines are zero, this is shown as `N/A`.
+- `LOC`: total accepted changed lines for the session (`accepted_lines_added + accepted_lines_removed`)
+- `+Lines`: accepted added lines for the session
+- `-Lines`: accepted removed lines for the session
+- `Words/LOC`: user-word count divided by accepted changed lines; if accepted changed lines are zero, this is `N/A`
 
 ### Change Metrics
 
-- `Commits` - Count of included commits in the current filter or group.
-- `Heavy Commits` - Count of commits where the AI-attributed share of changed lines is at least 50%. Internally this is derived from matched AI lines divided by total changed lines in the commit.
-- `Merge Rate` - *Numerator* = heavy commits marked as having reached mainline. *Denominator* = heavy commits. A commit counts as merged if either it is directly present on the repo's mainline ref (`main`, `master`, or remote equivalent), or at least 30 matched AI-added lines can be found on mainline with at least 80% content match after line-hash normalization. This makes the metric squash-aware instead of relying only on commit ancestry.
-- `vs Staging` - Live diff size from `git diff staging...<branch>` for task-grouped rows. It is not stored in the analytics tables; it is computed at render time.
+- `Commits`: count of included commits in the current filter or group
+- `Heavy Commits`: commits where the AI-attributed share of changed lines is at least 50%
+- `Merge Rate`: share of heavy commits that later reached mainline, including squash-aware content matching
+- `vs Staging`: live diff size from `git diff staging...<branch>` for task-grouped rows; computed at render time
 
 ### Lifecycle Metrics
 
-- `Code Churn Rate` - *Numerator* = AI-added lines from heavy commits that reached mainline and were later removed from mainline within a 14-day window. *Denominator* = AI-added lines from heavy commits that reached mainline. Matching is line-hash based, not full-file snapshot based.
-- `Revert Rate` - *Numerator* = heavy commits later reverted. *Denominator* = heavy commits. Reverts are detected from git history by scanning commit bodies for `This reverts commit <sha>`.
+- `Code Churn Rate`: share of AI-added lines from heavy commits that reached mainline and were removed from mainline within a 14-day window
+- `Revert Rate`: share of heavy commits later reverted by a commit body containing `This reverts commit <sha>`
 
 ### Grouped Report Weighting
 
-- `Repo and Weekly Rollups` - Use ordinary counts and averages over included sessions or commits.
-- `Provider/Model Grouped Change and Lifecycle Reports` - Work from commit-session attribution rows so unmatched commits can appear as `human`.
-- `Task-Grouped Session Reports` - Use attribution-weighted averages and rates. The weight for a session-task row is the total matched lines linking that session to commits on the task; if that weight is zero, it falls back to `1`.
-- `Task-Grouped Change and Lifecycle Reports` - Use task-attributed commit rows and exclude non-ticket task keys plus integration branches such as `main`, `staging`, `master`, and `develop`.
-
-## Prebuilt Binaries
-
-Prefer not to build from source? Download a prebuilt release from [GitHub Releases](https://github.com/PaceFlow/vibe-coding-analytics/releases).
-
-Supported release targets:
-
-| Platform | Asset |
-| --- | --- |
-| Windows x86_64 | `vca-x86_64-pc-windows-msvc.zip` |
-| Linux x86_64 (glibc) | `vca-x86_64-unknown-linux-gnu.tar.gz` |
-| macOS Intel | `vca-x86_64-apple-darwin.tar.gz` |
-| macOS Apple Silicon | `vca-aarch64-apple-darwin.tar.gz` |
-
-Windows (PowerShell):
-
-```powershell
-$version = "v0.1.0"
-$asset = "vca-x86_64-pc-windows-msvc.zip"
-Invoke-WebRequest `
-  -Uri "https://github.com/PaceFlow/vibe-coding-analytics/releases/download/$version/$asset" `
-  -OutFile $asset
-Expand-Archive .\$asset -DestinationPath .\vca
-.\vca\vca.exe --help
-```
-
-macOS/Linux:
-
-```bash
-version="v0.1.0"
-asset="vca-x86_64-unknown-linux-gnu.tar.gz"
-curl -L "https://github.com/PaceFlow/vibe-coding-analytics/releases/download/${version}/${asset}" -o "${asset}"
-tar -xzf "${asset}"
-./vca-x86_64-unknown-linux-gnu/vca --help
-```
-
-Requirements:
-
-- `git` must be installed and available on `PATH`
-- `vca` reads local Codex sessions from `~/.codex/sessions`
-- `vca` reads local Cursor state/history from the OS config directory under `Cursor/User`
-- If Cursor data lives elsewhere, set `VCA_CURSOR_STATE_PATH` and/or `VCA_CURSOR_HISTORY_PATH`
+- Repo and weekly rollups use ordinary counts and averages over included sessions or commits
+- Provider/model grouped change and lifecycle reports work from commit-session attribution rows so unmatched commits can appear as `human`
+- Task-grouped session reports use attribution-weighted averages and rates
+- Task-grouped change and lifecycle reports exclude non-ticket task keys plus integration branches such as `main`, `staging`, `master`, and `develop`
 
 ## Notes
 
-- `session`, `change`, and `lifecycle` share the same filter interface: `--weekly`, `--group-by`, `--from`, `--to`, `--repo`, `--provider`, `--task`, `--model`, and `--limit`.
-- Provider `human` means a commit had no matched AI session attribution at all.
-- Task-grouped rows only show ticket-style task keys such as `ABC-123` and exclude integration branches such as `main`, `staging`, `master`, and `develop`.
-- `change --group-by task` includes `vs Staging`, derived from `git diff staging...<branch>` for non-integration branches.
+- `session`, `change`, and `lifecycle` share the same filter interface: `--weekly`, `--group-by`, `--from`, `--to`, `--repo`, `--provider`, `--task`, `--model`, and `--limit`
+- Provider `human` means a commit had no matched AI session attribution at all
+- Task-grouped rows only show ticket-style task keys such as `ABC-123` and exclude integration branches such as `main`, `staging`, `master`, and `develop`
+- `change --group-by task` includes `vs Staging`, derived from `git diff staging...<branch>` for non-integration branches
+- Local analytics state lives under `~/.aea/aea.db` by default; override the base home with `AEA_HOME`
 
 Development notes, profiling setup, and source-oriented workflows live in [DEV.md](DEV.md).

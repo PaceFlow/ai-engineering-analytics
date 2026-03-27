@@ -143,16 +143,17 @@ mod tests {
     #[test]
     fn normalizes_https_remote() {
         assert_eq!(
-            normalize_git_remote("https://github.com/Paceflow/vca.git").as_deref(),
-            Some("github.com/Paceflow/vca")
+            normalize_git_remote("https://github.com/PaceFlow/ai-engineering-analytics.git")
+                .as_deref(),
+            Some("github.com/PaceFlow/ai-engineering-analytics")
         );
     }
 
     #[test]
     fn normalizes_ssh_remote() {
         assert_eq!(
-            normalize_git_remote("git@github.com:Paceflow/vca.git").as_deref(),
-            Some("github.com/Paceflow/vca")
+            normalize_git_remote("git@github.com:PaceFlow/ai-engineering-analytics.git").as_deref(),
+            Some("github.com/PaceFlow/ai-engineering-analytics")
         );
     }
 

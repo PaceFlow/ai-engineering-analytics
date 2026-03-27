@@ -1,13 +1,13 @@
-# `vca` release
+# `aea` release
 
-Download the archive for your platform from the Assets section below, extract it, and run `vca --help`.
+Download the archive for your platform from the Assets section below, extract it, and run `aea --help`.
 
 Quick start:
 
-- `vca ingest`
-- `vca session`
-- `vca change`
-- `vca lifecycle`
+- `aea ingest`
+- `aea session`
+- `aea change`
+- `aea lifecycle`
 
 Requirements:
 
@@ -16,5 +16,5 @@ Requirements:
 
 If Cursor data lives in a non-standard location, use:
 
-- `VCA_CURSOR_STATE_PATH`
-- `VCA_CURSOR_HISTORY_PATH`
+- `AEA_CURSOR_STATE_PATH`
+- `AEA_CURSOR_HISTORY_PATH`

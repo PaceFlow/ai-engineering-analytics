@@ -1,10 +1,11 @@
 [package]
-name = "vibe-coding-analytics"
+name = "ai-engineering-analytics"
 version = "0.1.0"
 edition = "2024"
+default-run = "aea"
 
 [[bin]]
-name = "vca"
+name = "aea"
 path = "src/main.rs"
 
 [dependencies]
