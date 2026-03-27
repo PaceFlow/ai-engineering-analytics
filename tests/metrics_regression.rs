@@ -12,15 +12,15 @@ const HOME_TEMPLATE_CURSOR_DB: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/fixtures/regression/home_template/cursor/state.vscdb"
 );
-const VCA_BUNDLE: &str = concat!(
+const AEA_BUNDLE: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/tests/fixtures/regression/repos/vca.bundle"
+    "/tests/fixtures/regression/repos/aea.bundle"
 );
 
 struct TestEnv {
     _tempdir: TempDir,
     home: PathBuf,
-    vca_repo: PathBuf,
+    aea_repo: PathBuf,
     cursor_dir: PathBuf,
 }
 
@@ -54,28 +54,28 @@ impl TestEnv {
         let tempdir = TempDir::new()?;
         let home = tempdir.path().to_path_buf();
         let work_dir = home.join("work");
-        let vca_repo = work_dir.join("fixture-vca");
+        let aea_repo = work_dir.join("fixture-aea");
         let cursor_dir = work_dir.join("fixture-cursor");
 
         fs::create_dir_all(&work_dir)?;
         fs::create_dir_all(&cursor_dir)?;
 
-        materialize_vca_repo(&vca_repo)?;
+        materialize_aea_repo(&aea_repo)?;
         copy_codex_sessions(
             &home,
-            &["__REPO_VCA__", "__REPO_CURSOR__", "__HOME__"],
+            &["__REPO_AEA__", "__REPO_CURSOR__", "__HOME__"],
             &[
-                &vca_repo.to_string_lossy(),
+                &aea_repo.to_string_lossy(),
                 &cursor_dir.to_string_lossy(),
                 &home.to_string_lossy(),
             ],
         )?;
-        install_cursor_fixture(&home, &vca_repo, &cursor_dir)?;
+        install_cursor_fixture(&home, &aea_repo, &cursor_dir)?;
 
         Ok(Self {
             _tempdir: tempdir,
             home,
-            vca_repo,
+            aea_repo,
             cursor_dir,
         })
     }
@@ -84,16 +84,16 @@ impl TestEnv {
         let tempdir = TempDir::new()?;
         let home = tempdir.path().to_path_buf();
         let work_dir = home.join("work");
-        let vca_repo = work_dir.join("fixture-vca");
+        let aea_repo = work_dir.join("fixture-aea");
         let cursor_dir = work_dir.join("fixture-cursor");
 
-        fs::create_dir_all(&vca_repo)?;
+        fs::create_dir_all(&aea_repo)?;
         fs::create_dir_all(&cursor_dir)?;
 
         let env = Self {
             _tempdir: tempdir,
             home,
-            vca_repo,
+            aea_repo,
             cursor_dir,
         };
         env.initialize_db_schema()?;
@@ -142,7 +142,7 @@ impl TestEnv {
     fn seed_reporting_fixture(&self) -> anyhow::Result<()> {
         fs::create_dir_all(self.home.join(".aea"))?;
         let conn = Connection::open(self.db_path())?;
-        let repo_root = "__REPO_VCA__";
+        let repo_root = "__REPO_AEA__";
 
         let sessions = [
             (
@@ -487,7 +487,7 @@ impl TestEnv {
         let mut normalized = output;
         let mut replacements = Vec::new();
         for (path, placeholder) in [
-            (&self.vca_repo, "__REPO_VCA__"),
+            (&self.aea_repo, "__REPO_AEA__"),
             (&self.cursor_dir, "__REPO_CURSOR__"),
             (&self.home, "__HOME__"),
         ] {
@@ -684,11 +684,11 @@ fn fixture_corpus_ingest_smoke_is_cross_platform_friendly() -> anyhow::Result<()
     Ok(())
 }
 
-fn materialize_vca_repo(repo_path: &Path) -> anyhow::Result<()> {
+fn materialize_aea_repo(repo_path: &Path) -> anyhow::Result<()> {
     run_command(
         Command::new("git")
             .arg("clone")
-            .arg(VCA_BUNDLE)
+            .arg(AEA_BUNDLE)
             .arg(repo_path),
     )?;
     run_command(
@@ -736,7 +736,7 @@ fn copy_codex_sessions(home: &Path, from: &[&str], to: &[&str]) -> anyhow::Resul
     Ok(())
 }
 
-fn install_cursor_fixture(home: &Path, vca_repo: &Path, cursor_dir: &Path) -> anyhow::Result<()> {
+fn install_cursor_fixture(home: &Path, aea_repo: &Path, cursor_dir: &Path) -> anyhow::Result<()> {
     for rel in [
         Path::new("Library")
             .join("Application Support")
@@ -752,7 +752,7 @@ fn install_cursor_fixture(home: &Path, vca_repo: &Path, cursor_dir: &Path) -> an
 
         let db_path = global_storage.join("state.vscdb");
         fs::copy(HOME_TEMPLATE_CURSOR_DB, &db_path)?;
-        rewrite_cursor_db(&db_path, home, vca_repo, cursor_dir)?;
+        rewrite_cursor_db(&db_path, home, aea_repo, cursor_dir)?;
     }
     Ok(())
 }
@@ -760,7 +760,7 @@ fn install_cursor_fixture(home: &Path, vca_repo: &Path, cursor_dir: &Path) -> an
 fn rewrite_cursor_db(
     db_path: &Path,
     home: &Path,
-    vca_repo: &Path,
+    aea_repo: &Path,
     cursor_dir: &Path,
 ) -> anyhow::Result<()> {
     let conn = Connection::open(db_path)?;
@@ -768,13 +768,13 @@ fn rewrite_cursor_db(
         "UPDATE cursorDiskKV
          SET value = replace(
              replace(
-                 replace(value, '__REPO_VCA__', ?1),
+                 replace(value, '__REPO_AEA__', ?1),
                  '__REPO_CURSOR__', ?2
              ),
              '__HOME__', ?3
          )",
         (
-            vca_repo.to_string_lossy().to_string(),
+            aea_repo.to_string_lossy().to_string(),
             cursor_dir.to_string_lossy().to_string(),
             home.to_string_lossy().to_string(),
         ),

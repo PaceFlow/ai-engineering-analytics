@@ -7,4 +7,4 @@ L1 code churn rate = share of AI-added lines on heavy AI commits that were later
 L4 revert rate = share of heavy AI commits that were later reverted
 
 Group                            Heavy     L1(churn)    L4(revert)
-__REPO_VCA__                         3          1.5%          0.0%
+__REPO_AEA__                         3          1.5%          0.0%

@@ -1,7 +1,7 @@
 # Conversation Notes
 
 ## Topic
-Designing a new analytics data model for `vibe-coding-analytics` that separates source ingestion, enrichment, analytic events, and metric calculation.
+Designing a new analytics data model for `ai-engineering-analytics` that separates source ingestion, enrichment, analytic events, and metric calculation.
 
 ## Main Direction
 We moved away from Rust computing final metrics directly and toward a layered model:
@@ -135,11 +135,11 @@ We checked dbt modeling ideas and aligned with these principles:
 That reinforced the chosen model.
 
 ## Documents Created During This Discussion
-- [AGENTS.md](/home/tadas/Work/paceflow/vibe-coding-analytics/AGENTS.md)
-- [ARCHITECTURE.md](/home/tadas/Work/paceflow/vibe-coding-analytics/docs/ARCHITECTURE.md)
-- [METRIC_ENGINE_MIGRATION.md](/home/tadas/Work/paceflow/vibe-coding-analytics/docs/METRIC_ENGINE_MIGRATION.md)
-- [DATA_MODEL_MIGRATION_PROPOSAL.md](/home/tadas/Work/paceflow/vibe-coding-analytics/docs/DATA_MODEL_MIGRATION_PROPOSAL.md)
-- [DATA_MODEL_MIGRATION_PROPOSAL_V2.md](/home/tadas/Work/paceflow/vibe-coding-analytics/docs/DATA_MODEL_MIGRATION_PROPOSAL_V2.md)
+- [AGENTS.md](/home/tadas/Work/paceflow/ai-engineering-analytics/AGENTS.md)
+- [ARCHITECTURE.md](/home/tadas/Work/paceflow/ai-engineering-analytics/docs/ARCHITECTURE.md)
+- [METRIC_ENGINE_MIGRATION.md](/home/tadas/Work/paceflow/ai-engineering-analytics/docs/METRIC_ENGINE_MIGRATION.md)
+- [DATA_MODEL_MIGRATION_PROPOSAL.md](/home/tadas/Work/paceflow/ai-engineering-analytics/docs/DATA_MODEL_MIGRATION_PROPOSAL.md)
+- [DATA_MODEL_MIGRATION_PROPOSAL_V2.md](/home/tadas/Work/paceflow/ai-engineering-analytics/docs/DATA_MODEL_MIGRATION_PROPOSAL_V2.md)
 
 ## Current Recommended Direction
 The current best proposal is the V2 data model with this shape:

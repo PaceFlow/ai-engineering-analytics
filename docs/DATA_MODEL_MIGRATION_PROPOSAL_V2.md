@@ -270,8 +270,8 @@ Becomes `fact_task_commit_assignment`, then feeds `event_task_commit`.
 ### Current Rust metric code
 Replace with Rust-built `event_*` materializers and SQL `view_*` objects:
 
-- [`src/metrics/quality.rs`](/home/tadas/Work/paceflow/vibe-coding-analytics/src/metrics/quality.rs) -> mostly replaced by builders for `event_session_quality`, `event_commit_outcome`, `event_commit_churn`
-- [`src/commands/task_stats.rs`](/home/tadas/Work/paceflow/vibe-coding-analytics/src/commands/task_stats.rs) -> mostly replaced by builder for `event_task_session` plus SQL view queries
+- [`src/metrics/quality.rs`](/home/tadas/Work/paceflow/ai-engineering-analytics/src/metrics/quality.rs) -> mostly replaced by builders for `event_session_quality`, `event_commit_outcome`, `event_commit_churn`
+- [`src/commands/task_stats.rs`](/home/tadas/Work/paceflow/ai-engineering-analytics/src/commands/task_stats.rs) -> mostly replaced by builder for `event_task_session` plus SQL view queries
 
 ## Migration Plan
 ### Phase 1: Add new schema side by side

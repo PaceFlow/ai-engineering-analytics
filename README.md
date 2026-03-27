@@ -131,7 +131,6 @@ Supported release targets:
 | --- | --- |
 | Windows x86_64 | `aea-x86_64-pc-windows-msvc.zip` |
 | Linux x86_64 (glibc) | `aea-x86_64-unknown-linux-gnu.tar.gz` |
-| macOS Intel | `aea-x86_64-apple-darwin.tar.gz` |
 | macOS Apple Silicon | `aea-aarch64-apple-darwin.tar.gz` |
 
 Windows (PowerShell):

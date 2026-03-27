@@ -144,8 +144,8 @@ Examples:
 ### Phase 6: Remove old metric code
 After parity is verified, retire:
 
-- direct aggregation logic in [`src/metrics/quality.rs`](/home/tadas/Work/paceflow/vibe-coding-analytics/src/metrics/quality.rs)
-- task metric aggregation logic in [`src/commands/task_stats.rs`](/home/tadas/Work/paceflow/vibe-coding-analytics/src/commands/task_stats.rs)
+- direct aggregation logic in [`src/metrics/quality.rs`](/home/tadas/Work/paceflow/ai-engineering-analytics/src/metrics/quality.rs)
+- task metric aggregation logic in [`src/commands/task_stats.rs`](/home/tadas/Work/paceflow/ai-engineering-analytics/src/commands/task_stats.rs)
 
 Keep only:
 
