@@ -22,7 +22,7 @@ tasks:
     deps:
       - build-release
     cmds:
-      - samply record ./target/release/aea {{.CLI_ARGS}}
+      - samply record ./target/release/aieng {{.CLI_ARGS}}
 
   profile-live:
     desc: "Attach perf top to an existing PID and watch live samples in the terminal. Example: task profile-live PID=12345"

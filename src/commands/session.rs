@@ -45,7 +45,7 @@ fn render_session_report(rows: &[analytics::SessionReportRow], args: &SessionRep
     out.push_str("No-output session rate = share of sessions with no accepted code changes\n\n");
 
     if rows.is_empty() {
-        out.push_str("No session rows found. Run `aea ingest` first.\n");
+        out.push_str("No session rows found. Run `aieng ingest` first.\n");
         return out;
     }
 
@@ -144,7 +144,7 @@ fn render_session_list(rows: &[analytics::SessionListRow]) -> String {
     let mut out = String::new();
     out.push_str("Session List\n\n");
     if rows.is_empty() {
-        out.push_str("No session rows found. Run `aea ingest` first.\n");
+        out.push_str("No session rows found. Run `aieng ingest` first.\n");
         return out;
     }
 

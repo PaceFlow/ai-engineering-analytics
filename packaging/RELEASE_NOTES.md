@@ -1,13 +1,13 @@
-# `aea` release
+# `aieng` release
 
-Download the archive for your platform from the Assets section below, extract it, and run `aea --help`.
+Download the archive for your platform from the Assets section below, extract it, and run `aieng --help`.
 
 Quick start:
 
-- `aea ingest`
-- `aea session`
-- `aea change`
-- `aea lifecycle`
+- `aieng ingest`
+- `aieng session`
+- `aieng change`
+- `aieng lifecycle`
 
 Requirements:
 
@@ -16,5 +16,5 @@ Requirements:
 
 If Cursor data lives in a non-standard location, use:
 
-- `AEA_CURSOR_STATE_PATH`
-- `AEA_CURSOR_HISTORY_PATH`
+- `AIENG_CURSOR_STATE_PATH`
+- `AIENG_CURSOR_HISTORY_PATH`

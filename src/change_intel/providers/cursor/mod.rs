@@ -1326,7 +1326,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        std::env::temp_dir().join(format!("aea_cursor_{}_{}.db", label, n))
+        std::env::temp_dir().join(format!("aieng_cursor_{}_{}.db", label, n))
     }
 
     fn create_cursor_db(path: &Path, rows: &[(String, String)]) -> Result<()> {

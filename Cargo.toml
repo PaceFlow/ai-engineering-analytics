@@ -2,10 +2,10 @@
 name = "ai-engineering-analytics"
 version = "0.1.0"
 edition = "2024"
-default-run = "aea"
+default-run = "aieng"
 
 [[bin]]
-name = "aea"
+name = "aieng"
 path = "src/main.rs"
 
 [dependencies]

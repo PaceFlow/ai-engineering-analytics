@@ -7,7 +7,7 @@ Local-first CLI for answering the questions that matter after you use coding age
 - Did it hold up?
 - What should I do differently next time?
 
-`aea` reads local Codex/Cursor history plus git metadata and turns that evidence into three practical views:
+`aieng` reads local Codex/Cursor history plus git metadata and turns that evidence into three practical views:
 
 - `session`: were you getting leverage, or just steering and retrying?
 - `change`: did AI-heavy work turn into real commits that reached mainline?
@@ -29,9 +29,9 @@ If those patterns show up repeatedly, you usually need tighter task slicing, bet
 
 ## What You Learn Quickly
 
-- `aea session` tells you whether your sessions were efficient, noisy, or stuck in loops.
-- `aea change` tells you whether AI-assisted work actually turned into shipped change.
-- `aea lifecycle` tells you whether accepted code created durable value or follow-up cleanup.
+- `aieng session` tells you whether your sessions were efficient, noisy, or stuck in loops.
+- `aieng change` tells you whether AI-assisted work actually turned into shipped change.
+- `aieng lifecycle` tells you whether accepted code created durable value or follow-up cleanup.
 
 ## Example: Session Report
 
@@ -97,21 +97,21 @@ What to do differently:
 
 ## Quick Start
 
-Once `aea` is installed, ingest your local history and open the three report views:
+Once `aieng` is installed, ingest your local history and open the three report views:
 
 ```bash
-aea ingest
-aea session
-aea change
-aea lifecycle
+aieng ingest
+aieng session
+aieng change
+aieng lifecycle
 ```
 
 Useful follow-ups:
 
-- `aea session --list-sessions`
-- `aea session --group-by provider`
-- `aea change --group-by task`
-- `aea lifecycle --group-by provider`
+- `aieng session --list-sessions`
+- `aieng session --group-by provider`
+- `aieng change --group-by task`
+- `aieng lifecycle --group-by provider`
 
 ## Installation
 
@@ -129,38 +129,38 @@ Supported release targets:
 
 | Platform | Asset |
 | --- | --- |
-| Windows x86_64 | `aea-x86_64-pc-windows-msvc.zip` |
-| Linux x86_64 (glibc) | `aea-x86_64-unknown-linux-gnu.tar.gz` |
-| macOS Apple Silicon | `aea-aarch64-apple-darwin.tar.gz` |
+| Windows x86_64 | `aieng-x86_64-pc-windows-msvc.zip` |
+| Linux x86_64 (glibc) | `aieng-x86_64-unknown-linux-gnu.tar.gz` |
+| macOS Apple Silicon | `aieng-aarch64-apple-darwin.tar.gz` |
 
 Windows (PowerShell):
 
 ```powershell
 $version = "v0.1.0"
-$asset = "aea-x86_64-pc-windows-msvc.zip"
+$asset = "aieng-x86_64-pc-windows-msvc.zip"
 Invoke-WebRequest `
   -Uri "https://github.com/PaceFlow/ai-engineering-analytics/releases/download/$version/$asset" `
   -OutFile $asset
-Expand-Archive .\$asset -DestinationPath .\aea
-.\aea\aea.exe --help
+Expand-Archive .\$asset -DestinationPath .\aieng
+.\aieng\aieng.exe --help
 ```
 
 macOS/Linux:
 
 ```bash
 version="v0.1.0"
-asset="aea-x86_64-unknown-linux-gnu.tar.gz"
+asset="aieng-x86_64-unknown-linux-gnu.tar.gz"
 curl -L "https://github.com/PaceFlow/ai-engineering-analytics/releases/download/${version}/${asset}" -o "${asset}"
 tar -xzf "${asset}"
-./aea-x86_64-unknown-linux-gnu/aea --help
+./aieng-x86_64-unknown-linux-gnu/aieng --help
 ```
 
 Requirements:
 
 - `git` must be installed and available on `PATH`
-- `aea` reads local Codex sessions from `~/.codex/sessions`
-- `aea` reads local Cursor state/history from the OS config directory under `Cursor/User`
-- If Cursor data lives elsewhere, set `AEA_CURSOR_STATE_PATH` and/or `AEA_CURSOR_HISTORY_PATH`
+- `aieng` reads local Codex sessions from `~/.codex/sessions`
+- `aieng` reads local Cursor state/history from the OS config directory under `Cursor/User`
+- If Cursor data lives elsewhere, set `AIENG_CURSOR_STATE_PATH` and/or `AIENG_CURSOR_HISTORY_PATH`
 
 ## Who It's For
 
@@ -246,6 +246,6 @@ The reports are built from normalized session events, matched commit/session att
 - Provider `human` means a commit had no matched AI session attribution at all
 - Task-grouped rows only show ticket-style task keys such as `ABC-123` and exclude integration branches such as `main`, `staging`, `master`, and `develop`
 - `change --group-by task` includes `vs Staging`, derived from `git diff staging...<branch>` for non-integration branches
-- Local analytics state lives under `~/.aea/aea.db` by default; override the base home with `AEA_HOME`
+- Local analytics state lives under `~/.aieng/aieng.db` by default; override the base home with `AIENG_HOME`
 
 Development notes, profiling setup, and source-oriented workflows live in [DEV.md](DEV.md).

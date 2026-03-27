@@ -1,8 +1,8 @@
 use anyhow::{Result, ensure};
 use std::path::{Path, PathBuf};
 
-pub const CURSOR_STATE_PATH_ENV: &str = "AEA_CURSOR_STATE_PATH";
-pub const CURSOR_HISTORY_PATH_ENV: &str = "AEA_CURSOR_HISTORY_PATH";
+pub const CURSOR_STATE_PATH_ENV: &str = "AIENG_CURSOR_STATE_PATH";
+pub const CURSOR_HISTORY_PATH_ENV: &str = "AIENG_CURSOR_HISTORY_PATH";
 
 pub fn cursor_state_path() -> Result<Option<PathBuf>> {
     resolve_state_path_from(None, &default_cursor_user_roots())

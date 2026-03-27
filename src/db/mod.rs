@@ -7,13 +7,13 @@ use crate::change_intel::schema::init_change_intel_schema;
 use crate::path_utils::{detect_repo_root, to_rel_path};
 
 pub fn open() -> Result<Connection> {
-    let home = env::var_os("AEA_HOME")
+    let home = env::var_os("AIENG_HOME")
         .map(std::path::PathBuf::from)
         .or_else(dirs::home_dir)
         .ok_or_else(|| anyhow::anyhow!("Home directory not found"))?;
-    let aea_dir = home.join(".aea");
-    std::fs::create_dir_all(&aea_dir)?;
-    let db_path = aea_dir.join("aea.db");
+    let aieng_dir = home.join(".aieng");
+    std::fs::create_dir_all(&aieng_dir)?;
+    let db_path = aieng_dir.join("aieng.db");
     let conn = Connection::open(db_path)?;
     init_app_schema(&conn)?;
     Ok(conn)
