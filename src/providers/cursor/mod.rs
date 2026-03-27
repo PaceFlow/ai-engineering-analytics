@@ -274,14 +274,12 @@ fn ingest_composer(
     let last_updated = data.last_updated_at.map(ms_to_iso);
     let project_path = extract_project_path(&data);
     let mut model_name = extract_model_name(&raw_json);
-    if matches!(model_name.as_deref(), None | Some("default")) {
-        if let Some(bubble_model_name) =
+    if matches!(model_name.as_deref(), None | Some("default"))
+        && let Some(bubble_model_name) =
             extract_model_name_from_bubbles(vscdb, session_id, &data.full_conversation_headers_only)
-        {
-            if model_name.is_none() || bubble_model_name != "default" {
-                model_name = Some(bubble_model_name);
-            }
-        }
+        && (model_name.is_none() || bubble_model_name != "default")
+    {
+        model_name = Some(bubble_model_name);
     }
 
     if db::session_exists(db, session_id)? {
@@ -414,21 +412,20 @@ fn ingest_composer(
     }
 
     // LOC fallback for new schema: aggregate counts on composerData object
-    if loc_events_pushed == 0 {
-        if let (Some(added), Some(removed)) = (data.total_lines_added, data.total_lines_removed) {
-            if added > 0 || removed > 0 {
-                db::ingest_accepted_code_change(
-                    db,
-                    "cursor",
-                    session_id,
-                    "__total__",
-                    added,
-                    removed,
-                    timestamp.as_deref(),
-                )?;
-                written += 1;
-            }
-        }
+    if loc_events_pushed == 0
+        && let (Some(added), Some(removed)) = (data.total_lines_added, data.total_lines_removed)
+        && (added > 0 || removed > 0)
+    {
+        db::ingest_accepted_code_change(
+            db,
+            "cursor",
+            session_id,
+            "__total__",
+            added,
+            removed,
+            timestamp.as_deref(),
+        )?;
+        written += 1;
     }
 
     Ok(written)
@@ -505,10 +502,10 @@ fn extract_project_path(data: &ComposerData) -> Option<String> {
 
     if let Some(ctx) = &data.context {
         for sel in &ctx.file_selections {
-            if let Some(uri) = &sel.uri {
-                if let Some(p) = &uri.fs_path {
-                    paths.push(p.clone());
-                }
+            if let Some(uri) = &sel.uri
+                && let Some(p) = &uri.fs_path
+            {
+                paths.push(p.clone());
             }
         }
     }

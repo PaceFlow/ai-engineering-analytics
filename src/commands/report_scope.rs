@@ -10,12 +10,12 @@ pub fn resolve_report_args(args: &ReportArgs) -> ReportArgs {
 
 fn resolve_report_args_for_cwd(args: &ReportArgs, cwd: Option<&Path>) -> ReportArgs {
     let mut resolved = args.clone();
-    if resolved.repo.is_none() && !resolved.all_projects {
-        if let Some(cwd) = cwd {
-            if let Some(repo_root) = detect_repo_root(cwd) {
-                resolved.repo = Some(repo_root.to_string_lossy().into_owned());
-            }
-        }
+    if resolved.repo.is_none()
+        && !resolved.all_projects
+        && let Some(cwd) = cwd
+        && let Some(repo_root) = detect_repo_root(cwd)
+    {
+        resolved.repo = Some(repo_root.to_string_lossy().into_owned());
     }
     resolved
 }

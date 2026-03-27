@@ -197,22 +197,22 @@ fn ingest_session(path: &PathBuf, db: &Connection) -> Result<usize> {
             }
             "event_msg" => {
                 // Only handle user_message subtype
-                if line.payload.get("type").and_then(|v| v.as_str()) == Some("user_message") {
-                    if let Some(msg) = line.payload.get("message").and_then(|v| v.as_str()) {
-                        let content = msg.to_string();
-                        let words = content.split_whitespace().count();
-                        if words > 0 {
-                            db::ingest_session_message(
-                                db,
-                                "codex",
-                                session_id,
-                                "user",
-                                &content,
-                                words as i64,
-                                ts.as_deref(),
-                            )?;
-                            written += 1;
-                        }
+                if line.payload.get("type").and_then(|v| v.as_str()) == Some("user_message")
+                    && let Some(msg) = line.payload.get("message").and_then(|v| v.as_str())
+                {
+                    let content = msg.to_string();
+                    let words = content.split_whitespace().count();
+                    if words > 0 {
+                        db::ingest_session_message(
+                            db,
+                            "codex",
+                            session_id,
+                            "user",
+                            &content,
+                            words as i64,
+                            ts.as_deref(),
+                        )?;
+                        written += 1;
                     }
                 }
             }
@@ -348,21 +348,20 @@ fn parse_tool_call(
                 .ok()
                 .and_then(|obj| obj.get("cmd").and_then(|v| v.as_str()).map(String::from));
 
-            if let Some(cmd) = cmd {
-                if let Some((file_path, lines_added, lines_removed)) =
+            if let Some(cmd) = cmd
+                && let Some((file_path, lines_added, lines_removed)) =
                     parse_exec_cmd_write(&cmd, file_cache)
-                {
-                    db::ingest_accepted_code_change(
-                        db,
-                        "codex",
-                        session_id,
-                        &file_path,
-                        lines_added,
-                        lines_removed,
-                        timestamp,
-                    )?;
-                    return Ok(1);
-                }
+            {
+                db::ingest_accepted_code_change(
+                    db,
+                    "codex",
+                    session_id,
+                    &file_path,
+                    lines_added,
+                    lines_removed,
+                    timestamp,
+                )?;
+                return Ok(1);
             }
         }
         return Ok(0);
@@ -419,10 +418,10 @@ fn parse_exec_cmd_write(
     let redirect_and_path = after_cat[..heredoc_pos].trim();
 
     // Extract file path from `> /path` or `>> /path`
-    let file_path = if redirect_and_path.starts_with(">>") {
-        redirect_and_path[2..].trim()
-    } else if redirect_and_path.starts_with('>') {
-        redirect_and_path[1..].trim()
+    let file_path = if let Some(path) = redirect_and_path.strip_prefix(">>") {
+        path.trim()
+    } else if let Some(path) = redirect_and_path.strip_prefix('>') {
+        path.trim()
     } else {
         return None;
     };
@@ -474,10 +473,10 @@ fn parse_unified_diff(diff: &str) -> Vec<(String, i64, i64)> {
             if !rest.starts_with("++") {
                 added += 1;
             }
-        } else if let Some(rest) = line.strip_prefix('-') {
-            if !rest.starts_with("--") {
-                removed += 1;
-            }
+        } else if let Some(rest) = line.strip_prefix('-')
+            && !rest.starts_with("--")
+        {
+            removed += 1;
         }
     }
 

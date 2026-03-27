@@ -453,19 +453,19 @@ pub fn session_exists(conn: &Connection, session_id: &str) -> Result<bool> {
 fn derive_repo_root(project_path: Option<&str>, file_path: Option<&str>) -> Option<String> {
     if let Some(fp) = file_path {
         let fp_path = Path::new(fp);
-        if fp_path.is_absolute() {
-            if let Some(root) = detect_repo_root(fp_path) {
-                return Some(root.to_string_lossy().to_string());
-            }
+        if fp_path.is_absolute()
+            && let Some(root) = detect_repo_root(fp_path)
+        {
+            return Some(root.to_string_lossy().to_string());
         }
     }
 
     if let Some(pp) = project_path {
         let pp_path = Path::new(pp);
-        if pp_path.is_absolute() {
-            if let Some(root) = detect_repo_root(pp_path) {
-                return Some(root.to_string_lossy().to_string());
-            }
+        if pp_path.is_absolute()
+            && let Some(root) = detect_repo_root(pp_path)
+        {
+            return Some(root.to_string_lossy().to_string());
         }
     }
 
@@ -608,6 +608,10 @@ pub fn upsert_metadata_model(
     Ok(Some(model_id))
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "session upserts mirror the metadata row plus optional model identity fields"
+)]
 pub fn upsert_metadata_session_with_model(
     conn: &Connection,
     provider: &str,
@@ -633,6 +637,10 @@ pub fn upsert_metadata_session_with_model(
     )
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the internal session upsert writes the full metadata payload and one policy flag in a single call"
+)]
 fn upsert_metadata_session_with_model_internal(
     conn: &Connection,
     provider: &str,
@@ -869,6 +877,10 @@ pub fn load_session_metadata(
     Ok(row.unwrap_or_default())
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "session starts write the same session metadata fields as the general upsert helper"
+)]
 pub fn begin_session_with_model(
     conn: &Connection,
     provider: &str,
@@ -1014,6 +1026,10 @@ pub fn insert_fact_session_message(
     Ok(())
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "accepted code change facts map directly to persisted analytics columns"
+)]
 pub fn insert_fact_accepted_code_change(
     conn: &Connection,
     provider: &str,
@@ -1201,6 +1217,10 @@ pub fn delete_fact_session_code_change_by_id(conn: &Connection, code_change_id: 
     Ok(())
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "commit fact upserts intentionally mirror the stored commit columns"
+)]
 pub fn upsert_fact_commit(
     conn: &Connection,
     repo_root: &str,
@@ -1329,6 +1349,10 @@ pub fn replace_fact_commit_file_change_line_hashes(
     Ok(())
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "commit attribution updates write a fixed set of derived analytics fields together"
+)]
 pub fn update_fact_commit_attribution(
     conn: &Connection,
     repo_root: &str,
@@ -1396,6 +1420,10 @@ pub fn replace_fact_commit_session_matches(
     Ok(())
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "task assignment facts are written as one denormalized row"
+)]
 pub fn upsert_fact_task_commit_assignment(
     conn: &Connection,
     repo_root: &str,

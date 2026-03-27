@@ -1594,23 +1594,23 @@ fn build_conditions(
     if let Some(repo) = args.repo.as_deref() {
         conditions.push(format!("repo_root = {}", sql_literal(repo)));
     }
-    if let Some(provider) = args.provider.as_deref() {
-        if provider_capable {
-            conditions.push(format!("provider = {}", sql_literal(provider)));
-        }
+    if let Some(provider) = args.provider.as_deref()
+        && provider_capable
+    {
+        conditions.push(format!("provider = {}", sql_literal(provider)));
     }
-    if let Some(task) = args.task.as_deref() {
-        if task_capable {
-            conditions.push(format!("task_key = {}", sql_literal(task)));
-        }
+    if let Some(task) = args.task.as_deref()
+        && task_capable
+    {
+        conditions.push(format!("task_key = {}", sql_literal(task)));
     }
-    if let Some(model) = args.model.as_deref() {
-        if model_capable {
-            conditions.push(format!(
-                "COALESCE(model_name, '(unknown)') = {}",
-                sql_literal(model)
-            ));
-        }
+    if let Some(model) = args.model.as_deref()
+        && model_capable
+    {
+        conditions.push(format!(
+            "COALESCE(model_name, '(unknown)') = {}",
+            sql_literal(model)
+        ));
     }
     if let Some(from) = args.from.as_deref() {
         conditions.push(format!(
@@ -1918,6 +1918,10 @@ fn derive_repo_commit_events(
     )
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the preloaded commit-analysis caches are passed separately to avoid building an extra bundle"
+)]
 fn derive_commit_events_from_preloaded(
     commits: &[CandidateCommit],
     revert_map: &HashMap<String, DateTime<Utc>>,
@@ -1952,8 +1956,8 @@ fn derive_commit_events_from_preloaded(
         }
 
         let budget = build_ai_added_budget_from_preloaded(
-            &commit_added_hashes,
-            &session_added_availability,
+            commit_added_hashes,
+            session_added_availability,
             &commit.commit_sha,
         );
         let budget_total = budget_total(&budget);
@@ -2157,10 +2161,10 @@ fn is_debug_loop_session(turns: &[SessionTurn]) -> bool {
 
 fn extract_error_signature(user_text: &str, previous_signature: Option<&str>) -> Option<String> {
     let lower = user_text.to_ascii_lowercase();
-    if is_error_continuation(&lower) {
-        if let Some(prev) = previous_signature {
-            return Some(prev.to_string());
-        }
+    if is_error_continuation(&lower)
+        && let Some(prev) = previous_signature
+    {
+        return Some(prev.to_string());
     }
     if !contains_debug_keyword(&lower) {
         return None;
@@ -2288,14 +2292,14 @@ fn collapse_digits(token: &str) -> String {
 
 fn looks_like_hex_hash(token: &str) -> bool {
     let len = token.len();
-    len >= 8 && len <= 64 && token.chars().all(|ch| ch.is_ascii_hexdigit())
+    (8..=64).contains(&len) && token.chars().all(|ch| ch.is_ascii_hexdigit())
 }
 
 fn shorten_repo(path: &str) -> String {
-    if let Some(home) = dirs::home_dir() {
-        if let Some(shortened) = strip_home_prefix(path, &home) {
-            return shortened;
-        }
+    if let Some(home) = dirs::home_dir()
+        && let Some(shortened) = strip_home_prefix(path, &home)
+    {
+        return shortened;
     }
     path.to_string()
 }
@@ -2537,7 +2541,7 @@ fn is_content_merged_in_index(budget: &PathHashCounts, index: &MainlineIndex) ->
     if total_budget <= 0 {
         return false;
     }
-    let matched = match_budget_to_mainline(budget, &index);
+    let matched = match_budget_to_mainline(budget, index);
     let ratio = matched as f64 / total_budget as f64;
     matched >= C2_MIN_MATCHED_LINES && ratio >= C2_MIN_RATIO
 }
@@ -2621,15 +2625,15 @@ fn match_budget_to_mainline(
         let strict_ratio = strict as f64 / file_total as f64;
         let mut selected = strict;
 
-        if strict_ratio < C2_STRICT_WEAK_RATIO {
-            if let Some(alias_path) = choose_alias_path(path, hashes, file_total, index) {
-                let mut alias_matched = 0i64;
-                for (line_hash, budget_count) in hashes {
-                    alias_matched += index.strict_match(&alias_path, line_hash, *budget_count);
-                }
-                if alias_matched > selected {
-                    selected = alias_matched;
-                }
+        if strict_ratio < C2_STRICT_WEAK_RATIO
+            && let Some(alias_path) = choose_alias_path(path, hashes, file_total, index)
+        {
+            let mut alias_matched = 0i64;
+            for (line_hash, budget_count) in hashes {
+                alias_matched += index.strict_match(&alias_path, line_hash, *budget_count);
+            }
+            if alias_matched > selected {
+                selected = alias_matched;
             }
         }
 

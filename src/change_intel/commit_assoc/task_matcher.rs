@@ -238,7 +238,7 @@ fn select_branch_point(
 }
 
 fn extract_task_key(branch: &str) -> String {
-    for segment in branch.split(|c: char| c == '/' || c == '_' || c == '.') {
+    for segment in branch.split(['/', '_', '.']) {
         if let Some(ticket) = parse_ticket_prefix(segment) {
             return ticket;
         }
