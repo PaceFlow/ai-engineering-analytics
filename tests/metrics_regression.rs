@@ -12,15 +12,15 @@ const HOME_TEMPLATE_CURSOR_DB: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/fixtures/regression/home_template/cursor/state.vscdb"
 );
-const VCA_BUNDLE: &str = concat!(
+const AEA_BUNDLE: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/tests/fixtures/regression/repos/vca.bundle"
+    "/tests/fixtures/regression/repos/aea.bundle"
 );
 
 struct TestEnv {
     _tempdir: TempDir,
     home: PathBuf,
-    vca_repo: PathBuf,
+    aea_repo: PathBuf,
     cursor_dir: PathBuf,
 }
 
@@ -54,28 +54,28 @@ impl TestEnv {
         let tempdir = TempDir::new()?;
         let home = tempdir.path().to_path_buf();
         let work_dir = home.join("work");
-        let vca_repo = work_dir.join("fixture-vca");
+        let aea_repo = work_dir.join("fixture-aea");
         let cursor_dir = work_dir.join("fixture-cursor");
 
         fs::create_dir_all(&work_dir)?;
         fs::create_dir_all(&cursor_dir)?;
 
-        materialize_vca_repo(&vca_repo)?;
+        materialize_aea_repo(&aea_repo)?;
         copy_codex_sessions(
             &home,
-            &["__REPO_VCA__", "__REPO_CURSOR__", "__HOME__"],
+            &["__REPO_AEA__", "__REPO_CURSOR__", "__HOME__"],
             &[
-                &vca_repo.to_string_lossy(),
+                &aea_repo.to_string_lossy(),
                 &cursor_dir.to_string_lossy(),
                 &home.to_string_lossy(),
             ],
         )?;
-        install_cursor_fixture(&home, &vca_repo, &cursor_dir)?;
+        install_cursor_fixture(&home, &aea_repo, &cursor_dir)?;
 
         Ok(Self {
             _tempdir: tempdir,
             home,
-            vca_repo,
+            aea_repo,
             cursor_dir,
         })
     }
@@ -84,16 +84,16 @@ impl TestEnv {
         let tempdir = TempDir::new()?;
         let home = tempdir.path().to_path_buf();
         let work_dir = home.join("work");
-        let vca_repo = work_dir.join("fixture-vca");
+        let aea_repo = work_dir.join("fixture-aea");
         let cursor_dir = work_dir.join("fixture-cursor");
 
-        fs::create_dir_all(&vca_repo)?;
+        fs::create_dir_all(&aea_repo)?;
         fs::create_dir_all(&cursor_dir)?;
 
         let env = Self {
             _tempdir: tempdir,
             home,
-            vca_repo,
+            aea_repo,
             cursor_dir,
         };
         env.initialize_db_schema()?;
@@ -101,11 +101,11 @@ impl TestEnv {
         Ok(env)
     }
 
-    fn run_vca(&self, args: &[&str]) -> anyhow::Result<String> {
-        let output = Command::cargo_bin("vca")?
+    fn run_aea(&self, args: &[&str]) -> anyhow::Result<String> {
+        let output = Command::cargo_bin("aea")?
             .args(args)
             .current_dir(&self.home)
-            .env("VCA_HOME", &self.home)
+            .env("AEA_HOME", &self.home)
             .env("HOME", &self.home)
             .env("USERPROFILE", &self.home)
             .env_remove("HOMEDRIVE")
@@ -115,7 +115,7 @@ impl TestEnv {
 
         if !output.status.success() {
             anyhow::bail!(
-                "vca {:?} failed\nstdout:\n{}\nstderr:\n{}",
+                "aea {:?} failed\nstdout:\n{}\nstderr:\n{}",
                 args,
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)
@@ -126,23 +126,23 @@ impl TestEnv {
     }
 
     fn ingest(&self) -> anyhow::Result<()> {
-        self.run_vca(&["ingest"])?;
+        self.run_aea(&["ingest"])?;
         Ok(())
     }
 
     fn initialize_db_schema(&self) -> anyhow::Result<()> {
-        let _ = self.run_vca(&["session"])?;
+        let _ = self.run_aea(&["session"])?;
         Ok(())
     }
 
     fn db_path(&self) -> PathBuf {
-        self.home.join(".vibe").join("vca.db")
+        self.home.join(".aea").join("aea.db")
     }
 
     fn seed_reporting_fixture(&self) -> anyhow::Result<()> {
-        fs::create_dir_all(self.home.join(".vibe"))?;
+        fs::create_dir_all(self.home.join(".aea"))?;
         let conn = Connection::open(self.db_path())?;
-        let repo_root = "__REPO_VCA__";
+        let repo_root = "__REPO_AEA__";
 
         let sessions = [
             (
@@ -487,7 +487,7 @@ impl TestEnv {
         let mut normalized = output;
         let mut replacements = Vec::new();
         for (path, placeholder) in [
-            (&self.vca_repo, "__REPO_VCA__"),
+            (&self.aea_repo, "__REPO_AEA__"),
             (&self.cursor_dir, "__REPO_CURSOR__"),
             (&self.home, "__HOME__"),
         ] {
@@ -509,9 +509,9 @@ impl TestEnv {
 fn category_reports_match_snapshots() -> anyhow::Result<()> {
     let env = TestEnv::new_seeded_reporting()?;
 
-    let session = env.normalize_output(env.run_vca(&["session"])?);
-    let change = env.normalize_output(env.run_vca(&["change"])?);
-    let lifecycle = env.normalize_output(env.run_vca(&["lifecycle"])?);
+    let session = env.normalize_output(env.run_aea(&["session"])?);
+    let change = env.normalize_output(env.run_aea(&["change"])?);
+    let lifecycle = env.normalize_output(env.run_aea(&["lifecycle"])?);
 
     assert!(session.contains("Session Metrics"));
     assert!(change.contains("Change Metrics"));
@@ -542,12 +542,12 @@ fn grouped_and_weekly_reports_match_snapshots() -> anyhow::Result<()> {
     let env = TestEnv::new_seeded_reporting()?;
 
     let session_grouped =
-        env.normalize_output(env.run_vca(&["session", "--group-by", "provider"])?);
-    let change_grouped = env.normalize_output(env.run_vca(&["change", "--group-by", "repo"])?);
+        env.normalize_output(env.run_aea(&["session", "--group-by", "provider"])?);
+    let change_grouped = env.normalize_output(env.run_aea(&["change", "--group-by", "repo"])?);
     let lifecycle_grouped =
-        env.normalize_output(env.run_vca(&["lifecycle", "--group-by", "repo"])?);
+        env.normalize_output(env.run_aea(&["lifecycle", "--group-by", "repo"])?);
     let session_weekly =
-        env.normalize_output(env.run_vca(&["session", "--weekly", "--group-by", "provider"])?);
+        env.normalize_output(env.run_aea(&["session", "--weekly", "--group-by", "provider"])?);
 
     assert_snapshot!(
         "fixture_corpus_session_grouped_by_provider_text",
@@ -571,10 +571,10 @@ fn event_stream_matches_snapshots() -> anyhow::Result<()> {
     let env = TestEnv::new_seeded_reporting()?;
 
     let session_stream =
-        env.normalize_output(env.run_vca(&["event-stream", "--stream", "session-base"])?);
+        env.normalize_output(env.run_aea(&["event-stream", "--stream", "session-base"])?);
     let task_commit_stream =
-        env.normalize_output(env.run_vca(&["event-stream", "--stream", "task-commit-base"])?);
-    let all_streams_smoke = env.normalize_output(env.run_vca(&["event-stream", "--limit", "5"])?);
+        env.normalize_output(env.run_aea(&["event-stream", "--stream", "task-commit-base"])?);
+    let all_streams_smoke = env.normalize_output(env.run_aea(&["event-stream", "--limit", "5"])?);
 
     assert_snapshot!("fixture_corpus_event_stream_session_base", session_stream);
     assert_snapshot!(
@@ -612,16 +612,16 @@ fn ingest_is_idempotent_for_fixture_corpus() -> anyhow::Result<()> {
     let env = TestEnv::new_live_fixture()?;
     env.ingest()?;
 
-    let session_before = env.run_vca(&["session"])?;
-    let change_before = env.run_vca(&["change"])?;
-    let lifecycle_before = env.run_vca(&["lifecycle"])?;
+    let session_before = env.run_aea(&["session"])?;
+    let change_before = env.run_aea(&["change"])?;
+    let lifecycle_before = env.run_aea(&["lifecycle"])?;
 
-    let second_ingest = env.run_vca(&["ingest"])?;
+    let second_ingest = env.run_aea(&["ingest"])?;
     assert!(second_ingest.contains("Ingest progress: 100%"));
 
-    let session_after = env.run_vca(&["session"])?;
-    let change_after = env.run_vca(&["change"])?;
-    let lifecycle_after = env.run_vca(&["lifecycle"])?;
+    let session_after = env.run_aea(&["session"])?;
+    let change_after = env.run_aea(&["change"])?;
+    let lifecycle_after = env.run_aea(&["lifecycle"])?;
 
     assert_eq!(
         session_before, session_after,
@@ -642,7 +642,7 @@ fn ingest_is_idempotent_for_fixture_corpus() -> anyhow::Result<()> {
 #[test]
 fn ingest_reports_commit_event_progress() -> anyhow::Result<()> {
     let env = TestEnv::new_live_fixture()?;
-    let ingest_output = env.run_vca(&["ingest"])?;
+    let ingest_output = env.run_aea(&["ingest"])?;
 
     assert!(ingest_output.contains("Planning ingest..."));
     assert!(ingest_output.contains("Stage: codex sessions"));
@@ -657,17 +657,17 @@ fn ingest_reports_commit_event_progress() -> anyhow::Result<()> {
 #[test]
 fn fixture_corpus_ingest_smoke_is_cross_platform_friendly() -> anyhow::Result<()> {
     let env = TestEnv::new_live_fixture()?;
-    let ingest_output = env.normalize_output(env.run_vca(&["ingest"])?);
+    let ingest_output = env.normalize_output(env.run_aea(&["ingest"])?);
 
     assert!(ingest_output.contains("Association summary:"));
     assert!(ingest_output.contains("Commit events materialized: repos="));
     assert!(ingest_output.contains("commits_scanned="));
 
-    let session = env.normalize_output(env.run_vca(&["session"])?);
-    let change = env.normalize_output(env.run_vca(&["change"])?);
-    let lifecycle = env.normalize_output(env.run_vca(&["lifecycle"])?);
-    let change_grouped = env.normalize_output(env.run_vca(&["change", "--group-by", "repo"])?);
-    let event_stream = env.normalize_output(env.run_vca(&["event-stream", "--limit", "5"])?);
+    let session = env.normalize_output(env.run_aea(&["session"])?);
+    let change = env.normalize_output(env.run_aea(&["change"])?);
+    let lifecycle = env.normalize_output(env.run_aea(&["lifecycle"])?);
+    let change_grouped = env.normalize_output(env.run_aea(&["change", "--group-by", "repo"])?);
+    let event_stream = env.normalize_output(env.run_aea(&["event-stream", "--limit", "5"])?);
 
     assert!(session.contains("Session Metrics"));
     assert!(change.contains("Change Metrics"));
@@ -684,11 +684,11 @@ fn fixture_corpus_ingest_smoke_is_cross_platform_friendly() -> anyhow::Result<()
     Ok(())
 }
 
-fn materialize_vca_repo(repo_path: &Path) -> anyhow::Result<()> {
+fn materialize_aea_repo(repo_path: &Path) -> anyhow::Result<()> {
     run_command(
         Command::new("git")
             .arg("clone")
-            .arg(VCA_BUNDLE)
+            .arg(AEA_BUNDLE)
             .arg(repo_path),
     )?;
     run_command(
@@ -736,7 +736,7 @@ fn copy_codex_sessions(home: &Path, from: &[&str], to: &[&str]) -> anyhow::Resul
     Ok(())
 }
 
-fn install_cursor_fixture(home: &Path, vca_repo: &Path, cursor_dir: &Path) -> anyhow::Result<()> {
+fn install_cursor_fixture(home: &Path, aea_repo: &Path, cursor_dir: &Path) -> anyhow::Result<()> {
     for rel in [
         Path::new("Library")
             .join("Application Support")
@@ -752,7 +752,7 @@ fn install_cursor_fixture(home: &Path, vca_repo: &Path, cursor_dir: &Path) -> an
 
         let db_path = global_storage.join("state.vscdb");
         fs::copy(HOME_TEMPLATE_CURSOR_DB, &db_path)?;
-        rewrite_cursor_db(&db_path, home, vca_repo, cursor_dir)?;
+        rewrite_cursor_db(&db_path, home, aea_repo, cursor_dir)?;
     }
     Ok(())
 }
@@ -760,7 +760,7 @@ fn install_cursor_fixture(home: &Path, vca_repo: &Path, cursor_dir: &Path) -> an
 fn rewrite_cursor_db(
     db_path: &Path,
     home: &Path,
-    vca_repo: &Path,
+    aea_repo: &Path,
     cursor_dir: &Path,
 ) -> anyhow::Result<()> {
     let conn = Connection::open(db_path)?;
@@ -768,13 +768,13 @@ fn rewrite_cursor_db(
         "UPDATE cursorDiskKV
          SET value = replace(
              replace(
-                 replace(value, '__REPO_VCA__', ?1),
+                 replace(value, '__REPO_AEA__', ?1),
                  '__REPO_CURSOR__', ?2
              ),
              '__HOME__', ?3
          )",
         (
-            vca_repo.to_string_lossy().to_string(),
+            aea_repo.to_string_lossy().to_string(),
             cursor_dir.to_string_lossy().to_string(),
             home.to_string_lossy().to_string(),
         ),

@@ -16,8 +16,8 @@ The poker model is strong for step 2. In this repo, step 1 is large and cannot b
 ## Current Problem
 Today, metric logic is split across:
 
-- [`src/metrics/quality.rs`](/home/tadas/Work/paceflow/vibe-coding-analytics/src/metrics/quality.rs)
-- [`src/commands/task_stats.rs`](/home/tadas/Work/paceflow/vibe-coding-analytics/src/commands/task_stats.rs)
+- [`src/metrics/quality.rs`](/home/tadas/Work/paceflow/ai-engineering-analytics/src/metrics/quality.rs)
+- [`src/commands/task_stats.rs`](/home/tadas/Work/paceflow/ai-engineering-analytics/src/commands/task_stats.rs)
 
 Each metric mixes:
 

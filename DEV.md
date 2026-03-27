@@ -37,9 +37,9 @@ The repository also includes a [`Taskfile.yml`](Taskfile.yml) with helper tasks:
 task build-release
 task install-profiler
 task profile -- ingest
-task profile -- stats
+task profile -- session
 task install-live-profiler
-task profile-live PID=$(pgrep -n vca)
+task profile-live PID=$(pgrep -n aea)
 ```
 
 ### Browser-Based Profiling With Samply
@@ -66,10 +66,10 @@ This uses call stacks based on frame pointers:
 perf top -p <pid> -g --call-graph fp
 ```
 
-If you need to find the newest `vca` process first:
+If you need to find the newest `aea` process first:
 
 ```bash
-pgrep -n vca
+pgrep -n aea
 ```
 
 ### Environment Notes

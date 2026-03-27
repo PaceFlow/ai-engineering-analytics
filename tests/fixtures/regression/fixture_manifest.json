@@ -6,7 +6,7 @@
   "cursor_visible_session": "b052dae4-a1d2-43f0-a3ba-6faf6a40489e",
   "cursor_change_intel_session": "fe3cc3e4-b074-48a3-8e88-8f8915c89b3f",
   "placeholders": {
-    "__REPO_VCA__": "~/work/fixture-vca",
+    "__REPO_AEA__": "~/work/fixture-aea",
     "__REPO_CURSOR__": "~/work/fixture-cursor",
     "__HOME__": "~"
   }

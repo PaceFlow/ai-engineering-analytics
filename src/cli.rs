@@ -1,14 +1,14 @@
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
-const SESSION_AFTER_HELP: &str = "Examples:\n  vca session\n  vca session --group-by provider\n  vca session --list-sessions\n\nMetrics:\n  Average user prompts: average number of user prompts per session.\n  Avg time to first accepted change: minutes from session start to the first accepted code change.\n  Debug loop rate: share of sessions that look like repeated fix-retry cycles.\n  Error paste rate: share of sessions where an error message was pasted mid-session.\n  Session-to-commit rate: share of sessions followed by a commit within 4 hours.\n  No-output session rate: share of sessions with no accepted code changes.";
-const CHANGE_AFTER_HELP: &str = "Examples:\n  vca change\n  vca change --group-by provider\n  vca change --group-by task --task ABC-123\n\nMetrics:\n  Heavy commits: commits where matched AI-attributed lines are at least half of changed lines.\n  C2 merge rate: share of heavy AI commits that later reached mainline.";
-const LIFECYCLE_AFTER_HELP: &str = "Examples:\n  vca lifecycle\n  vca lifecycle --group-by provider\n  vca lifecycle --group-by task --task ABC-123\n\nMetrics:\n  L1 code churn rate: share of AI-added lines on heavy AI commits that were removed again within the churn window.\n  L4 revert rate: share of heavy AI commits that were later reverted.";
+const SESSION_AFTER_HELP: &str = "Examples:\n  aea session\n  aea session --group-by provider\n  aea session --list-sessions\n\nMetrics:\n  Average user prompts: average number of user prompts per session.\n  Avg time to first accepted change: minutes from session start to the first accepted code change.\n  Debug loop rate: share of sessions that look like repeated fix-retry cycles.\n  Error paste rate: share of sessions where an error message was pasted mid-session.\n  Session-to-commit rate: share of sessions followed by a commit within 4 hours.\n  No-output session rate: share of sessions with no accepted code changes.";
+const CHANGE_AFTER_HELP: &str = "Examples:\n  aea change\n  aea change --group-by provider\n  aea change --group-by task --task ABC-123\n\nMetrics:\n  Heavy commits: commits where matched AI-attributed lines are at least half of changed lines.\n  C2 merge rate: share of heavy AI commits that later reached mainline.";
+const LIFECYCLE_AFTER_HELP: &str = "Examples:\n  aea lifecycle\n  aea lifecycle --group-by provider\n  aea lifecycle --group-by task --task ABC-123\n\nMetrics:\n  L1 code churn rate: share of AI-added lines on heavy AI commits that were removed again within the churn window.\n  L4 revert rate: share of heavy AI commits that were later reverted.";
 
 #[derive(Parser)]
 #[command(
-    name = "vca",
-    about = "Local-first analytics for improving AI-assisted development workflows",
-    after_help = "Quick start:\n  vca ingest\n  vca session\n  vca change\n  vca lifecycle\n\nStart here:\n  vca session          # session efficiency and delivery signals\n  vca change           # commit attribution and merge outcomes\n  vca lifecycle        # churn and revert follow-through\n\nManual validation:\n  vca event-stream --stream session-base\n\nDiscover options:\n  vca --help\n  vca <command> --help"
+    name = "aea",
+    about = "Local-first analytics for improving agent-assisted engineering outcomes",
+    after_help = "Quick start:\n  aea ingest\n  aea session\n  aea change\n  aea lifecycle\n\nStart here:\n  aea session          # find noisy or productive sessions\n  aea change           # see whether AI-heavy work shipped\n  aea lifecycle        # see whether accepted code held up\n\nManual validation:\n  aea event-stream --stream session-base\n\nDiscover options:\n  aea --help\n  aea <command> --help"
 )]
 pub struct Cli {
     #[arg(short, long, global = true)]
@@ -156,7 +156,7 @@ mod tests {
 
     #[test]
     fn parses_session_group_by_repo() {
-        let cli = Cli::parse_from(["vca", "session", "--group-by", "repo"]);
+        let cli = Cli::parse_from(["aea", "session", "--group-by", "repo"]);
         match cli.command {
             Commands::Session(args) => assert_eq!(args.report.group_by, Some(GroupBy::Repo)),
             _ => panic!("expected session command"),
@@ -165,7 +165,7 @@ mod tests {
 
     #[test]
     fn parses_change_weekly_group_by_task() {
-        let cli = Cli::parse_from(["vca", "change", "--weekly", "--group-by", "task"]);
+        let cli = Cli::parse_from(["aea", "change", "--weekly", "--group-by", "task"]);
         match cli.command {
             Commands::Change(args) => {
                 assert!(args.report.weekly);
@@ -177,7 +177,7 @@ mod tests {
 
     #[test]
     fn parses_lifecycle_model_filter() {
-        let cli = Cli::parse_from(["vca", "lifecycle", "--model", "gpt-5"]);
+        let cli = Cli::parse_from(["aea", "lifecycle", "--model", "gpt-5"]);
         match cli.command {
             Commands::Lifecycle(args) => assert_eq!(args.report.model.as_deref(), Some("gpt-5")),
             _ => panic!("expected lifecycle command"),
@@ -186,7 +186,7 @@ mod tests {
 
     #[test]
     fn parses_report_all_projects_flag() {
-        let cli = Cli::parse_from(["vca", "session", "--all-projects"]);
+        let cli = Cli::parse_from(["aea", "session", "--all-projects"]);
         match cli.command {
             Commands::Session(args) => assert!(args.report.all_projects),
             _ => panic!("expected session command"),
@@ -195,7 +195,7 @@ mod tests {
 
     #[test]
     fn parses_event_stream_defaults() {
-        let cli = Cli::parse_from(["vca", "event-stream"]);
+        let cli = Cli::parse_from(["aea", "event-stream"]);
         match cli.command {
             Commands::EventStream(args) => {
                 assert_eq!(args.category, EventCategory::All);
@@ -208,7 +208,7 @@ mod tests {
 
     #[test]
     fn parses_event_stream_category_session() {
-        let cli = Cli::parse_from(["vca", "event-stream", "--category", "session"]);
+        let cli = Cli::parse_from(["aea", "event-stream", "--category", "session"]);
         match cli.command {
             Commands::EventStream(args) => assert_eq!(args.category, EventCategory::Session),
             _ => panic!("expected event-stream command"),
@@ -218,7 +218,7 @@ mod tests {
     #[test]
     fn parses_event_stream_stream_and_task_filter() {
         let cli = Cli::parse_from([
-            "vca",
+            "aea",
             "event-stream",
             "--stream",
             "task-commit-base",
@@ -236,7 +236,7 @@ mod tests {
 
     #[test]
     fn parses_event_stream_pretty_flag() {
-        let cli = Cli::parse_from(["vca", "event-stream", "--pretty"]);
+        let cli = Cli::parse_from(["aea", "event-stream", "--pretty"]);
         match cli.command {
             Commands::EventStream(args) => assert!(args.pretty),
             _ => panic!("expected event-stream command"),

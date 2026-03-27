@@ -1,12 +1,12 @@
 # Repository Guidelines
 
 ## Project Structure & Module Organization
-`src/` contains the entire CLI application. `src/main.rs` wires the `vca` binary and dispatches subcommands defined in `src/cli.rs`. Command handlers live in `src/commands/`, provider-specific ingestion logic in `src/providers/` and `src/change_intel/providers/`, shared analytics code in `src/analytics.rs`, and SQLite access in `src/db/`. Build artifacts are written to `target/` and should not be committed.
+`src/` contains the entire CLI application. `src/main.rs` wires the `aea` binary and dispatches subcommands defined in `src/cli.rs`. Command handlers live in `src/commands/`, provider-specific ingestion logic in `src/providers/` and `src/change_intel/providers/`, shared analytics code in `src/analytics.rs`, and SQLite access in `src/db/`. Build artifacts are written to `target/` and should not be committed.
 
 ## Build, Test, and Development Commands
 Use Cargo for all local workflows:
 
-- `cargo build` builds the `vca` binary.
+- `cargo build` builds the `aea` binary.
 - `cargo run -- --help` shows CLI usage during development.
 - `cargo run -- ingest` ingests local session data, associates commits, and materializes analytics events.
 - `cargo run -- session` shows session KPIs and breakdowns.

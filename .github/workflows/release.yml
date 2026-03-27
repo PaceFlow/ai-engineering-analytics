@@ -32,24 +32,24 @@ jobs:
         include:
           - os: windows-2022
             target: x86_64-pc-windows-msvc
-            archive_name: vca-x86_64-pc-windows-msvc
-            binary_name: vca.exe
+            archive_name: aea-x86_64-pc-windows-msvc
+            binary_name: aea.exe
             archive_ext: zip
           - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
-            archive_name: vca-x86_64-unknown-linux-gnu
-            binary_name: vca
+            archive_name: aea-x86_64-unknown-linux-gnu
+            binary_name: aea
             archive_ext: tar.gz
           - os: macos-14
             target: aarch64-apple-darwin
-            archive_name: vca-aarch64-apple-darwin
-            binary_name: vca
+            archive_name: aea-aarch64-apple-darwin
+            binary_name: aea
             archive_ext: tar.gz
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - name: Build release binary
-        run: cargo build --release
+        run: cargo build --release --bin aea
       - name: Package archive (Windows)
         if: runner.os == 'Windows'
         shell: pwsh

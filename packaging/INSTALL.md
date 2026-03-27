@@ -1,18 +1,18 @@
-# `vca` Install Notes
+# `aea` Install Notes
 
-`vca` is a single-file CLI binary. Download the archive for your platform, extract it, and run:
+`aea` is a single-file CLI binary. Download the archive for your platform, extract it, and run:
 
 ```text
-vca --help
-vca ingest
+aea --help
+aea ingest
 ```
 
 Requirements:
 
 - Git must be installed and available on `PATH`
-- Cursor/Codex local session data must exist on the machine you run `vca` on
+- Cursor/Codex local session data must exist on the machine you run `aea` on
 
 Optional support overrides:
 
-- `VCA_CURSOR_STATE_PATH`
-- `VCA_CURSOR_HISTORY_PATH`
+- `AEA_CURSOR_STATE_PATH`
+- `AEA_CURSOR_HISTORY_PATH`

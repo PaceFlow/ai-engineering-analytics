@@ -24,7 +24,7 @@ fn render_lifecycle_report(
     out.push_str("L4 revert rate = share of heavy AI commits that were later reverted\n\n");
 
     if rows.is_empty() {
-        out.push_str("No lifecycle rows found. Run `vca ingest` first.\n");
+        out.push_str("No lifecycle rows found. Run `aea ingest` first.\n");
         return out;
     }
 
