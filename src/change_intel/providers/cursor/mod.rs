@@ -131,11 +131,12 @@ pub(crate) fn ingest_cursor_code_changes_from_path(
 
     if let Some((mtime, size)) = sig {
         let cursor = storage::get_ingest_cursor(conn, CURSOR_CURSOR_NAMESPACE, &source_file)?;
-        if let Some(cursor) = cursor {
-            if cursor.file_mtime == mtime && cursor.file_size == size {
-                summary.sources_skipped += 1;
-                return Ok(summary);
-            }
+        if let Some(cursor) = cursor
+            && cursor.file_mtime == mtime
+            && cursor.file_size == size
+        {
+            summary.sources_skipped += 1;
+            return Ok(summary);
         }
     }
 
@@ -313,6 +314,10 @@ fn populate_checkpoint_paths(
     Ok(())
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "cursor ingestion threads database handles, mutable accumulators, and source metadata through one helper"
+)]
 fn ingest_inline_undo_rows(
     conn: &Connection,
     vscdb: &Connection,
@@ -397,6 +402,10 @@ fn ingest_inline_undo_rows(
     Ok(())
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "cursor fallback ingestion needs shared mutable state plus parser context in one place"
+)]
 fn ingest_partial_fates_fallback(
     conn: &Connection,
     vscdb: &Connection,
@@ -504,6 +513,10 @@ fn ingest_partial_fates_fallback(
     Ok(())
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "legacy fallback ingestion carries the same shared parser state as the other cursor ingestion helpers"
+)]
 fn ingest_legacy_code_block_fallback(
     conn: &Connection,
     vscdb: &Connection,
@@ -764,6 +777,10 @@ fn extract_legacy_diff_lines(
     Ok(lines)
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the parsed change fields are not materialized anywhere else before constructing the candidate"
+)]
 fn build_change_op_candidate(
     session: &CandidateSession,
     call_id: String,
@@ -959,6 +976,10 @@ fn build_partial_fates_op(
     }))
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "parse errors are recorded directly from the callsite context without allocating an intermediate struct"
+)]
 fn insert_parse_error(
     conn: &Connection,
     summary: &mut ProviderCodeChangeSummary,
@@ -990,6 +1011,10 @@ fn insert_parse_error(
     Ok(())
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "legacy parse errors reuse the shared helper while incrementing legacy-specific summary counters"
+)]
 fn insert_legacy_parse_error(
     conn: &Connection,
     summary: &mut ProviderCodeChangeSummary,
@@ -1213,10 +1238,10 @@ fn is_candidate_session(parsed: &Value) -> bool {
 fn extract_file_path_from_uri_value(uri: &Value) -> Option<String> {
     match uri {
         Value::Object(map) => {
-            if let Some(scheme) = map.get("scheme").and_then(|v| v.as_str()) {
-                if scheme != "file" {
-                    return None;
-                }
+            if let Some(scheme) = map.get("scheme").and_then(|v| v.as_str())
+                && scheme != "file"
+            {
+                return None;
             }
 
             if let Some(fs_path) = map.get("fsPath").and_then(|v| v.as_str()) {

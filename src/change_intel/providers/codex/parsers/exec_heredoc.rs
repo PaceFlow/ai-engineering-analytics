@@ -256,18 +256,17 @@ impl PatternParser for ExecHeredocWriteParser {
             return out;
         };
 
-        if let Some(read_path) = Self::parse_plain_cat_read(&args.cmd) {
-            if let Some(output_json) = &event.output_json {
-                if let Some(content) = Self::parse_output_text(output_json) {
-                    let abs_path = resolve_path(
-                        &read_path,
-                        args.workdir.as_deref(),
-                        ctx.session_cwd.as_deref(),
-                    );
-                    ctx.file_cache
-                        .insert(abs_path.to_string_lossy().to_string(), content);
-                }
-            }
+        if let Some(read_path) = Self::parse_plain_cat_read(&args.cmd)
+            && let Some(output_json) = &event.output_json
+            && let Some(content) = Self::parse_output_text(output_json)
+        {
+            let abs_path = resolve_path(
+                &read_path,
+                args.workdir.as_deref(),
+                ctx.session_cwd.as_deref(),
+            );
+            ctx.file_cache
+                .insert(abs_path.to_string_lossy().to_string(), content);
         }
 
         let segments = match Self::extract_heredoc_segments(&args.cmd) {

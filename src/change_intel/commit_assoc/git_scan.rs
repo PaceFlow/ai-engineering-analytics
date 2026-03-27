@@ -220,7 +220,7 @@ pub fn load_commit_diff(repo_root: &str, commit_sha: &str) -> Result<GitCommitDi
         parse_commit_metadata_line(commit_sha, meta_line.trim())?;
     let patch = patch.trim_start_matches('\n');
 
-    let file_diffs = parse_patch_file_diffs(&patch);
+    let file_diffs = parse_patch_file_diffs(patch);
 
     Ok(GitCommitDiff {
         commit_sha: commit_sha.to_string(),

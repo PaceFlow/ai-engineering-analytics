@@ -109,11 +109,12 @@ fn ingest_codex_sources(
             if let Some((mtime, size)) = sig {
                 let cursor =
                     storage::get_ingest_cursor(conn, CODEX_CURSOR_NAMESPACE, &source_file)?;
-                if let Some(cursor) = cursor {
-                    if cursor.file_mtime == mtime && cursor.file_size == size {
-                        summary.sources_skipped += 1;
-                        return Ok(());
-                    }
+                if let Some(cursor) = cursor
+                    && cursor.file_mtime == mtime
+                    && cursor.file_size == size
+                {
+                    summary.sources_skipped += 1;
+                    return Ok(());
                 }
             }
 
@@ -242,10 +243,10 @@ fn parse_codex_source(path: &Path) -> Result<ParsedSource> {
             .get("timestamp")
             .and_then(|v| v.as_str())
             .map(ToOwned::to_owned);
-        if let Some(ts) = &timestamp {
-            if last_seen_at.as_ref().map(|s| ts > s).unwrap_or(true) {
-                last_seen_at = Some(ts.clone());
-            }
+        if let Some(ts) = &timestamp
+            && last_seen_at.as_ref().map(|s| ts > s).unwrap_or(true)
+        {
+            last_seen_at = Some(ts.clone());
         }
 
         match parsed.get("type").and_then(|v| v.as_str()) {
@@ -494,10 +495,10 @@ mod tests {
             json!({"timestamp":"2026-03-04T10:00:02Z","type":"response_item","payload":{"type":"function_call_output","call_id":"c1","output":"Chunk ID: 1\nProcess exited with code 0\nOutput:\n"}}),
         ])?;
 
-        let summary1 = ingest_codex_sources(&mut conn, &[path.clone()], false, None)?;
+        let summary1 = ingest_codex_sources(&mut conn, std::slice::from_ref(&path), false, None)?;
         assert_eq!(summary1.ops_upserted, 1);
 
-        let summary2 = ingest_codex_sources(&mut conn, &[path.clone()], false, None)?;
+        let summary2 = ingest_codex_sources(&mut conn, std::slice::from_ref(&path), false, None)?;
         assert_eq!(summary2.sources_skipped, 1);
 
         assert_eq!(tool_write_count(&conn)?, 1);
@@ -517,7 +518,7 @@ mod tests {
             json!({"timestamp":"2026-03-04T10:00:02Z","type":"response_item","payload":{"type":"function_call_output","call_id":"c1","output":"Chunk ID: 1\nProcess exited with code 1\nOutput:\n"}}),
         ])?;
 
-        let summary = ingest_codex_sources(&mut conn, &[path.clone()], false, None)?;
+        let summary = ingest_codex_sources(&mut conn, std::slice::from_ref(&path), false, None)?;
         assert_eq!(summary.ops_upserted, 0);
 
         assert_eq!(tool_write_count(&conn)?, 0);
@@ -551,7 +552,7 @@ mod tests {
             json!({"timestamp":"2026-03-04T10:00:04Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"p_fail","output": fail_output}}),
         ])?;
 
-        let summary = ingest_codex_sources(&mut conn, &[path.clone()], false, None)?;
+        let summary = ingest_codex_sources(&mut conn, std::slice::from_ref(&path), false, None)?;
         assert_eq!(summary.ops_upserted, 1);
 
         let modes = load_tool_write_modes(&conn)?;
