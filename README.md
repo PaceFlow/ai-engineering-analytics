@@ -155,6 +155,16 @@ tar -xzf "${asset}"
 ./aieng-x86_64-unknown-linux-gnu/aieng --help
 ```
 
+macOS note for internal builds:
+
+- If Gatekeeper blocks `aieng`, go to `System Settings > Privacy & Security` and click `Open Anyway`, then rerun the binary.
+- Fresh extractions can inherit quarantine from the downloaded archive. If needed, clear quarantine on the extracted folder:
+
+```bash
+xattr -dr com.apple.quarantine aieng-aarch64-apple-darwin
+./aieng-aarch64-apple-darwin/aieng --help
+```
+
 Requirements:
 
 - `git` must be installed and available on `PATH`
