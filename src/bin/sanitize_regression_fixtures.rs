@@ -240,17 +240,15 @@ fn sanitize_codex_session(path: &Path) -> Result<()> {
                     if let Some(base_instructions) = payload
                         .get_mut("base_instructions")
                         .and_then(Value::as_object_mut)
-                    {
-                        if base_instructions
+                        && base_instructions
                             .get("text")
                             .and_then(Value::as_str)
                             .is_some()
-                        {
-                            base_instructions.insert(
-                                "text".to_string(),
-                                Value::String(SANITIZED_BASE_INSTRUCTIONS.to_string()),
-                            );
-                        }
+                    {
+                        base_instructions.insert(
+                            "text".to_string(),
+                            Value::String(SANITIZED_BASE_INSTRUCTIONS.to_string()),
+                        );
                     }
                 }
                 "event_msg" => {
@@ -377,24 +375,24 @@ fn sanitize_cursor_row(key: &str, value: &str, row_index: usize) -> Result<Strin
         serde_json::from_str(value).with_context(|| format!("parsing cursor row for key {key}"))?;
 
     if key.starts_with("bubbleId:") {
-        if let Some(text) = parsed.get_mut("text") {
-            if text.is_string() {
-                *text = Value::String(USER_TEMPLATES[row_index % USER_TEMPLATES.len()].to_string());
-            }
+        if let Some(text) = parsed.get_mut("text")
+            && text.is_string()
+        {
+            *text = Value::String(USER_TEMPLATES[row_index % USER_TEMPLATES.len()].to_string());
         }
         return Ok(serde_json::to_string(&parsed)?);
     }
 
     if key.starts_with("composerData:") {
-        if let Some(text) = parsed.get_mut("text") {
-            if text.is_string() {
-                *text = Value::String(USER_TEMPLATES[row_index % USER_TEMPLATES.len()].to_string());
-            }
+        if let Some(text) = parsed.get_mut("text")
+            && text.is_string()
+        {
+            *text = Value::String(USER_TEMPLATES[row_index % USER_TEMPLATES.len()].to_string());
         }
-        if let Some(rich_text) = parsed.get_mut("richText") {
-            if rich_text.is_string() {
-                *rich_text = Value::String(EMPTY_RICH_TEXT.to_string());
-            }
+        if let Some(rich_text) = parsed.get_mut("richText")
+            && rich_text.is_string()
+        {
+            *rich_text = Value::String(EMPTY_RICH_TEXT.to_string());
         }
         if let Some(conversation) = parsed.get_mut("conversation").and_then(Value::as_array_mut) {
             for (idx, bubble) in conversation.iter_mut().enumerate() {
