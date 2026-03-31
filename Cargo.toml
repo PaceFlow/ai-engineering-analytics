@@ -2,10 +2,10 @@
 name = "ai-engineering-analytics"
 version = "0.1.0"
 edition = "2024"
-default-run = "aieng"
+default-run = "paceflow"
 
 [[bin]]
-name = "aieng"
+name = "paceflow"
 path = "src/main.rs"
 
 [dependencies]

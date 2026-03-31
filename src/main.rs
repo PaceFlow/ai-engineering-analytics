@@ -18,8 +18,8 @@ fn main() -> anyhow::Result<()> {
     match cli.command {
         Commands::Ingest => commands::ingest::run(cli.verbose)?,
         Commands::Session(args) => commands::session::run(args)?,
-        Commands::Change(args) => commands::change::run(args)?,
-        Commands::Lifecycle(args) => commands::lifecycle::run(args)?,
+        Commands::Delivery(args) => commands::delivery::run(args)?,
+        Commands::Quality(args) => commands::quality::run(args)?,
         Commands::EventStream(args) => commands::event_stream::run(args)?,
     }
     Ok(())

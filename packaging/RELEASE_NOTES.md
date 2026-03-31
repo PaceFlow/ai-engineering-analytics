@@ -1,13 +1,13 @@
-# `aieng` release
+# `paceflow` release
 
-Download the archive for your platform from the Assets section below, extract it, and run `aieng --help`.
+Download the archive for your platform from the Assets section below, extract it, and run `paceflow --help`.
 
 Quick start:
 
-- `aieng ingest`
-- `aieng session`
-- `aieng change`
-- `aieng lifecycle`
+- `paceflow ingest`
+- `paceflow session`
+- `paceflow delivery`
+- `paceflow quality`
 
 Requirements:
 
@@ -16,5 +16,5 @@ Requirements:
 
 If Cursor data lives in a non-standard location, use:
 
-- `AIENG_CURSOR_STATE_PATH`
-- `AIENG_CURSOR_HISTORY_PATH`
+- `PACEFLOW_CURSOR_STATE_PATH`
+- `PACEFLOW_CURSOR_HISTORY_PATH`

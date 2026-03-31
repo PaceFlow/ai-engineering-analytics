@@ -1294,7 +1294,7 @@ fn selected_event_streams(args: &EventStreamArgs) -> Vec<EventStreamKind> {
             EventStreamKind::SessionBase,
             EventStreamKind::TaskSessionBase,
         ],
-        EventCategory::Change | EventCategory::Lifecycle => vec![
+        EventCategory::Delivery | EventCategory::Quality => vec![
             EventStreamKind::ChangeBase,
             EventStreamKind::CommitSessionBase,
             EventStreamKind::TaskCommitBase,
@@ -1466,7 +1466,7 @@ fn effective_event_stream_category(
             }
             EventStreamKind::ChangeBase
             | EventStreamKind::CommitSessionBase
-            | EventStreamKind::TaskCommitBase => EventCategory::Change,
+            | EventStreamKind::TaskCommitBase => EventCategory::Delivery,
             EventStreamKind::All => EventCategory::All,
         },
         _ => requested,
@@ -1476,8 +1476,8 @@ fn effective_event_stream_category(
 fn event_category_name(category: EventCategory) -> &'static str {
     match category {
         EventCategory::Session => "session",
-        EventCategory::Change => "change",
-        EventCategory::Lifecycle => "lifecycle",
+        EventCategory::Delivery => "delivery",
+        EventCategory::Quality => "quality",
         EventCategory::All => "all",
     }
 }
@@ -3791,7 +3791,7 @@ mod tests {
     }
 
     #[test]
-    fn event_stream_lifecycle_category_labels_commit_rows_as_lifecycle() -> Result<()> {
+    fn event_stream_quality_category_labels_commit_rows_as_quality() -> Result<()> {
         let conn = open_test_db()?;
         conn.execute(
             "INSERT INTO event_commit_outcome (
@@ -3812,7 +3812,7 @@ mod tests {
         let rows = query_event_stream(
             &conn,
             &EventStreamArgs {
-                category: EventCategory::Lifecycle,
+                category: EventCategory::Quality,
                 stream: EventStreamKind::All,
                 from: None,
                 to: None,
@@ -3826,7 +3826,7 @@ mod tests {
         )?;
 
         assert!(!rows.is_empty());
-        assert!(rows.iter().all(|row| row.category == "lifecycle"));
+        assert!(rows.iter().all(|row| row.category == "quality"));
         Ok(())
     }
 }

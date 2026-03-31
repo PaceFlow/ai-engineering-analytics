@@ -2,9 +2,9 @@
 source: tests/metrics_regression.rs
 expression: lifecycle_grouped
 ---
-Lifecycle Metrics
+Quality Metrics
 L1 code churn rate = share of AI-added lines on heavy AI commits that were later removed within the churn window
 L4 revert rate = share of heavy AI commits that were later reverted
 
 Group                            Heavy     L1(churn)    L4(revert)
-__REPO_AIENG__                       3          1.5%          0.0%
+__REPO_PACEFLOW__                    3          1.5%          0.0%

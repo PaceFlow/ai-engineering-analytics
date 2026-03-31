@@ -16,7 +16,7 @@ The entry point is [`src/main.rs`](/home/tadas/Work/paceflow/ai-engineering-anal
 
 ## High-Level Flow
 ### 1. Source data discovery
-The ingest command ([`src/commands/ingest.rs`](/home/tadas/Work/paceflow/ai-engineering-analytics/src/commands/ingest.rs)) opens `~/.aieng/aieng.db`, loads all registered providers from [`src/providers/mod.rs`](/home/tadas/Work/paceflow/ai-engineering-analytics/src/providers/mod.rs), and processes each provider in turn.
+The ingest command ([`src/commands/ingest.rs`](/home/tadas/Work/paceflow/ai-engineering-analytics/src/commands/ingest.rs)) opens `~/.paceflow/paceflow.db`, loads all registered providers from [`src/providers/mod.rs`](/home/tadas/Work/paceflow/ai-engineering-analytics/src/providers/mod.rs), and processes each provider in turn.
 
 Providers are responsible for reading raw local history and converting it into a shared `Event` model from [`src/events.rs`](/home/tadas/Work/paceflow/ai-engineering-analytics/src/events.rs):
 
@@ -88,7 +88,7 @@ For each repo seen in `change_ops`, the program:
 The important idea is simple: if line-content hashes extracted from AI tool calls later appear in a git commit, that commit gets AI attribution.
 
 ## How Numbers Are Produced
-### `aieng stats`
+### `paceflow stats`
 [`src/commands/stats.rs`](/home/tadas/Work/paceflow/ai-engineering-analytics/src/commands/stats.rs) combines two outputs:
 
 - `db::query_stats()`: session totals such as user words, accepted LOC, added lines, and removed lines.
@@ -101,7 +101,7 @@ The important idea is simple: if line-content hashes extracted from AI tool call
 - `C2`: merge-through rate of heavy AI commits to mainline
 - `L1`: 14-day churn rate after merge
 
-### `aieng task-stats`
+### `paceflow task-stats`
 [`src/commands/task_stats.rs`](/home/tadas/Work/paceflow/ai-engineering-analytics/src/commands/task_stats.rs) starts from `commit_task_attributions`, joins commit/session attribution rows, and then combines:
 
 - commit counts per task

@@ -1,14 +1,14 @@
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
-const SESSION_AFTER_HELP: &str = "Examples:\n  aieng session\n  aieng session --group-by provider\n  aieng session --list-sessions\n\nMetrics:\n  Average user prompts: average number of user prompts per session.\n  Avg time to first accepted change: minutes from session start to the first accepted code change.\n  Debug loop rate: share of sessions that look like repeated fix-retry cycles.\n  Error paste rate: share of sessions where an error message was pasted mid-session.\n  Session-to-commit rate: share of sessions followed by a commit within 4 hours.\n  No-output session rate: share of sessions with no accepted code changes.";
-const CHANGE_AFTER_HELP: &str = "Examples:\n  aieng change\n  aieng change --group-by provider\n  aieng change --group-by task --task ABC-123\n\nMetrics:\n  Heavy commits: commits where matched AI-attributed lines are at least half of changed lines.\n  C2 merge rate: share of heavy AI commits that later reached mainline.";
-const LIFECYCLE_AFTER_HELP: &str = "Examples:\n  aieng lifecycle\n  aieng lifecycle --group-by provider\n  aieng lifecycle --group-by task --task ABC-123\n\nMetrics:\n  L1 code churn rate: share of AI-added lines on heavy AI commits that were removed again within the churn window.\n  L4 revert rate: share of heavy AI commits that were later reverted.";
+const SESSION_AFTER_HELP: &str = "Examples:\n  paceflow session\n  paceflow session --group-by provider\n  paceflow session --list-sessions\n\nMetrics:\n  Average user prompts: average number of user prompts per session.\n  Avg time to first accepted change: minutes from session start to the first accepted code change.\n  Debug loop rate: share of sessions that look like repeated fix-retry cycles.\n  Error paste rate: share of sessions where an error message was pasted mid-session.\n  Session-to-commit rate: share of sessions followed by a commit within 4 hours.\n  No-output session rate: share of sessions with no accepted code changes.";
+const DELIVERY_AFTER_HELP: &str = "Examples:\n  paceflow delivery\n  paceflow delivery --group-by provider\n  paceflow delivery --group-by task --task ABC-123\n\nMetrics:\n  Heavy commits: commits where matched AI-attributed lines are at least half of changed lines.\n  C2 merge rate: share of heavy AI commits that later reached mainline.";
+const QUALITY_AFTER_HELP: &str = "Examples:\n  paceflow quality\n  paceflow quality --group-by provider\n  paceflow quality --group-by task --task ABC-123\n\nMetrics:\n  L1 code churn rate: share of AI-added lines on heavy AI commits that were removed again within the churn window.\n  L4 revert rate: share of heavy AI commits that were later reverted.";
 
 #[derive(Parser)]
 #[command(
-    name = "aieng",
+    name = "paceflow",
     about = "Local-first analytics for improving agent-assisted engineering outcomes",
-    after_help = "Quick start:\n  aieng ingest\n  aieng session\n  aieng change\n  aieng lifecycle\n\nStart here:\n  aieng session          # find noisy or productive sessions\n  aieng change           # see whether AI-heavy work shipped\n  aieng lifecycle        # see whether accepted code held up\n\nManual validation:\n  aieng event-stream --stream session-base\n\nDiscover options:\n  aieng --help\n  aieng <command> --help"
+    after_help = "Quick start:\n  paceflow ingest\n  paceflow session\n  paceflow delivery\n  paceflow quality\n\nStart here:\n  paceflow session       # find noisy or productive sessions\n  paceflow delivery      # see whether AI-heavy work shipped\n  paceflow quality       # see whether accepted code held up\n\nManual validation:\n  paceflow event-stream --stream session-base\n\nDiscover options:\n  paceflow --help\n  paceflow <command> --help"
 )]
 pub struct Cli {
     #[arg(short, long, global = true)]
@@ -24,9 +24,9 @@ pub enum Commands {
     /// Show session efficiency and delivery metrics
     Session(SessionReportArgs),
     /// Show commit attribution and merge outcome metrics
-    Change(ChangeReportArgs),
+    Delivery(DeliveryReportArgs),
     /// Show churn and revert follow-through for heavy AI commits
-    Lifecycle(LifecycleReportArgs),
+    Quality(QualityReportArgs),
     /// Print analytics-ready base-view rows as NDJSON for manual validation
     EventStream(EventStreamArgs),
 }
@@ -42,8 +42,8 @@ pub enum GroupBy {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum EventCategory {
     Session,
-    Change,
-    Lifecycle,
+    Delivery,
+    Quality,
     All,
 }
 
@@ -77,7 +77,7 @@ pub struct ReportArgs {
     /// Show results across all tracked projects instead of defaulting to the current repo
     #[arg(long)]
     pub all_projects: bool,
-    /// Restrict to a provider (for change/lifecycle this can include `human`)
+    /// Restrict to a provider (for delivery/quality this can include `human`)
     #[arg(long)]
     pub provider: Option<String>,
     /// Restrict to a specific task key (ticket format, e.g. ABC-123)
@@ -102,15 +102,15 @@ pub struct SessionReportArgs {
 }
 
 #[derive(Args, Debug, Clone)]
-#[command(after_help = CHANGE_AFTER_HELP)]
-pub struct ChangeReportArgs {
+#[command(after_help = DELIVERY_AFTER_HELP)]
+pub struct DeliveryReportArgs {
     #[command(flatten)]
     pub report: ReportArgs,
 }
 
 #[derive(Args, Debug, Clone)]
-#[command(after_help = LIFECYCLE_AFTER_HELP)]
-pub struct LifecycleReportArgs {
+#[command(after_help = QUALITY_AFTER_HELP)]
+pub struct QualityReportArgs {
     #[command(flatten)]
     pub report: ReportArgs,
 }
@@ -156,7 +156,7 @@ mod tests {
 
     #[test]
     fn parses_session_group_by_repo() {
-        let cli = Cli::parse_from(["aieng", "session", "--group-by", "repo"]);
+        let cli = Cli::parse_from(["paceflow", "session", "--group-by", "repo"]);
         match cli.command {
             Commands::Session(args) => assert_eq!(args.report.group_by, Some(GroupBy::Repo)),
             _ => panic!("expected session command"),
@@ -164,29 +164,29 @@ mod tests {
     }
 
     #[test]
-    fn parses_change_weekly_group_by_task() {
-        let cli = Cli::parse_from(["aieng", "change", "--weekly", "--group-by", "task"]);
+    fn parses_delivery_weekly_group_by_task() {
+        let cli = Cli::parse_from(["paceflow", "delivery", "--weekly", "--group-by", "task"]);
         match cli.command {
-            Commands::Change(args) => {
+            Commands::Delivery(args) => {
                 assert!(args.report.weekly);
                 assert_eq!(args.report.group_by, Some(GroupBy::Task));
             }
-            _ => panic!("expected change command"),
+            _ => panic!("expected delivery command"),
         }
     }
 
     #[test]
-    fn parses_lifecycle_model_filter() {
-        let cli = Cli::parse_from(["aieng", "lifecycle", "--model", "gpt-5"]);
+    fn parses_quality_model_filter() {
+        let cli = Cli::parse_from(["paceflow", "quality", "--model", "gpt-5"]);
         match cli.command {
-            Commands::Lifecycle(args) => assert_eq!(args.report.model.as_deref(), Some("gpt-5")),
-            _ => panic!("expected lifecycle command"),
+            Commands::Quality(args) => assert_eq!(args.report.model.as_deref(), Some("gpt-5")),
+            _ => panic!("expected quality command"),
         }
     }
 
     #[test]
     fn parses_report_all_projects_flag() {
-        let cli = Cli::parse_from(["aieng", "session", "--all-projects"]);
+        let cli = Cli::parse_from(["paceflow", "session", "--all-projects"]);
         match cli.command {
             Commands::Session(args) => assert!(args.report.all_projects),
             _ => panic!("expected session command"),
@@ -195,7 +195,7 @@ mod tests {
 
     #[test]
     fn parses_event_stream_defaults() {
-        let cli = Cli::parse_from(["aieng", "event-stream"]);
+        let cli = Cli::parse_from(["paceflow", "event-stream"]);
         match cli.command {
             Commands::EventStream(args) => {
                 assert_eq!(args.category, EventCategory::All);
@@ -208,7 +208,7 @@ mod tests {
 
     #[test]
     fn parses_event_stream_category_session() {
-        let cli = Cli::parse_from(["aieng", "event-stream", "--category", "session"]);
+        let cli = Cli::parse_from(["paceflow", "event-stream", "--category", "session"]);
         match cli.command {
             Commands::EventStream(args) => assert_eq!(args.category, EventCategory::Session),
             _ => panic!("expected event-stream command"),
@@ -216,10 +216,12 @@ mod tests {
     }
 
     #[test]
-    fn parses_event_stream_stream_and_task_filter() {
+    fn parses_event_stream_delivery_category_and_task_filter() {
         let cli = Cli::parse_from([
-            "aieng",
+            "paceflow",
             "event-stream",
+            "--category",
+            "delivery",
             "--stream",
             "task-commit-base",
             "--task",
@@ -227,6 +229,7 @@ mod tests {
         ]);
         match cli.command {
             Commands::EventStream(args) => {
+                assert_eq!(args.category, EventCategory::Delivery);
                 assert_eq!(args.stream, EventStreamKind::TaskCommitBase);
                 assert_eq!(args.task.as_deref(), Some("PAC-999"));
             }
@@ -236,11 +239,17 @@ mod tests {
 
     #[test]
     fn parses_event_stream_pretty_flag() {
-        let cli = Cli::parse_from(["aieng", "event-stream", "--pretty"]);
+        let cli = Cli::parse_from(["paceflow", "event-stream", "--pretty"]);
         match cli.command {
             Commands::EventStream(args) => assert!(args.pretty),
             _ => panic!("expected event-stream command"),
         }
+    }
+
+    #[test]
+    fn rejects_legacy_change_and_lifecycle_commands() {
+        assert!(Cli::try_parse_from(["paceflow", "change"]).is_err());
+        assert!(Cli::try_parse_from(["paceflow", "lifecycle"]).is_err());
     }
 
     #[test]
@@ -260,27 +269,27 @@ mod tests {
     }
 
     #[test]
-    fn change_and_lifecycle_help_explain_metrics_and_human_provider_context() {
+    fn delivery_and_quality_help_explain_metrics_and_human_provider_context() {
         let mut command = Cli::command();
-        let mut change_buffer = Vec::new();
+        let mut delivery_buffer = Vec::new();
         command
-            .find_subcommand_mut("change")
-            .expect("change subcommand")
-            .write_long_help(&mut change_buffer)
-            .expect("write change help");
-        let change_help = String::from_utf8(change_buffer).expect("utf8");
-        assert!(change_help.contains("Heavy commits"));
-        assert!(change_help.contains("C2 merge rate"));
+            .find_subcommand_mut("delivery")
+            .expect("delivery subcommand")
+            .write_long_help(&mut delivery_buffer)
+            .expect("write delivery help");
+        let delivery_help = String::from_utf8(delivery_buffer).expect("utf8");
+        assert!(delivery_help.contains("Heavy commits"));
+        assert!(delivery_help.contains("C2 merge rate"));
 
         let mut command = Cli::command();
-        let mut lifecycle_buffer = Vec::new();
+        let mut quality_buffer = Vec::new();
         command
-            .find_subcommand_mut("lifecycle")
-            .expect("lifecycle subcommand")
-            .write_long_help(&mut lifecycle_buffer)
-            .expect("write lifecycle help");
-        let lifecycle_help = String::from_utf8(lifecycle_buffer).expect("utf8");
-        assert!(lifecycle_help.contains("L1 code churn rate"));
-        assert!(lifecycle_help.contains("L4 revert rate"));
+            .find_subcommand_mut("quality")
+            .expect("quality subcommand")
+            .write_long_help(&mut quality_buffer)
+            .expect("write quality help");
+        let quality_help = String::from_utf8(quality_buffer).expect("utf8");
+        assert!(quality_help.contains("L1 code churn rate"));
+        assert!(quality_help.contains("L4 revert rate"));
     }
 }

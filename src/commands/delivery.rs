@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::process::Command;
 
 use crate::analytics;
-use crate::cli::{ChangeReportArgs, GroupBy};
+use crate::cli::{DeliveryReportArgs, GroupBy};
 use crate::commands::report_scope;
 use crate::db;
 
@@ -13,23 +13,26 @@ struct DiffStat {
     removed: i64,
 }
 
-pub fn run(args: ChangeReportArgs) -> Result<()> {
+pub fn run(args: DeliveryReportArgs) -> Result<()> {
     let db = db::open()?;
     analytics::create_reporting_views(&db)?;
     let report = report_scope::resolve_report_args(&args.report);
     let rows = analytics::query_change_report(&db, &report)?;
-    print!("{}", render_change_report(&rows, &args));
+    print!("{}", render_delivery_report(&rows, &args));
     Ok(())
 }
 
-fn render_change_report(rows: &[analytics::ChangeReportRow], args: &ChangeReportArgs) -> String {
+fn render_delivery_report(
+    rows: &[analytics::ChangeReportRow],
+    args: &DeliveryReportArgs,
+) -> String {
     let mut out = String::new();
-    out.push_str("Change Metrics\n");
+    out.push_str("Delivery Metrics\n");
     out.push_str("Heavy commits = commits where matched AI-attributed lines are at least half of changed lines\n");
     out.push_str("C2 merge rate = share of heavy AI commits that later reached mainline\n\n");
 
     if rows.is_empty() {
-        out.push_str("No change rows found. Run `aieng ingest` first.\n");
+        out.push_str("No delivery rows found. Run `paceflow ingest` first.\n");
         return out;
     }
 

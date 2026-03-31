@@ -7,11 +7,11 @@ Local-first CLI for answering the questions that matter after you use coding age
 - Did it hold up?
 - What should I do differently next time?
 
-`aieng` reads local Codex/Cursor history plus git metadata and turns that evidence into three practical views:
+`paceflow` reads local Codex/Cursor history plus git metadata and turns that evidence into three practical views:
 
 - `session`: were you getting leverage, or just steering and retrying?
-- `change`: did AI-heavy work turn into real commits that reached mainline?
-- `lifecycle`: did accepted AI-generated code stick, or did it get churned out later?
+- `delivery`: did AI-heavy work turn into real commits that reached mainline?
+- `quality`: did accepted AI-generated code stick, or did it get churned out later?
 
 The point is not to count prompts or accepted lines for their own sake. The point is to help an individual engineer improve how they work with coding agents.
 
@@ -29,9 +29,9 @@ If those patterns show up repeatedly, you usually need tighter task slicing, bet
 
 ## What You Learn Quickly
 
-- `aieng session` tells you whether your sessions were efficient, noisy, or stuck in loops.
-- `aieng change` tells you whether AI-assisted work actually turned into shipped change.
-- `aieng lifecycle` tells you whether accepted code created durable value or follow-up cleanup.
+- `paceflow session` tells you whether your sessions were efficient, noisy, or stuck in loops.
+- `paceflow delivery` tells you whether AI-assisted work actually turned into shipped change.
+- `paceflow quality` tells you whether accepted code created durable value or follow-up cleanup.
 
 ## Example: Session Report
 
@@ -55,10 +55,10 @@ What to do differently:
 - Put constraints and acceptance criteria in the first request.
 - Stop a failing retry cycle earlier and verify assumptions manually.
 
-## Example: Change Report
+## Example: Delivery Report
 
 ```text
-Change Metrics
+Delivery Metrics
 
 Group                         Branch                      Commits     Heavy   C2(merge)   vs Staging
 API-142                       API-142-agent-auth               7         5       80.0%     +184/-41
@@ -76,10 +76,10 @@ What to do differently:
 - If AI-heavy tasks have weak merge rates, reduce branch size and tighten review before accepting generated code.
 - If a task has large diffs and weak outcomes, split it into smaller units with clearer verification points.
 
-## Example: Lifecycle Report
+## Example: Quality Report
 
 ```text
-Lifecycle Metrics
+Quality Metrics
 Heavy commits: 52
 L1 Code Churn Rate: 12.40% (98/790)
 L4 Revert Rate: 1.92% (1/52)
@@ -97,21 +97,21 @@ What to do differently:
 
 ## Quick Start
 
-Once `aieng` is installed, ingest your local history and open the three report views:
+Once `paceflow` is installed, ingest your local history and open the three report views:
 
 ```bash
-aieng ingest
-aieng session
-aieng change
-aieng lifecycle
+paceflow ingest
+paceflow session
+paceflow delivery
+paceflow quality
 ```
 
 Useful follow-ups:
 
-- `aieng session --list-sessions`
-- `aieng session --group-by provider`
-- `aieng change --group-by task`
-- `aieng lifecycle --group-by provider`
+- `paceflow session --list-sessions`
+- `paceflow session --group-by provider`
+- `paceflow delivery --group-by task`
+- `paceflow quality --group-by provider`
 
 ## Installation
 
@@ -129,48 +129,48 @@ Supported release targets:
 
 | Platform | Asset |
 | --- | --- |
-| Windows x86_64 | `aieng-x86_64-pc-windows-msvc.zip` |
-| Linux x86_64 (glibc) | `aieng-x86_64-unknown-linux-gnu.tar.gz` |
-| macOS Apple Silicon | `aieng-aarch64-apple-darwin.tar.gz` |
+| Windows x86_64 | `paceflow-x86_64-pc-windows-msvc.zip` |
+| Linux x86_64 (glibc) | `paceflow-x86_64-unknown-linux-gnu.tar.gz` |
+| macOS Apple Silicon | `paceflow-aarch64-apple-darwin.tar.gz` |
 
 Windows (PowerShell):
 
 ```powershell
 $version = "v0.1.0"
-$asset = "aieng-x86_64-pc-windows-msvc.zip"
+$asset = "paceflow-x86_64-pc-windows-msvc.zip"
 Invoke-WebRequest `
   -Uri "https://github.com/PaceFlow/ai-engineering-analytics/releases/download/$version/$asset" `
   -OutFile $asset
-Expand-Archive .\$asset -DestinationPath .\aieng
-.\aieng\aieng.exe --help
+Expand-Archive .\$asset -DestinationPath .\paceflow
+.\paceflow\paceflow.exe --help
 ```
 
 macOS/Linux:
 
 ```bash
 version="v0.1.0"
-asset="aieng-x86_64-unknown-linux-gnu.tar.gz"
+asset="paceflow-x86_64-unknown-linux-gnu.tar.gz"
 curl -L "https://github.com/PaceFlow/ai-engineering-analytics/releases/download/${version}/${asset}" -o "${asset}"
 tar -xzf "${asset}"
-./aieng-x86_64-unknown-linux-gnu/aieng --help
+./paceflow-x86_64-unknown-linux-gnu/paceflow --help
 ```
 
 macOS note for internal builds:
 
-- If Gatekeeper blocks `aieng`, go to `System Settings > Privacy & Security` and click `Open Anyway`, then rerun the binary.
+- If Gatekeeper blocks `paceflow`, go to `System Settings > Privacy & Security` and click `Open Anyway`, then rerun the binary.
 - Fresh extractions can inherit quarantine from the downloaded archive. If needed, clear quarantine on the extracted folder:
 
 ```bash
-xattr -dr com.apple.quarantine aieng-aarch64-apple-darwin
-./aieng-aarch64-apple-darwin/aieng --help
+xattr -dr com.apple.quarantine paceflow-aarch64-apple-darwin
+./paceflow-aarch64-apple-darwin/paceflow --help
 ```
 
 Requirements:
 
 - `git` must be installed and available on `PATH`
-- `aieng` reads local Codex sessions from `~/.codex/sessions`
-- `aieng` reads local Cursor state/history from the OS config directory under `Cursor/User`
-- If Cursor data lives elsewhere, set `AIENG_CURSOR_STATE_PATH` and/or `AIENG_CURSOR_HISTORY_PATH`
+- `paceflow` reads local Codex sessions from `~/.codex/sessions`
+- `paceflow` reads local Cursor state/history from the OS config directory under `Cursor/User`
+- If Cursor data lives elsewhere, set `PACEFLOW_CURSOR_STATE_PATH` and/or `PACEFLOW_CURSOR_HISTORY_PATH`
 
 ## Who It's For
 
@@ -231,14 +231,14 @@ The reports are built from normalized session events, matched commit/session att
 - `-Lines`: accepted removed lines for the session
 - `Words/LOC`: user-word count divided by accepted changed lines; if accepted changed lines are zero, this is `N/A`
 
-### Change Metrics
+### Delivery Metrics
 
 - `Commits`: count of included commits in the current filter or group
 - `Heavy Commits`: commits where the AI-attributed share of changed lines is at least 50%
 - `Merge Rate`: share of heavy commits that later reached mainline, including squash-aware content matching
 - `vs Staging`: live diff size from `git diff staging...<branch>` for task-grouped rows; computed at render time
 
-### Lifecycle Metrics
+### Quality Metrics
 
 - `Code Churn Rate`: share of AI-added lines from heavy commits that reached mainline and were removed from mainline within a 14-day window
 - `Revert Rate`: share of heavy commits later reverted by a commit body containing `This reverts commit <sha>`
@@ -246,16 +246,16 @@ The reports are built from normalized session events, matched commit/session att
 ### Grouped Report Weighting
 
 - Repo and weekly rollups use ordinary counts and averages over included sessions or commits
-- Provider/model grouped change and lifecycle reports work from commit-session attribution rows so unmatched commits can appear as `human`
+- Provider/model grouped delivery and quality reports work from commit-session attribution rows so unmatched commits can appear as `human`
 - Task-grouped session reports use attribution-weighted averages and rates
-- Task-grouped change and lifecycle reports exclude non-ticket task keys plus integration branches such as `main`, `staging`, `master`, and `develop`
+- Task-grouped delivery and quality reports exclude non-ticket task keys plus integration branches such as `main`, `staging`, `master`, and `develop`
 
 ## Notes
 
-- `session`, `change`, and `lifecycle` share the same filter interface: `--weekly`, `--group-by`, `--from`, `--to`, `--repo`, `--provider`, `--task`, `--model`, and `--limit`
+- `session`, `delivery`, and `quality` share the same filter interface: `--weekly`, `--group-by`, `--from`, `--to`, `--repo`, `--provider`, `--task`, `--model`, and `--limit`
 - Provider `human` means a commit had no matched AI session attribution at all
 - Task-grouped rows only show ticket-style task keys such as `ABC-123` and exclude integration branches such as `main`, `staging`, `master`, and `develop`
-- `change --group-by task` includes `vs Staging`, derived from `git diff staging...<branch>` for non-integration branches
-- Local analytics state lives under `~/.aieng/aieng.db` by default; override the base home with `AIENG_HOME`
+- `delivery --group-by task` includes `vs Staging`, derived from `git diff staging...<branch>` for non-integration branches
+- Local analytics state lives under `~/.paceflow/paceflow.db` by default; override the base home with `PACEFLOW_HOME`
 
 Development notes, profiling setup, and source-oriented workflows live in [DEV.md](DEV.md).

@@ -12,15 +12,15 @@ const HOME_TEMPLATE_CURSOR_DB: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/fixtures/regression/home_template/cursor/state.vscdb"
 );
-const AIENG_BUNDLE: &str = concat!(
+const PACEFLOW_BUNDLE: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/tests/fixtures/regression/repos/aieng.bundle"
+    "/tests/fixtures/regression/repos/paceflow.bundle"
 );
 
 struct TestEnv {
     _tempdir: TempDir,
     home: PathBuf,
-    aieng_repo: PathBuf,
+    paceflow_repo: PathBuf,
     cursor_dir: PathBuf,
 }
 
@@ -54,28 +54,28 @@ impl TestEnv {
         let tempdir = TempDir::new()?;
         let home = tempdir.path().to_path_buf();
         let work_dir = home.join("work");
-        let aieng_repo = work_dir.join("fixture-aieng");
+        let paceflow_repo = work_dir.join("fixture-paceflow");
         let cursor_dir = work_dir.join("fixture-cursor");
 
         fs::create_dir_all(&work_dir)?;
         fs::create_dir_all(&cursor_dir)?;
 
-        materialize_aieng_repo(&aieng_repo)?;
+        materialize_paceflow_repo(&paceflow_repo)?;
         copy_codex_sessions(
             &home,
-            &["__REPO_AIENG__", "__REPO_CURSOR__", "__HOME__"],
+            &["__REPO_PACEFLOW__", "__REPO_CURSOR__", "__HOME__"],
             &[
-                &aieng_repo.to_string_lossy(),
+                &paceflow_repo.to_string_lossy(),
                 &cursor_dir.to_string_lossy(),
                 &home.to_string_lossy(),
             ],
         )?;
-        install_cursor_fixture(&home, &aieng_repo, &cursor_dir)?;
+        install_cursor_fixture(&home, &paceflow_repo, &cursor_dir)?;
 
         Ok(Self {
             _tempdir: tempdir,
             home,
-            aieng_repo,
+            paceflow_repo,
             cursor_dir,
         })
     }
@@ -84,16 +84,16 @@ impl TestEnv {
         let tempdir = TempDir::new()?;
         let home = tempdir.path().to_path_buf();
         let work_dir = home.join("work");
-        let aieng_repo = work_dir.join("fixture-aieng");
+        let paceflow_repo = work_dir.join("fixture-paceflow");
         let cursor_dir = work_dir.join("fixture-cursor");
 
-        fs::create_dir_all(&aieng_repo)?;
+        fs::create_dir_all(&paceflow_repo)?;
         fs::create_dir_all(&cursor_dir)?;
 
         let env = Self {
             _tempdir: tempdir,
             home,
-            aieng_repo,
+            paceflow_repo,
             cursor_dir,
         };
         env.initialize_db_schema()?;
@@ -101,11 +101,11 @@ impl TestEnv {
         Ok(env)
     }
 
-    fn run_aieng(&self, args: &[&str]) -> anyhow::Result<String> {
-        let output = Command::cargo_bin("aieng")?
+    fn run_paceflow(&self, args: &[&str]) -> anyhow::Result<String> {
+        let output = Command::cargo_bin("paceflow")?
             .args(args)
             .current_dir(&self.home)
-            .env("AIENG_HOME", &self.home)
+            .env("PACEFLOW_HOME", &self.home)
             .env("HOME", &self.home)
             .env("USERPROFILE", &self.home)
             .env_remove("HOMEDRIVE")
@@ -115,7 +115,7 @@ impl TestEnv {
 
         if !output.status.success() {
             anyhow::bail!(
-                "aieng {:?} failed\nstdout:\n{}\nstderr:\n{}",
+                "paceflow {:?} failed\nstdout:\n{}\nstderr:\n{}",
                 args,
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)
@@ -126,23 +126,23 @@ impl TestEnv {
     }
 
     fn ingest(&self) -> anyhow::Result<()> {
-        self.run_aieng(&["ingest"])?;
+        self.run_paceflow(&["ingest"])?;
         Ok(())
     }
 
     fn initialize_db_schema(&self) -> anyhow::Result<()> {
-        let _ = self.run_aieng(&["session"])?;
+        let _ = self.run_paceflow(&["session"])?;
         Ok(())
     }
 
     fn db_path(&self) -> PathBuf {
-        self.home.join(".aieng").join("aieng.db")
+        self.home.join(".paceflow").join("paceflow.db")
     }
 
     fn seed_reporting_fixture(&self) -> anyhow::Result<()> {
-        fs::create_dir_all(self.home.join(".aieng"))?;
+        fs::create_dir_all(self.home.join(".paceflow"))?;
         let conn = Connection::open(self.db_path())?;
-        let repo_root = "__REPO_AIENG__";
+        let repo_root = "__REPO_PACEFLOW__";
 
         let sessions = [
             (
@@ -487,7 +487,7 @@ impl TestEnv {
         let mut normalized = output;
         let mut replacements = Vec::new();
         for (path, placeholder) in [
-            (&self.aieng_repo, "__REPO_AIENG__"),
+            (&self.paceflow_repo, "__REPO_PACEFLOW__"),
             (&self.cursor_dir, "__REPO_CURSOR__"),
             (&self.home, "__HOME__"),
         ] {
@@ -509,13 +509,13 @@ impl TestEnv {
 fn category_reports_match_snapshots() -> anyhow::Result<()> {
     let env = TestEnv::new_seeded_reporting()?;
 
-    let session = env.normalize_output(env.run_aieng(&["session"])?);
-    let change = env.normalize_output(env.run_aieng(&["change"])?);
-    let lifecycle = env.normalize_output(env.run_aieng(&["lifecycle"])?);
+    let session = env.normalize_output(env.run_paceflow(&["session"])?);
+    let change = env.normalize_output(env.run_paceflow(&["delivery"])?);
+    let lifecycle = env.normalize_output(env.run_paceflow(&["quality"])?);
 
     assert!(session.contains("Session Metrics"));
-    assert!(change.contains("Change Metrics"));
-    assert!(lifecycle.contains("Lifecycle Metrics"));
+    assert!(change.contains("Delivery Metrics"));
+    assert!(lifecycle.contains("Quality Metrics"));
 
     let structured_session = parse_session_summary(&session)?;
     let structured_change = parse_change_summary(&change)?;
@@ -542,12 +542,17 @@ fn grouped_and_weekly_reports_match_snapshots() -> anyhow::Result<()> {
     let env = TestEnv::new_seeded_reporting()?;
 
     let session_grouped =
-        env.normalize_output(env.run_aieng(&["session", "--group-by", "provider"])?);
-    let change_grouped = env.normalize_output(env.run_aieng(&["change", "--group-by", "repo"])?);
+        env.normalize_output(env.run_paceflow(&["session", "--group-by", "provider"])?);
+    let change_grouped =
+        env.normalize_output(env.run_paceflow(&["delivery", "--group-by", "repo"])?);
     let lifecycle_grouped =
-        env.normalize_output(env.run_aieng(&["lifecycle", "--group-by", "repo"])?);
-    let session_weekly =
-        env.normalize_output(env.run_aieng(&["session", "--weekly", "--group-by", "provider"])?);
+        env.normalize_output(env.run_paceflow(&["quality", "--group-by", "repo"])?);
+    let session_weekly = env.normalize_output(env.run_paceflow(&[
+        "session",
+        "--weekly",
+        "--group-by",
+        "provider",
+    ])?);
 
     assert_snapshot!(
         "fixture_corpus_session_grouped_by_provider_text",
@@ -571,11 +576,14 @@ fn event_stream_matches_snapshots() -> anyhow::Result<()> {
     let env = TestEnv::new_seeded_reporting()?;
 
     let session_stream =
-        env.normalize_output(env.run_aieng(&["event-stream", "--stream", "session-base"])?);
-    let task_commit_stream =
-        env.normalize_output(env.run_aieng(&["event-stream", "--stream", "task-commit-base"])?);
+        env.normalize_output(env.run_paceflow(&["event-stream", "--stream", "session-base"])?);
+    let task_commit_stream = env.normalize_output(env.run_paceflow(&[
+        "event-stream",
+        "--stream",
+        "task-commit-base",
+    ])?);
     let all_streams_smoke =
-        env.normalize_output(env.run_aieng(&["event-stream", "--limit", "5"])?);
+        env.normalize_output(env.run_paceflow(&["event-stream", "--limit", "5"])?);
 
     assert_snapshot!("fixture_corpus_event_stream_session_base", session_stream);
     assert_snapshot!(
@@ -613,16 +621,16 @@ fn ingest_is_idempotent_for_fixture_corpus() -> anyhow::Result<()> {
     let env = TestEnv::new_live_fixture()?;
     env.ingest()?;
 
-    let session_before = env.run_aieng(&["session"])?;
-    let change_before = env.run_aieng(&["change"])?;
-    let lifecycle_before = env.run_aieng(&["lifecycle"])?;
+    let session_before = env.run_paceflow(&["session"])?;
+    let change_before = env.run_paceflow(&["delivery"])?;
+    let lifecycle_before = env.run_paceflow(&["quality"])?;
 
-    let second_ingest = env.run_aieng(&["ingest"])?;
+    let second_ingest = env.run_paceflow(&["ingest"])?;
     assert!(second_ingest.contains("Ingest progress: 100%"));
 
-    let session_after = env.run_aieng(&["session"])?;
-    let change_after = env.run_aieng(&["change"])?;
-    let lifecycle_after = env.run_aieng(&["lifecycle"])?;
+    let session_after = env.run_paceflow(&["session"])?;
+    let change_after = env.run_paceflow(&["delivery"])?;
+    let lifecycle_after = env.run_paceflow(&["quality"])?;
 
     assert_eq!(
         session_before, session_after,
@@ -643,7 +651,7 @@ fn ingest_is_idempotent_for_fixture_corpus() -> anyhow::Result<()> {
 #[test]
 fn ingest_reports_commit_event_progress() -> anyhow::Result<()> {
     let env = TestEnv::new_live_fixture()?;
-    let ingest_output = env.run_aieng(&["ingest"])?;
+    let ingest_output = env.run_paceflow(&["ingest"])?;
 
     assert!(ingest_output.contains("Planning ingest..."));
     assert!(ingest_output.contains("Stage: codex sessions"));
@@ -658,23 +666,24 @@ fn ingest_reports_commit_event_progress() -> anyhow::Result<()> {
 #[test]
 fn fixture_corpus_ingest_smoke_is_cross_platform_friendly() -> anyhow::Result<()> {
     let env = TestEnv::new_live_fixture()?;
-    let ingest_output = env.normalize_output(env.run_aieng(&["ingest"])?);
+    let ingest_output = env.normalize_output(env.run_paceflow(&["ingest"])?);
 
     assert!(ingest_output.contains("Association summary:"));
     assert!(ingest_output.contains("Commit events materialized: repos="));
     assert!(ingest_output.contains("commits_scanned="));
 
-    let session = env.normalize_output(env.run_aieng(&["session"])?);
-    let change = env.normalize_output(env.run_aieng(&["change"])?);
-    let lifecycle = env.normalize_output(env.run_aieng(&["lifecycle"])?);
-    let change_grouped = env.normalize_output(env.run_aieng(&["change", "--group-by", "repo"])?);
-    let event_stream = env.normalize_output(env.run_aieng(&["event-stream", "--limit", "5"])?);
+    let session = env.normalize_output(env.run_paceflow(&["session"])?);
+    let change = env.normalize_output(env.run_paceflow(&["delivery"])?);
+    let lifecycle = env.normalize_output(env.run_paceflow(&["quality"])?);
+    let change_grouped =
+        env.normalize_output(env.run_paceflow(&["delivery", "--group-by", "repo"])?);
+    let event_stream = env.normalize_output(env.run_paceflow(&["event-stream", "--limit", "5"])?);
 
     assert!(session.contains("Session Metrics"));
-    assert!(change.contains("Change Metrics"));
-    assert!(lifecycle.contains("Lifecycle Metrics"));
-    assert!(change_grouped.contains("Change Metrics"));
-    assert!(change_grouped.contains("Group") || change_grouped.contains("No change rows found."));
+    assert!(change.contains("Delivery Metrics"));
+    assert!(lifecycle.contains("Quality Metrics"));
+    assert!(change_grouped.contains("Delivery Metrics"));
+    assert!(change_grouped.contains("Group") || change_grouped.contains("No delivery rows found."));
     assert!(event_stream.trim().is_empty() || event_stream.contains("\"stream_type\""));
 
     let structured_change = parse_change_summary(&change)?;
@@ -685,11 +694,11 @@ fn fixture_corpus_ingest_smoke_is_cross_platform_friendly() -> anyhow::Result<()
     Ok(())
 }
 
-fn materialize_aieng_repo(repo_path: &Path) -> anyhow::Result<()> {
+fn materialize_paceflow_repo(repo_path: &Path) -> anyhow::Result<()> {
     run_command(
         Command::new("git")
             .arg("clone")
-            .arg(AIENG_BUNDLE)
+            .arg(PACEFLOW_BUNDLE)
             .arg(repo_path),
     )?;
     run_command(
@@ -737,7 +746,11 @@ fn copy_codex_sessions(home: &Path, from: &[&str], to: &[&str]) -> anyhow::Resul
     Ok(())
 }
 
-fn install_cursor_fixture(home: &Path, aieng_repo: &Path, cursor_dir: &Path) -> anyhow::Result<()> {
+fn install_cursor_fixture(
+    home: &Path,
+    paceflow_repo: &Path,
+    cursor_dir: &Path,
+) -> anyhow::Result<()> {
     for rel in [
         Path::new("Library")
             .join("Application Support")
@@ -753,7 +766,7 @@ fn install_cursor_fixture(home: &Path, aieng_repo: &Path, cursor_dir: &Path) -> 
 
         let db_path = global_storage.join("state.vscdb");
         fs::copy(HOME_TEMPLATE_CURSOR_DB, &db_path)?;
-        rewrite_cursor_db(&db_path, home, aieng_repo, cursor_dir)?;
+        rewrite_cursor_db(&db_path, home, paceflow_repo, cursor_dir)?;
     }
     Ok(())
 }
@@ -761,7 +774,7 @@ fn install_cursor_fixture(home: &Path, aieng_repo: &Path, cursor_dir: &Path) -> 
 fn rewrite_cursor_db(
     db_path: &Path,
     home: &Path,
-    aieng_repo: &Path,
+    paceflow_repo: &Path,
     cursor_dir: &Path,
 ) -> anyhow::Result<()> {
     let conn = Connection::open(db_path)?;
@@ -769,13 +782,13 @@ fn rewrite_cursor_db(
         "UPDATE cursorDiskKV
          SET value = replace(
              replace(
-                 replace(value, '__REPO_AIENG__', ?1),
+                 replace(value, '__REPO_PACEFLOW__', ?1),
                  '__REPO_CURSOR__', ?2
              ),
              '__HOME__', ?3
          )",
         (
-            aieng_repo.to_string_lossy().to_string(),
+            paceflow_repo.to_string_lossy().to_string(),
             cursor_dir.to_string_lossy().to_string(),
             home.to_string_lossy().to_string(),
         ),

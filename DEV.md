@@ -9,8 +9,8 @@ Use Cargo for local development:
 ```bash
 cargo run -- ingest
 cargo run -- session
-cargo run -- change
-cargo run -- lifecycle
+cargo run -- delivery
+cargo run -- quality
 ```
 
 ## Build And Validation
@@ -39,7 +39,7 @@ task install-profiler
 task profile -- ingest
 task profile -- session
 task install-live-profiler
-task profile-live PID=$(pgrep -n aieng)
+task profile-live PID=$(pgrep -n paceflow)
 ```
 
 ### Browser-Based Profiling With Samply
@@ -66,10 +66,10 @@ This uses call stacks based on frame pointers:
 perf top -p <pid> -g --call-graph fp
 ```
 
-If you need to find the newest `aieng` process first:
+If you need to find the newest `paceflow` process first:
 
 ```bash
-pgrep -n aieng
+pgrep -n paceflow
 ```
 
 ### Environment Notes

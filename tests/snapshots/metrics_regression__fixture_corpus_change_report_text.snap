@@ -2,7 +2,7 @@
 source: tests/metrics_regression.rs
 expression: change
 ---
-Change Metrics
+Delivery Metrics
 Heavy commits = commits where matched AI-attributed lines are at least half of changed lines
 C2 merge rate = share of heavy AI commits that later reached mainline
 

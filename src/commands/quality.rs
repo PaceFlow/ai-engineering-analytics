@@ -1,30 +1,30 @@
 use anyhow::Result;
 
 use crate::analytics;
-use crate::cli::{GroupBy, LifecycleReportArgs};
+use crate::cli::{GroupBy, QualityReportArgs};
 use crate::commands::report_scope;
 use crate::db;
 
-pub fn run(args: LifecycleReportArgs) -> Result<()> {
+pub fn run(args: QualityReportArgs) -> Result<()> {
     let db = db::open()?;
     analytics::create_reporting_views(&db)?;
     let report = report_scope::resolve_report_args(&args.report);
     let rows = analytics::query_lifecycle_report(&db, &report)?;
-    print!("{}", render_lifecycle_report(&rows, &args));
+    print!("{}", render_quality_report(&rows, &args));
     Ok(())
 }
 
-fn render_lifecycle_report(
+fn render_quality_report(
     rows: &[analytics::LifecycleReportRow],
-    args: &LifecycleReportArgs,
+    args: &QualityReportArgs,
 ) -> String {
     let mut out = String::new();
-    out.push_str("Lifecycle Metrics\n");
+    out.push_str("Quality Metrics\n");
     out.push_str("L1 code churn rate = share of AI-added lines on heavy AI commits that were later removed within the churn window\n");
     out.push_str("L4 revert rate = share of heavy AI commits that were later reverted\n\n");
 
     if rows.is_empty() {
-        out.push_str("No lifecycle rows found. Run `aieng ingest` first.\n");
+        out.push_str("No quality rows found. Run `paceflow ingest` first.\n");
         return out;
     }
 
