@@ -7,11 +7,16 @@ use crate::change_intel::schema::init_change_intel_schema;
 use crate::path_utils::{detect_repo_root, to_rel_path};
 
 pub fn open() -> Result<Connection> {
+    let has_override = env::var_os("PACEFLOW_HOME").is_some();
     let home = env::var_os("PACEFLOW_HOME")
         .map(std::path::PathBuf::from)
         .or_else(dirs::home_dir)
         .ok_or_else(|| anyhow::anyhow!("Home directory not found"))?;
-    migrate_legacy_default_home_if_needed(env::var_os("PACEFLOW_HOME").is_some(), &home)?;
+    open_at_home(&home, has_override)
+}
+
+fn open_at_home(home: &Path, has_override: bool) -> Result<Connection> {
+    migrate_legacy_default_home_if_needed(has_override, home)?;
     let app_dir = home.join(".paceflow");
     std::fs::create_dir_all(&app_dir)?;
     let db_path = app_dir.join("paceflow.db");
@@ -1800,7 +1805,7 @@ mod tests {
     }
 
     #[test]
-    fn open_migrates_legacy_default_db_into_paceflow_home() -> Result<()> {
+    fn open_at_home_migrates_legacy_default_db_into_paceflow_home() -> Result<()> {
         let _guard = lock_env();
         let tempdir = tempdir()?;
         let legacy_dir = tempdir.path().join(".aieng");
@@ -1810,15 +1815,7 @@ mod tests {
         legacy_conn.execute("CREATE TABLE migration_probe (id INTEGER PRIMARY KEY)", [])?;
         drop(legacy_conn);
 
-        let _legacy_home = ScopedEnvVar::remove("AIENG_HOME");
-        let _paceflow_home = ScopedEnvVar::remove("PACEFLOW_HOME");
-        let _home = ScopedEnvVar::set("HOME", tempdir.path());
-        let _userprofile = ScopedEnvVar::set("USERPROFILE", tempdir.path());
-        let _homedrive = ScopedEnvVar::remove("HOMEDRIVE");
-        let _homepath = ScopedEnvVar::remove("HOMEPATH");
-        let _xdg_config_home = ScopedEnvVar::remove("XDG_CONFIG_HOME");
-
-        let conn = open()?;
+        let conn = open_at_home(tempdir.path(), false)?;
         let migrated_count: i64 = conn.query_row(
             "SELECT COUNT(*)
              FROM sqlite_master
