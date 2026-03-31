@@ -136,7 +136,7 @@ Supported release targets:
 Windows (PowerShell):
 
 ```powershell
-$version = "v0.1.0"
+$version = "v0.1.0-beta.1"
 $asset = "paceflow-x86_64-pc-windows-msvc.zip"
 Invoke-WebRequest `
   -Uri "https://github.com/PaceFlow/ai-engineering-analytics/releases/download/$version/$asset" `
@@ -148,7 +148,7 @@ Expand-Archive .\$asset -DestinationPath .\paceflow
 macOS/Linux:
 
 ```bash
-version="v0.1.0"
+version="v0.1.0-beta.1"
 asset="paceflow-x86_64-unknown-linux-gnu.tar.gz"
 curl -L "https://github.com/PaceFlow/ai-engineering-analytics/releases/download/${version}/${asset}" -o "${asset}"
 tar -xzf "${asset}"

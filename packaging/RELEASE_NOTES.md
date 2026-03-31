@@ -1,5 +1,7 @@
 # `paceflow` release
 
+This is the public beta release of `paceflow`.
+
 Download the archive for your platform from the Assets section below, extract it, and run `paceflow --help`.
 
 Quick start:
