@@ -1505,12 +1505,55 @@ pub fn upsert_fact_task_commit_assignment(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, OnceLock};
+    use std::ffi::{OsStr, OsString};
+    use std::sync::{Mutex, MutexGuard, OnceLock};
     use tempfile::tempdir;
 
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn lock_env() -> MutexGuard<'static, ()> {
+        env_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    struct ScopedEnvVar {
+        key: &'static str,
+        original: Option<OsString>,
+    }
+
+    impl ScopedEnvVar {
+        fn set(key: &'static str, value: impl AsRef<OsStr>) -> Self {
+            let original = std::env::var_os(key);
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, original }
+        }
+
+        fn remove(key: &'static str) -> Self {
+            let original = std::env::var_os(key);
+            unsafe {
+                std::env::remove_var(key);
+            }
+            Self { key, original }
+        }
+    }
+
+    impl Drop for ScopedEnvVar {
+        fn drop(&mut self) {
+            match &self.original {
+                Some(value) => unsafe {
+                    std::env::set_var(self.key, value);
+                },
+                None => unsafe {
+                    std::env::remove_var(self.key);
+                },
+            }
+        }
     }
 
     fn open_test_db() -> Result<Connection> {
@@ -1738,12 +1781,10 @@ mod tests {
 
     #[test]
     fn open_uses_paceflow_home_env_and_db_path() -> Result<()> {
-        let _guard = env_lock().lock().expect("env lock");
+        let _guard = lock_env();
         let tempdir = tempdir()?;
-        unsafe {
-            std::env::remove_var("AIENG_HOME");
-            std::env::set_var("PACEFLOW_HOME", tempdir.path());
-        }
+        let _legacy_home = ScopedEnvVar::remove("AIENG_HOME");
+        let _paceflow_home = ScopedEnvVar::set("PACEFLOW_HOME", tempdir.path());
 
         let _conn = open()?;
 
@@ -1755,15 +1796,12 @@ mod tests {
                 .is_file()
         );
         assert!(!tempdir.path().join(".aieng").join("aieng.db").exists());
-        unsafe {
-            std::env::remove_var("PACEFLOW_HOME");
-        }
         Ok(())
     }
 
     #[test]
     fn open_migrates_legacy_default_db_into_paceflow_home() -> Result<()> {
-        let _guard = env_lock().lock().expect("env lock");
+        let _guard = lock_env();
         let tempdir = tempdir()?;
         let legacy_dir = tempdir.path().join(".aieng");
         std::fs::create_dir_all(&legacy_dir)?;
@@ -1772,11 +1810,13 @@ mod tests {
         legacy_conn.execute("CREATE TABLE migration_probe (id INTEGER PRIMARY KEY)", [])?;
         drop(legacy_conn);
 
-        unsafe {
-            std::env::remove_var("AIENG_HOME");
-            std::env::remove_var("PACEFLOW_HOME");
-            std::env::set_var("HOME", tempdir.path());
-        }
+        let _legacy_home = ScopedEnvVar::remove("AIENG_HOME");
+        let _paceflow_home = ScopedEnvVar::remove("PACEFLOW_HOME");
+        let _home = ScopedEnvVar::set("HOME", tempdir.path());
+        let _userprofile = ScopedEnvVar::set("USERPROFILE", tempdir.path());
+        let _homedrive = ScopedEnvVar::remove("HOMEDRIVE");
+        let _homepath = ScopedEnvVar::remove("HOMEPATH");
+        let _xdg_config_home = ScopedEnvVar::remove("XDG_CONFIG_HOME");
 
         let conn = open()?;
         let migrated_count: i64 = conn.query_row(
@@ -1795,9 +1835,6 @@ mod tests {
                 .join("paceflow.db")
                 .is_file()
         );
-        unsafe {
-            std::env::remove_var("HOME");
-        }
         Ok(())
     }
 }
