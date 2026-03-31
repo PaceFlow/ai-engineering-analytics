@@ -1,63 +1,26 @@
 use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension, params};
 use std::env;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use crate::change_intel::schema::init_change_intel_schema;
 use crate::path_utils::{detect_repo_root, to_rel_path};
 
 pub fn open() -> Result<Connection> {
-    let has_override = env::var_os("PACEFLOW_HOME").is_some();
     let home = env::var_os("PACEFLOW_HOME")
         .map(std::path::PathBuf::from)
         .or_else(dirs::home_dir)
         .ok_or_else(|| anyhow::anyhow!("Home directory not found"))?;
-    open_at_home(&home, has_override)
+    open_at_home(&home)
 }
 
-fn open_at_home(home: &Path, has_override: bool) -> Result<Connection> {
-    migrate_legacy_default_home_if_needed(has_override, home)?;
+fn open_at_home(home: &Path) -> Result<Connection> {
     let app_dir = home.join(".paceflow");
     std::fs::create_dir_all(&app_dir)?;
     let db_path = app_dir.join("paceflow.db");
     let conn = Connection::open(db_path)?;
     init_app_schema(&conn)?;
     Ok(conn)
-}
-
-fn migrate_legacy_default_home_if_needed(has_override: bool, home: &Path) -> Result<()> {
-    if has_override {
-        return Ok(());
-    }
-
-    let target_db = home.join(".paceflow").join("paceflow.db");
-    if target_db.exists() {
-        return Ok(());
-    }
-
-    let legacy_db = home.join(".aieng").join("aieng.db");
-    if !legacy_db.exists() {
-        return Ok(());
-    }
-
-    let target_dir = target_db
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("."));
-    std::fs::create_dir_all(&target_dir)?;
-    move_file(&legacy_db, &target_db)?;
-    Ok(())
-}
-
-fn move_file(from: &Path, to: &Path) -> Result<()> {
-    match std::fs::rename(from, to) {
-        Ok(()) => Ok(()),
-        Err(_) => {
-            std::fs::copy(from, to)?;
-            std::fs::remove_file(from)?;
-            Ok(())
-        }
-    }
 }
 
 pub(crate) fn init_app_schema(conn: &Connection) -> Result<()> {
@@ -1538,14 +1501,6 @@ mod tests {
             }
             Self { key, original }
         }
-
-        fn remove(key: &'static str) -> Self {
-            let original = std::env::var_os(key);
-            unsafe {
-                std::env::remove_var(key);
-            }
-            Self { key, original }
-        }
     }
 
     impl Drop for ScopedEnvVar {
@@ -1788,43 +1743,10 @@ mod tests {
     fn open_uses_paceflow_home_env_and_db_path() -> Result<()> {
         let _guard = lock_env();
         let tempdir = tempdir()?;
-        let _legacy_home = ScopedEnvVar::remove("AIENG_HOME");
         let _paceflow_home = ScopedEnvVar::set("PACEFLOW_HOME", tempdir.path());
 
         let _conn = open()?;
 
-        assert!(
-            tempdir
-                .path()
-                .join(".paceflow")
-                .join("paceflow.db")
-                .is_file()
-        );
-        assert!(!tempdir.path().join(".aieng").join("aieng.db").exists());
-        Ok(())
-    }
-
-    #[test]
-    fn open_at_home_migrates_legacy_default_db_into_paceflow_home() -> Result<()> {
-        let _guard = lock_env();
-        let tempdir = tempdir()?;
-        let legacy_dir = tempdir.path().join(".aieng");
-        std::fs::create_dir_all(&legacy_dir)?;
-        let legacy_db = legacy_dir.join("aieng.db");
-        let legacy_conn = Connection::open(&legacy_db)?;
-        legacy_conn.execute("CREATE TABLE migration_probe (id INTEGER PRIMARY KEY)", [])?;
-        drop(legacy_conn);
-
-        let conn = open_at_home(tempdir.path(), false)?;
-        let migrated_count: i64 = conn.query_row(
-            "SELECT COUNT(*)
-             FROM sqlite_master
-             WHERE type = 'table' AND name = 'migration_probe'",
-            [],
-            |row| row.get(0),
-        )?;
-
-        assert_eq!(migrated_count, 1);
         assert!(
             tempdir
                 .path()

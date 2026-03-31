@@ -447,7 +447,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        let path = std::env::temp_dir().join(format!("aieng_codex_change_{}.jsonl", now));
+        let path = std::env::temp_dir().join(format!("paceflow_codex_change_{}.jsonl", now));
 
         let mut body = String::new();
         for line in lines {
