@@ -82,7 +82,8 @@ jobs:
           fi
       - name: Skip live GitHub test
         if: steps.config.outputs.enabled != 'true'
-        run: echo "Skipping live GitHub test: missing repository secrets"
+        run: |
+          echo "Skipping live GitHub test: missing repository secrets"
       - name: Run live GitHub test
         if: steps.config.outputs.enabled == 'true'
         run: cargo test --test github_live -- --ignored --nocapture
