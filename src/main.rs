@@ -10,6 +10,7 @@ fn main() -> anyhow::Result<()> {
         Commands::Delivery(args) => commands::delivery::run(args)?,
         Commands::Quality(args) => commands::quality::run(args)?,
         Commands::EventStream(args) => commands::event_stream::run(args)?,
+        Commands::GitHub(args) => commands::github::run(args)?,
     }
     Ok(())
 }

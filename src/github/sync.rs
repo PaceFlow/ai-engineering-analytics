@@ -8,9 +8,8 @@ use tokio::runtime::Builder;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
-use crate::github::client::{
-    GitHubApi, GitHubApiErrorKind, ReqwestGitHubApi, github_token_from_env,
-};
+use crate::github::auth::github_token;
+use crate::github::client::{GitHubApi, GitHubApiErrorKind, ReqwestGitHubApi};
 use crate::github::types::{
     CommitLookupResult, CommitLookupStatus, GitHubRepo, GitHubSyncSummary, PullRequestRecord,
     PullRequestRefreshResult,
@@ -42,7 +41,7 @@ pub fn sync_github_pull_requests(
         ..GitHubSyncSummary::default()
     };
 
-    let Some(token) = github_token_from_env() else {
+    let Some(token) = github_token()? else {
         rebuild_commit_pr_outcomes(conn)?;
         return Ok(summary);
     };

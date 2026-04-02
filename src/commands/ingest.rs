@@ -176,7 +176,7 @@ pub fn run(verbose: bool) -> Result<()> {
         commit_refresh.elapsed_ms as f64 / 1000.0
     );
 
-    let github_token_configured = github::client::github_token_from_env().is_some();
+    let github_token_configured = github::auth::github_token_source()?.is_some();
     let github_summary = github::sync::sync_github_pull_requests(&mut db, verbose)?;
     if github_summary.commit_lookups_enqueued > 0 || github_summary.open_pull_requests_refreshed > 0
     {
@@ -198,7 +198,7 @@ pub fn run(verbose: bool) -> Result<()> {
             println!("GitHub PR sync: no pending GitHub updates for eligible repos");
         } else {
             println!(
-                "GitHub PR sync: skipped remote fetch (set PACEFLOW_GITHUB_TOKEN to enable refresh)"
+                "GitHub PR sync: skipped remote fetch (run `paceflow github token` or set PACEFLOW_GITHUB_TOKEN to enable refresh)"
             );
         }
     }

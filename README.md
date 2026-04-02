@@ -115,6 +115,15 @@ Useful follow-ups:
 - `paceflow delivery --group-by task`
 - `paceflow quality --group-by provider`
 
+Optional GitHub PR sync setup:
+
+```bash
+paceflow github token
+paceflow ingest
+```
+
+Rerun `paceflow github token` to replace or delete the saved token. For CI or one-off overrides, `PACEFLOW_GITHUB_TOKEN` still takes precedence over the saved local token.
+
 ## Installation
 
 Build and install from source:
@@ -173,6 +182,7 @@ Requirements:
 - `paceflow` reads local Codex sessions from `~/.codex/sessions`
 - `paceflow` reads local Cursor state/history from the OS config directory under `Cursor/User`
 - If Cursor data lives elsewhere, set `PACEFLOW_CURSOR_STATE_PATH` and/or `PACEFLOW_CURSOR_HISTORY_PATH`
+- To enable GitHub PR sync during ingest, either run `paceflow github token` once or set `PACEFLOW_GITHUB_TOKEN`
 - To enable GitHub-backed `C1` and `C3` metrics for `github.com` repos, set `PACEFLOW_GITHUB_TOKEN` with at least `Pull requests: read`
 
 ## Who It's For
