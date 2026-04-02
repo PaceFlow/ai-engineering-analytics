@@ -4,7 +4,10 @@ expression: change_grouped
 ---
 Delivery Metrics
 Heavy commits = commits where matched AI-attributed lines are at least half of changed lines
+C1 PR reach rate = share of heavy GitHub AI commits that reached a pull request
 C2 merge rate = share of heavy AI commits that later reached mainline
 
-Group                          Commits     Heavy     C2(merge)
-__REPO_PACEFLOW__                    9         3        100.0%
+C3 PR merge rate = share of PR-linked heavy GitHub AI commits whose PR merged
+
+Group                          Commits     Heavy      C1(PR)     C2(merge)    C3(PR merge)
+__REPO_PACEFLOW__                    9         3         N/A        100.0%             N/A

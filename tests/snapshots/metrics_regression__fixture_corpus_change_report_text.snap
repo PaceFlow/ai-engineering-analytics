@@ -4,8 +4,13 @@ expression: change
 ---
 Delivery Metrics
 Heavy commits = commits where matched AI-attributed lines are at least half of changed lines
+C1 PR reach rate = share of heavy GitHub AI commits that reached a pull request
 C2 merge rate = share of heavy AI commits that later reached mainline
+
+C3 PR merge rate = share of PR-linked heavy GitHub AI commits whose PR merged
 
 Commits: 9
 Heavy commits: 3
+C1 PR Reach Rate: N/A
 C2 Merge Rate: 100.00% (3/3)
+C3 PR Merge Rate: N/A

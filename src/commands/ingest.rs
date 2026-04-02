@@ -5,6 +5,7 @@ use crate::analytics;
 use crate::change_intel::commit_assoc;
 use crate::change_intel::pipeline;
 use crate::db;
+use crate::github;
 use crate::ingest_progress::{
     IngestExecutionPlan, IngestProgress, IngestProgressObserver, ProviderWorkPlan,
 };
@@ -174,6 +175,33 @@ pub fn run(verbose: bool) -> Result<()> {
         commit_refresh.commits_total,
         commit_refresh.elapsed_ms as f64 / 1000.0
     );
+
+    let github_token_configured = github::client::github_token_from_env().is_some();
+    let github_summary = github::sync::sync_github_pull_requests(&mut db, verbose)?;
+    if github_summary.commit_lookups_enqueued > 0 || github_summary.open_pull_requests_refreshed > 0
+    {
+        println!(
+            "GitHub PR sync: repos={} lookups={}/{} resolved={} no_pr={} failed={} rate_limited={} prs={} pr_commits={} refreshed_open_prs={}",
+            github_summary.repos_considered,
+            github_summary.commit_lookups_completed,
+            github_summary.commit_lookups_enqueued,
+            github_summary.resolved_commits,
+            github_summary.no_pr_commits,
+            github_summary.failed_commits,
+            github_summary.rate_limited_commits,
+            github_summary.pull_requests_upserted,
+            github_summary.pull_request_commits_upserted,
+            github_summary.open_pull_requests_refreshed
+        );
+    } else if github_summary.repos_considered > 0 {
+        if github_token_configured {
+            println!("GitHub PR sync: no pending GitHub updates for eligible repos");
+        } else {
+            println!(
+                "GitHub PR sync: skipped remote fetch (set PACEFLOW_GITHUB_TOKEN to enable refresh)"
+            );
+        }
+    }
     println!("\nTotal rows written: {}", grand_total);
     Ok(())
 }

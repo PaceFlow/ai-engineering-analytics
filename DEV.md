@@ -24,6 +24,28 @@ cargo fmt
 cargo clippy --all-targets --all-features
 ```
 
+## Live GitHub Test
+
+The live GitHub integration test is ignored by default and only runs when you provide an explicit fixture:
+
+```bash
+export PACEFLOW_GITHUB_TOKEN=github_pat_...
+export PACEFLOW_GITHUB_TEST_REPO_KEY=git:github.com/OWNER/REPO
+export PACEFLOW_GITHUB_TEST_COMMIT_SHA=<commit-with-pr>
+export PACEFLOW_GITHUB_TEST_EXPECTED_PR=<pr-number>
+export PACEFLOW_GITHUB_TEST_EXPECTED_MERGED=true
+# optional: a commit known to have no PR association
+export PACEFLOW_GITHUB_TEST_NO_PR_COMMIT_SHA=<commit-without-pr>
+
+cargo test --test github_live -- --ignored --nocapture
+```
+
+What it verifies:
+
+- commit to PR lookup against the live GitHub API
+- persisted PR metadata and lookup status
+- derived `event_commit_pr_outcome` flags used by `C1` and `C3`
+
 ## Profiling Setup
 
 Release builds are configured for profiler-friendly output:

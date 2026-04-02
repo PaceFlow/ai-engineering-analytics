@@ -234,6 +234,48 @@ pub(crate) fn init_metadata_schema(conn: &Connection) -> Result<()> {
             CHECK (is_fallback IN (0,1))
         );
 
+        CREATE TABLE IF NOT EXISTS fact_github_pull_request (
+            repo_key     TEXT NOT NULL,
+            pr_number    INTEGER NOT NULL,
+            state        TEXT NOT NULL,
+            draft_flag   INTEGER NOT NULL DEFAULT 0,
+            created_at   TEXT,
+            updated_at   TEXT,
+            closed_at    TEXT,
+            merged_at    TEXT,
+            base_ref     TEXT,
+            head_ref     TEXT,
+            html_url     TEXT,
+            PRIMARY KEY(repo_key, pr_number),
+            CHECK (draft_flag IN (0,1))
+        );
+
+        CREATE TABLE IF NOT EXISTS fact_github_pull_request_commit (
+            repo_key        TEXT NOT NULL,
+            pr_number       INTEGER NOT NULL,
+            commit_sha      TEXT NOT NULL,
+            commit_position INTEGER,
+            PRIMARY KEY(repo_key, pr_number, commit_sha)
+        );
+
+        CREATE TABLE IF NOT EXISTS fact_github_commit_pr_lookup (
+            repo_key          TEXT NOT NULL,
+            commit_sha        TEXT NOT NULL,
+            status            TEXT NOT NULL,
+            owning_pr_number  INTEGER,
+            last_checked_at   TEXT NOT NULL,
+            last_error        TEXT,
+            PRIMARY KEY(repo_key, commit_sha)
+        );
+
+        CREATE TABLE IF NOT EXISTS fact_github_sync_state (
+            repo_key                 TEXT PRIMARY KEY,
+            last_commit_scan_at      TEXT,
+            last_open_pr_refresh_at  TEXT,
+            last_error               TEXT,
+            updated_at               TEXT NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS event_session_quality (
             provider                     TEXT NOT NULL,
             session_id                   TEXT NOT NULL,
@@ -357,6 +399,21 @@ pub(crate) fn init_metadata_schema(conn: &Connection) -> Result<()> {
             CHECK (accepted_output_flag IN (0,1) OR accepted_output_flag IS NULL)
         );
 
+        CREATE TABLE IF NOT EXISTS event_commit_pr_outcome (
+            repo_root          TEXT NOT NULL,
+            repo_key           TEXT NOT NULL,
+            commit_sha         TEXT NOT NULL,
+            lookup_status      TEXT NOT NULL,
+            pr_number          INTEGER,
+            pr_opened_flag     INTEGER NOT NULL DEFAULT 0,
+            pr_merged_flag     INTEGER NOT NULL DEFAULT 0,
+            pr_created_at      TEXT,
+            pr_merged_at       TEXT,
+            PRIMARY KEY(repo_root, commit_sha),
+            CHECK (pr_opened_flag IN (0,1)),
+            CHECK (pr_merged_flag IN (0,1))
+        );
+
         CREATE INDEX IF NOT EXISTS idx_fact_session_message_session
             ON fact_session_message(provider, session_id, message_index);
         CREATE INDEX IF NOT EXISTS idx_fact_session_change_session
@@ -381,6 +438,10 @@ pub(crate) fn init_metadata_schema(conn: &Connection) -> Result<()> {
             ON fact_task_commit_assignment(task_key);
         CREATE INDEX IF NOT EXISTS idx_fact_task_commit_assignment_repo_commit
             ON fact_task_commit_assignment(repo_root, commit_sha);
+        CREATE INDEX IF NOT EXISTS idx_fact_github_pr_commit_commit
+            ON fact_github_pull_request_commit(repo_key, commit_sha);
+        CREATE INDEX IF NOT EXISTS idx_fact_github_lookup_status
+            ON fact_github_commit_pr_lookup(repo_key, status, last_checked_at);
         CREATE INDEX IF NOT EXISTS idx_event_session_quality_sync
             ON event_session_quality(repo_key, member_email, provider, session_id);
         CREATE INDEX IF NOT EXISTS idx_event_session_productivity_sync
@@ -402,7 +463,11 @@ pub(crate) fn init_metadata_schema(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_event_task_session_sync
             ON event_task_session(repo_key, task_key, member_email, provider, session_id);
         CREATE INDEX IF NOT EXISTS idx_event_commit_outcome_repo
-            ON event_commit_outcome(repo_root, commit_time);",
+            ON event_commit_outcome(repo_root, commit_time);
+        CREATE INDEX IF NOT EXISTS idx_event_commit_pr_outcome_repo
+            ON event_commit_pr_outcome(repo_root, commit_sha);
+        CREATE INDEX IF NOT EXISTS idx_event_commit_pr_outcome_repo_key
+            ON event_commit_pr_outcome(repo_key, commit_sha);",
     )?;
     let _ = conn.execute_batch("ALTER TABLE metadata_sessions ADD COLUMN model_id INTEGER;");
     for statement in [
@@ -1735,6 +1800,30 @@ mod tests {
              VALUES ('codex', 's1', 1)",
             [],
         )?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn metadata_schema_creates_github_pr_tables() -> Result<()> {
+        let conn = open_test_db()?;
+
+        for table in [
+            "fact_github_pull_request",
+            "fact_github_pull_request_commit",
+            "fact_github_commit_pr_lookup",
+            "fact_github_sync_state",
+            "event_commit_pr_outcome",
+        ] {
+            let count: i64 = conn.query_row(
+                "SELECT COUNT(*)
+                 FROM sqlite_master
+                 WHERE type = 'table' AND name = ?1",
+                params![table],
+                |row| row.get(0),
+            )?;
+            assert_eq!(count, 1, "missing table {table}");
+        }
 
         Ok(())
     }
