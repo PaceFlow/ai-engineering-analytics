@@ -54,6 +54,8 @@ impl IngestExecutionPlan {
 
 pub trait IngestProgressObserver {
     fn advance(&mut self, item_label: &str);
+
+    fn replace_future_units(&mut self, _old_units: usize, _new_units: usize) {}
 }
 
 #[derive(Debug, Clone)]
@@ -77,6 +79,10 @@ pub struct IngestProgress {
 impl IngestProgress {
     pub fn new(plan: &IngestExecutionPlan) -> Self {
         Self::new_with_tty(plan.total_units.max(1), std::io::stdout().is_terminal())
+    }
+
+    pub fn new_for_total_units(total_units: usize) -> Self {
+        Self::new_with_tty(total_units.max(1), std::io::stdout().is_terminal())
     }
 
     fn new_with_tty(total_units: usize, tty: bool) -> Self {
@@ -241,6 +247,10 @@ pub struct StageProgress<'a> {
 impl IngestProgressObserver for StageProgress<'_> {
     fn advance(&mut self, item_label: &str) {
         self.progress.advance(1, item_label);
+    }
+
+    fn replace_future_units(&mut self, old_units: usize, new_units: usize) {
+        self.progress.replace_future_units(old_units, new_units);
     }
 }
 

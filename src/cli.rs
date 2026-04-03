@@ -1,8 +1,9 @@
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 const SESSION_AFTER_HELP: &str = "Examples:\n  paceflow session\n  paceflow session --group-by provider\n  paceflow session --list-sessions\n\nMetrics:\n  Average user prompts: average number of user prompts per session.\n  Avg time to first accepted change: minutes from session start to the first accepted code change.\n  Debug loop rate: share of sessions that look like repeated fix-retry cycles.\n  Error paste rate: share of sessions where an error message was pasted mid-session.\n  Session-to-commit rate: share of sessions followed by a commit within 4 hours.\n  No-output session rate: share of sessions with no accepted code changes.";
-const DELIVERY_AFTER_HELP: &str = "Examples:\n  paceflow delivery\n  paceflow delivery --group-by provider\n  paceflow delivery --group-by task --task ABC-123\n\nMetrics:\n  Heavy commits: commits where matched AI-attributed lines are at least half of changed lines.\n  C2 merge rate: share of heavy AI commits that later reached mainline.";
+const DELIVERY_AFTER_HELP: &str = "Examples:\n  paceflow delivery\n  paceflow delivery --group-by provider\n  paceflow delivery --group-by task --task ABC-123\n\nMetrics:\n  Heavy commits: commits where matched AI-attributed lines are at least half of changed lines.\n  C1 PR reach rate: share of heavy GitHub AI commits that reached a pull request.\n  C2 merge rate: share of heavy AI commits that later reached mainline.\n  C3 PR merge rate: share of PR-linked heavy GitHub AI commits whose PR merged.";
 const QUALITY_AFTER_HELP: &str = "Examples:\n  paceflow quality\n  paceflow quality --group-by provider\n  paceflow quality --group-by task --task ABC-123\n\nMetrics:\n  L1 code churn rate: share of AI-added lines on heavy AI commits that were removed again within the churn window.\n  L4 revert rate: share of heavy AI commits that were later reverted.";
+const GITHUB_AFTER_HELP: &str = "Examples:\n  paceflow github token\n\nGitHub token setup:\n  Use this command to save, replace, or delete the local GitHub token used for PR sync during ingest.";
 
 #[derive(Parser)]
 #[command(
@@ -29,6 +30,22 @@ pub enum Commands {
     Quality(QualityReportArgs),
     /// Print analytics-ready base-view rows as NDJSON for manual validation
     EventStream(EventStreamArgs),
+    #[command(name = "github")]
+    /// Manage GitHub token setup for live PR sync
+    GitHub(GitHubArgs),
+}
+
+#[derive(Args, Debug, Clone)]
+#[command(after_help = GITHUB_AFTER_HELP)]
+pub struct GitHubArgs {
+    #[command(subcommand)]
+    pub command: GitHubCommands,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum GitHubCommands {
+    /// Save, replace, or delete the local GitHub token
+    Token,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -247,6 +264,17 @@ mod tests {
     }
 
     #[test]
+    fn parses_github_token_command() {
+        let cli = Cli::parse_from(["paceflow", "github", "token"]);
+        match cli.command {
+            Commands::GitHub(args) => match args.command {
+                GitHubCommands::Token => {}
+            },
+            _ => panic!("expected github command"),
+        }
+    }
+
+    #[test]
     fn rejects_legacy_change_and_lifecycle_commands() {
         assert!(Cli::try_parse_from(["paceflow", "change"]).is_err());
         assert!(Cli::try_parse_from(["paceflow", "lifecycle"]).is_err());
@@ -279,7 +307,9 @@ mod tests {
             .expect("write delivery help");
         let delivery_help = String::from_utf8(delivery_buffer).expect("utf8");
         assert!(delivery_help.contains("Heavy commits"));
+        assert!(delivery_help.contains("C1 PR reach rate"));
         assert!(delivery_help.contains("C2 merge rate"));
+        assert!(delivery_help.contains("C3 PR merge rate"));
 
         let mut command = Cli::command();
         let mut quality_buffer = Vec::new();

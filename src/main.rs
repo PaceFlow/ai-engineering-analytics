@@ -1,17 +1,6 @@
-mod analytics;
-mod change_intel;
-mod cli;
-mod commands;
-mod cursor_paths;
-mod db;
-mod error;
-mod ingest_progress;
-mod path_utils;
-mod providers;
-mod sync_identity;
-
+use ai_engineering_analytics::cli::{Cli, Commands};
+use ai_engineering_analytics::commands;
 use clap::Parser;
-use cli::{Cli, Commands};
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -21,6 +10,7 @@ fn main() -> anyhow::Result<()> {
         Commands::Delivery(args) => commands::delivery::run(args)?,
         Commands::Quality(args) => commands::quality::run(args)?,
         Commands::EventStream(args) => commands::event_stream::run(args)?,
+        Commands::GitHub(args) => commands::github::run(args)?,
     }
     Ok(())
 }

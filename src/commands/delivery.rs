@@ -29,7 +29,13 @@ fn render_delivery_report(
     let mut out = String::new();
     out.push_str("Delivery Metrics\n");
     out.push_str("Heavy commits = commits where matched AI-attributed lines are at least half of changed lines\n");
+    out.push_str(
+        "C1 PR reach rate = share of heavy GitHub AI commits that reached a pull request\n",
+    );
     out.push_str("C2 merge rate = share of heavy AI commits that later reached mainline\n\n");
+    out.push_str(
+        "C3 PR merge rate = share of PR-linked heavy GitHub AI commits whose PR merged\n\n",
+    );
 
     if rows.is_empty() {
         out.push_str("No delivery rows found. Run `paceflow ingest` first.\n");
@@ -41,8 +47,16 @@ fn render_delivery_report(
         out.push_str(&format!("Commits: {}\n", row.commit_count));
         out.push_str(&format!("Heavy commits: {}\n", row.heavy_commit_count));
         out.push_str(&format!(
+            "C1 PR Reach Rate: {}\n",
+            fmt_optional_ratio(&row.pr_reach_rate, row.github_pr_metrics_available, 2)
+        ));
+        out.push_str(&format!(
             "C2 Merge Rate: {}\n",
             fmt_ratio(&row.merge_rate, 2)
+        ));
+        out.push_str(&format!(
+            "C3 PR Merge Rate: {}\n",
+            fmt_optional_ratio(&row.pr_merge_rate, row.github_pr_metrics_available, 2)
         ));
         return out;
     }
@@ -64,7 +78,9 @@ fn render_delivery_report(
     }
     headers.push(format!("{:>8}", "Commits"));
     headers.push(format!("{:>8}", "Heavy"));
+    headers.push(format!("{:>10}", "C1(PR)"));
     headers.push(format!("{:>12}", "C2(merge)"));
+    headers.push(format!("{:>14}", "C3(PR merge)"));
     if show_branch {
         headers.push(format!("{:>12}", "vs Staging"));
     }
@@ -89,7 +105,15 @@ fn render_delivery_report(
         }
         cols.push(format!("{:>8}", row.commit_count));
         cols.push(format!("{:>8}", row.heavy_commit_count));
+        cols.push(format!(
+            "{:>10}",
+            fmt_optional_ratio_percent(&row.pr_reach_rate, row.github_pr_metrics_available, 1)
+        ));
         cols.push(format!("{:>12}", fmt_ratio_percent(&row.merge_rate, 1)));
+        cols.push(format!(
+            "{:>14}",
+            fmt_optional_ratio_percent(&row.pr_merge_rate, row.github_pr_metrics_available, 1)
+        ));
         if show_branch {
             cols.push(format!(
                 "{:>12}",
@@ -116,11 +140,33 @@ fn fmt_ratio(metric: &analytics::RatioMetric, precision: usize) -> String {
     }
 }
 
+fn fmt_optional_ratio(
+    metric: &analytics::RatioMetric,
+    available: bool,
+    precision: usize,
+) -> String {
+    if !available {
+        return "N/A".to_string();
+    }
+    fmt_ratio(metric, precision)
+}
+
 fn fmt_ratio_percent(metric: &analytics::RatioMetric, precision: usize) -> String {
     match metric.percent() {
         Some(value) => format!("{:.*}%", precision, value),
         None => "N/A".to_string(),
     }
+}
+
+fn fmt_optional_ratio_percent(
+    metric: &analytics::RatioMetric,
+    available: bool,
+    precision: usize,
+) -> String {
+    if !available {
+        return "N/A".to_string();
+    }
+    fmt_ratio_percent(metric, precision)
 }
 
 fn truncate(input: &str, max_len: usize) -> String {
@@ -238,4 +284,99 @@ fn resolve_ref(repo_root: &str, refs: &[&str]) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::analytics::{ChangeReportRow, RatioMetric};
+    use crate::cli::ReportArgs;
+
+    #[test]
+    fn render_delivery_report_shows_c1_and_c3_summary_metrics() {
+        let rows = vec![ChangeReportRow {
+            week_start: None,
+            group_value: None,
+            branch_name: None,
+            repo_root: None,
+            commit_count: 4,
+            heavy_commit_count: 2,
+            pr_reach_rate: RatioMetric {
+                numerator: 1,
+                denominator: 2,
+            },
+            merge_rate: RatioMetric {
+                numerator: 2,
+                denominator: 2,
+            },
+            pr_merge_rate: RatioMetric {
+                numerator: 1,
+                denominator: 1,
+            },
+            github_pr_metrics_available: true,
+        }];
+        let args = DeliveryReportArgs {
+            report: ReportArgs {
+                weekly: false,
+                group_by: None,
+                from: None,
+                to: None,
+                repo: None,
+                all_projects: false,
+                provider: None,
+                task: None,
+                model: None,
+                limit: 50,
+            },
+        };
+
+        let rendered = render_delivery_report(&rows, &args);
+        assert!(rendered.contains("C1 PR Reach Rate: 50.00% (1/2)"));
+        assert!(rendered.contains("C2 Merge Rate: 100.00% (2/2)"));
+        assert!(rendered.contains("C3 PR Merge Rate: 100.00% (1/1)"));
+    }
+
+    #[test]
+    fn render_delivery_report_uses_na_for_github_metrics_without_complete_sync() {
+        let rows = vec![ChangeReportRow {
+            week_start: None,
+            group_value: Some("codex".to_string()),
+            branch_name: None,
+            repo_root: None,
+            commit_count: 4,
+            heavy_commit_count: 2,
+            pr_reach_rate: RatioMetric {
+                numerator: 0,
+                denominator: 2,
+            },
+            merge_rate: RatioMetric {
+                numerator: 1,
+                denominator: 2,
+            },
+            pr_merge_rate: RatioMetric {
+                numerator: 0,
+                denominator: 0,
+            },
+            github_pr_metrics_available: false,
+        }];
+        let args = DeliveryReportArgs {
+            report: ReportArgs {
+                weekly: false,
+                group_by: Some(GroupBy::Provider),
+                from: None,
+                to: None,
+                repo: None,
+                all_projects: false,
+                provider: None,
+                task: None,
+                model: None,
+                limit: 50,
+            },
+        };
+
+        let rendered = render_delivery_report(&rows, &args);
+        assert!(rendered.contains("C1(PR)"));
+        assert!(rendered.contains("C3(PR merge)"));
+        assert!(rendered.contains("N/A"));
+    }
 }

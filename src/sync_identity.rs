@@ -50,6 +50,17 @@ fn normalize_git_remote(input: &str) -> Option<String> {
     Some(format!("{}/{}", host.to_ascii_lowercase(), path))
 }
 
+pub fn github_repo_from_repo_key(repo_key: &str) -> Option<(String, String)> {
+    let repo = repo_key.trim().strip_prefix("git:github.com/")?;
+    let (owner, name) = repo.split_once('/')?;
+    let owner = owner.trim();
+    let name = name.trim();
+    if owner.is_empty() || name.is_empty() || name.contains('/') {
+        return None;
+    }
+    Some((owner.to_string(), name.to_string()))
+}
+
 pub fn repo_key_for_repo_root(repo_root: Option<&str>) -> Option<String> {
     static CACHE: OnceLock<Mutex<HashMap<String, Option<String>>>> = OnceLock::new();
 
@@ -163,5 +174,24 @@ mod tests {
         let right = device_id();
         assert_eq!(left, right);
         assert!(left.starts_with("device:"));
+    }
+
+    #[test]
+    fn parses_github_repo_key() {
+        assert_eq!(
+            github_repo_from_repo_key("git:github.com/PaceFlow/ai-engineering-analytics"),
+            Some((
+                "PaceFlow".to_string(),
+                "ai-engineering-analytics".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn rejects_non_github_repo_keys() {
+        assert_eq!(
+            github_repo_from_repo_key("git:gitlab.com/PaceFlow/ai-engineering-analytics"),
+            None
+        );
     }
 }

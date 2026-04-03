@@ -1,0 +1,12 @@
+pub mod analytics;
+pub mod change_intel;
+pub mod cli;
+pub mod commands;
+pub mod cursor_paths;
+pub mod db;
+pub mod error;
+pub mod github;
+pub mod ingest_progress;
+pub mod path_utils;
+pub mod providers;
+pub mod sync_identity;

@@ -233,7 +233,10 @@ pub struct ChangeReportRow {
     pub repo_root: Option<String>,
     pub commit_count: i64,
     pub heavy_commit_count: i64,
+    pub pr_reach_rate: RatioMetric,
     pub merge_rate: RatioMetric,
+    pub pr_merge_rate: RatioMetric,
+    pub github_pr_metrics_available: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1031,27 +1034,39 @@ pub fn query_change_report(conn: &Connection, args: &ReportArgs) -> Result<Vec<C
     let timestamp_col = "commit_time";
     let mut select = vec![];
     let mut group = vec![];
+    let mut base_sql = format!("SELECT * FROM {}", source);
+    let conditions = build_conditions(
+        args,
+        timestamp_col,
+        source == "view_task_commit_metrics_base",
+        source != "view_change_metrics_base",
+        true,
+    );
+    if !conditions.is_empty() {
+        base_sql.push_str(" WHERE ");
+        base_sql.push_str(&conditions.join(" AND "));
+    }
 
     if args.weekly {
-        select.push("week_start".to_string());
-        group.push("week_start".to_string());
+        select.push("base.week_start".to_string());
+        group.push("base.week_start".to_string());
     } else {
         select.push("NULL AS week_start".to_string());
     }
     if matches!(args.group_by, Some(GroupBy::Task)) {
-        select.push("repo_root".to_string());
-        group.push("repo_root".to_string());
+        select.push("base.repo_root".to_string());
+        group.push("base.repo_root".to_string());
     } else {
         select.push("NULL AS repo_root".to_string());
     }
 
     let mut branch_selected = false;
-    if let Some(group_expr) = change_lifecycle_group_expr(args.group_by) {
+    if let Some(group_expr) = change_report_group_expr(args.group_by) {
         select.push(format!("{group_expr} AS group_value"));
         group.push(group_expr.to_string());
         if matches!(args.group_by, Some(GroupBy::Task)) {
-            select.push("branch_name".to_string());
-            group.push("branch_name".to_string());
+            select.push("base.branch_name".to_string());
+            group.push("base.branch_name".to_string());
             branch_selected = true;
         } else {
             select.push("NULL AS branch_name".to_string());
@@ -1065,39 +1080,63 @@ pub fn query_change_report(conn: &Connection, args: &ReportArgs) -> Result<Vec<C
     }
 
     if use_commit_session_base {
-        select.push("COUNT(DISTINCT commit_sha) AS commit_count".to_string());
+        select.push("COUNT(DISTINCT base.commit_sha) AS commit_count".to_string());
         select.push(
-            "COUNT(DISTINCT CASE WHEN heavy_ai_flag = 1 THEN commit_sha END) AS heavy_commit_count"
+            "COUNT(DISTINCT CASE WHEN base.heavy_ai_flag = 1 THEN base.commit_sha END) AS heavy_commit_count"
                 .to_string(),
         );
-        select.push("COUNT(DISTINCT CASE WHEN heavy_ai_flag = 1 AND merged_to_mainline_flag = 1 THEN commit_sha END) AS c2_n".to_string());
+        select.push("COUNT(DISTINCT CASE WHEN base.heavy_ai_flag = 1 AND base.merged_to_mainline_flag = 1 THEN base.commit_sha END) AS c2_n".to_string());
         select.push(
-            "COUNT(DISTINCT CASE WHEN heavy_ai_flag = 1 THEN commit_sha END) AS c2_d".to_string(),
+            "COUNT(DISTINCT CASE WHEN base.heavy_ai_flag = 1 THEN base.commit_sha END) AS c2_d"
+                .to_string(),
         );
     } else {
         select.push("COUNT(*) AS commit_count".to_string());
         select.push(
-            "COALESCE(SUM(CASE WHEN heavy_ai_flag = 1 THEN 1 ELSE 0 END), 0) AS heavy_commit_count"
+            "COALESCE(SUM(CASE WHEN base.heavy_ai_flag = 1 THEN 1 ELSE 0 END), 0) AS heavy_commit_count"
                 .to_string(),
         );
-        select.push("COALESCE(SUM(CASE WHEN heavy_ai_flag = 1 AND merged_to_mainline_flag = 1 THEN 1 ELSE 0 END), 0) AS c2_n".to_string());
+        select.push("COALESCE(SUM(CASE WHEN base.heavy_ai_flag = 1 AND base.merged_to_mainline_flag = 1 THEN 1 ELSE 0 END), 0) AS c2_n".to_string());
         select.push(
-            "COALESCE(SUM(CASE WHEN heavy_ai_flag = 1 THEN 1 ELSE 0 END), 0) AS c2_d".to_string(),
+            "COALESCE(SUM(CASE WHEN base.heavy_ai_flag = 1 THEN 1 ELSE 0 END), 0) AS c2_d"
+                .to_string(),
         );
     }
-
-    let mut sql = format!("SELECT {} FROM {}", select.join(", "), source);
-    let conditions = build_conditions(
-        args,
-        timestamp_col,
-        source == "view_task_commit_metrics_base",
-        source != "view_change_metrics_base",
-        true,
+    select.push(
+        "COUNT(DISTINCT CASE WHEN base.heavy_ai_flag = 1 AND eo.repo_key LIKE 'git:github.com/%' THEN base.commit_sha END) AS c1_d"
+            .to_string(),
     );
-    if !conditions.is_empty() {
-        sql.push_str(" WHERE ");
-        sql.push_str(&conditions.join(" AND "));
-    }
+    select.push(
+        "COUNT(DISTINCT CASE WHEN base.heavy_ai_flag = 1 AND eo.repo_key LIKE 'git:github.com/%' AND lu.status IN ('resolved', 'no_pr') THEN base.commit_sha END) AS github_ready_count"
+            .to_string(),
+    );
+    select.push(
+        "COUNT(DISTINCT CASE WHEN base.heavy_ai_flag = 1 AND eo.repo_key LIKE 'git:github.com/%' AND pr.pr_opened_flag = 1 THEN base.commit_sha END) AS c1_n"
+            .to_string(),
+    );
+    select.push(
+        "COUNT(DISTINCT CASE WHEN base.heavy_ai_flag = 1 AND eo.repo_key LIKE 'git:github.com/%' AND pr.pr_opened_flag = 1 AND pr.pr_merged_flag = 1 THEN base.commit_sha END) AS c3_n"
+            .to_string(),
+    );
+    select.push(
+        "COUNT(DISTINCT CASE WHEN base.heavy_ai_flag = 1 AND eo.repo_key LIKE 'git:github.com/%' AND pr.pr_opened_flag = 1 THEN base.commit_sha END) AS c3_d"
+            .to_string(),
+    );
+
+    let mut sql = format!(
+        "SELECT {} FROM ({}) base
+         LEFT JOIN event_commit_outcome eo
+           ON eo.repo_root = base.repo_root
+          AND eo.commit_sha = base.commit_sha
+         LEFT JOIN fact_github_commit_pr_lookup lu
+           ON lu.repo_key = eo.repo_key
+          AND lu.commit_sha = base.commit_sha
+         LEFT JOIN event_commit_pr_outcome pr
+           ON pr.repo_root = base.repo_root
+          AND pr.commit_sha = base.commit_sha",
+        select.join(", "),
+        base_sql
+    );
     let apply_sql_limit = !group.is_empty() && !matches!(args.group_by, Some(GroupBy::Task));
     if !group.is_empty() {
         sql.push_str(" GROUP BY ");
@@ -1118,7 +1157,14 @@ pub fn query_change_report(conn: &Connection, args: &ReportArgs) -> Result<Vec<C
             branch_name: row.get(3)?,
             commit_count: row.get(4)?,
             heavy_commit_count: row.get(5)?,
+            pr_reach_rate: ratio_metric(row.get(10)?, row.get(8)?),
             merge_rate: ratio_metric(row.get(6)?, row.get(7)?),
+            pr_merge_rate: ratio_metric(row.get(11)?, row.get(12)?),
+            github_pr_metrics_available: {
+                let eligible: i64 = row.get(8)?;
+                let ready: i64 = row.get(9)?;
+                eligible > 0 && eligible == ready
+            },
         })
     })?;
     let mut out = Vec::new();
@@ -1566,6 +1612,16 @@ fn change_lifecycle_group_expr(group_by: Option<GroupBy>) -> Option<&'static str
         Some(GroupBy::Provider) => Some("provider"),
         Some(GroupBy::Task) => Some("task_key"),
         Some(GroupBy::Model) => Some("COALESCE(model_name, '(unknown)')"),
+        None => None,
+    }
+}
+
+fn change_report_group_expr(group_by: Option<GroupBy>) -> Option<&'static str> {
+    match group_by {
+        Some(GroupBy::Repo) => Some("COALESCE(base.repo_root, '(unknown)')"),
+        Some(GroupBy::Provider) => Some("base.provider"),
+        Some(GroupBy::Task) => Some("base.task_key"),
+        Some(GroupBy::Model) => Some("COALESCE(base.model_name, '(unknown)')"),
         None => None,
     }
 }
@@ -3084,6 +3140,117 @@ mod tests {
             lifecycle_rows[0].branch_name.as_deref(),
             Some("PAC-1-branch")
         );
+        Ok(())
+    }
+
+    #[test]
+    fn change_report_computes_github_pr_rates_when_lookup_is_complete() -> Result<()> {
+        let conn = open_test_db()?;
+        conn.execute(
+            "INSERT INTO event_commit_outcome (
+                repo_root, repo_key, commit_sha, commit_time, heavy_ai_flag, merged_to_mainline_flag,
+                reverted_later_flag, total_matched_ai_lines, commit_total_changed_lines
+             ) VALUES
+                ('/tmp/repo', 'git:github.com/PaceFlow/repo', 'c1', '2026-03-17T09:00:00Z', 1, 1, 0, 20, 30),
+                ('/tmp/repo', 'git:github.com/PaceFlow/repo', 'c2', '2026-03-17T10:00:00Z', 1, 0, 0, 22, 28)",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO event_commit_churn (
+                repo_root, repo_key, commit_sha, ai_added_lines_reaching_mainline,
+                ai_added_lines_removed_within_window, churn_window_days
+             ) VALUES
+                ('/tmp/repo', 'git:github.com/PaceFlow/repo', 'c1', 18, 1, 14),
+                ('/tmp/repo', 'git:github.com/PaceFlow/repo', 'c2', 0, 0, 14)",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO fact_github_commit_pr_lookup (
+                repo_key, commit_sha, status, owning_pr_number, last_checked_at, last_error
+             ) VALUES
+                ('git:github.com/PaceFlow/repo', 'c1', 'resolved', 11, '2026-03-17T11:00:00Z', NULL),
+                ('git:github.com/PaceFlow/repo', 'c2', 'no_pr', NULL, '2026-03-17T11:00:00Z', NULL)",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO event_commit_pr_outcome (
+                repo_root, repo_key, commit_sha, lookup_status, pr_number, pr_opened_flag,
+                pr_merged_flag, pr_created_at, pr_merged_at
+             ) VALUES
+                ('/tmp/repo', 'git:github.com/PaceFlow/repo', 'c1', 'resolved', 11, 1, 1, '2026-03-17T08:00:00Z', '2026-03-18T08:00:00Z'),
+                ('/tmp/repo', 'git:github.com/PaceFlow/repo', 'c2', 'no_pr', NULL, 0, 0, NULL, NULL)",
+            [],
+        )?;
+
+        create_reporting_views(&conn)?;
+        let rows = query_change_report(
+            &conn,
+            &ReportArgs {
+                weekly: false,
+                group_by: None,
+                from: None,
+                to: None,
+                repo: None,
+                all_projects: false,
+                provider: None,
+                task: None,
+                model: None,
+                limit: 10,
+            },
+        )?;
+
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].github_pr_metrics_available);
+        assert_eq!(rows[0].pr_reach_rate.numerator, 1);
+        assert_eq!(rows[0].pr_reach_rate.denominator, 2);
+        assert_eq!(rows[0].merge_rate.numerator, 1);
+        assert_eq!(rows[0].merge_rate.denominator, 2);
+        assert_eq!(rows[0].pr_merge_rate.numerator, 1);
+        assert_eq!(rows[0].pr_merge_rate.denominator, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn change_report_marks_github_pr_metrics_unavailable_when_lookup_is_incomplete() -> Result<()> {
+        let conn = open_test_db()?;
+        conn.execute(
+            "INSERT INTO event_commit_outcome (
+                repo_root, repo_key, commit_sha, commit_time, heavy_ai_flag, merged_to_mainline_flag,
+                reverted_later_flag, total_matched_ai_lines, commit_total_changed_lines
+             ) VALUES
+                ('/tmp/repo', 'git:github.com/PaceFlow/repo', 'c1', '2026-03-17T09:00:00Z', 1, 1, 0, 20, 30)",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO event_commit_churn (
+                repo_root, repo_key, commit_sha, ai_added_lines_reaching_mainline,
+                ai_added_lines_removed_within_window, churn_window_days
+             ) VALUES
+                ('/tmp/repo', 'git:github.com/PaceFlow/repo', 'c1', 18, 1, 14)",
+            [],
+        )?;
+
+        create_reporting_views(&conn)?;
+        let rows = query_change_report(
+            &conn,
+            &ReportArgs {
+                weekly: false,
+                group_by: None,
+                from: None,
+                to: None,
+                repo: None,
+                all_projects: false,
+                provider: None,
+                task: None,
+                model: None,
+                limit: 10,
+            },
+        )?;
+
+        assert_eq!(rows.len(), 1);
+        assert!(!rows[0].github_pr_metrics_available);
+        assert_eq!(rows[0].pr_reach_rate.denominator, 1);
+        assert_eq!(rows[0].pr_reach_rate.numerator, 0);
         Ok(())
     }
 

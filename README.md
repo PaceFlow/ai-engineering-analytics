@@ -69,7 +69,9 @@ OPS-88                        OPS-88-deploy-cleanup            4         3      
 Why it matters:
 
 - Heavy commits tell you where AI materially influenced the diff instead of just assisting around the edges.
+- C1 tells you whether AI-heavy work even made it to review as a pull request.
 - Merge rate tells you whether that work survived review and integration.
+- C3 tells you whether PR-linked AI-heavy work actually cleared the PR funnel and merged.
 
 What to do differently:
 
@@ -112,6 +114,15 @@ Useful follow-ups:
 - `paceflow session --group-by provider`
 - `paceflow delivery --group-by task`
 - `paceflow quality --group-by provider`
+
+Optional GitHub PR sync setup:
+
+```bash
+paceflow github token
+paceflow ingest
+```
+
+Rerun `paceflow github token` to replace or delete the saved token. For CI or one-off overrides, `PACEFLOW_GITHUB_TOKEN` still takes precedence over the saved local token.
 
 ## Installation
 
@@ -171,6 +182,8 @@ Requirements:
 - `paceflow` reads local Codex sessions from `~/.codex/sessions`
 - `paceflow` reads local Cursor state/history from the OS config directory under `Cursor/User`
 - If Cursor data lives elsewhere, set `PACEFLOW_CURSOR_STATE_PATH` and/or `PACEFLOW_CURSOR_HISTORY_PATH`
+- To enable GitHub PR sync during ingest, either run `paceflow github token` once or set `PACEFLOW_GITHUB_TOKEN`
+- To enable GitHub-backed `C1` and `C3` metrics for `github.com` repos, set `PACEFLOW_GITHUB_TOKEN` with at least `Pull requests: read`
 
 ## Who It's For
 
@@ -199,7 +212,9 @@ These are workflow-quality signals, not just activity counters.
 ### 2. Did the work turn into shipped change?
 
 - Heavy commits
+- PR reach rate
 - Merge rate
+- PR merge rate
 - Session-to-commit rate
 
 These tell you whether session effort turned into commits and whether those commits made it into mainline history.
