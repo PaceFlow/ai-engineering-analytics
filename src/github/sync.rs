@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use chrono::{SecondsFormat, Utc};
+use chrono::{Duration, SecondsFormat, Utc};
 use rusqlite::{Connection, TransactionBehavior, params};
 use tokio::runtime::Builder;
 use tokio::sync::Semaphore;
@@ -19,6 +19,9 @@ use crate::sync_identity;
 
 const GLOBAL_CONCURRENCY: usize = 8;
 const PER_REPO_CONCURRENCY: usize = 2;
+const OPEN_PR_REFRESH_TTL_HOURS: i64 = 6;
+
+type PullRequestKey = (String, i64);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct CommitLookupWorkItem {
@@ -55,11 +58,12 @@ pub fn sync_github_pull_requests(
 }
 
 pub fn plan_github_pull_requests(conn: &Connection) -> Result<GitHubSyncWorkPlan> {
+    let stale_cutoff = stale_open_pr_refresh_cutoff();
     Ok(GitHubSyncWorkPlan {
         commit_lookup_units: dedupe_commit_lookup_work_items(load_commit_lookup_work_items(conn)?)
             .len(),
         pull_request_refresh_units: dedupe_pull_request_refresh_work_items(
-            load_open_pull_request_refresh_items(conn)?,
+            load_open_pull_request_refresh_items(conn, &HashSet::new(), &stale_cutoff)?,
         )
         .len(),
     })
@@ -79,13 +83,18 @@ where
     };
 
     let lookup_items = dedupe_commit_lookup_work_items(load_commit_lookup_work_items(conn)?);
+    let stale_cutoff = stale_open_pr_refresh_cutoff();
+    let planned_refresh_items = dedupe_pull_request_refresh_work_items(
+        load_open_pull_request_refresh_items(conn, &HashSet::new(), &stale_cutoff)?,
+    );
     summary.commit_lookups_enqueued = lookup_items.len();
+    let mut lookup_results = Vec::new();
     if !lookup_items.is_empty() {
         let runtime = Builder::new_current_thread()
             .enable_all()
             .build()
             .context("build GitHub sync runtime")?;
-        let lookup_results = if let Some(observer) = progress.as_mut() {
+        lookup_results = if let Some(observer) = progress.as_mut() {
             runtime.block_on(run_commit_lookup_jobs(
                 Arc::clone(&api),
                 lookup_items.clone(),
@@ -101,8 +110,13 @@ where
         summary.commit_lookups_completed = lookup_results.len();
         persist_commit_lookup_results(conn, &lookup_items, &lookup_results, &mut summary)?;
     }
-    let refresh_items =
-        dedupe_pull_request_refresh_work_items(load_open_pull_request_refresh_items(conn)?);
+    let touched_pull_requests = touched_open_pull_request_keys(&lookup_results);
+    let refresh_items = dedupe_pull_request_refresh_work_items(
+        load_open_pull_request_refresh_items(conn, &touched_pull_requests, &stale_cutoff)?,
+    );
+    if let Some(observer) = progress.as_mut() {
+        observer.replace_future_units(planned_refresh_items.len(), refresh_items.len());
+    }
     if !refresh_items.is_empty() {
         let runtime = Builder::new_current_thread()
             .enable_all()
@@ -259,6 +273,29 @@ fn format_pull_request_refresh_progress_label(item: &PullRequestRefreshWorkItem)
 
 fn short_commit_sha(commit_sha: &str) -> &str {
     &commit_sha[..commit_sha.len().min(8)]
+}
+
+fn stale_open_pr_refresh_cutoff() -> String {
+    (Utc::now() - Duration::hours(OPEN_PR_REFRESH_TTL_HOURS))
+        .to_rfc3339_opts(SecondsFormat::Millis, true)
+}
+
+fn touched_open_pull_request_keys(results: &[CommitLookupResult]) -> HashSet<PullRequestKey> {
+    let mut touched = HashSet::new();
+    for result in results {
+        let Some(pr_number) = result.owning_pr_number else {
+            continue;
+        };
+        let is_open = result.pull_requests.iter().any(|pull_request| {
+            pull_request.number == pr_number
+                && pull_request.state == "open"
+                && pull_request.merged_at.is_none()
+        });
+        if is_open {
+            touched.insert((result.repo.repo_key.clone(), pr_number));
+        }
+    }
+    touched
 }
 
 fn persist_commit_lookup_results(
@@ -536,22 +573,38 @@ fn load_commit_lookup_work_items(conn: &Connection) -> Result<Vec<CommitLookupWo
 
 fn load_open_pull_request_refresh_items(
     conn: &Connection,
+    touched_pull_requests: &HashSet<PullRequestKey>,
+    stale_cutoff: &str,
 ) -> Result<Vec<PullRequestRefreshWorkItem>> {
     let mut statement = conn.prepare(
-        "SELECT repo_key, pr_number
-         FROM fact_github_pull_request
-         WHERE repo_key LIKE 'git:github.com/%'
-           AND state = 'open'
-           AND merged_at IS NULL
-         ORDER BY repo_key, pr_number",
+        "SELECT pr.repo_key, pr.pr_number, ss.last_open_pr_refresh_at
+         FROM fact_github_pull_request pr
+         LEFT JOIN fact_github_sync_state ss
+           ON ss.repo_key = pr.repo_key
+         WHERE pr.repo_key LIKE 'git:github.com/%'
+           AND pr.state = 'open'
+           AND pr.merged_at IS NULL
+         ORDER BY pr.repo_key, pr.pr_number",
     )?;
     let rows = statement.query_map([], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, Option<String>>(2)?,
+        ))
     })?;
 
     let mut items = Vec::new();
     for row in rows {
-        let (repo_key, pr_number) = row?;
+        let (repo_key, pr_number, last_open_pr_refresh_at) = row?;
+        let key = (repo_key.clone(), pr_number);
+        let repo_is_stale = last_open_pr_refresh_at
+            .as_deref()
+            .map(|value| value < stale_cutoff)
+            .unwrap_or(true);
+        if !repo_is_stale && !touched_pull_requests.contains(&key) {
+            continue;
+        }
         let Some((owner, name)) = sync_identity::github_repo_from_repo_key(&repo_key) else {
             continue;
         };
@@ -697,6 +750,35 @@ mod tests {
         Ok(conn)
     }
 
+    fn insert_open_pull_request(conn: &Connection, repo_key: &str, pr_number: i64) -> Result<()> {
+        conn.execute(
+            "INSERT INTO fact_github_pull_request (
+                repo_key, pr_number, state, draft_flag, created_at, updated_at, closed_at,
+                merged_at, base_ref, head_ref, html_url
+             ) VALUES (?1, ?2, 'open', 0, '2026-03-10T10:00:00Z', '2026-03-12T10:00:00Z',
+                NULL, NULL, 'main', 'feature-a', 'https://github.com/PaceFlow/repo/pull/12')",
+            params![repo_key, pr_number],
+        )?;
+        Ok(())
+    }
+
+    fn upsert_repo_refresh_state(
+        conn: &Connection,
+        repo_key: &str,
+        last_open_pr_refresh_at: &str,
+    ) -> Result<()> {
+        conn.execute(
+            "INSERT INTO fact_github_sync_state (
+                repo_key, last_commit_scan_at, last_open_pr_refresh_at, last_error, updated_at
+             ) VALUES (?1, NULL, ?2, NULL, ?2)
+             ON CONFLICT(repo_key) DO UPDATE SET
+                last_open_pr_refresh_at = excluded.last_open_pr_refresh_at,
+                updated_at = excluded.updated_at",
+            params![repo_key, last_open_pr_refresh_at],
+        )?;
+        Ok(())
+    }
+
     #[derive(Default)]
     struct RecordingProgress {
         labels: Vec<String>,
@@ -823,43 +905,88 @@ mod tests {
                 ('/tmp/repo', 'git:github.com/PaceFlow/repo', 'abc', '2026-03-18T10:00:00Z', 1, 0, 0, 40, 50)",
             [],
         )?;
-        conn.execute(
-            "INSERT INTO fact_github_pull_request (
-                repo_key, pr_number, state, draft_flag, created_at, updated_at, closed_at,
-                merged_at, base_ref, head_ref, html_url
-             ) VALUES
-                ('git:github.com/PaceFlow/repo', 12, 'open', 0, '2026-03-10T10:00:00Z',
-                 '2026-03-12T10:00:00Z', NULL, NULL, 'main', 'feature-a',
-                 'https://github.com/PaceFlow/repo/pull/12')",
-            [],
+        insert_open_pull_request(&conn, "git:github.com/PaceFlow/repo", 12)?;
+        upsert_repo_refresh_state(
+            &conn,
+            "git:github.com/PaceFlow/repo",
+            "9999-03-18T10:05:00.000Z",
         )?;
 
         let plan = plan_github_pull_requests(&conn)?;
         assert_eq!(plan.commit_lookup_units, 1);
+        assert_eq!(plan.pull_request_refresh_units, 0);
+        assert_eq!(plan.total_units(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn plan_counts_stale_open_pr_refresh_work() -> Result<()> {
+        let conn = open_test_db()?;
+        insert_open_pull_request(&conn, "git:github.com/PaceFlow/repo", 12)?;
+        upsert_repo_refresh_state(
+            &conn,
+            "git:github.com/PaceFlow/repo",
+            "2000-03-18T10:05:00.000Z",
+        )?;
+
+        let plan = plan_github_pull_requests(&conn)?;
+        assert_eq!(plan.commit_lookup_units, 0);
         assert_eq!(plan.pull_request_refresh_units, 1);
-        assert_eq!(plan.total_units(), 2);
+        assert_eq!(plan.total_units(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn sync_skips_open_pr_refresh_for_fresh_repo_without_new_lookups() -> Result<()> {
+        let mut conn = open_test_db()?;
+        insert_open_pull_request(&conn, "git:github.com/PaceFlow/repo", 12)?;
+        upsert_repo_refresh_state(
+            &conn,
+            "git:github.com/PaceFlow/repo",
+            "9999-03-18T10:05:00.000Z",
+        )?;
+
+        let api = Arc::new(FakeGitHubApi::default());
+        let summary = sync_github_pull_requests_with_api(&mut conn, api.clone(), None)?;
+
+        assert_eq!(summary.commit_lookups_completed, 0);
+        assert_eq!(summary.open_pull_requests_refreshed, 0);
+        assert!(api.pull_calls.lock().unwrap().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn sync_refreshes_open_prs_for_stale_repo() -> Result<()> {
+        let mut conn = open_test_db()?;
+        insert_open_pull_request(&conn, "git:github.com/PaceFlow/repo", 12)?;
+        upsert_repo_refresh_state(
+            &conn,
+            "git:github.com/PaceFlow/repo",
+            "2000-03-18T10:05:00.000Z",
+        )?;
+
+        let api = Arc::new(FakeGitHubApi::default());
+        let summary = sync_github_pull_requests_with_api(&mut conn, api.clone(), None)?;
+
+        assert_eq!(summary.open_pull_requests_refreshed, 1);
+        assert_eq!(api.pull_calls.lock().unwrap().len(), 1);
         Ok(())
     }
 
     #[test]
     fn sync_advances_progress_for_commit_lookup_and_open_pr_refresh() -> Result<()> {
         let mut conn = open_test_db()?;
+        upsert_repo_refresh_state(
+            &conn,
+            "git:github.com/PaceFlow/repo",
+            "9999-03-18T10:05:00.000Z",
+        )?;
         conn.execute(
             "INSERT INTO event_commit_outcome (
                 repo_root, repo_key, commit_sha, commit_time, heavy_ai_flag,
                 merged_to_mainline_flag, reverted_later_flag, total_matched_ai_lines, commit_total_changed_lines
              ) VALUES
                 ('/tmp/repo', 'git:github.com/PaceFlow/repo', 'abc', '2026-03-18T10:00:00Z', 1, 0, 0, 40, 50)",
-            [],
-        )?;
-        conn.execute(
-            "INSERT INTO fact_github_pull_request (
-                repo_key, pr_number, state, draft_flag, created_at, updated_at, closed_at,
-                merged_at, base_ref, head_ref, html_url
-             ) VALUES
-                ('git:github.com/PaceFlow/repo', 12, 'open', 0, '2026-03-10T10:00:00Z',
-                 '2026-03-12T10:00:00Z', NULL, NULL, 'main', 'feature-a',
-                 'https://github.com/PaceFlow/repo/pull/12')",
             [],
         )?;
 
@@ -882,10 +1009,12 @@ mod tests {
         );
 
         let mut progress = RecordingProgress::default();
-        let summary = sync_github_pull_requests_with_api(&mut conn, api, Some(&mut progress))?;
+        let summary =
+            sync_github_pull_requests_with_api(&mut conn, api.clone(), Some(&mut progress))?;
 
         assert_eq!(summary.commit_lookups_completed, 1);
         assert_eq!(summary.open_pull_requests_refreshed, 1);
+        assert_eq!(api.pull_calls.lock().unwrap().len(), 1);
         assert_eq!(progress.labels.len(), 2);
         assert!(progress.labels.iter().any(|label| label.contains("abc")));
         assert!(progress.labels.iter().any(|label| label.contains("#12")));

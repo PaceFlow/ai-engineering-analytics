@@ -54,6 +54,8 @@ impl IngestExecutionPlan {
 
 pub trait IngestProgressObserver {
     fn advance(&mut self, item_label: &str);
+
+    fn replace_future_units(&mut self, _old_units: usize, _new_units: usize) {}
 }
 
 #[derive(Debug, Clone)]
@@ -245,6 +247,10 @@ pub struct StageProgress<'a> {
 impl IngestProgressObserver for StageProgress<'_> {
     fn advance(&mut self, item_label: &str) {
         self.progress.advance(1, item_label);
+    }
+
+    fn replace_future_units(&mut self, old_units: usize, new_units: usize) {
+        self.progress.replace_future_units(old_units, new_units);
     }
 }
 
