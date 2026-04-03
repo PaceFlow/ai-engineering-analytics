@@ -54,6 +54,18 @@ pub struct PullRequestRefreshResult {
     pub pull_request: PullRequestRecord,
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct GitHubSyncWorkPlan {
+    pub commit_lookup_units: usize,
+    pub pull_request_refresh_units: usize,
+}
+
+impl GitHubSyncWorkPlan {
+    pub fn total_units(&self) -> usize {
+        self.commit_lookup_units + self.pull_request_refresh_units
+    }
+}
+
 #[derive(Debug, Default, Clone, Copy)]
 pub struct GitHubSyncSummary {
     pub repos_considered: usize,

@@ -11,9 +11,10 @@ use tokio::task::JoinSet;
 use crate::github::auth::github_token;
 use crate::github::client::{GitHubApi, GitHubApiErrorKind, ReqwestGitHubApi};
 use crate::github::types::{
-    CommitLookupResult, CommitLookupStatus, GitHubRepo, GitHubSyncSummary, PullRequestRecord,
-    PullRequestRefreshResult,
+    CommitLookupResult, CommitLookupStatus, GitHubRepo, GitHubSyncSummary, GitHubSyncWorkPlan,
+    PullRequestRecord, PullRequestRefreshResult,
 };
+use crate::ingest_progress::IngestProgressObserver;
 use crate::sync_identity;
 
 const GLOBAL_CONCURRENCY: usize = 8;
@@ -35,6 +36,7 @@ struct PullRequestRefreshWorkItem {
 pub fn sync_github_pull_requests(
     conn: &mut Connection,
     _verbose: bool,
+    progress: Option<&mut dyn IngestProgressObserver>,
 ) -> Result<GitHubSyncSummary> {
     let mut summary = GitHubSyncSummary {
         repos_considered: count_github_repos(conn)?,
@@ -47,14 +49,26 @@ pub fn sync_github_pull_requests(
     };
 
     let api = Arc::new(ReqwestGitHubApi::new(&token)?);
-    summary = sync_github_pull_requests_with_api(conn, api)?;
+    summary = sync_github_pull_requests_with_api(conn, api, progress)?;
     summary.repos_considered = count_github_repos(conn)?;
     Ok(summary)
+}
+
+pub fn plan_github_pull_requests(conn: &Connection) -> Result<GitHubSyncWorkPlan> {
+    Ok(GitHubSyncWorkPlan {
+        commit_lookup_units: dedupe_commit_lookup_work_items(load_commit_lookup_work_items(conn)?)
+            .len(),
+        pull_request_refresh_units: dedupe_pull_request_refresh_work_items(
+            load_open_pull_request_refresh_items(conn)?,
+        )
+        .len(),
+    })
 }
 
 fn sync_github_pull_requests_with_api<A>(
     conn: &mut Connection,
     api: Arc<A>,
+    mut progress: Option<&mut dyn IngestProgressObserver>,
 ) -> Result<GitHubSyncSummary>
 where
     A: GitHubApi + Send + Sync + 'static,
@@ -71,10 +85,19 @@ where
             .enable_all()
             .build()
             .context("build GitHub sync runtime")?;
-        let lookup_results = runtime.block_on(run_commit_lookup_jobs(
-            Arc::clone(&api),
-            lookup_items.clone(),
-        ));
+        let lookup_results = if let Some(observer) = progress.as_mut() {
+            runtime.block_on(run_commit_lookup_jobs(
+                Arc::clone(&api),
+                lookup_items.clone(),
+                Some(&mut **observer),
+            ))
+        } else {
+            runtime.block_on(run_commit_lookup_jobs(
+                Arc::clone(&api),
+                lookup_items.clone(),
+                None,
+            ))
+        };
         summary.commit_lookups_completed = lookup_results.len();
         persist_commit_lookup_results(conn, &lookup_items, &lookup_results, &mut summary)?;
     }
@@ -85,10 +108,19 @@ where
             .enable_all()
             .build()
             .context("build GitHub refresh runtime")?;
-        let refresh_results = runtime.block_on(run_pull_request_refresh_jobs(
-            Arc::clone(&api),
-            refresh_items.clone(),
-        ));
+        let refresh_results = if let Some(observer) = progress.as_mut() {
+            runtime.block_on(run_pull_request_refresh_jobs(
+                Arc::clone(&api),
+                refresh_items.clone(),
+                Some(&mut **observer),
+            ))
+        } else {
+            runtime.block_on(run_pull_request_refresh_jobs(
+                Arc::clone(&api),
+                refresh_items.clone(),
+                None,
+            ))
+        };
         persist_pull_request_refresh_results(conn, &refresh_items, &refresh_results, &mut summary)?;
     }
 
@@ -99,6 +131,7 @@ where
 async fn run_commit_lookup_jobs<A>(
     api: Arc<A>,
     items: Vec<CommitLookupWorkItem>,
+    mut progress: Option<&mut dyn IngestProgressObserver>,
 ) -> Vec<CommitLookupResult>
 where
     A: GitHubApi + Send + Sync + 'static,
@@ -154,6 +187,9 @@ where
     let mut results = Vec::new();
     while let Some(result) = jobs.join_next().await {
         if let Ok(value) = result {
+            if let Some(observer) = progress.as_deref_mut() {
+                observer.advance(&format_commit_lookup_progress_label(&value));
+            }
             results.push(value);
         }
     }
@@ -163,6 +199,7 @@ where
 async fn run_pull_request_refresh_jobs<A>(
     api: Arc<A>,
     items: Vec<PullRequestRefreshWorkItem>,
+    mut progress: Option<&mut dyn IngestProgressObserver>,
 ) -> Vec<PullRequestRefreshResult>
 where
     A: GitHubApi + Send + Sync + 'static,
@@ -182,23 +219,46 @@ where
         jobs.spawn(async move {
             let _global_permit = global_limit.acquire_owned().await.ok();
             let _repo_permit = repo_limit.acquire_owned().await.ok();
-            api.fetch_pull_request(&item.repo, item.pr_number)
+            let pull_request = api
+                .fetch_pull_request(&item.repo, item.pr_number)
                 .await
-                .ok()
-                .map(|pull_request| PullRequestRefreshResult {
-                    repo: item.repo,
-                    pull_request,
-                })
+                .ok();
+            (item, pull_request)
         });
     }
 
     let mut results = Vec::new();
     while let Some(result) = jobs.join_next().await {
-        if let Ok(Some(value)) = result {
-            results.push(value);
+        if let Ok((item, pull_request)) = result {
+            if let Some(observer) = progress.as_deref_mut() {
+                observer.advance(&format_pull_request_refresh_progress_label(&item));
+            }
+            if let Some(pull_request) = pull_request {
+                results.push(PullRequestRefreshResult {
+                    repo: item.repo,
+                    pull_request,
+                });
+            }
         }
     }
     results
+}
+
+fn format_commit_lookup_progress_label(result: &CommitLookupResult) -> String {
+    format!(
+        "{}/{} {}",
+        result.repo.owner,
+        result.repo.name,
+        short_commit_sha(&result.commit_sha)
+    )
+}
+
+fn format_pull_request_refresh_progress_label(item: &PullRequestRefreshWorkItem) -> String {
+    format!("{}/{} #{}", item.repo.owner, item.repo.name, item.pr_number)
+}
+
+fn short_commit_sha(commit_sha: &str) -> &str {
+    &commit_sha[..commit_sha.len().min(8)]
 }
 
 fn persist_commit_lookup_results(
@@ -554,6 +614,7 @@ mod tests {
 
     use super::*;
     use crate::db::init_app_schema;
+    use crate::ingest_progress::IngestProgressObserver;
 
     type CommitLookupResponse =
         std::result::Result<Vec<PullRequestRecord>, crate::github::client::GitHubApiError>;
@@ -636,6 +697,17 @@ mod tests {
         Ok(conn)
     }
 
+    #[derive(Default)]
+    struct RecordingProgress {
+        labels: Vec<String>,
+    }
+
+    impl IngestProgressObserver for RecordingProgress {
+        fn advance(&mut self, item_label: &str) {
+            self.labels.push(item_label.to_string());
+        }
+    }
+
     #[test]
     fn choose_owning_pr_prefers_earliest_created_at_then_lower_number() {
         let earliest = PullRequestRecord {
@@ -713,7 +785,7 @@ mod tests {
             ]),
         );
 
-        let summary = sync_github_pull_requests_with_api(&mut conn, api.clone())?;
+        let summary = sync_github_pull_requests_with_api(&mut conn, api.clone(), None)?;
         assert_eq!(summary.commit_lookups_enqueued, 1);
         assert_eq!(summary.resolved_commits, 1);
 
@@ -737,6 +809,86 @@ mod tests {
             |row| row.get(0),
         )?;
         assert_eq!(owning_pr, 12);
+        Ok(())
+    }
+
+    #[test]
+    fn plan_counts_pending_commit_lookups_and_open_pr_refreshes() -> Result<()> {
+        let conn = open_test_db()?;
+        conn.execute(
+            "INSERT INTO event_commit_outcome (
+                repo_root, repo_key, commit_sha, commit_time, heavy_ai_flag,
+                merged_to_mainline_flag, reverted_later_flag, total_matched_ai_lines, commit_total_changed_lines
+             ) VALUES
+                ('/tmp/repo', 'git:github.com/PaceFlow/repo', 'abc', '2026-03-18T10:00:00Z', 1, 0, 0, 40, 50)",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO fact_github_pull_request (
+                repo_key, pr_number, state, draft_flag, created_at, updated_at, closed_at,
+                merged_at, base_ref, head_ref, html_url
+             ) VALUES
+                ('git:github.com/PaceFlow/repo', 12, 'open', 0, '2026-03-10T10:00:00Z',
+                 '2026-03-12T10:00:00Z', NULL, NULL, 'main', 'feature-a',
+                 'https://github.com/PaceFlow/repo/pull/12')",
+            [],
+        )?;
+
+        let plan = plan_github_pull_requests(&conn)?;
+        assert_eq!(plan.commit_lookup_units, 1);
+        assert_eq!(plan.pull_request_refresh_units, 1);
+        assert_eq!(plan.total_units(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn sync_advances_progress_for_commit_lookup_and_open_pr_refresh() -> Result<()> {
+        let mut conn = open_test_db()?;
+        conn.execute(
+            "INSERT INTO event_commit_outcome (
+                repo_root, repo_key, commit_sha, commit_time, heavy_ai_flag,
+                merged_to_mainline_flag, reverted_later_flag, total_matched_ai_lines, commit_total_changed_lines
+             ) VALUES
+                ('/tmp/repo', 'git:github.com/PaceFlow/repo', 'abc', '2026-03-18T10:00:00Z', 1, 0, 0, 40, 50)",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO fact_github_pull_request (
+                repo_key, pr_number, state, draft_flag, created_at, updated_at, closed_at,
+                merged_at, base_ref, head_ref, html_url
+             ) VALUES
+                ('git:github.com/PaceFlow/repo', 12, 'open', 0, '2026-03-10T10:00:00Z',
+                 '2026-03-12T10:00:00Z', NULL, NULL, 'main', 'feature-a',
+                 'https://github.com/PaceFlow/repo/pull/12')",
+            [],
+        )?;
+
+        let api = Arc::new(FakeGitHubApi::default());
+        api.insert_commit_response(
+            "git:github.com/PaceFlow/repo",
+            "abc",
+            Ok(vec![PullRequestRecord {
+                number: 12,
+                state: "open".to_string(),
+                draft: false,
+                created_at: Some("2026-03-10T10:00:00Z".to_string()),
+                updated_at: Some("2026-03-12T10:00:00Z".to_string()),
+                closed_at: None,
+                merged_at: None,
+                base_ref: Some("main".to_string()),
+                head_ref: Some("feature-a".to_string()),
+                html_url: Some("https://github.com/PaceFlow/repo/pull/12".to_string()),
+            }]),
+        );
+
+        let mut progress = RecordingProgress::default();
+        let summary = sync_github_pull_requests_with_api(&mut conn, api, Some(&mut progress))?;
+
+        assert_eq!(summary.commit_lookups_completed, 1);
+        assert_eq!(summary.open_pull_requests_refreshed, 1);
+        assert_eq!(progress.labels.len(), 2);
+        assert!(progress.labels.iter().any(|label| label.contains("abc")));
+        assert!(progress.labels.iter().any(|label| label.contains("#12")));
         Ok(())
     }
 

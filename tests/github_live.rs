@@ -119,7 +119,7 @@ impl LiveGitHubFixture {
             seed_github_candidate_commit(&conn, &config.repo_key, no_pr_commit_sha, 1)?;
         }
 
-        let summary = github::sync::sync_github_pull_requests(&mut conn, false)?;
+        let summary = github::sync::sync_github_pull_requests(&mut conn, false, None)?;
 
         Ok(Some(Self {
             _env_guard: env_guard,

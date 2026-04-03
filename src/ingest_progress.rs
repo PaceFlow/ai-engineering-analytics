@@ -79,6 +79,10 @@ impl IngestProgress {
         Self::new_with_tty(plan.total_units.max(1), std::io::stdout().is_terminal())
     }
 
+    pub fn new_for_total_units(total_units: usize) -> Self {
+        Self::new_with_tty(total_units.max(1), std::io::stdout().is_terminal())
+    }
+
     fn new_with_tty(total_units: usize, tty: bool) -> Self {
         Self {
             total_units,

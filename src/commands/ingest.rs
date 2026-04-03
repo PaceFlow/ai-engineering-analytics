@@ -177,7 +177,26 @@ pub fn run(verbose: bool) -> Result<()> {
     );
 
     let github_token_configured = github::auth::github_token_source()?.is_some();
-    let github_summary = github::sync::sync_github_pull_requests(&mut db, verbose)?;
+    let github_sync_plan = if github_token_configured {
+        Some(github::sync::plan_github_pull_requests(&db)?)
+    } else {
+        None
+    };
+    let github_summary = match github_sync_plan {
+        Some(plan) if plan.total_units() > 0 => {
+            let mut github_progress = IngestProgress::new_for_total_units(plan.total_units());
+            let result = {
+                let result = {
+                    let mut observer = github_progress.stage("GitHub PR sync", plan.total_units());
+                    github::sync::sync_github_pull_requests(&mut db, verbose, Some(&mut observer))
+                };
+                github_progress.finish_stage();
+                result
+            };
+            result?
+        }
+        _ => github::sync::sync_github_pull_requests(&mut db, verbose, None)?,
+    };
     if github_summary.commit_lookups_enqueued > 0 || github_summary.open_pull_requests_refreshed > 0
     {
         println!(
