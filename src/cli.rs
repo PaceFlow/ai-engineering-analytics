@@ -2,7 +2,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 
 const SESSION_AFTER_HELP: &str = "Examples:\n  paceflow session\n  paceflow session --group-by provider\n  paceflow session --list-sessions\n\nMetrics:\n  Average user prompts: average number of user prompts per session.\n  Avg time to first accepted change: minutes from session start to the first accepted code change.\n  Debug loop rate: share of sessions that look like repeated fix-retry cycles.\n  Error paste rate: share of sessions where an error message was pasted mid-session.\n  Session-to-commit rate: share of sessions followed by a commit within 4 hours.\n  No-output session rate: share of sessions with no accepted code changes.";
 const DELIVERY_AFTER_HELP: &str = "Examples:\n  paceflow delivery\n  paceflow delivery --group-by provider\n  paceflow delivery --group-by task --task ABC-123\n\nMetrics:\n  Heavy commits: commits where matched AI-attributed lines are at least half of changed lines.\n  C1 PR reach rate: share of heavy GitHub AI commits that reached a pull request.\n  C2 merge rate: share of heavy AI commits that later reached mainline.\n  C3 PR merge rate: share of PR-linked heavy GitHub AI commits whose PR merged.";
-const QUALITY_AFTER_HELP: &str = "Examples:\n  paceflow quality\n  paceflow quality --group-by provider\n  paceflow quality --group-by task --task ABC-123\n\nMetrics:\n  L1 code churn rate: share of AI-added lines on heavy AI commits that were removed again within the churn window.\n  L4 revert rate: share of heavy AI commits that were later reverted.";
+const QUALITY_AFTER_HELP: &str = "Examples:\n  paceflow quality\n  paceflow quality --group-by provider\n  paceflow quality --group-by task --task ABC-123\n\nMetrics:\n  L1 code churn rate: share of AI-added lines on heavy AI commits that were removed again within the churn window.\n  L3 bug-after-merge rate: share of merged heavy AI commits that drew a later fix-like commit within 60 days.\n  L4 revert rate: share of heavy AI commits that were later reverted.";
 const GITHUB_AFTER_HELP: &str = "Examples:\n  paceflow github token\n\nGitHub token setup:\n  Use this command to save, replace, or delete the local GitHub token used for PR sync during ingest.";
 
 #[derive(Parser)]
@@ -26,7 +26,7 @@ pub enum Commands {
     Session(SessionReportArgs),
     /// Show commit attribution and merge outcome metrics
     Delivery(DeliveryReportArgs),
-    /// Show churn and revert follow-through for heavy AI commits
+    /// Show churn, bug-fix, and revert follow-through for heavy AI commits
     Quality(QualityReportArgs),
     /// Print analytics-ready base-view rows as NDJSON for manual validation
     EventStream(EventStreamArgs),
@@ -320,6 +320,7 @@ mod tests {
             .expect("write quality help");
         let quality_help = String::from_utf8(quality_buffer).expect("utf8");
         assert!(quality_help.contains("L1 code churn rate"));
+        assert!(quality_help.contains("L3 bug-after-merge rate"));
         assert!(quality_help.contains("L4 revert rate"));
     }
 }

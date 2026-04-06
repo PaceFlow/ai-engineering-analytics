@@ -20,6 +20,32 @@ pub struct PullRequestRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IssueRecord {
+    pub number: i64,
+    pub state: String,
+    pub created_at: Option<String>,
+    pub updated_at: Option<String>,
+    pub closed_at: Option<String>,
+    pub is_pull_request: bool,
+    pub label_names: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IssueTimelineEvent {
+    pub event: String,
+    pub created_at: Option<String>,
+    pub source_pr_number: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PullRequestFileRecord {
+    pub filename: String,
+    pub previous_filename: Option<String>,
+    pub status: String,
+    pub patch: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CommitLookupStatus {
     Resolved,
     NoPr,
@@ -58,11 +84,12 @@ pub struct PullRequestRefreshResult {
 pub struct GitHubSyncWorkPlan {
     pub commit_lookup_units: usize,
     pub pull_request_refresh_units: usize,
+    pub issue_scan_units: usize,
 }
 
 impl GitHubSyncWorkPlan {
     pub fn total_units(&self) -> usize {
-        self.commit_lookup_units + self.pull_request_refresh_units
+        self.commit_lookup_units + self.pull_request_refresh_units + self.issue_scan_units
     }
 }
 
@@ -78,4 +105,10 @@ pub struct GitHubSyncSummary {
     pub failed_commits: usize,
     pub rate_limited_commits: usize,
     pub open_pull_requests_refreshed: usize,
+    pub issue_scans_enqueued: usize,
+    pub issue_scans_completed: usize,
+    pub issue_scans_refreshed: usize,
+    pub issues_upserted: usize,
+    pub issue_fix_pull_requests_upserted: usize,
+    pub pull_request_removed_hashes_upserted: usize,
 }

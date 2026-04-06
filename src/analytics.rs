@@ -1,11 +1,13 @@
 use anyhow::{Result, anyhow};
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
+use regex::Regex;
 use rusqlite::{Connection, Row, TransactionBehavior, params, types::ValueRef};
 use serde::Serialize;
 use serde_json::{Map as JsonMap, Value as JsonValue};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 use std::process::Command;
+use std::sync::OnceLock;
 use std::time::Instant;
 
 use crate::change_intel::commit_assoc::git_scan::load_commit_diff;
@@ -18,6 +20,7 @@ const C2_MIN_RATIO: f64 = 0.80;
 const C2_MIN_MATCHED_LINES: i64 = 30;
 const C2_WINNER_MARGIN: f64 = 0.20;
 const CHURN_WINDOW_DAYS: i64 = 14;
+const BUG_AFTER_MERGE_WINDOW_DAYS: i64 = 60;
 const REPORTING_VIEWS_SQL: &str = r#"
 DROP VIEW IF EXISTS view_session_metrics_base;
 DROP VIEW IF EXISTS view_task_session_metrics_base;
@@ -96,11 +99,18 @@ SELECT
     o.reverted_later_flag,
     o.commit_total_changed_lines,
     c.ai_added_lines_reaching_mainline,
-    c.ai_added_lines_removed_within_window
+    c.ai_added_lines_removed_within_window,
+    COALESCE(b.bug_after_merge_flag, 0) AS bug_after_merge_flag,
+    COALESCE(b.bug_signal_count, 0) AS bug_signal_count,
+    b.first_bug_signal_commit_sha,
+    b.first_bug_signal_commit_time
 FROM event_commit_outcome o
 JOIN event_commit_churn c
   ON c.repo_root = o.repo_root
- AND c.commit_sha = o.commit_sha;
+ AND c.commit_sha = o.commit_sha
+LEFT JOIN event_commit_bug_signal b
+  ON b.repo_root = o.repo_root
+ AND b.commit_sha = o.commit_sha;
 
 CREATE VIEW view_commit_session_metrics_base AS
 SELECT
@@ -126,14 +136,21 @@ SELECT
     o.reverted_later_flag,
     o.commit_total_changed_lines,
     c.ai_added_lines_reaching_mainline,
-    c.ai_added_lines_removed_within_window
+    c.ai_added_lines_removed_within_window,
+    COALESCE(b.bug_after_merge_flag, 0) AS bug_after_merge_flag,
+    COALESCE(b.bug_signal_count, 0) AS bug_signal_count,
+    b.first_bug_signal_commit_sha,
+    b.first_bug_signal_commit_time
 FROM event_commit_session cs
 JOIN event_commit_outcome o
   ON o.repo_root = cs.repo_root
  AND o.commit_sha = cs.commit_sha
 JOIN event_commit_churn c
   ON c.repo_root = cs.repo_root
- AND c.commit_sha = cs.commit_sha;
+ AND c.commit_sha = cs.commit_sha
+LEFT JOIN event_commit_bug_signal b
+  ON b.repo_root = cs.repo_root
+ AND b.commit_sha = cs.commit_sha;
 
 CREATE VIEW view_task_commit_metrics_base AS
 SELECT
@@ -153,14 +170,21 @@ SELECT
     o.reverted_later_flag,
     o.commit_total_changed_lines,
     c.ai_added_lines_reaching_mainline,
-    c.ai_added_lines_removed_within_window
+    c.ai_added_lines_removed_within_window,
+    COALESCE(b.bug_after_merge_flag, 0) AS bug_after_merge_flag,
+    COALESCE(b.bug_signal_count, 0) AS bug_signal_count,
+    b.first_bug_signal_commit_sha,
+    b.first_bug_signal_commit_time
 FROM event_task_commit tc
 LEFT JOIN event_commit_outcome o
   ON o.repo_root = tc.repo_root
  AND o.commit_sha = tc.commit_sha
 LEFT JOIN event_commit_churn c
   ON c.repo_root = tc.repo_root
- AND c.commit_sha = tc.commit_sha;
+ AND c.commit_sha = tc.commit_sha
+LEFT JOIN event_commit_bug_signal b
+  ON b.repo_root = tc.repo_root
+ AND b.commit_sha = tc.commit_sha;
 
 CREATE VIEW view_session_productivity AS
 SELECT
@@ -246,6 +270,7 @@ pub struct LifecycleReportRow {
     pub branch_name: Option<String>,
     pub heavy_commit_count: i64,
     pub code_churn_rate: RatioMetric,
+    pub bug_after_merge_rate: RatioMetric,
     pub revert_rate: RatioMetric,
 }
 
@@ -320,12 +345,74 @@ struct TimedLineHashChange {
 }
 
 #[derive(Debug, Clone)]
+struct BugFixCandidate {
+    commit_sha: String,
+    commit_time: DateTime<Utc>,
+    removed_hashes: PathHashCounts,
+}
+
+#[derive(Debug, Clone)]
+struct IssueLinkedBugSignalCandidate {
+    signal_ref: String,
+    signal_time: DateTime<Utc>,
+    window_anchor_time: DateTime<Utc>,
+    removed_hashes: PathHashCounts,
+}
+
+#[derive(Debug, Clone)]
 struct DerivedCommitEvent {
     reverted_later: bool,
     merged_to_mainline: bool,
     budget: PathHashCounts,
     ai_added_lines_reaching_mainline: i64,
     ai_added_lines_removed_within_window: i64,
+    bug_after_merge: bool,
+    first_bug_signal_commit_sha: Option<String>,
+    first_bug_signal_commit_time: Option<DateTime<Utc>>,
+    bug_signal_count: i64,
+    bug_signal_sources: BTreeSet<String>,
+}
+
+fn record_bug_signal(
+    event: &mut DerivedCommitEvent,
+    signal_ref: String,
+    signal_time: DateTime<Utc>,
+    source: &str,
+) {
+    event.bug_after_merge = true;
+    event.bug_signal_count += 1;
+    event.bug_signal_sources.insert(source.to_string());
+
+    let should_replace = match event.first_bug_signal_commit_time {
+        None => true,
+        Some(existing) => {
+            signal_time < existing
+                || (signal_time == existing
+                    && event
+                        .first_bug_signal_commit_sha
+                        .as_deref()
+                        .map(|existing_ref| signal_ref.as_str() < existing_ref)
+                        .unwrap_or(true))
+        }
+    };
+
+    if should_replace {
+        event.first_bug_signal_commit_sha = Some(signal_ref);
+        event.first_bug_signal_commit_time = Some(signal_time);
+    }
+}
+
+fn bug_signal_source(event: &DerivedCommitEvent) -> String {
+    if event.bug_signal_sources.is_empty() {
+        "git_fix_commit".to_string()
+    } else {
+        event
+            .bug_signal_sources
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("+")
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -633,6 +720,7 @@ pub fn refresh_commit_events(conn: &mut Connection, verbose: bool) -> Result<Com
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     tx.execute("DELETE FROM event_commit_outcome", [])?;
     tx.execute("DELETE FROM event_commit_churn", [])?;
+    tx.execute("DELETE FROM event_commit_bug_signal", [])?;
     tx.execute("DELETE FROM event_commit_session", [])?;
     tx.execute("DELETE FROM event_task_commit", [])?;
     tx.execute("DELETE FROM event_task_session", [])?;
@@ -650,6 +738,12 @@ pub fn refresh_commit_events(conn: &mut Connection, verbose: bool) -> Result<Com
             repo_root, repo_key, commit_sha, ai_added_lines_reaching_mainline,
             ai_added_lines_removed_within_window, churn_window_days
          ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+    )?;
+    let mut insert_bug_signal = tx.prepare_cached(
+        "INSERT INTO event_commit_bug_signal (
+            repo_root, repo_key, commit_sha, bug_after_merge_flag, first_bug_signal_commit_sha,
+            first_bug_signal_commit_time, bug_signal_count, window_days, signal_source
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
     )?;
 
     for (repo_index, (repo_root, mut repo_commits)) in by_repo.into_iter().enumerate() {
@@ -708,6 +802,20 @@ pub fn refresh_commit_events(conn: &mut Connection, verbose: bool) -> Result<Com
                 event.ai_added_lines_removed_within_window,
                 CHURN_WINDOW_DAYS
             ])?;
+            insert_bug_signal.execute(params![
+                repo_root,
+                repo_key,
+                commit.commit_sha,
+                event.bug_after_merge as i64,
+                event.first_bug_signal_commit_sha.as_deref(),
+                event
+                    .first_bug_signal_commit_time
+                    .as_ref()
+                    .map(|value| value.to_rfc3339_opts(SecondsFormat::Millis, true)),
+                event.bug_signal_count,
+                BUG_AFTER_MERGE_WINDOW_DAYS,
+                bug_signal_source(event)
+            ])?;
 
             commits_processed += 1;
             if verbose && (commit_index + 1) % 100 == 0 {
@@ -729,6 +837,7 @@ pub fn refresh_commit_events(conn: &mut Connection, verbose: bool) -> Result<Com
     }
     drop(insert_outcome);
     drop(insert_churn);
+    drop(insert_bug_signal);
 
     tx.execute(
         "INSERT INTO event_commit_session (
@@ -1224,21 +1333,25 @@ pub fn query_lifecycle_report(
             "COUNT(DISTINCT CASE WHEN heavy_ai_flag = 1 THEN commit_sha END) AS heavy_commit_count"
                 .to_string(),
         );
-        select.push("CAST(ROUND(SUM(CASE WHEN heavy_ai_flag = 1 AND reverted_later_flag = 1 THEN share_of_ai ELSE 0 END), 0) AS INTEGER) AS l4_n".to_string());
-        select.push("CAST(ROUND(SUM(CASE WHEN heavy_ai_flag = 1 THEN share_of_ai ELSE 0 END), 0) AS INTEGER) AS l4_d".to_string());
         select.push("CAST(ROUND(SUM(CASE WHEN heavy_ai_flag = 1 THEN share_of_ai * ai_added_lines_removed_within_window ELSE 0 END), 0) AS INTEGER) AS l1_n".to_string());
         select.push("CAST(ROUND(SUM(CASE WHEN heavy_ai_flag = 1 THEN share_of_ai * ai_added_lines_reaching_mainline ELSE 0 END), 0) AS INTEGER) AS l1_d".to_string());
+        select.push("CAST(ROUND(SUM(CASE WHEN heavy_ai_flag = 1 AND merged_to_mainline_flag = 1 AND bug_after_merge_flag = 1 THEN share_of_ai ELSE 0 END), 0) AS INTEGER) AS l3_n".to_string());
+        select.push("CAST(ROUND(SUM(CASE WHEN heavy_ai_flag = 1 AND merged_to_mainline_flag = 1 THEN share_of_ai ELSE 0 END), 0) AS INTEGER) AS l3_d".to_string());
+        select.push("CAST(ROUND(SUM(CASE WHEN heavy_ai_flag = 1 AND reverted_later_flag = 1 THEN share_of_ai ELSE 0 END), 0) AS INTEGER) AS l4_n".to_string());
+        select.push("CAST(ROUND(SUM(CASE WHEN heavy_ai_flag = 1 THEN share_of_ai ELSE 0 END), 0) AS INTEGER) AS l4_d".to_string());
     } else {
         select.push(
             "COALESCE(SUM(CASE WHEN heavy_ai_flag = 1 THEN 1 ELSE 0 END), 0) AS heavy_commit_count"
                 .to_string(),
         );
+        select.push("COALESCE(SUM(CASE WHEN heavy_ai_flag = 1 THEN ai_added_lines_removed_within_window ELSE 0 END), 0) AS l1_n".to_string());
+        select.push("COALESCE(SUM(CASE WHEN heavy_ai_flag = 1 THEN ai_added_lines_reaching_mainline ELSE 0 END), 0) AS l1_d".to_string());
+        select.push("COALESCE(SUM(CASE WHEN heavy_ai_flag = 1 AND merged_to_mainline_flag = 1 AND bug_after_merge_flag = 1 THEN 1 ELSE 0 END), 0) AS l3_n".to_string());
+        select.push("COALESCE(SUM(CASE WHEN heavy_ai_flag = 1 AND merged_to_mainline_flag = 1 THEN 1 ELSE 0 END), 0) AS l3_d".to_string());
         select.push("COALESCE(SUM(CASE WHEN heavy_ai_flag = 1 THEN reverted_later_flag ELSE 0 END), 0) AS l4_n".to_string());
         select.push(
             "COALESCE(SUM(CASE WHEN heavy_ai_flag = 1 THEN 1 ELSE 0 END), 0) AS l4_d".to_string(),
         );
-        select.push("COALESCE(SUM(CASE WHEN heavy_ai_flag = 1 THEN ai_added_lines_removed_within_window ELSE 0 END), 0) AS l1_n".to_string());
-        select.push("COALESCE(SUM(CASE WHEN heavy_ai_flag = 1 THEN ai_added_lines_reaching_mainline ELSE 0 END), 0) AS l1_d".to_string());
     }
 
     let mut sql = format!("SELECT {} FROM {}", select.join(", "), source);
@@ -1271,8 +1384,9 @@ pub fn query_lifecycle_report(
             group_value: row.get(1)?,
             branch_name: row.get(2)?,
             heavy_commit_count: row.get(3)?,
-            revert_rate: ratio_metric(row.get(4)?, row.get(5)?),
-            code_churn_rate: ratio_metric(row.get(6)?, row.get(7)?),
+            code_churn_rate: ratio_metric(row.get(4)?, row.get(5)?),
+            bug_after_merge_rate: ratio_metric(row.get(6)?, row.get(7)?),
+            revert_rate: ratio_metric(row.get(8)?, row.get(9)?),
         })
     })?;
     let mut out = Vec::new();
@@ -1962,7 +2076,7 @@ fn derive_repo_commit_events(
         );
     }
 
-    derive_commit_events_from_preloaded(
+    let mut derived = derive_commit_events_from_preloaded(
         commits,
         &revert_map,
         &merge_commit_set,
@@ -1971,7 +2085,11 @@ fn derive_repo_commit_events(
         &session_added_availability,
         &mainline_added_events,
         &mainline_removed_events,
-    )
+    )?;
+    annotate_bug_after_merge_signals(conn, repo_root, commits, &mut derived)?;
+    let repo_key = sync_identity::repo_key_for_repo_root(Some(repo_root)).unwrap_or_default();
+    annotate_issue_linked_bug_after_merge_signals(conn, &repo_key, commits, &mut derived)?;
+    Ok(derived)
 }
 
 #[expect(
@@ -2035,6 +2153,11 @@ fn derive_commit_events_from_preloaded(
                 budget,
                 ai_added_lines_reaching_mainline: if merged_to_mainline { budget_total } else { 0 },
                 ai_added_lines_removed_within_window: 0,
+                bug_after_merge: false,
+                first_bug_signal_commit_sha: None,
+                first_bug_signal_commit_time: None,
+                bug_signal_count: 0,
+                bug_signal_sources: BTreeSet::new(),
             },
         );
     }
@@ -2077,6 +2200,152 @@ fn derive_commit_events_from_preloaded(
     }
 
     Ok(out)
+}
+
+fn annotate_bug_after_merge_signals(
+    conn: &Connection,
+    repo_root: &str,
+    commits: &[CandidateCommit],
+    derived: &mut HashMap<String, DerivedCommitEvent>,
+) -> Result<()> {
+    let commit_messages = load_repo_commit_messages(repo_root)?;
+    let commit_removed_hashes = load_commit_removed_hashes(conn, repo_root)?;
+    annotate_bug_after_merge_signals_from_data(
+        commits,
+        &commit_messages,
+        &commit_removed_hashes,
+        derived,
+    );
+    Ok(())
+}
+
+fn annotate_bug_after_merge_signals_from_data(
+    commits: &[CandidateCommit],
+    commit_messages: &HashMap<String, String>,
+    commit_removed_hashes: &CommitPathHashCounts,
+    derived: &mut HashMap<String, DerivedCommitEvent>,
+) {
+    let mut ordered_commits = commits.to_vec();
+    ordered_commits.sort_by(|a, b| {
+        a.commit_time
+            .cmp(&b.commit_time)
+            .then_with(|| a.commit_sha.cmp(&b.commit_sha))
+    });
+
+    let mut fix_candidates = Vec::new();
+    for commit in &ordered_commits {
+        let Some(message) = commit_messages.get(&commit.commit_sha) else {
+            continue;
+        };
+        let Some(removed_hashes) = commit_removed_hashes.get(&commit.commit_sha) else {
+            continue;
+        };
+        if budget_total(removed_hashes) <= 0
+            || !is_fix_like_commit_message(message)
+            || is_revert_commit_message(message)
+        {
+            continue;
+        }
+        fix_candidates.push(BugFixCandidate {
+            commit_sha: commit.commit_sha.clone(),
+            commit_time: commit.commit_time,
+            removed_hashes: removed_hashes.clone(),
+        });
+    }
+
+    for commit in &ordered_commits {
+        let Some(event) = derived.get_mut(&commit.commit_sha) else {
+            continue;
+        };
+        if !commit.heavy_ai || !event.merged_to_mainline || budget_total(&event.budget) <= 0 {
+            continue;
+        }
+
+        let window_end = commit.commit_time + Duration::days(BUG_AFTER_MERGE_WINDOW_DAYS);
+        for candidate in &fix_candidates {
+            if candidate.commit_time <= commit.commit_time {
+                continue;
+            }
+            if candidate.commit_time > window_end {
+                break;
+            }
+            if exact_hash_overlap_count(&event.budget, &candidate.removed_hashes) <= 0 {
+                continue;
+            }
+            record_bug_signal(
+                event,
+                candidate.commit_sha.clone(),
+                candidate.commit_time,
+                "git_fix_commit",
+            );
+        }
+    }
+}
+
+fn annotate_issue_linked_bug_after_merge_signals(
+    conn: &Connection,
+    repo_key: &str,
+    commits: &[CandidateCommit],
+    derived: &mut HashMap<String, DerivedCommitEvent>,
+) -> Result<()> {
+    if !repo_key.starts_with("git:github.com/") {
+        return Ok(());
+    }
+    let candidates = load_issue_linked_bug_signal_candidates(conn, repo_key)?;
+    annotate_issue_linked_bug_after_merge_signals_from_data(commits, &candidates, derived);
+    Ok(())
+}
+
+fn annotate_issue_linked_bug_after_merge_signals_from_data(
+    commits: &[CandidateCommit],
+    candidates: &[IssueLinkedBugSignalCandidate],
+    derived: &mut HashMap<String, DerivedCommitEvent>,
+) {
+    if candidates.is_empty() {
+        return;
+    }
+
+    let mut ordered_signals = candidates.to_vec();
+    ordered_signals.sort_by(|left, right| {
+        left.window_anchor_time
+            .cmp(&right.window_anchor_time)
+            .then_with(|| left.signal_ref.cmp(&right.signal_ref))
+    });
+
+    let mut ordered_commits = commits.to_vec();
+    ordered_commits.sort_by(|a, b| {
+        a.commit_time
+            .cmp(&b.commit_time)
+            .then_with(|| a.commit_sha.cmp(&b.commit_sha))
+    });
+
+    for commit in &ordered_commits {
+        let Some(event) = derived.get_mut(&commit.commit_sha) else {
+            continue;
+        };
+        if !commit.heavy_ai || !event.merged_to_mainline || budget_total(&event.budget) <= 0 {
+            continue;
+        }
+
+        let window_end = commit.commit_time + Duration::days(BUG_AFTER_MERGE_WINDOW_DAYS);
+        for candidate in &ordered_signals {
+            if candidate.window_anchor_time <= commit.commit_time {
+                continue;
+            }
+            if candidate.window_anchor_time > window_end {
+                break;
+            }
+            if exact_hash_overlap_count(&event.budget, &candidate.removed_hashes) <= 0 {
+                continue;
+            }
+            record_bug_signal(
+                event,
+                candidate.signal_ref.clone(),
+                candidate.signal_time,
+                "github_issue_fix_pr_exact_hash",
+            );
+        }
+    }
 }
 
 fn build_session_turns(messages: &[SessionMessage]) -> Vec<SessionTurn> {
@@ -2495,6 +2764,113 @@ fn extract_reverted_shas(body: &str) -> Vec<String> {
     out
 }
 
+fn load_repo_commit_messages(repo_root: &str) -> Result<HashMap<String, String>> {
+    let out = run_git_capture(
+        repo_root,
+        &[
+            "log".to_string(),
+            "--all".to_string(),
+            "--pretty=format:%H%x1f%B%x1e".to_string(),
+        ],
+    )?;
+    let mut messages = HashMap::new();
+    for record in out.split('\u{1e}') {
+        let rec = record.trim();
+        if rec.is_empty() {
+            continue;
+        }
+        let mut parts = rec.splitn(2, '\u{1f}');
+        let Some(commit_sha) = parts.next() else {
+            continue;
+        };
+        let Some(message) = parts.next() else {
+            continue;
+        };
+        messages.insert(commit_sha.to_string(), message.trim().to_string());
+    }
+    Ok(messages)
+}
+
+fn is_fix_like_commit_message(message: &str) -> bool {
+    static FIX_KEYWORD_RE: OnceLock<Regex> = OnceLock::new();
+    let regex = FIX_KEYWORD_RE.get_or_init(|| {
+        Regex::new(r"(?i)\b(fix|fixes|fixed|bug|bugs|hotfix|hotfixes|patch|patches|broken|regression|regressions)\b")
+            .expect("valid fix keyword regex")
+    });
+    regex.is_match(message)
+}
+
+fn is_revert_commit_message(message: &str) -> bool {
+    let trimmed = message.trim_start();
+    trimmed.starts_with("Revert ")
+        || trimmed.starts_with("revert ")
+        || trimmed.contains("This reverts commit ")
+}
+
+fn load_issue_linked_bug_signal_candidates(
+    conn: &Connection,
+    repo_key: &str,
+) -> Result<Vec<IssueLinkedBugSignalCandidate>> {
+    let mut stmt = conn.prepare(
+        "SELECT i.issue_number, pr.merged_at, ipr.pr_number, h.rel_path, h.line_hash, h.count
+         FROM fact_github_issue i
+         JOIN fact_github_issue_fix_pull_request ipr
+           ON ipr.repo_key = i.repo_key
+          AND ipr.issue_number = i.issue_number
+         JOIN fact_github_pull_request pr
+           ON pr.repo_key = ipr.repo_key
+          AND pr.pr_number = ipr.pr_number
+         JOIN fact_github_pull_request_removed_line_hash h
+           ON h.repo_key = pr.repo_key
+          AND h.pr_number = pr.pr_number
+         WHERE i.repo_key = ?1
+           AND i.bug_candidate_flag = 1
+           AND i.is_pull_request_flag = 0
+           AND pr.merged_at IS NOT NULL
+           AND pr.removed_hashes_complete_flag = 1
+         ORDER BY i.issue_number, ipr.pr_number, h.rel_path, h.line_hash",
+    )?;
+    let rows = stmt.query_map(params![repo_key], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, Option<String>>(1)?,
+            row.get::<_, i64>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, String>(4)?,
+            row.get::<_, i64>(5)?,
+        ))
+    })?;
+
+    let mut grouped = BTreeMap::<(i64, i64), IssueLinkedBugSignalCandidate>::new();
+    for row in rows {
+        let (issue_number, merged_at_raw, pr_number, rel_path, line_hash, count) = row?;
+        let Some(merged_at_raw) = merged_at_raw else {
+            continue;
+        };
+        let merged_at = DateTime::parse_from_rfc3339(&merged_at_raw)
+            .map_err(|e| anyhow!("invalid pr merged_at '{}': {}", merged_at_raw, e))?
+            .with_timezone(&Utc);
+
+        let entry = grouped.entry((issue_number, pr_number)).or_insert_with(|| {
+            IssueLinkedBugSignalCandidate {
+                signal_ref: format!("issue#{issue_number}/pr#{pr_number}"),
+                signal_time: merged_at,
+                window_anchor_time: merged_at,
+                removed_hashes: PathHashCounts::new(),
+            }
+        });
+        entry
+            .removed_hashes
+            .entry(rel_path)
+            .or_default()
+            .entry(line_hash)
+            .and_modify(|value| *value += count)
+            .or_insert(count);
+    }
+
+    Ok(grouped.into_values().collect())
+}
+
 fn load_commit_added_hashes(conn: &Connection, repo_root: &str) -> Result<CommitPathHashCounts> {
     let mut stmt = conn.prepare(
         "SELECT f.commit_sha, f.rel_path, h.line_hash, h.count
@@ -2502,6 +2878,37 @@ fn load_commit_added_hashes(conn: &Connection, repo_root: &str) -> Result<Commit
          JOIN fact_commit_file_change_line_hashes h ON h.file_change_id = f.id
          WHERE f.repo_root = ?1
            AND h.side = '+'",
+    )?;
+    let rows = stmt.query_map(params![repo_root], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, i64>(3)?,
+        ))
+    })?;
+
+    let mut out = CommitPathHashCounts::new();
+    for row in rows {
+        let (commit_sha, rel_path, line_hash, count) = row?;
+        out.entry(commit_sha)
+            .or_default()
+            .entry(rel_path)
+            .or_default()
+            .entry(line_hash)
+            .and_modify(|value| *value += count)
+            .or_insert(count);
+    }
+    Ok(out)
+}
+
+fn load_commit_removed_hashes(conn: &Connection, repo_root: &str) -> Result<CommitPathHashCounts> {
+    let mut stmt = conn.prepare(
+        "SELECT f.commit_sha, f.rel_path, h.line_hash, h.count
+         FROM fact_commit_file_change f
+         JOIN fact_commit_file_change_line_hashes h ON h.file_change_id = f.id
+         WHERE f.repo_root = ?1
+           AND h.side = '-'",
     )?;
     let rows = stmt.query_map(params![repo_root], |row| {
         Ok((
@@ -2661,6 +3068,20 @@ fn compute_churn(
         }
     }
     churn
+}
+
+fn exact_hash_overlap_count(left: &PathHashCounts, right: &PathHashCounts) -> i64 {
+    let mut total = 0i64;
+    for (path, left_hashes) in left {
+        let Some(right_hashes) = right.get(path) else {
+            continue;
+        };
+        for (line_hash, left_count) in left_hashes {
+            let right_count = right_hashes.get(line_hash).copied().unwrap_or(0);
+            total += (*left_count).min(right_count);
+        }
+    }
+    total
 }
 
 fn match_budget_to_mainline(
@@ -2835,6 +3256,7 @@ fn is_integration_branch(branch_name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::change_intel::line_hash::hash_line;
     use crate::db::{upsert_metadata_session, upsert_metadata_session_with_model};
 
     fn open_test_db() -> Result<Connection> {
@@ -2962,6 +3384,21 @@ mod tests {
         DateTime::parse_from_rfc3339(raw)
             .unwrap()
             .with_timezone(&Utc)
+    }
+
+    fn derived_event(merged_to_mainline: bool) -> DerivedCommitEvent {
+        DerivedCommitEvent {
+            reverted_later: false,
+            merged_to_mainline,
+            budget: PathHashCounts::new(),
+            ai_added_lines_reaching_mainline: 0,
+            ai_added_lines_removed_within_window: 0,
+            bug_after_merge: false,
+            first_bug_signal_commit_sha: None,
+            first_bug_signal_commit_time: None,
+            bug_signal_count: 0,
+            bug_signal_sources: BTreeSet::new(),
+        }
     }
 
     #[test]
@@ -3140,6 +3577,64 @@ mod tests {
             lifecycle_rows[0].branch_name.as_deref(),
             Some("PAC-1-branch")
         );
+        Ok(())
+    }
+
+    #[test]
+    fn lifecycle_report_computes_bug_after_merge_rate_from_event_signals() -> Result<()> {
+        let conn = open_test_db()?;
+        conn.execute(
+            "INSERT INTO event_commit_outcome (
+                repo_root, commit_sha, commit_time, heavy_ai_flag, merged_to_mainline_flag,
+                reverted_later_flag, total_matched_ai_lines, commit_total_changed_lines
+             ) VALUES
+                ('/tmp/repo', 'c1', '2026-03-17T09:00:00Z', 1, 1, 0, 20, 30),
+                ('/tmp/repo', 'c2', '2026-03-18T09:00:00Z', 1, 1, 0, 18, 24),
+                ('/tmp/repo', 'c3', '2026-03-19T09:00:00Z', 1, 0, 0, 18, 24)",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO event_commit_churn (
+                repo_root, commit_sha, ai_added_lines_reaching_mainline,
+                ai_added_lines_removed_within_window, churn_window_days
+             ) VALUES
+                ('/tmp/repo', 'c1', 12, 2, 14),
+                ('/tmp/repo', 'c2', 10, 1, 14),
+                ('/tmp/repo', 'c3', 0, 0, 14)",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO event_commit_bug_signal (
+                repo_root, commit_sha, bug_after_merge_flag, first_bug_signal_commit_sha,
+                first_bug_signal_commit_time, bug_signal_count, window_days, signal_source
+             ) VALUES
+                ('/tmp/repo', 'c1', 1, 'fix1', '2026-03-20T10:00:00Z', 1, 60, 'git_fix_commit'),
+                ('/tmp/repo', 'c2', 0, NULL, NULL, 0, 60, 'git_fix_commit'),
+                ('/tmp/repo', 'c3', 1, 'fix2', '2026-03-21T10:00:00Z', 1, 60, 'git_fix_commit')",
+            [],
+        )?;
+
+        create_reporting_views(&conn)?;
+        let rows = query_lifecycle_report(
+            &conn,
+            &ReportArgs {
+                weekly: false,
+                group_by: None,
+                from: None,
+                to: None,
+                repo: None,
+                all_projects: false,
+                provider: None,
+                task: None,
+                model: None,
+                limit: 10,
+            },
+        )?;
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].heavy_commit_count, 3);
+        assert_eq!(rows[0].bug_after_merge_rate.numerator, 1);
+        assert_eq!(rows[0].bug_after_merge_rate.denominator, 2);
         Ok(())
     }
 
@@ -3540,6 +4035,464 @@ mod tests {
         assert!(commit_b.merged_to_mainline);
         assert_eq!(commit_b.ai_added_lines_reaching_mainline, 20);
         assert_eq!(commit_b.ai_added_lines_removed_within_window, 10);
+        Ok(())
+    }
+
+    #[test]
+    fn bug_after_merge_detection_marks_later_fix_commit_with_file_overlap() {
+        let commits = vec![
+            CandidateCommit {
+                repo_root: "/tmp/repo".to_string(),
+                commit_sha: "orig".to_string(),
+                commit_time: parse_ts("2026-03-01T10:00:00Z"),
+                heavy_ai: true,
+                matched_total_lines: 20,
+                commit_total_lines: 20,
+            },
+            CandidateCommit {
+                repo_root: "/tmp/repo".to_string(),
+                commit_sha: "fix".to_string(),
+                commit_time: parse_ts("2026-03-10T10:00:00Z"),
+                heavy_ai: false,
+                matched_total_lines: 0,
+                commit_total_lines: 6,
+            },
+        ];
+        let commit_messages = HashMap::from([
+            ("orig".to_string(), "feat: add parser".to_string()),
+            (
+                "fix".to_string(),
+                "fix: repair parser regression\n\nbroken edge case".to_string(),
+            ),
+        ]);
+        let commit_removed_hashes = HashMap::from([(
+            "fix".to_string(),
+            HashMap::from([(
+                "src/lib.rs".to_string(),
+                HashMap::from([(hash_line("buggy();"), 1)]),
+            )]),
+        )]);
+        let mut derived = HashMap::from([
+            (
+                "orig".to_string(),
+                DerivedCommitEvent {
+                    budget: HashMap::from([(
+                        "src/lib.rs".to_string(),
+                        HashMap::from([(hash_line("buggy();"), 1)]),
+                    )]),
+                    ..derived_event(true)
+                },
+            ),
+            ("fix".to_string(), derived_event(false)),
+        ]);
+
+        annotate_bug_after_merge_signals_from_data(
+            &commits,
+            &commit_messages,
+            &commit_removed_hashes,
+            &mut derived,
+        );
+
+        let original = derived.get("orig").expect("original event");
+        assert!(original.bug_after_merge);
+        assert_eq!(original.first_bug_signal_commit_sha.as_deref(), Some("fix"));
+        assert_eq!(
+            original.first_bug_signal_commit_time,
+            Some(parse_ts("2026-03-10T10:00:00Z"))
+        );
+        assert_eq!(original.bug_signal_count, 1);
+    }
+
+    #[test]
+    fn bug_after_merge_detection_ignores_non_overlapping_late_and_revert_followups() {
+        let commits = vec![
+            CandidateCommit {
+                repo_root: "/tmp/repo".to_string(),
+                commit_sha: "orig".to_string(),
+                commit_time: parse_ts("2026-03-01T10:00:00Z"),
+                heavy_ai: true,
+                matched_total_lines: 20,
+                commit_total_lines: 20,
+            },
+            CandidateCommit {
+                repo_root: "/tmp/repo".to_string(),
+                commit_sha: "late".to_string(),
+                commit_time: parse_ts("2026-05-05T10:00:00Z"),
+                heavy_ai: false,
+                matched_total_lines: 0,
+                commit_total_lines: 3,
+            },
+            CandidateCommit {
+                repo_root: "/tmp/repo".to_string(),
+                commit_sha: "other".to_string(),
+                commit_time: parse_ts("2026-03-05T10:00:00Z"),
+                heavy_ai: false,
+                matched_total_lines: 0,
+                commit_total_lines: 3,
+            },
+            CandidateCommit {
+                repo_root: "/tmp/repo".to_string(),
+                commit_sha: "revert".to_string(),
+                commit_time: parse_ts("2026-03-06T10:00:00Z"),
+                heavy_ai: false,
+                matched_total_lines: 0,
+                commit_total_lines: 3,
+            },
+        ];
+        let commit_messages = HashMap::from([
+            ("orig".to_string(), "feat: add parser".to_string()),
+            ("late".to_string(), "fix: late cleanup".to_string()),
+            ("other".to_string(), "fix: unrelated module".to_string()),
+            (
+                "revert".to_string(),
+                "Revert \"feat: add parser\"\n\nThis reverts commit 1234567890abcdef1234567890abcdef12345678."
+                    .to_string(),
+            ),
+        ]);
+        let commit_removed_hashes = HashMap::from([
+            (
+                "late".to_string(),
+                HashMap::from([(
+                    "src/lib.rs".to_string(),
+                    HashMap::from([(hash_line("buggy();"), 1)]),
+                )]),
+            ),
+            (
+                "other".to_string(),
+                HashMap::from([(
+                    "src/other.rs".to_string(),
+                    HashMap::from([(hash_line("buggy();"), 1)]),
+                )]),
+            ),
+            (
+                "revert".to_string(),
+                HashMap::from([(
+                    "src/lib.rs".to_string(),
+                    HashMap::from([(hash_line("buggy();"), 1)]),
+                )]),
+            ),
+        ]);
+        let mut derived = HashMap::from([
+            (
+                "orig".to_string(),
+                DerivedCommitEvent {
+                    budget: HashMap::from([(
+                        "src/lib.rs".to_string(),
+                        HashMap::from([(hash_line("buggy();"), 1)]),
+                    )]),
+                    ..derived_event(true)
+                },
+            ),
+            ("late".to_string(), derived_event(false)),
+            ("other".to_string(), derived_event(false)),
+            ("revert".to_string(), derived_event(false)),
+        ]);
+
+        annotate_bug_after_merge_signals_from_data(
+            &commits,
+            &commit_messages,
+            &commit_removed_hashes,
+            &mut derived,
+        );
+
+        let original = derived.get("orig").expect("original event");
+        assert!(!original.bug_after_merge);
+        assert_eq!(original.first_bug_signal_commit_sha, None);
+        assert_eq!(original.bug_signal_count, 0);
+    }
+
+    #[test]
+    fn bug_after_merge_detection_ignores_same_file_fix_without_exact_removed_overlap() {
+        let commits = vec![
+            CandidateCommit {
+                repo_root: "/tmp/repo".to_string(),
+                commit_sha: "orig".to_string(),
+                commit_time: parse_ts("2026-03-01T10:00:00Z"),
+                heavy_ai: true,
+                matched_total_lines: 20,
+                commit_total_lines: 20,
+            },
+            CandidateCommit {
+                repo_root: "/tmp/repo".to_string(),
+                commit_sha: "fix".to_string(),
+                commit_time: parse_ts("2026-03-03T10:00:00Z"),
+                heavy_ai: false,
+                matched_total_lines: 0,
+                commit_total_lines: 3,
+            },
+        ];
+        let commit_messages = HashMap::from([
+            ("orig".to_string(), "feat: add parser".to_string()),
+            ("fix".to_string(), "fix: unrelated cleanup".to_string()),
+        ]);
+        let commit_removed_hashes = HashMap::from([(
+            "fix".to_string(),
+            HashMap::from([(
+                "src/lib.rs".to_string(),
+                HashMap::from([(hash_line("other();"), 1)]),
+            )]),
+        )]);
+        let mut derived = HashMap::from([
+            (
+                "orig".to_string(),
+                DerivedCommitEvent {
+                    budget: HashMap::from([(
+                        "src/lib.rs".to_string(),
+                        HashMap::from([(hash_line("buggy();"), 1)]),
+                    )]),
+                    ..derived_event(true)
+                },
+            ),
+            ("fix".to_string(), derived_event(false)),
+        ]);
+
+        annotate_bug_after_merge_signals_from_data(
+            &commits,
+            &commit_messages,
+            &commit_removed_hashes,
+            &mut derived,
+        );
+
+        let original = derived.get("orig").expect("original event");
+        assert!(!original.bug_after_merge);
+        assert_eq!(original.first_bug_signal_commit_sha, None);
+        assert_eq!(original.bug_signal_count, 0);
+    }
+
+    #[test]
+    fn issue_linked_bug_after_merge_detection_requires_exact_hash_overlap_within_window() {
+        let commits = vec![
+            CandidateCommit {
+                repo_root: "/tmp/repo".to_string(),
+                commit_sha: "orig".to_string(),
+                commit_time: parse_ts("2026-03-01T10:00:00Z"),
+                heavy_ai: true,
+                matched_total_lines: 20,
+                commit_total_lines: 20,
+            },
+            CandidateCommit {
+                repo_root: "/tmp/repo".to_string(),
+                commit_sha: "other".to_string(),
+                commit_time: parse_ts("2026-03-02T10:00:00Z"),
+                heavy_ai: true,
+                matched_total_lines: 20,
+                commit_total_lines: 20,
+            },
+        ];
+        let matching_hash = hash_line("buggy();");
+        let non_matching_hash = hash_line("fixed();");
+        let candidates = vec![
+            IssueLinkedBugSignalCandidate {
+                signal_ref: "issue#7/pr#19".to_string(),
+                signal_time: parse_ts("2026-03-10T09:00:00Z"),
+                window_anchor_time: parse_ts("2026-03-10T09:00:00Z"),
+                removed_hashes: HashMap::from([(
+                    "src/lib.rs".to_string(),
+                    HashMap::from([(matching_hash.clone(), 1)]),
+                )]),
+            },
+            IssueLinkedBugSignalCandidate {
+                signal_ref: "issue#8/pr#20".to_string(),
+                signal_time: parse_ts("2026-05-10T09:00:00Z"),
+                window_anchor_time: parse_ts("2026-05-10T09:00:00Z"),
+                removed_hashes: HashMap::from([(
+                    "src/lib.rs".to_string(),
+                    HashMap::from([(matching_hash.clone(), 1)]),
+                )]),
+            },
+            IssueLinkedBugSignalCandidate {
+                signal_ref: "issue#9/pr#21".to_string(),
+                signal_time: parse_ts("2026-03-12T09:00:00Z"),
+                window_anchor_time: parse_ts("2026-03-12T09:00:00Z"),
+                removed_hashes: HashMap::from([(
+                    "src/lib.rs".to_string(),
+                    HashMap::from([(non_matching_hash, 1)]),
+                )]),
+            },
+        ];
+        let mut derived = HashMap::from([
+            (
+                "orig".to_string(),
+                DerivedCommitEvent {
+                    budget: HashMap::from([(
+                        "src/lib.rs".to_string(),
+                        HashMap::from([(matching_hash, 1)]),
+                    )]),
+                    ..derived_event(true)
+                },
+            ),
+            (
+                "other".to_string(),
+                DerivedCommitEvent {
+                    budget: HashMap::from([(
+                        "src/other.rs".to_string(),
+                        HashMap::from([(hash_line("elsewhere();"), 1)]),
+                    )]),
+                    ..derived_event(true)
+                },
+            ),
+        ]);
+
+        annotate_issue_linked_bug_after_merge_signals_from_data(
+            &commits,
+            &candidates,
+            &mut derived,
+        );
+
+        let original = derived.get("orig").expect("original event");
+        assert!(original.bug_after_merge);
+        assert_eq!(
+            original.first_bug_signal_commit_sha.as_deref(),
+            Some("issue#7/pr#19")
+        );
+        assert_eq!(
+            original.first_bug_signal_commit_time,
+            Some(parse_ts("2026-03-10T09:00:00Z"))
+        );
+        assert_eq!(original.bug_signal_count, 1);
+
+        let other = derived.get("other").expect("other event");
+        assert!(!other.bug_after_merge);
+        assert_eq!(other.bug_signal_count, 0);
+    }
+
+    #[test]
+    fn issue_linked_bug_after_merge_detection_uses_fix_pr_merge_time_not_issue_created_time() {
+        let commits = vec![CandidateCommit {
+            repo_root: "/tmp/repo".to_string(),
+            commit_sha: "orig".to_string(),
+            commit_time: parse_ts("2026-03-05T10:00:00Z"),
+            heavy_ai: true,
+            matched_total_lines: 20,
+            commit_total_lines: 20,
+        }];
+        let matching_hash = hash_line("buggy();");
+        let candidates = vec![IssueLinkedBugSignalCandidate {
+            signal_ref: "issue#7/pr#19".to_string(),
+            signal_time: parse_ts("2026-03-10T09:00:00Z"),
+            window_anchor_time: parse_ts("2026-03-10T09:00:00Z"),
+            removed_hashes: HashMap::from([(
+                "src/lib.rs".to_string(),
+                HashMap::from([(matching_hash.clone(), 1)]),
+            )]),
+        }];
+        let mut derived = HashMap::from([(
+            "orig".to_string(),
+            DerivedCommitEvent {
+                budget: HashMap::from([(
+                    "src/lib.rs".to_string(),
+                    HashMap::from([(matching_hash, 1)]),
+                )]),
+                ..derived_event(true)
+            },
+        )]);
+
+        annotate_issue_linked_bug_after_merge_signals_from_data(
+            &commits,
+            &candidates,
+            &mut derived,
+        );
+
+        let original = derived.get("orig").expect("original event");
+        assert!(original.bug_after_merge);
+        assert_eq!(
+            original.first_bug_signal_commit_time,
+            Some(parse_ts("2026-03-10T09:00:00Z"))
+        );
+    }
+
+    #[test]
+    fn issue_linked_bug_after_merge_detection_ignores_fix_pr_merged_after_window() {
+        let commits = vec![CandidateCommit {
+            repo_root: "/tmp/repo".to_string(),
+            commit_sha: "orig".to_string(),
+            commit_time: parse_ts("2026-03-01T10:00:00Z"),
+            heavy_ai: true,
+            matched_total_lines: 20,
+            commit_total_lines: 20,
+        }];
+        let matching_hash = hash_line("buggy();");
+        let candidates = vec![IssueLinkedBugSignalCandidate {
+            signal_ref: "issue#8/pr#20".to_string(),
+            signal_time: parse_ts("2026-05-10T09:00:00Z"),
+            window_anchor_time: parse_ts("2026-05-10T09:00:00Z"),
+            removed_hashes: HashMap::from([(
+                "src/lib.rs".to_string(),
+                HashMap::from([(matching_hash.clone(), 1)]),
+            )]),
+        }];
+        let mut derived = HashMap::from([(
+            "orig".to_string(),
+            DerivedCommitEvent {
+                budget: HashMap::from([(
+                    "src/lib.rs".to_string(),
+                    HashMap::from([(matching_hash, 1)]),
+                )]),
+                ..derived_event(true)
+            },
+        )]);
+
+        annotate_issue_linked_bug_after_merge_signals_from_data(
+            &commits,
+            &candidates,
+            &mut derived,
+        );
+
+        let original = derived.get("orig").expect("original event");
+        assert!(!original.bug_after_merge);
+        assert_eq!(original.first_bug_signal_commit_sha, None);
+        assert_eq!(original.bug_signal_count, 0);
+    }
+
+    #[test]
+    fn load_issue_linked_bug_signal_candidates_uses_pr_merge_time_and_skips_incomplete_prs()
+    -> Result<()> {
+        let conn = open_test_db()?;
+        conn.execute(
+            "INSERT INTO fact_github_issue (
+                repo_key, issue_number, state, created_at, updated_at, closed_at, is_pull_request_flag, bug_candidate_flag
+             ) VALUES
+                ('git:github.com/PaceFlow/repo', 7, 'closed', '2026-02-20T09:00:00Z', NULL, NULL, 0, 1),
+                ('git:github.com/PaceFlow/repo', 8, 'closed', '2026-03-10T09:00:00Z', NULL, NULL, 0, 1)",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO fact_github_issue_fix_pull_request (
+                repo_key, issue_number, pr_number, linked_at
+             ) VALUES
+                ('git:github.com/PaceFlow/repo', 7, 19, '2026-03-09T08:00:00Z'),
+                ('git:github.com/PaceFlow/repo', 8, 20, '2026-03-11T08:00:00Z')",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO fact_github_pull_request (
+                repo_key, pr_number, state, draft_flag, created_at, updated_at, closed_at,
+                merged_at, base_ref, head_ref, html_url, removed_hashes_complete_flag
+             ) VALUES
+                ('git:github.com/PaceFlow/repo', 19, 'closed', 0, '2026-03-08T08:00:00Z', NULL, NULL,
+                 '2026-03-10T09:00:00Z', 'main', 'fix-bug', NULL, 1),
+                ('git:github.com/PaceFlow/repo', 20, 'closed', 0, '2026-03-10T08:00:00Z', NULL, NULL,
+                 '2026-03-12T09:00:00Z', 'main', 'fix-bug-2', NULL, 0)",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO fact_github_pull_request_removed_line_hash (
+                repo_key, pr_number, rel_path, line_hash, count
+             ) VALUES
+                ('git:github.com/PaceFlow/repo', 19, 'src/lib.rs', ?1, 1)",
+            params![hash_line("buggy();")],
+        )?;
+
+        let candidates =
+            load_issue_linked_bug_signal_candidates(&conn, "git:github.com/PaceFlow/repo")?;
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].signal_ref, "issue#7/pr#19");
+        assert_eq!(candidates[0].signal_time, parse_ts("2026-03-10T09:00:00Z"));
+        assert_eq!(
+            candidates[0].window_anchor_time,
+            parse_ts("2026-03-10T09:00:00Z")
+        );
         Ok(())
     }
 

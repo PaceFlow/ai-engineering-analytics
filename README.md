@@ -84,12 +84,14 @@ What to do differently:
 Quality Metrics
 Heavy commits: 52
 L1 Code Churn Rate: 12.40% (98/790)
+L3 Bug-After-Merge Rate: 9.62% (5/52)
 L4 Revert Rate: 1.92% (1/52)
 ```
 
 Why it matters:
 
 - Churn means accepted code landed, but was the wrong fit or needed cleanup soon after.
+- Bug-after-merge rate catches code that shipped but triggered later fix work.
 - Reverts are the clearest signal that the workflow created cost, not leverage.
 
 What to do differently:
@@ -222,6 +224,7 @@ These tell you whether session effort turned into commits and whether those comm
 ### 3. Did the code hold up?
 
 - Code churn rate
+- Bug-after-merge rate
 - Revert rate
 
 These are the strongest signals for whether AI-assisted work created durable value or follow-up cleanup.
@@ -256,6 +259,7 @@ The reports are built from normalized session events, matched commit/session att
 ### Quality Metrics
 
 - `Code Churn Rate`: share of AI-added lines from heavy commits that reached mainline and were removed from mainline within a 14-day window
+- `Bug-After-Merge Rate`: share of merged heavy AI commits that drew at least one later fix-like commit touching the same files within a 60-day window
 - `Revert Rate`: share of heavy commits later reverted by a commit body containing `This reverts commit <sha>`
 
 ### Grouped Report Weighting

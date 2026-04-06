@@ -21,6 +21,7 @@ fn render_quality_report(
     let mut out = String::new();
     out.push_str("Quality Metrics\n");
     out.push_str("L1 code churn rate = share of AI-added lines on heavy AI commits that were later removed within the churn window\n");
+    out.push_str("L3 bug-after-merge rate = share of merged heavy AI commits that drew a later fix-like commit within 60 days\n");
     out.push_str("L4 revert rate = share of heavy AI commits that were later reverted\n\n");
 
     if rows.is_empty() {
@@ -34,6 +35,10 @@ fn render_quality_report(
         out.push_str(&format!(
             "L1 Code Churn Rate: {}\n",
             fmt_ratio(&row.code_churn_rate, 2)
+        ));
+        out.push_str(&format!(
+            "L3 Bug-After-Merge Rate: {}\n",
+            fmt_ratio(&row.bug_after_merge_rate, 2)
         ));
         out.push_str(&format!(
             "L4 Revert Rate: {}\n",
@@ -58,6 +63,7 @@ fn render_quality_report(
     }
     headers.push(format!("{:>8}", "Heavy"));
     headers.push(format!("{:>12}", "L1(churn)"));
+    headers.push(format!("{:>10}", "L3(bug)"));
     headers.push(format!("{:>12}", "L4(revert)"));
     out.push_str(&format!("{}\n", headers.join("  ")));
 
@@ -82,6 +88,10 @@ fn render_quality_report(
         cols.push(format!(
             "{:>12}",
             fmt_ratio_percent(&row.code_churn_rate, 1)
+        ));
+        cols.push(format!(
+            "{:>10}",
+            fmt_ratio_percent(&row.bug_after_merge_rate, 1)
         ));
         cols.push(format!("{:>12}", fmt_ratio_percent(&row.revert_rate, 1)));
         out.push_str(&format!("{}\n", cols.join("  ")));
@@ -120,4 +130,90 @@ fn truncate(input: &str, max_len: usize) -> String {
     }
     out.push_str("...");
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::analytics::{LifecycleReportRow, RatioMetric};
+    use crate::cli::ReportArgs;
+
+    #[test]
+    fn render_quality_report_shows_l3_summary_metric() {
+        let rows = vec![LifecycleReportRow {
+            week_start: None,
+            group_value: None,
+            branch_name: None,
+            heavy_commit_count: 3,
+            code_churn_rate: RatioMetric {
+                numerator: 4,
+                denominator: 20,
+            },
+            bug_after_merge_rate: RatioMetric {
+                numerator: 1,
+                denominator: 3,
+            },
+            revert_rate: RatioMetric {
+                numerator: 0,
+                denominator: 3,
+            },
+        }];
+        let args = QualityReportArgs {
+            report: ReportArgs {
+                weekly: false,
+                group_by: None,
+                from: None,
+                to: None,
+                repo: None,
+                all_projects: false,
+                provider: None,
+                task: None,
+                model: None,
+                limit: 50,
+            },
+        };
+
+        let rendered = render_quality_report(&rows, &args);
+        assert!(rendered.contains("L3 Bug-After-Merge Rate: 33.33% (1/3)"));
+    }
+
+    #[test]
+    fn render_quality_report_shows_l3_grouped_column() {
+        let rows = vec![LifecycleReportRow {
+            week_start: None,
+            group_value: Some("codex".to_string()),
+            branch_name: None,
+            heavy_commit_count: 3,
+            code_churn_rate: RatioMetric {
+                numerator: 4,
+                denominator: 20,
+            },
+            bug_after_merge_rate: RatioMetric {
+                numerator: 1,
+                denominator: 3,
+            },
+            revert_rate: RatioMetric {
+                numerator: 0,
+                denominator: 3,
+            },
+        }];
+        let args = QualityReportArgs {
+            report: ReportArgs {
+                weekly: false,
+                group_by: Some(GroupBy::Provider),
+                from: None,
+                to: None,
+                repo: None,
+                all_projects: false,
+                provider: None,
+                task: None,
+                model: None,
+                limit: 50,
+            },
+        };
+
+        let rendered = render_quality_report(&rows, &args);
+        assert!(rendered.contains("L3(bug)"));
+        assert!(rendered.contains("33.3%"));
+    }
 }

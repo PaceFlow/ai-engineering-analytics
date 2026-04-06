@@ -46,6 +46,7 @@ struct ChangeSummarySnapshot {
 struct LifecycleSummarySnapshot {
     heavy_commits: String,
     code_churn_rate: String,
+    bug_after_merge_rate: String,
     revert_rate: String,
 }
 
@@ -112,11 +113,6 @@ impl TestEnv {
             .env_remove("HOMEPATH")
             .env_remove("XDG_CONFIG_HOME")
             .env_remove("PACEFLOW_GITHUB_TOKEN")
-            .env_remove("PACEFLOW_GITHUB_TEST_REPO_KEY")
-            .env_remove("PACEFLOW_GITHUB_TEST_COMMIT_SHA")
-            .env_remove("PACEFLOW_GITHUB_TEST_EXPECTED_PR")
-            .env_remove("PACEFLOW_GITHUB_TEST_EXPECTED_MERGED")
-            .env_remove("PACEFLOW_GITHUB_TEST_NO_PR_COMMIT_SHA")
             .output()?;
 
         if !output.status.success() {
@@ -418,6 +414,28 @@ impl TestEnv {
                     commit_sha,
                     ai_added_lines_reaching_mainline,
                     ai_added_lines_removed_within_window,
+                ),
+            )?;
+            conn.execute(
+                "INSERT INTO event_commit_bug_signal (
+                    repo_root, commit_sha, bug_after_merge_flag, first_bug_signal_commit_sha,
+                    first_bug_signal_commit_time, bug_signal_count, window_days, signal_source
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 60, 'git_fix_commit')",
+                (
+                    repo_root,
+                    commit_sha,
+                    i64::from(commit_sha == "f3d68adc96fbfb533c2e76cda51ca174f6d7954f"),
+                    if commit_sha == "f3d68adc96fbfb533c2e76cda51ca174f6d7954f" {
+                        Some("2f00f00d2f00f00d2f00f00d2f00f00d2f00f00d")
+                    } else {
+                        None
+                    },
+                    if commit_sha == "f3d68adc96fbfb533c2e76cda51ca174f6d7954f" {
+                        Some("2026-03-15T09:00:00.000Z")
+                    } else {
+                        None
+                    },
+                    i64::from(commit_sha == "f3d68adc96fbfb533c2e76cda51ca174f6d7954f"),
                 ),
             )?;
             conn.execute(
@@ -872,6 +890,7 @@ fn parse_lifecycle_summary(output: &str) -> anyhow::Result<LifecycleSummarySnaps
     Ok(LifecycleSummarySnapshot {
         heavy_commits: line_value(output, "Heavy commits: ")?,
         code_churn_rate: line_value(output, "L1 Code Churn Rate: ")?,
+        bug_after_merge_rate: line_value(output, "L3 Bug-After-Merge Rate: ")?,
         revert_rate: line_value(output, "L4 Revert Rate: ")?,
     })
 }

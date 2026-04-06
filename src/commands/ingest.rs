@@ -197,10 +197,12 @@ pub fn run(verbose: bool) -> Result<()> {
         }
         _ => github::sync::sync_github_pull_requests(&mut db, verbose, None)?,
     };
-    if github_summary.commit_lookups_enqueued > 0 || github_summary.open_pull_requests_refreshed > 0
+    if github_summary.commit_lookups_enqueued > 0
+        || github_summary.open_pull_requests_refreshed > 0
+        || github_summary.issue_scans_enqueued > 0
     {
         println!(
-            "GitHub PR sync: repos={} lookups={}/{} resolved={} no_pr={} failed={} rate_limited={} prs={} pr_commits={} refreshed_open_prs={}",
+            "GitHub PR sync: repos={} lookups={}/{} resolved={} no_pr={} failed={} rate_limited={} prs={} pr_commits={} refreshed_open_prs={} issue_scans={}/{} refreshed_issue_scans={} issues={} issue_fix_prs={} pr_removed_hashes={}",
             github_summary.repos_considered,
             github_summary.commit_lookups_completed,
             github_summary.commit_lookups_enqueued,
@@ -210,7 +212,13 @@ pub fn run(verbose: bool) -> Result<()> {
             github_summary.rate_limited_commits,
             github_summary.pull_requests_upserted,
             github_summary.pull_request_commits_upserted,
-            github_summary.open_pull_requests_refreshed
+            github_summary.open_pull_requests_refreshed,
+            github_summary.issue_scans_completed,
+            github_summary.issue_scans_enqueued,
+            github_summary.issue_scans_refreshed,
+            github_summary.issues_upserted,
+            github_summary.issue_fix_pull_requests_upserted,
+            github_summary.pull_request_removed_hashes_upserted
         );
     } else if github_summary.repos_considered > 0 {
         if github_token_configured {
@@ -220,6 +228,18 @@ pub fn run(verbose: bool) -> Result<()> {
                 "GitHub PR sync: skipped remote fetch (run `paceflow github token` or set PACEFLOW_GITHUB_TOKEN to enable refresh)"
             );
         }
+    }
+    if github_summary.repos_considered > 0 {
+        println!("\nRe-materializing commit events with GitHub evidence ...");
+        let commit_refresh = analytics::refresh_commit_events(&mut db, verbose)?;
+        println!(
+            "Commit events materialized: repos={}/{} commits={}/{} elapsed={:.1}s",
+            commit_refresh.repos_processed,
+            commit_refresh.repos_total,
+            commit_refresh.commits_processed,
+            commit_refresh.commits_total,
+            commit_refresh.elapsed_ms as f64 / 1000.0
+        );
     }
     println!("\nTotal rows written: {}", grand_total);
     Ok(())
