@@ -1,11 +1,14 @@
 ---
 source: tests/metrics_regression.rs
+assertion_line: 555
 expression: lifecycle
 ---
 Quality Metrics
 L1 code churn rate = share of AI-added lines on heavy AI commits that were later removed within the churn window
+L3 bug-after-merge rate = share of merged heavy AI commits that drew a later fix-like commit within 60 days
 L4 revert rate = share of heavy AI commits that were later reverted
 
 Heavy commits: 3
 L1 Code Churn Rate: 1.47% (59/4006)
+L3 Bug-After-Merge Rate: 33.33% (1/3)
 L4 Revert Rate: 0.00% (0/3)

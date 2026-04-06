@@ -246,8 +246,10 @@ pub(crate) fn init_metadata_schema(conn: &Connection) -> Result<()> {
             base_ref     TEXT,
             head_ref     TEXT,
             html_url     TEXT,
+            removed_hashes_complete_flag INTEGER,
             PRIMARY KEY(repo_key, pr_number),
-            CHECK (draft_flag IN (0,1))
+            CHECK (draft_flag IN (0,1)),
+            CHECK (removed_hashes_complete_flag IN (0,1))
         );
 
         CREATE TABLE IF NOT EXISTS fact_github_pull_request_commit (
@@ -272,8 +274,40 @@ pub(crate) fn init_metadata_schema(conn: &Connection) -> Result<()> {
             repo_key                 TEXT PRIMARY KEY,
             last_commit_scan_at      TEXT,
             last_open_pr_refresh_at  TEXT,
+            last_issue_scan_at       TEXT,
             last_error               TEXT,
             updated_at               TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS fact_github_issue (
+            repo_key             TEXT NOT NULL,
+            issue_number         INTEGER NOT NULL,
+            state                TEXT NOT NULL,
+            created_at           TEXT,
+            updated_at           TEXT,
+            closed_at            TEXT,
+            is_pull_request_flag INTEGER NOT NULL DEFAULT 0,
+            bug_candidate_flag   INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY(repo_key, issue_number),
+            CHECK (is_pull_request_flag IN (0,1)),
+            CHECK (bug_candidate_flag IN (0,1))
+        );
+
+        CREATE TABLE IF NOT EXISTS fact_github_issue_fix_pull_request (
+            repo_key        TEXT NOT NULL,
+            issue_number    INTEGER NOT NULL,
+            pr_number       INTEGER NOT NULL,
+            linked_at       TEXT,
+            PRIMARY KEY(repo_key, issue_number, pr_number)
+        );
+
+        CREATE TABLE IF NOT EXISTS fact_github_pull_request_removed_line_hash (
+            repo_key     TEXT NOT NULL,
+            pr_number    INTEGER NOT NULL,
+            rel_path     TEXT NOT NULL,
+            line_hash    TEXT NOT NULL,
+            count        INTEGER NOT NULL,
+            PRIMARY KEY(repo_key, pr_number, rel_path, line_hash)
         );
 
         CREATE TABLE IF NOT EXISTS event_session_quality (
@@ -342,6 +376,20 @@ pub(crate) fn init_metadata_schema(conn: &Connection) -> Result<()> {
             ai_added_lines_removed_within_window INTEGER NOT NULL DEFAULT 0,
             churn_window_days                 INTEGER NOT NULL DEFAULT 14,
             PRIMARY KEY(repo_root, commit_sha)
+        );
+
+        CREATE TABLE IF NOT EXISTS event_commit_bug_signal (
+            repo_root                     TEXT NOT NULL,
+            repo_key                      TEXT,
+            commit_sha                    TEXT NOT NULL,
+            bug_after_merge_flag          INTEGER NOT NULL DEFAULT 0,
+            first_bug_signal_commit_sha   TEXT,
+            first_bug_signal_commit_time  TEXT,
+            bug_signal_count              INTEGER NOT NULL DEFAULT 0,
+            window_days                   INTEGER NOT NULL DEFAULT 60,
+            signal_source                 TEXT NOT NULL DEFAULT 'git_fix_commit',
+            PRIMARY KEY(repo_root, commit_sha),
+            CHECK (bug_after_merge_flag IN (0,1))
         );
 
         CREATE TABLE IF NOT EXISTS event_commit_session (
@@ -442,6 +490,12 @@ pub(crate) fn init_metadata_schema(conn: &Connection) -> Result<()> {
             ON fact_github_pull_request_commit(repo_key, commit_sha);
         CREATE INDEX IF NOT EXISTS idx_fact_github_lookup_status
             ON fact_github_commit_pr_lookup(repo_key, status, last_checked_at);
+        CREATE INDEX IF NOT EXISTS idx_fact_github_issue_bug
+            ON fact_github_issue(repo_key, bug_candidate_flag, created_at);
+        CREATE INDEX IF NOT EXISTS idx_fact_github_issue_fix_pr_issue
+            ON fact_github_issue_fix_pull_request(repo_key, issue_number, pr_number);
+        CREATE INDEX IF NOT EXISTS idx_fact_github_pr_removed_hash
+            ON fact_github_pull_request_removed_line_hash(repo_key, pr_number, rel_path, line_hash);
         CREATE INDEX IF NOT EXISTS idx_event_session_quality_sync
             ON event_session_quality(repo_key, member_email, provider, session_id);
         CREATE INDEX IF NOT EXISTS idx_event_session_productivity_sync
@@ -450,6 +504,8 @@ pub(crate) fn init_metadata_schema(conn: &Connection) -> Result<()> {
             ON event_commit_outcome(repo_key, commit_sha);
         CREATE INDEX IF NOT EXISTS idx_event_commit_churn_repo_key
             ON event_commit_churn(repo_key, commit_sha);
+        CREATE INDEX IF NOT EXISTS idx_event_commit_bug_signal_repo_key
+            ON event_commit_bug_signal(repo_key, commit_sha);
         CREATE INDEX IF NOT EXISTS idx_event_commit_session_session
             ON event_commit_session(provider, session_id);
         CREATE INDEX IF NOT EXISTS idx_event_commit_session_repo_commit
@@ -499,6 +555,8 @@ pub(crate) fn init_metadata_schema(conn: &Connection) -> Result<()> {
         "ALTER TABLE event_task_session ADD COLUMN accepted_output_flag INTEGER;",
         "ALTER TABLE event_task_session ADD COLUMN first_accepted_change_at TEXT;",
         "ALTER TABLE event_task_session ADD COLUMN minutes_to_first_accepted_change REAL;",
+        "ALTER TABLE fact_github_sync_state ADD COLUMN last_issue_scan_at TEXT;",
+        "ALTER TABLE fact_github_pull_request ADD COLUMN removed_hashes_complete_flag INTEGER;",
     ] {
         let _ = conn.execute_batch(statement);
     }
@@ -1813,7 +1871,11 @@ mod tests {
             "fact_github_pull_request_commit",
             "fact_github_commit_pr_lookup",
             "fact_github_sync_state",
+            "fact_github_issue",
+            "fact_github_issue_fix_pull_request",
+            "fact_github_pull_request_removed_line_hash",
             "event_commit_pr_outcome",
+            "event_commit_bug_signal",
         ] {
             let count: i64 = conn.query_row(
                 "SELECT COUNT(*)

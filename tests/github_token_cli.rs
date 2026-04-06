@@ -31,12 +31,7 @@ impl TestEnv {
             .env_remove("HOMEDRIVE")
             .env_remove("HOMEPATH")
             .env_remove("XDG_CONFIG_HOME")
-            .env_remove("PACEFLOW_GITHUB_TOKEN")
-            .env_remove("PACEFLOW_GITHUB_TEST_REPO_KEY")
-            .env_remove("PACEFLOW_GITHUB_TEST_COMMIT_SHA")
-            .env_remove("PACEFLOW_GITHUB_TEST_EXPECTED_PR")
-            .env_remove("PACEFLOW_GITHUB_TEST_EXPECTED_MERGED")
-            .env_remove("PACEFLOW_GITHUB_TEST_NO_PR_COMMIT_SHA");
+            .env_remove("PACEFLOW_GITHUB_TOKEN");
         Ok(command)
     }
 

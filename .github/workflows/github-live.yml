@@ -14,11 +14,6 @@ jobs:
       contents: read
     env:
       PACEFLOW_GITHUB_TOKEN: ${{ secrets.PACEFLOW_GITHUB_TOKEN }}
-      PACEFLOW_GITHUB_TEST_REPO_KEY: ${{ secrets.PACEFLOW_GITHUB_TEST_REPO_KEY }}
-      PACEFLOW_GITHUB_TEST_COMMIT_SHA: ${{ secrets.PACEFLOW_GITHUB_TEST_COMMIT_SHA }}
-      PACEFLOW_GITHUB_TEST_EXPECTED_PR: ${{ secrets.PACEFLOW_GITHUB_TEST_EXPECTED_PR }}
-      PACEFLOW_GITHUB_TEST_EXPECTED_MERGED: ${{ secrets.PACEFLOW_GITHUB_TEST_EXPECTED_MERGED }}
-      PACEFLOW_GITHUB_TEST_NO_PR_COMMIT_SHA: ${{ secrets.PACEFLOW_GITHUB_TEST_NO_PR_COMMIT_SHA }}
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -27,12 +22,7 @@ jobs:
         shell: bash
         run: |
           missing=0
-          for key in \
-            PACEFLOW_GITHUB_TOKEN \
-            PACEFLOW_GITHUB_TEST_REPO_KEY \
-            PACEFLOW_GITHUB_TEST_COMMIT_SHA \
-            PACEFLOW_GITHUB_TEST_EXPECTED_PR \
-            PACEFLOW_GITHUB_TEST_EXPECTED_MERGED
+          for key in PACEFLOW_GITHUB_TOKEN
           do
             if [ -z "${!key}" ]; then
               echo "missing $key"
@@ -47,7 +37,7 @@ jobs:
       - name: Skip live GitHub test
         if: steps.config.outputs.enabled != 'true'
         run: |
-          echo "Skipping live GitHub test: missing repository secrets"
+          echo "Skipping live GitHub test: missing PACEFLOW_GITHUB_TOKEN secret"
       - name: Run live GitHub test
         if: steps.config.outputs.enabled == 'true'
         run: cargo test --test github_live -- --ignored --nocapture

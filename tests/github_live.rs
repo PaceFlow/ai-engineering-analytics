@@ -2,13 +2,18 @@ use ai_engineering_analytics::analytics;
 use ai_engineering_analytics::cli::ReportArgs;
 use ai_engineering_analytics::db;
 use ai_engineering_analytics::github;
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use rusqlite::{Connection, params};
 use std::ffi::{OsStr, OsString};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use tempfile::TempDir;
 
 const LIVE_REPO_ROOT: &str = "/tmp/paceflow-github-live";
+const LIVE_REPO_KEY: &str = "git:github.com/PaceFlow/ai-engineering-analytics";
+const LIVE_COMMIT_SHA: &str = "0c42afacd5ce7f20e666f77682e6de10e09f1508";
+const LIVE_EXPECTED_PR: i64 = 3;
+const LIVE_EXPECTED_MERGED: bool = true;
+const LIVE_NO_PR_COMMIT_SHA: Option<&str> = Some("17d0dd8df07dcd0e1ae8c8c285e344e857761ee5");
 
 fn env_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -61,32 +66,17 @@ struct LiveGitHubConfig {
 
 impl LiveGitHubConfig {
     fn from_env() -> Result<Option<Self>> {
-        let token = required_env("PACEFLOW_GITHUB_TOKEN");
-        let repo_key = required_env("PACEFLOW_GITHUB_TEST_REPO_KEY");
-        let commit_sha = required_env("PACEFLOW_GITHUB_TEST_COMMIT_SHA");
-        let expected_pr = required_env("PACEFLOW_GITHUB_TEST_EXPECTED_PR");
-        let expected_merged = required_env("PACEFLOW_GITHUB_TEST_EXPECTED_MERGED");
-
-        let (
-            Some(token),
-            Some(repo_key),
-            Some(commit_sha),
-            Some(expected_pr),
-            Some(expected_merged),
-        ) = (token, repo_key, commit_sha, expected_pr, expected_merged)
-        else {
+        let Some(token) = required_env("PACEFLOW_GITHUB_TOKEN") else {
             return Ok(None);
         };
 
         Ok(Some(Self {
             token,
-            repo_key,
-            commit_sha,
-            expected_pr: expected_pr
-                .parse()
-                .map_err(|err| anyhow!("invalid PACEFLOW_GITHUB_TEST_EXPECTED_PR: {err}"))?,
-            expected_merged: parse_bool(&expected_merged)?,
-            no_pr_commit_sha: optional_env("PACEFLOW_GITHUB_TEST_NO_PR_COMMIT_SHA"),
+            repo_key: LIVE_REPO_KEY.to_string(),
+            commit_sha: LIVE_COMMIT_SHA.to_string(),
+            expected_pr: LIVE_EXPECTED_PR,
+            expected_merged: LIVE_EXPECTED_MERGED,
+            no_pr_commit_sha: LIVE_NO_PR_COMMIT_SHA.map(str::to_string),
         }))
     }
 }
@@ -134,7 +124,7 @@ impl LiveGitHubFixture {
 }
 
 #[test]
-#[ignore = "requires live GitHub credentials and fixture env vars"]
+#[ignore = "requires live GitHub token"]
 fn github_live_commit_lookup_and_pr_state_match_expected_fixture() -> Result<()> {
     let Some(fixture) = LiveGitHubFixture::load()? else {
         return Ok(());
@@ -203,7 +193,7 @@ fn github_live_commit_lookup_and_pr_state_match_expected_fixture() -> Result<()>
 }
 
 #[test]
-#[ignore = "requires live GitHub credentials and fixture env vars"]
+#[ignore = "requires live GitHub token"]
 fn github_live_change_report_exposes_c1_and_c3_for_synced_commits() -> Result<()> {
     let Some(fixture) = LiveGitHubFixture::load()? else {
         return Ok(());
@@ -251,9 +241,7 @@ fn query_live_change_report(conn: &Connection) -> Result<Vec<analytics::ChangeRe
 }
 
 fn missing_live_test_env_message() -> &'static str {
-    "skipping live GitHub test: set PACEFLOW_GITHUB_TOKEN, PACEFLOW_GITHUB_TEST_REPO_KEY, \
-PACEFLOW_GITHUB_TEST_COMMIT_SHA, PACEFLOW_GITHUB_TEST_EXPECTED_PR, and \
-PACEFLOW_GITHUB_TEST_EXPECTED_MERGED"
+    "skipping live GitHub test: set PACEFLOW_GITHUB_TOKEN"
 }
 
 fn required_env(key: &'static str) -> Option<String> {
@@ -265,14 +253,6 @@ fn optional_env(key: &'static str) -> Option<String> {
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
-}
-
-fn parse_bool(raw: &str) -> Result<bool> {
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "1" | "true" | "yes" => Ok(true),
-        "0" | "false" | "no" => Ok(false),
-        other => Err(anyhow!("invalid boolean value `{other}`")),
-    }
 }
 
 fn seed_github_candidate_commit(
