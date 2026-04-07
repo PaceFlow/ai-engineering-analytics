@@ -1,8 +1,15 @@
 # `paceflow` release
 
-This is the public beta release of `paceflow`.
+This is the first stable public release of `paceflow`.
 
 Download the archive for your platform from the Assets section below, extract it, and run `paceflow --help`.
+
+Highlights in `v0.1.0`:
+
+- GitHub-backed delivery metrics for `C1` and `C3`
+- GitHub PR sync with saved token setup flow
+- `L3` bug-after-merge tracking for quality reporting
+- Streamlined ingest progress output
 
 Quick start:
 
