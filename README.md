@@ -131,12 +131,12 @@ Rerun `paceflow github token` to replace or delete the saved token. For CI or on
 Build and install from source:
 
 ```bash
-git clone https://github.com/PaceFlow/vibe-coding-analytics.git
-cd vibe-coding-analytics
+git clone https://github.com/PaceFlow/ai-engineering-analytics.git
+cd ai-engineering-analytics
 cargo install --path . --force
 ```
 
-Prefer not to build from source? Download a prebuilt release from [GitHub Releases](https://github.com/PaceFlow/vibe-coding-analytics/releases).
+Prefer not to build from source? Download a prebuilt release from [GitHub Releases](https://github.com/PaceFlow/ai-engineering-analytics/releases).
 
 Supported release targets:
 
@@ -152,7 +152,7 @@ Windows (PowerShell):
 $version = "v0.1.0"
 $asset = "paceflow-x86_64-pc-windows-msvc.zip"
 Invoke-WebRequest `
-  -Uri "https://github.com/PaceFlow/vibe-coding-analytics/releases/download/$version/$asset" `
+  -Uri "https://github.com/PaceFlow/ai-engineering-analytics/releases/download/$version/$asset" `
   -OutFile $asset
 Expand-Archive .\$asset -DestinationPath .\paceflow
 .\paceflow\paceflow.exe --help
@@ -163,7 +163,7 @@ macOS/Linux:
 ```bash
 version="v0.1.0"
 asset="paceflow-x86_64-unknown-linux-gnu.tar.gz"
-curl -L "https://github.com/PaceFlow/vibe-coding-analytics/releases/download/${version}/${asset}" -o "${asset}"
+curl -L "https://github.com/PaceFlow/ai-engineering-analytics/releases/download/${version}/${asset}" -o "${asset}"
 tar -xzf "${asset}"
 ./paceflow-x86_64-unknown-linux-gnu/paceflow --help
 ```
