@@ -27,20 +27,27 @@ impl ProviderWorkPlan {
 pub struct IngestExecutionPlan {
     pub provider_plans: Vec<ProviderWorkPlan>,
     pub association_units_estimate: usize,
+    pub commit_materialization_units_estimate: usize,
     pub total_units: usize,
 }
 
 impl IngestExecutionPlan {
-    pub fn new(provider_plans: Vec<ProviderWorkPlan>, association_units_estimate: usize) -> Self {
+    pub fn new(
+        provider_plans: Vec<ProviderWorkPlan>,
+        association_units_estimate: usize,
+        commit_materialization_units_estimate: usize,
+    ) -> Self {
         let provider_units = provider_plans
             .iter()
             .map(|plan| plan.session_units() + plan.code_change_units())
             .sum::<usize>();
-        let total_units = provider_units + 1 + association_units_estimate;
+        let total_units =
+            provider_units + 1 + association_units_estimate + commit_materialization_units_estimate;
 
         Self {
             provider_plans,
             association_units_estimate,
+            commit_materialization_units_estimate,
             total_units,
         }
     }
@@ -197,12 +204,24 @@ impl IngestProgress {
             return;
         }
 
+        let width = terminal_size()
+            .map(|(Width(width), _)| width as usize)
+            .unwrap_or(100)
+            .max(60);
+        let line = self.render_line(width);
+        let pad = self.last_render_width.saturating_sub(line.len());
+        print!("\r{}{}", line, " ".repeat(pad));
+        let _ = std::io::stdout().flush();
+        self.line_active = true;
+        self.last_render_width = line.len();
+    }
+
+    fn render_line(&self, width: usize) -> String {
         let stage_label = self
             .stage
             .as_ref()
             .map(|stage| stage.label.as_str())
-            .unwrap_or("ingest");
-        let item_label = self.current_item.as_deref().unwrap_or("");
+            .unwrap_or("Ingest");
         let elapsed = format_elapsed(self.started_at.elapsed().as_millis());
         let status = format!(
             "{} {}/{} {}",
@@ -211,13 +230,9 @@ impl IngestProgress {
             self.total_units,
             elapsed
         );
-        let width = terminal_size()
-            .map(|(Width(width), _)| width as usize)
-            .unwrap_or(100)
-            .max(60);
         let prefix = format!("{} ", truncate(stage_label, 24));
-        let suffix = format!(" {} {}", status, truncate(item_label, 30));
-        let reserved = prefix.len() + suffix.len() + 4;
+        let suffix = format!(" {}", status);
+        let reserved = prefix.len() + suffix.len() + 3;
         let bar_width = width.saturating_sub(reserved).clamp(10, 40);
         let filled = if self.total_units == 0 {
             bar_width
@@ -231,12 +246,8 @@ impl IngestProgress {
             "=".repeat(filled),
             " ".repeat(bar_width.saturating_sub(filled))
         );
-        let line = format!("{prefix}{bar}{suffix}");
-        let pad = self.last_render_width.saturating_sub(line.len());
-        print!("\r{}{}", line, " ".repeat(pad));
-        let _ = std::io::stdout().flush();
-        self.line_active = true;
-        self.last_render_width = line.len();
+
+        format!("{prefix}{bar}{suffix}")
     }
 }
 
@@ -311,5 +322,17 @@ mod tests {
         };
 
         assert_eq!(plan.total_units(), 1);
+    }
+
+    #[test]
+    fn render_line_omits_current_item_details() {
+        let mut progress = IngestProgress::new_with_tty(10, true);
+        progress.start_stage("Sessions".to_string(), 10);
+        progress.advance(1, "/tmp/repo/src/main.rs");
+
+        let line = progress.render_line(80);
+        assert!(line.contains("Sessions"));
+        assert!(line.contains("10%"));
+        assert!(!line.contains("/tmp/repo/src/main.rs"));
     }
 }

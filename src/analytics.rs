@@ -13,6 +13,7 @@ use std::time::Instant;
 use crate::change_intel::commit_assoc::git_scan::load_commit_diff;
 use crate::change_intel::types::LineSide;
 use crate::cli::{EventCategory, EventStreamArgs, EventStreamKind, GroupBy, ReportArgs};
+use crate::ingest_progress::IngestProgressObserver;
 use crate::sync_identity;
 
 const C2_STRICT_WEAK_RATIO: f64 = 0.20;
@@ -702,7 +703,11 @@ pub fn refresh_session_events(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-pub fn refresh_commit_events(conn: &mut Connection, verbose: bool) -> Result<CommitRefreshSummary> {
+pub fn refresh_commit_events(
+    conn: &mut Connection,
+    verbose: bool,
+    mut progress: Option<&mut dyn IngestProgressObserver>,
+) -> Result<CommitRefreshSummary> {
     let started = Instant::now();
     let commits = load_fact_commits(conn)?;
     let commits_total = commits.len();
@@ -715,7 +720,9 @@ pub fn refresh_commit_events(conn: &mut Connection, verbose: bool) -> Result<Com
     }
 
     let repos_total = by_repo.len();
-    println!("  repos={} commits={}", repos_total, commits_total);
+    if verbose {
+        println!("  repos={} commits={}", repos_total, commits_total);
+    }
 
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     tx.execute("DELETE FROM event_commit_outcome", [])?;
@@ -748,12 +755,14 @@ pub fn refresh_commit_events(conn: &mut Connection, verbose: bool) -> Result<Com
 
     for (repo_index, (repo_root, mut repo_commits)) in by_repo.into_iter().enumerate() {
         if !Path::new(&repo_root).join(".git").exists() {
-            println!(
-                "  [{}/{}] {} skipped (not a git repo)",
-                repo_index + 1,
-                repos_total,
-                shorten_repo(&repo_root)
-            );
+            if verbose {
+                println!(
+                    "  [{}/{}] {} skipped (not a git repo)",
+                    repo_index + 1,
+                    repos_total,
+                    shorten_repo(&repo_root)
+                );
+            }
             continue;
         }
         let repo_key = sync_identity::repo_key_for_repo_root(Some(&repo_root));
@@ -764,13 +773,15 @@ pub fn refresh_commit_events(conn: &mut Connection, verbose: bool) -> Result<Com
                 .then_with(|| a.commit_sha.cmp(&b.commit_sha))
         });
         let repo_started = Instant::now();
-        println!(
-            "  [{}/{}] {} commits={}",
-            repo_index + 1,
-            repos_total,
-            shorten_repo(&repo_root),
-            repo_commits.len()
-        );
+        if verbose {
+            println!(
+                "  [{}/{}] {} commits={}",
+                repo_index + 1,
+                repos_total,
+                shorten_repo(&repo_root),
+                repo_commits.len()
+            );
+        }
 
         let derived = derive_repo_commit_events(&tx, &repo_root, &repo_commits, verbose)?;
         repos_processed += 1;
@@ -818,6 +829,9 @@ pub fn refresh_commit_events(conn: &mut Connection, verbose: bool) -> Result<Com
             ])?;
 
             commits_processed += 1;
+            if let Some(observer) = progress.as_deref_mut() {
+                observer.advance(commit.commit_sha.as_str());
+            }
             if verbose && (commit_index + 1) % 100 == 0 {
                 println!(
                     "    {} processed {}/{} commits",
@@ -828,12 +842,14 @@ pub fn refresh_commit_events(conn: &mut Connection, verbose: bool) -> Result<Com
             }
         }
 
-        println!(
-            "  done {} commits={} elapsed={}",
-            shorten_repo(&repo_root),
-            repo_commits.len(),
-            format_elapsed(repo_started.elapsed().as_millis())
-        );
+        if verbose {
+            println!(
+                "  done {} commits={} elapsed={}",
+                shorten_repo(&repo_root),
+                repo_commits.len(),
+                format_elapsed(repo_started.elapsed().as_millis())
+            );
+        }
     }
     drop(insert_outcome);
     drop(insert_churn);

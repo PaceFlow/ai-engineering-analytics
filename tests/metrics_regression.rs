@@ -679,10 +679,18 @@ fn ingest_reports_commit_event_progress() -> anyhow::Result<()> {
 
     assert!(ingest_output.contains("Planning ingest..."));
     assert!(ingest_output.contains("Stage: codex sessions"));
-    assert!(ingest_output.contains("Stage: commit association"));
+    assert!(ingest_output.contains("Stage: cursor sessions"));
+    assert!(ingest_output.contains("Stage: codex changes"));
+    assert!(ingest_output.contains("Stage: cursor changes"));
+    assert!(ingest_output.contains("Stage: Commit Association"));
+    assert!(ingest_output.contains("Stage: Commit Materialization"));
     assert!(ingest_output.contains("Ingest progress: 100%"));
-    assert!(ingest_output.contains("Materializing commit events ..."));
-    assert!(ingest_output.contains("Commit events materialized: repos="));
+    assert!(ingest_output.contains("GitHub sync: skipped"));
+    assert!(ingest_output.contains("Rows written:"));
+    assert!(!ingest_output.contains("rows written"));
+    assert!(!ingest_output.contains("Association summary:"));
+    assert!(!ingest_output.contains("Commit events materialized: repos="));
+    assert!(!ingest_output.contains("GitHub PR sync:"));
 
     Ok(())
 }
@@ -692,9 +700,14 @@ fn fixture_corpus_ingest_smoke_is_cross_platform_friendly() -> anyhow::Result<()
     let env = TestEnv::new_live_fixture()?;
     let ingest_output = env.normalize_output(env.run_paceflow(&["ingest"])?);
 
-    assert!(ingest_output.contains("Association summary:"));
-    assert!(ingest_output.contains("Commit events materialized: repos="));
-    assert!(ingest_output.contains("commits_scanned="));
+    assert!(ingest_output.contains("Planning ingest..."));
+    assert!(ingest_output.contains("Stage: codex sessions"));
+    assert!(ingest_output.contains("Stage: cursor sessions"));
+    assert!(ingest_output.contains("Stage: Commit Materialization"));
+    assert!(ingest_output.contains("Rows written:"));
+    assert!(!ingest_output.contains("Association summary:"));
+    assert!(!ingest_output.contains("Commit events materialized: repos="));
+    assert!(!ingest_output.contains("commits_scanned="));
 
     let session = env.normalize_output(env.run_paceflow(&["session"])?);
     let change = env.normalize_output(env.run_paceflow(&["delivery"])?);
@@ -714,6 +727,18 @@ fn fixture_corpus_ingest_smoke_is_cross_platform_friendly() -> anyhow::Result<()
     let commits: i64 = structured_change.commits.parse()?;
     let heavy_commits: i64 = structured_change.heavy_commits.parse()?;
     assert!((0..=commits).contains(&heavy_commits));
+
+    Ok(())
+}
+
+#[test]
+fn verbose_ingest_retains_detailed_summaries() -> anyhow::Result<()> {
+    let env = TestEnv::new_live_fixture()?;
+    let ingest_output = env.run_paceflow(&["-v", "ingest"])?;
+
+    assert!(ingest_output.contains("Association summary:"));
+    assert!(ingest_output.contains("Commit events materialized: repos="));
+    assert!(ingest_output.contains("code changes ["));
 
     Ok(())
 }
