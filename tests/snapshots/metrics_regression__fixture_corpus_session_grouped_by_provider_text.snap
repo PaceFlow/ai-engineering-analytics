@@ -3,13 +3,12 @@ source: tests/metrics_regression.rs
 expression: session_grouped
 ---
 Session Metrics
-Average user prompts = average number of user prompts per session
-Avg time to first accepted change = minutes from session start to the first accepted code change
-Debug loop rate = share of sessions that look like repeated fix-retry loops
-Error paste rate = share of sessions where an error message was pasted mid-session
-Session-to-commit rate = share of sessions followed by a commit within 4 hours
-No-output session rate = share of sessions with no accepted code changes
 
-Group                         Sessions     Prompts    First Chg            Loop           Error       To Commit       No Output
+Provider                      Sessions     Prompts    First Chg            Loop           Error       To Commit       No Output
 codex                                2       66.00        320.4            0.0%          100.0%          100.0%            0.0%
 cursor                               1        1.00          0.0            0.0%            0.0%            0.0%            0.0%
+
+Legend:
+- Prompts = avg prompts per session.
+- First Chg = avg minutes to first accepted code change.
+- Loop, Error, To Commit, and No Output = percentage rates.

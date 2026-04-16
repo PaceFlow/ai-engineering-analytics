@@ -1,11 +1,22 @@
 use std::path::Path;
 
-use crate::cli::ReportArgs;
+use crate::cli::{GroupBy, ReportArgs};
 use crate::path_utils::detect_repo_root;
+
+#[derive(Debug, Clone)]
+pub struct ResolvedMainReportArgs {
+    pub report: ReportArgs,
+    pub implicit_model_default: bool,
+}
 
 pub fn resolve_report_args(args: &ReportArgs) -> ReportArgs {
     let cwd = std::env::current_dir().ok();
     resolve_report_args_for_cwd(args, cwd.as_deref())
+}
+
+pub fn resolve_main_report_args(args: &ReportArgs, overall: bool) -> ResolvedMainReportArgs {
+    let cwd = std::env::current_dir().ok();
+    resolve_main_report_args_for_cwd(args, overall, cwd.as_deref())
 }
 
 fn resolve_report_args_for_cwd(args: &ReportArgs, cwd: Option<&Path>) -> ReportArgs {
@@ -20,10 +31,27 @@ fn resolve_report_args_for_cwd(args: &ReportArgs, cwd: Option<&Path>) -> ReportA
     resolved
 }
 
+fn resolve_main_report_args_for_cwd(
+    args: &ReportArgs,
+    overall: bool,
+    cwd: Option<&Path>,
+) -> ResolvedMainReportArgs {
+    let mut report = resolve_report_args_for_cwd(args, cwd);
+    let implicit_model_default = !overall && report.group_by.is_none();
+    if implicit_model_default {
+        report.group_by = Some(GroupBy::Model);
+    }
+
+    ResolvedMainReportArgs {
+        report,
+        implicit_model_default,
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::resolve_report_args_for_cwd;
-    use crate::cli::ReportArgs;
+    use super::{resolve_main_report_args_for_cwd, resolve_report_args_for_cwd};
+    use crate::cli::{GroupBy, ReportArgs};
     use anyhow::Result;
     use std::path::Path;
     use std::process::Command;
@@ -117,5 +145,33 @@ mod tests {
 
         assert_eq!(resolved.repo.as_deref(), Some("/tmp/explicit"));
         Ok(())
+    }
+
+    #[test]
+    fn main_reports_default_to_model_grouping() {
+        let args = base_args();
+        let resolved = resolve_main_report_args_for_cwd(&args, false, None);
+
+        assert_eq!(resolved.report.group_by, Some(GroupBy::Model));
+        assert!(resolved.implicit_model_default);
+    }
+
+    #[test]
+    fn overall_preserves_top_level_summary_view() {
+        let args = base_args();
+        let resolved = resolve_main_report_args_for_cwd(&args, true, None);
+
+        assert_eq!(resolved.report.group_by, None);
+        assert!(!resolved.implicit_model_default);
+    }
+
+    #[test]
+    fn explicit_grouping_beats_model_default() {
+        let mut args = base_args();
+        args.group_by = Some(GroupBy::Provider);
+
+        let resolved = resolve_main_report_args_for_cwd(&args, false, None);
+        assert_eq!(resolved.report.group_by, Some(GroupBy::Provider));
+        assert!(!resolved.implicit_model_default);
     }
 }

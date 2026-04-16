@@ -4,7 +4,7 @@ expression: structured_session
 ---
 sessions: "3"
 average_user_prompts: "44.33"
-avg_time_to_first_accepted_change_minutes: "213.58"
+avg_time_to_first_accepted_change_minutes: 213.58 min
 debug_loop_rate: 0.00% (0/3)
 s6_rate: 66.67% (2/3)
 s9_rate: 66.67% (2/3)

@@ -29,19 +29,22 @@ If those patterns show up repeatedly, you usually need tighter task slicing, bet
 
 ## What You Learn Quickly
 
-- `paceflow session` tells you whether your sessions were efficient, noisy, or stuck in loops.
-- `paceflow delivery` tells you whether AI-assisted work actually turned into shipped change.
-- `paceflow quality` tells you whether accepted code created durable value or follow-up cleanup.
+- `paceflow session` compares which models are efficient, noisy, or stuck in loops.
+- `paceflow delivery` compares which models actually turn into shipped change.
+- `paceflow quality` compares which models produce durable code versus cleanup.
 
 ## Example: Session Report
 
 ```text
 Session Metrics
-Sessions: 43
-Average User Prompts: 4.21
-Avg Time to First Accepted Change (min): 8.30
-Debug Loop Rate: 18.60% (8/43)
-No-Output Session Rate: 13.95% (6/43)
+Model                         Sessions     Prompts    First Chg            Loop           Error       To Commit       No Output
+codex/gpt-5.4                      33       12.67        237.5            3.0%           15.2%           45.5%           39.4%
+codex/gpt-5.3-codex                12        5.10         42.1            0.0%            8.3%           75.0%           16.7%
+cursor/default                      6        2.30          9.4            0.0%            0.0%           33.3%            0.0%
+Legend:
+- Prompts = avg prompts per session.
+- First Chg = avg minutes to first accepted code change.
+- Loop, Error, To Commit, and No Output = percentage rates.
 ```
 
 Why it matters:
@@ -59,33 +62,34 @@ What to do differently:
 
 ```text
 Delivery Metrics
-
-Group                         Branch                      Commits     Heavy   C2(merge)   vs Staging
-API-142                       API-142-agent-auth               7         5       80.0%     +184/-41
-WEB-203                       WEB-203-checkout-fixes           5         4       50.0%      +96/-88
-OPS-88                        OPS-88-deploy-cleanup            4         3       33.3%      +41/-73
+Model                          Commits     Heavy    PR Reach  Mainline Reach    PR Merge
+codex/gpt-5.4                      50        31       66.7%            96.8%       83.3%
+codex/gpt-5.3-codex                33        18       41.7%            94.4%       80.0%
+Legend:
+- PR Reach, Mainline Reach, and PR Merge = percentage rates.
 ```
 
 Why it matters:
 
 - Heavy commits tell you where AI materially influenced the diff instead of just assisting around the edges.
-- C1 tells you whether AI-heavy work even made it to review as a pull request.
-- Merge rate tells you whether that work survived review and integration.
-- C3 tells you whether PR-linked AI-heavy work actually cleared the PR funnel and merged.
+- PR reach tells you whether AI-heavy work even made it to review as a pull request.
+- Mainline reach tells you whether that work survived review and integration into mainline.
+- PR merge tells you whether PR-linked AI-heavy work actually cleared the PR funnel and merged.
 
 What to do differently:
 
-- If AI-heavy tasks have weak merge rates, reduce branch size and tighten review before accepting generated code.
+- If AI-heavy tasks have weak mainline reach, reduce branch size and tighten review before accepting generated code.
 - If a task has large diffs and weak outcomes, split it into smaller units with clearer verification points.
 
 ## Example: Quality Report
 
 ```text
 Quality Metrics
-Heavy commits: 52
-L1 Code Churn Rate: 12.40% (98/790)
-L3 Bug-After-Merge Rate: 9.62% (5/52)
-L4 Revert Rate: 1.92% (1/52)
+Model                            Heavy   Churn Rate   Bug Rate  Revert Rate
+codex/gpt-5.4                       31         19.9%      30.4%         0.0%
+codex/gpt-5.3-codex                 18         53.3%      85.7%         0.0%
+Legend:
+- Churn Rate, Bug Rate, and Revert Rate = percentage rates.
 ```
 
 Why it matters:
@@ -110,11 +114,20 @@ paceflow delivery
 paceflow quality
 ```
 
+By default those three views compare outcomes by model. Use `--overall` when you want the rolled-up one-row summary instead.
+Use `--model <provider/name>` when you want to keep the same report but narrow it to one model.
+
 Useful follow-ups:
 
+- `paceflow session --model codex/gpt-5.4`
+- `paceflow session --overall`
 - `paceflow session --list-sessions`
 - `paceflow session --group-by provider`
+- `paceflow delivery --model codex/gpt-5.4`
+- `paceflow delivery --overall`
 - `paceflow delivery --group-by task`
+- `paceflow quality --model codex/gpt-5.4`
+- `paceflow quality --overall`
 - `paceflow quality --group-by provider`
 
 Optional GitHub PR sync setup:
@@ -185,7 +198,7 @@ Requirements:
 - `paceflow` reads local Cursor state/history from the OS config directory under `Cursor/User`
 - If Cursor data lives elsewhere, set `PACEFLOW_CURSOR_STATE_PATH` and/or `PACEFLOW_CURSOR_HISTORY_PATH`
 - To enable GitHub PR sync during ingest, either run `paceflow github token` once or set `PACEFLOW_GITHUB_TOKEN`
-- To enable GitHub-backed `C1` and `C3` metrics for `github.com` repos, set `PACEFLOW_GITHUB_TOKEN` with at least `Pull requests: read`
+- To enable GitHub-backed PR reach and PR merge metrics for `github.com` repos, set `PACEFLOW_GITHUB_TOKEN` with at least `Pull requests: read`
 
 ## Who It's For
 
@@ -201,6 +214,10 @@ It can also support team or manager conversations later, but the default framing
 
 Use the reports to answer three practical questions:
 
+By default, `session`, `delivery`, and `quality` answer them by comparing models side by side. Use `--overall` if you want the old rolled-up summary instead of the trust comparison view.
+
+When you want to stay in the same report but inspect one model only, use `--model <provider/name>`. For example, `paceflow delivery --model codex/gpt-5.4` keeps the delivery view and filters it down to that one model.
+
 ### 1. Were my sessions actually useful?
 
 - Average user prompts
@@ -215,7 +232,7 @@ These are workflow-quality signals, not just activity counters.
 
 - Heavy commits
 - PR reach rate
-- Merge rate
+- Mainline reach rate
 - PR merge rate
 - Session-to-commit rate
 
@@ -228,6 +245,14 @@ These tell you whether session effort turned into commits and whether those comm
 - Revert rate
 
 These are the strongest signals for whether AI-assisted work created durable value or follow-up cleanup.
+
+### Status Bands
+
+`--overall` summaries attach `good`, `watch`, and `risk` labels using opinionated thresholds so you can scan a rolled-up report before you read the metric definitions in the footer.
+
+- Session: `Avg prompts <4 / <=7 / >7`, `Time to first change <15 / <=45 / >45 min`, `Debug loops <10 / <=25 / >25%`, `Error pastes <10 / <=25 / >25%`, `Sessions to commit >=50 / >=25 / <25%`, `No-output sessions <15 / <=35 / >35%`
+- Delivery: `PR reach >=70 / >=40 / <40%`, `Mainline reach >=75 / >=50 / <50%`, `PR merge >=75 / >=50 / <50%`
+- Quality: `Code churn <15 / <=30 / >30%`, `Bug-after-merge <15 / <=30 / >30%`, `Reverts <2 / <=5 / >5%`
 
 ## Metric Reference
 
@@ -253,7 +278,9 @@ The reports are built from normalized session events, matched commit/session att
 
 - `Commits`: count of included commits in the current filter or group
 - `Heavy Commits`: commits where the AI-attributed share of changed lines is at least 50%
-- `Merge Rate`: share of heavy commits that later reached mainline, including squash-aware content matching
+- `PR Reach`: share of heavy GitHub AI commits that reached a pull request
+- `Mainline Reach`: share of heavy commits that later reached mainline, including squash-aware content matching
+- `PR Merge`: share of PR-linked heavy GitHub AI commits whose PR merged
 - `vs Staging`: live diff size from `git diff staging...<branch>` for task-grouped rows; computed at render time
 
 ### Quality Metrics
@@ -272,6 +299,9 @@ The reports are built from normalized session events, matched commit/session att
 ## Notes
 
 - `session`, `delivery`, and `quality` share the same filter interface: `--weekly`, `--group-by`, `--from`, `--to`, `--repo`, `--provider`, `--task`, `--model`, and `--limit`
+- `session`, `delivery`, and `quality` default to `group-by model` when you do not pass `--group-by` or `--overall`
+- `--model` filters the current report to one model without changing the active view
+- `--overall` swaps the default model comparison for the rolled-up one-row summary and conflicts with `--group-by`
 - Provider `human` means a commit had no matched AI session attribution at all
 - Task-grouped rows only show ticket-style task keys such as `ABC-123` and exclude integration branches such as `main`, `staging`, `master`, and `develop`
 - `delivery --group-by task` includes `vs Staging`, derived from `git diff staging...<branch>` for non-integration branches

@@ -3,21 +3,32 @@ use std::io::{IsTerminal, Write};
 use std::process::{Command, Stdio};
 
 use crate::analytics;
-use crate::cli::SessionReportArgs;
+use crate::cli::{GroupBy, ReportArgs, SessionReportArgs};
+use crate::commands::report_layout::{
+    ScorecardRow, append_legend, classify_lower_better, classify_ratio_higher_better,
+    classify_ratio_lower_better, fmt_opt_decimal, fmt_ratio, fmt_ratio_percent, group_label,
+    render_scorecard, truncate,
+};
 use crate::commands::report_scope;
 use crate::db;
 
 pub fn run(args: SessionReportArgs) -> Result<()> {
     let db = db::open()?;
     analytics::create_reporting_views(&db)?;
-    let report = report_scope::resolve_report_args(&args.report);
+    let resolved = report_scope::resolve_main_report_args(&args.report, args.overall);
 
     let output = if args.list_sessions {
-        let rows = analytics::query_session_list_rows(&db, &report)?;
+        let rows = analytics::query_session_list_rows(&db, &resolved.report)?;
         render_session_list(&rows)
     } else {
-        let rows = analytics::query_session_report(&db, &report)?;
-        render_session_report(&rows, &args)
+        let rows = analytics::query_session_report_with_options(
+            &db,
+            &resolved.report,
+            analytics::ReportQueryOptions {
+                implicit_model_default: resolved.implicit_model_default,
+            },
+        )?;
+        render_session_report(&rows, &resolved.report)
     };
 
     if std::io::stdout().is_terminal() && output.lines().count() > terminal_height() {
@@ -28,66 +39,79 @@ pub fn run(args: SessionReportArgs) -> Result<()> {
     }
 }
 
-fn render_session_report(rows: &[analytics::SessionReportRow], args: &SessionReportArgs) -> String {
+fn render_session_report(rows: &[analytics::SessionReportRow], report: &ReportArgs) -> String {
     let mut out = String::new();
     out.push_str("Session Metrics\n");
-    out.push_str("Average user prompts = average number of user prompts per session\n");
-    out.push_str(
-        "Avg time to first accepted change = minutes from session start to the first accepted code change\n",
-    );
-    out.push_str("Debug loop rate = share of sessions that look like repeated fix-retry loops\n");
-    out.push_str(
-        "Error paste rate = share of sessions where an error message was pasted mid-session\n",
-    );
-    out.push_str(
-        "Session-to-commit rate = share of sessions followed by a commit within 4 hours\n",
-    );
-    out.push_str("No-output session rate = share of sessions with no accepted code changes\n\n");
 
     if rows.is_empty() {
         out.push_str("No session rows found. Run `paceflow ingest` first.\n");
         return out;
     }
 
-    if !args.report.weekly && args.report.group_by.is_none() {
+    if !report.weekly && report.group_by.is_none() {
         let row = &rows[0];
-        out.push_str(&format!("Sessions: {}\n", row.session_count));
-        out.push_str(&format!(
-            "Average User Prompts: {}\n",
-            fmt_opt_decimal(row.s2_avg, 2)
-        ));
-        out.push_str(&format!(
-            "Avg Time to First Accepted Change (min): {}\n",
-            fmt_opt_decimal(row.avg_minutes_to_first_accepted_change, 2)
-        ));
-        out.push_str(&format!(
-            "Debug Loop Rate: {}\n",
-            fmt_ratio(&row.debug_loop_rate, 2)
-        ));
-        out.push_str(&format!(
-            "Error Paste Rate: {}\n",
-            fmt_ratio(&row.s6_rate, 2)
-        ));
-        out.push_str(&format!(
-            "Session-to-Commit Rate: {}\n",
-            fmt_ratio(&row.s9_rate, 2)
-        ));
-        out.push_str(&format!(
-            "No-Output Session Rate: {}\n",
-            fmt_ratio(&row.no_output_session_rate, 2)
-        ));
+        out.push_str(&format!("Sessions analyzed: {}\n\n", row.session_count));
+        let scorecard = [
+            ScorecardRow {
+                label: "Time to first change",
+                value: match row.avg_minutes_to_first_accepted_change {
+                    Some(value) => format!("{value:.2} min"),
+                    None => "N/A".to_string(),
+                },
+                status: classify_lower_better(row.avg_minutes_to_first_accepted_change, 15.0, 45.0),
+            },
+            ScorecardRow {
+                label: "No-output sessions",
+                value: fmt_ratio(&row.no_output_session_rate, 2),
+                status: classify_ratio_lower_better(&row.no_output_session_rate, 15.0, 35.0),
+            },
+            ScorecardRow {
+                label: "Sessions to commit",
+                value: fmt_ratio(&row.s9_rate, 2),
+                status: classify_ratio_higher_better(&row.s9_rate, 50.0, 25.0),
+            },
+            ScorecardRow {
+                label: "Error pastes",
+                value: fmt_ratio(&row.s6_rate, 2),
+                status: classify_ratio_lower_better(&row.s6_rate, 10.0, 25.0),
+            },
+            ScorecardRow {
+                label: "Avg prompts",
+                value: fmt_opt_decimal(row.s2_avg, 2),
+                status: classify_lower_better(row.s2_avg, 4.0, 7.0),
+            },
+            ScorecardRow {
+                label: "Debug loops",
+                value: fmt_ratio(&row.debug_loop_rate, 2),
+                status: classify_ratio_lower_better(&row.debug_loop_rate, 10.0, 25.0),
+            },
+        ];
+        out.push_str(&render_scorecard(&scorecard));
+        append_legend(
+            &mut out,
+            &[
+                "Avg prompts: average number of user prompts per session.",
+                "Time to first change: average minutes from session start to first accepted code change.",
+                "Debug loops: share of sessions that look like repeated fix-retry loops.",
+                "Error pastes: share of sessions where an error message was pasted mid-session.",
+                "Sessions to commit: share of sessions followed by a commit within 4 hours.",
+                "No-output sessions: share of sessions with no accepted code changes.",
+                "Status: lower is better except Sessions to commit.",
+            ],
+        );
         return out;
     }
 
-    let show_week = args.report.weekly;
-    let show_group = args.report.group_by.is_some();
-    let show_branch = matches!(args.report.group_by, Some(crate::cli::GroupBy::Task));
+    let show_week = report.weekly;
+    let show_group = report.group_by.is_some();
+    let show_branch = matches!(report.group_by, Some(GroupBy::Task));
     let mut headers = vec![];
+    out.push('\n');
     if show_week {
         headers.push(format!("{:<10}", "Week"));
     }
     if show_group {
-        headers.push(format!("{:<28}", "Group"));
+        headers.push(format!("{:<28}", group_label(report.group_by)));
     }
     if show_branch {
         headers.push(format!("{:<26}", "Branch"));
@@ -136,6 +160,15 @@ fn render_session_report(rows: &[analytics::SessionReportRow], args: &SessionRep
         ));
         out.push_str(&format!("{}\n", cols.join("  ")));
     }
+
+    append_legend(
+        &mut out,
+        &[
+            "Prompts = avg prompts per session.",
+            "First Chg = avg minutes to first accepted code change.",
+            "Loop, Error, To Commit, and No Output = percentage rates.",
+        ],
+    );
 
     out
 }
@@ -198,44 +231,6 @@ fn render_session_list(rows: &[analytics::SessionListRow]) -> String {
         ));
     }
 
-    out
-}
-
-fn fmt_ratio(metric: &analytics::RatioMetric, precision: usize) -> String {
-    match metric.percent() {
-        Some(value) => format!(
-            "{:.*}% ({}/{})",
-            precision, value, metric.numerator, metric.denominator
-        ),
-        None => "N/A".to_string(),
-    }
-}
-
-fn fmt_ratio_percent(metric: &analytics::RatioMetric, precision: usize) -> String {
-    match metric.percent() {
-        Some(value) => format!("{:.*}%", precision, value),
-        None => "N/A".to_string(),
-    }
-}
-
-fn fmt_opt_decimal(value: Option<f64>, precision: usize) -> String {
-    value
-        .map(|value| format!("{:.*}", precision, value))
-        .unwrap_or_else(|| "N/A".to_string())
-}
-
-fn truncate(input: &str, max_len: usize) -> String {
-    if input.chars().count() <= max_len {
-        return input.to_string();
-    }
-    if max_len <= 3 {
-        return "...".to_string();
-    }
-    let mut out = String::new();
-    for ch in input.chars().take(max_len - 3) {
-        out.push(ch);
-    }
-    out.push_str("...");
     out
 }
 
@@ -345,8 +340,9 @@ fn pipe_to_pager(output: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{display_project_path, render_session_list};
-    use crate::analytics::SessionListRow;
+    use super::{display_project_path, render_session_list, render_session_report};
+    use crate::analytics::{RatioMetric, SessionListRow, SessionReportRow};
+    use crate::cli::ReportArgs;
 
     fn row(project_path: &str) -> SessionListRow {
         SessionListRow {
@@ -383,5 +379,56 @@ mod tests {
         assert!(output.contains("customer-portal"));
         assert!(output.contains("admin-portal"));
         assert!(!output.contains("/Users/daniel/work/company/apps/mobile/customer-portal"));
+    }
+
+    #[test]
+    fn render_session_report_uses_scorecard_summary_with_footer() {
+        let rows = vec![SessionReportRow {
+            week_start: None,
+            group_value: None,
+            branch_name: None,
+            session_count: 411,
+            s2_avg: Some(5.56),
+            avg_minutes_to_first_accepted_change: Some(46.63),
+            debug_loop_rate: RatioMetric {
+                numerator: 1,
+                denominator: 411,
+            },
+            s6_rate: RatioMetric {
+                numerator: 69,
+                denominator: 411,
+            },
+            s9_rate: RatioMetric {
+                numerator: 166,
+                denominator: 411,
+            },
+            no_output_session_rate: RatioMetric {
+                numerator: 159,
+                denominator: 411,
+            },
+        }];
+        let report = ReportArgs {
+            weekly: false,
+            group_by: None,
+            from: None,
+            to: None,
+            repo: None,
+            all_projects: false,
+            provider: None,
+            task: None,
+            model: None,
+            limit: 50,
+        };
+
+        let rendered = render_session_report(&rows, &report);
+        assert!(rendered.contains("Sessions analyzed: 411"));
+        assert!(rendered.contains("│ Signal"));
+        assert!(rendered.contains("│ Time to first change"));
+        assert!(rendered.contains("46.63 min"));
+        assert!(rendered.contains("watch"));
+        assert!(rendered.contains("risk"));
+        assert!(rendered.contains("Legend:"));
+        assert!(rendered.contains("Status: lower is better except Sessions to commit."));
+        assert!(!rendered.contains("Average user prompts ="));
     }
 }

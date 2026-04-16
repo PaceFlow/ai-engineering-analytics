@@ -533,9 +533,9 @@ impl TestEnv {
 fn category_reports_match_snapshots() -> anyhow::Result<()> {
     let env = TestEnv::new_seeded_reporting()?;
 
-    let session = env.normalize_output(env.run_paceflow(&["session"])?);
-    let change = env.normalize_output(env.run_paceflow(&["delivery"])?);
-    let lifecycle = env.normalize_output(env.run_paceflow(&["quality"])?);
+    let session = env.normalize_output(env.run_paceflow(&["session", "--overall"])?);
+    let change = env.normalize_output(env.run_paceflow(&["delivery", "--overall"])?);
+    let lifecycle = env.normalize_output(env.run_paceflow(&["quality", "--overall"])?);
 
     assert!(session.contains("Session Metrics"));
     assert!(change.contains("Delivery Metrics"));
@@ -557,6 +557,42 @@ fn category_reports_match_snapshots() -> anyhow::Result<()> {
         "fixture_corpus_lifecycle_report_structured",
         structured_lifecycle
     );
+
+    Ok(())
+}
+
+#[test]
+fn default_category_reports_group_by_model() -> anyhow::Result<()> {
+    let env = TestEnv::new_seeded_reporting()?;
+
+    let session = env.normalize_output(env.run_paceflow(&["session"])?);
+    let change = env.normalize_output(env.run_paceflow(&["delivery"])?);
+    let lifecycle = env.normalize_output(env.run_paceflow(&["quality"])?);
+
+    assert!(session.contains("Model"));
+    assert!(session.contains("codex/gpt-5.3-codex"));
+    assert!(!session.contains("Sessions analyzed:"));
+
+    assert!(change.contains("Model"));
+    assert!(change.contains("codex/gpt-5.3-codex"));
+    assert!(!change.contains("Commits analyzed:"));
+    assert!(change.contains("PR Reach"));
+    assert!(change.contains("Mainline Reach"));
+    assert!(change.contains("PR Merge"));
+    assert!(!change.contains("Merge Rate"));
+    assert!(!change.contains("C1(PR)"));
+    assert!(!change.contains("C2(merge)"));
+    assert!(!change.contains("C3(PR merge)"));
+
+    assert!(lifecycle.contains("Model"));
+    assert!(lifecycle.contains("codex/gpt-5.3-codex"));
+    assert!(!lifecycle.contains("Heavy commits analyzed:"));
+    assert!(lifecycle.contains("Churn Rate"));
+    assert!(lifecycle.contains("Bug Rate"));
+    assert!(lifecycle.contains("Revert Rate"));
+    assert!(!lifecycle.contains("L1(churn)"));
+    assert!(!lifecycle.contains("L3(bug)"));
+    assert!(!lifecycle.contains("L4(revert)"));
 
     Ok(())
 }
@@ -711,6 +747,7 @@ fn fixture_corpus_ingest_smoke_is_cross_platform_friendly() -> anyhow::Result<()
 
     let session = env.normalize_output(env.run_paceflow(&["session"])?);
     let change = env.normalize_output(env.run_paceflow(&["delivery"])?);
+    let change_overall = env.normalize_output(env.run_paceflow(&["delivery", "--overall"])?);
     let lifecycle = env.normalize_output(env.run_paceflow(&["quality"])?);
     let change_grouped =
         env.normalize_output(env.run_paceflow(&["delivery", "--group-by", "repo"])?);
@@ -720,10 +757,10 @@ fn fixture_corpus_ingest_smoke_is_cross_platform_friendly() -> anyhow::Result<()
     assert!(change.contains("Delivery Metrics"));
     assert!(lifecycle.contains("Quality Metrics"));
     assert!(change_grouped.contains("Delivery Metrics"));
-    assert!(change_grouped.contains("Group") || change_grouped.contains("No delivery rows found."));
+    assert!(change_grouped.contains("Repo") || change_grouped.contains("No delivery rows found."));
     assert!(event_stream.trim().is_empty() || event_stream.contains("\"stream_type\""));
 
-    let structured_change = parse_change_summary(&change)?;
+    let structured_change = parse_change_summary(&change_overall)?;
     let commits: i64 = structured_change.commits.parse()?;
     let heavy_commits: i64 = structured_change.heavy_commits.parse()?;
     assert!((0..=commits).contains(&heavy_commits));
@@ -890,33 +927,30 @@ fn run_command(cmd: &mut Command) -> anyhow::Result<()> {
 
 fn parse_session_summary(output: &str) -> anyhow::Result<SessionSummarySnapshot> {
     Ok(SessionSummarySnapshot {
-        sessions: line_value(output, "Sessions: ")?,
-        average_user_prompts: line_value(output, "Average User Prompts: ")?,
-        avg_time_to_first_accepted_change_minutes: line_value(
-            output,
-            "Avg Time to First Accepted Change (min): ",
-        )?,
-        debug_loop_rate: line_value(output, "Debug Loop Rate: ")?,
-        s6_rate: line_value(output, "Error Paste Rate: ")?,
-        s9_rate: line_value(output, "Session-to-Commit Rate: ")?,
-        no_output_session_rate: line_value(output, "No-Output Session Rate: ")?,
+        sessions: line_value(output, "Sessions analyzed: ")?,
+        average_user_prompts: scorecard_value(output, "Avg prompts")?,
+        avg_time_to_first_accepted_change_minutes: scorecard_value(output, "Time to first change")?,
+        debug_loop_rate: scorecard_value(output, "Debug loops")?,
+        s6_rate: scorecard_value(output, "Error pastes")?,
+        s9_rate: scorecard_value(output, "Sessions to commit")?,
+        no_output_session_rate: scorecard_value(output, "No-output sessions")?,
     })
 }
 
 fn parse_change_summary(output: &str) -> anyhow::Result<ChangeSummarySnapshot> {
     Ok(ChangeSummarySnapshot {
-        commits: line_value(output, "Commits: ")?,
-        heavy_commits: line_value(output, "Heavy commits: ")?,
-        merge_rate: line_value(output, "C2 Merge Rate: ")?,
+        commits: line_value(output, "Commits analyzed: ")?,
+        heavy_commits: first_token(&line_value(output, "Heavy commits: ")?)?.to_string(),
+        merge_rate: scorecard_value(output, "Mainline Reach")?,
     })
 }
 
 fn parse_lifecycle_summary(output: &str) -> anyhow::Result<LifecycleSummarySnapshot> {
     Ok(LifecycleSummarySnapshot {
-        heavy_commits: line_value(output, "Heavy commits: ")?,
-        code_churn_rate: line_value(output, "L1 Code Churn Rate: ")?,
-        bug_after_merge_rate: line_value(output, "L3 Bug-After-Merge Rate: ")?,
-        revert_rate: line_value(output, "L4 Revert Rate: ")?,
+        heavy_commits: line_value(output, "Heavy commits analyzed: ")?,
+        code_churn_rate: scorecard_value(output, "Code churn")?,
+        bug_after_merge_rate: scorecard_value(output, "Bug-after-merge")?,
+        revert_rate: scorecard_value(output, "Reverts")?,
     })
 }
 
@@ -928,4 +962,29 @@ fn line_value(output: &str, prefix: &str) -> anyhow::Result<String> {
                 .map(|value| value.trim().to_string())
         })
         .ok_or_else(|| anyhow::anyhow!("missing line for prefix {}", prefix))
+}
+
+fn scorecard_value(output: &str, label: &str) -> anyhow::Result<String> {
+    output
+        .lines()
+        .find_map(|line| {
+            let cells = line
+                .split('│')
+                .map(str::trim)
+                .filter(|cell| !cell.is_empty())
+                .collect::<Vec<_>>();
+            if cells.len() == 3 && cells[0] == label {
+                Some(cells[1].to_string())
+            } else {
+                None
+            }
+        })
+        .ok_or_else(|| anyhow::anyhow!("missing scorecard row for label {}", label))
+}
+
+fn first_token(value: &str) -> anyhow::Result<&str> {
+    value
+        .split_whitespace()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("missing token in value {}", value))
 }

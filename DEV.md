@@ -38,7 +38,7 @@ What it verifies:
 
 - commit to PR lookup against the live GitHub API
 - persisted PR metadata and lookup status
-- derived `event_commit_pr_outcome` flags used by `C1` and `C3`
+- derived `event_commit_pr_outcome` flags used by PR reach and PR merge delivery metrics
 
 ## Profiling Setup
 

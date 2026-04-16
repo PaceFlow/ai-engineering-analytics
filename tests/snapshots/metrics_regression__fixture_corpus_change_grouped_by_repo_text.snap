@@ -3,11 +3,10 @@ source: tests/metrics_regression.rs
 expression: change_grouped
 ---
 Delivery Metrics
-Heavy commits = commits where matched AI-attributed lines are at least half of changed lines
-C1 PR reach rate = share of heavy GitHub AI commits that reached a pull request
-C2 merge rate = share of heavy AI commits that later reached mainline
 
-C3 PR merge rate = share of PR-linked heavy GitHub AI commits whose PR merged
+Repo                           Commits     Heavy    PR Reach   Mainline Reach      PR Merge
+__REPO_PACEFLOW__                    9         3         N/A           100.0%             N/A
 
-Group                          Commits     Heavy      C1(PR)     C2(merge)    C3(PR merge)
-__REPO_PACEFLOW__                    9         3         N/A        100.0%             N/A
+Legend:
+- PR Reach, Mainline Reach, and PR Merge = percentage rates.
+- N/A means GitHub PR sync data is unavailable for PR-backed metrics.

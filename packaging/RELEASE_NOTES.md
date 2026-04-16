@@ -6,9 +6,10 @@ Download the archive for your platform from the Assets section below, extract it
 
 Highlights in `v0.1.0`:
 
-- GitHub-backed delivery metrics for `C1` and `C3`
+- GitHub-backed delivery metrics for PR reach and PR merge
 - GitHub PR sync with saved token setup flow
-- `L3` bug-after-merge tracking for quality reporting
+- Bug-after-merge tracking for quality reporting
+- Default model-grouped report views with `--overall` summary mode
 - Streamlined ingest progress output
 
 Quick start:

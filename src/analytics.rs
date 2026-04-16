@@ -223,6 +223,11 @@ impl RatioMetric {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ReportQueryOptions {
+    pub implicit_model_default: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct SessionListRow {
     pub provider: String,
@@ -1001,6 +1006,14 @@ pub fn query_session_list_rows(
 }
 
 pub fn query_session_report(conn: &Connection, args: &ReportArgs) -> Result<Vec<SessionReportRow>> {
+    query_session_report_with_options(conn, args, ReportQueryOptions::default())
+}
+
+pub fn query_session_report_with_options(
+    conn: &Connection,
+    args: &ReportArgs,
+    options: ReportQueryOptions,
+) -> Result<Vec<SessionReportRow>> {
     let use_task_base = matches!(args.group_by, Some(GroupBy::Task)) || args.task.is_some();
     let source = if use_task_base {
         "view_task_session_metrics_base"
@@ -1108,7 +1121,9 @@ pub fn query_session_report(conn: &Connection, args: &ReportArgs) -> Result<Vec<
         sql.push_str(" WHERE ");
         sql.push_str(&conditions.join(" AND "));
     }
-    let apply_sql_limit = !group.is_empty() && !matches!(args.group_by, Some(GroupBy::Task));
+    let apply_sql_limit = !group.is_empty()
+        && !matches!(args.group_by, Some(GroupBy::Task))
+        && !options.implicit_model_default;
     if !group.is_empty() {
         sql.push_str(" GROUP BY ");
         sql.push_str(&group.join(", "));
@@ -1150,10 +1165,18 @@ pub fn query_session_report(conn: &Connection, args: &ReportArgs) -> Result<Vec<
             break;
         }
     }
-    Ok(out)
+    Ok(apply_session_report_options(out, args, options))
 }
 
 pub fn query_change_report(conn: &Connection, args: &ReportArgs) -> Result<Vec<ChangeReportRow>> {
+    query_change_report_with_options(conn, args, ReportQueryOptions::default())
+}
+
+pub fn query_change_report_with_options(
+    conn: &Connection,
+    args: &ReportArgs,
+    options: ReportQueryOptions,
+) -> Result<Vec<ChangeReportRow>> {
     let source = change_lifecycle_source(args);
     let use_commit_session_base = source == "view_commit_session_metrics_base";
     let timestamp_col = "commit_time";
@@ -1262,7 +1285,9 @@ pub fn query_change_report(conn: &Connection, args: &ReportArgs) -> Result<Vec<C
         select.join(", "),
         base_sql
     );
-    let apply_sql_limit = !group.is_empty() && !matches!(args.group_by, Some(GroupBy::Task));
+    let apply_sql_limit = !group.is_empty()
+        && !matches!(args.group_by, Some(GroupBy::Task))
+        && !options.implicit_model_default;
     if !group.is_empty() {
         sql.push_str(" GROUP BY ");
         sql.push_str(&group.join(", "));
@@ -1305,12 +1330,20 @@ pub fn query_change_report(conn: &Connection, args: &ReportArgs) -> Result<Vec<C
             break;
         }
     }
-    Ok(out)
+    Ok(apply_change_report_options(out, args, options))
 }
 
 pub fn query_lifecycle_report(
     conn: &Connection,
     args: &ReportArgs,
+) -> Result<Vec<LifecycleReportRow>> {
+    query_lifecycle_report_with_options(conn, args, ReportQueryOptions::default())
+}
+
+pub fn query_lifecycle_report_with_options(
+    conn: &Connection,
+    args: &ReportArgs,
+    options: ReportQueryOptions,
 ) -> Result<Vec<LifecycleReportRow>> {
     let source = change_lifecycle_source(args);
     let use_commit_session_base = source == "view_commit_session_metrics_base";
@@ -1382,7 +1415,9 @@ pub fn query_lifecycle_report(
         sql.push_str(" WHERE ");
         sql.push_str(&conditions.join(" AND "));
     }
-    let apply_sql_limit = !group.is_empty() && !matches!(args.group_by, Some(GroupBy::Task));
+    let apply_sql_limit = !group.is_empty()
+        && !matches!(args.group_by, Some(GroupBy::Task))
+        && !options.implicit_model_default;
     if !group.is_empty() {
         sql.push_str(" GROUP BY ");
         sql.push_str(&group.join(", "));
@@ -1418,7 +1453,121 @@ pub fn query_lifecycle_report(
             break;
         }
     }
-    Ok(out)
+    Ok(apply_lifecycle_report_options(out, args, options))
+}
+
+fn apply_session_report_options(
+    rows: Vec<SessionReportRow>,
+    args: &ReportArgs,
+    options: ReportQueryOptions,
+) -> Vec<SessionReportRow> {
+    if !should_apply_implicit_model_default(args, options) {
+        return rows;
+    }
+
+    let filtered = filter_or_fallback(rows, |row: &SessionReportRow| row.session_count >= 3);
+    limit_rows(sort_session_rows(filtered), args.limit)
+}
+
+fn apply_change_report_options(
+    rows: Vec<ChangeReportRow>,
+    args: &ReportArgs,
+    options: ReportQueryOptions,
+) -> Vec<ChangeReportRow> {
+    if !should_apply_implicit_model_default(args, options) {
+        return rows;
+    }
+
+    let filtered = filter_or_fallback(rows, |row: &ChangeReportRow| {
+        row.heavy_commit_count >= 3 && row.group_value.as_deref() != Some("human/(unknown)")
+    });
+    limit_rows(sort_change_rows(filtered), args.limit)
+}
+
+fn apply_lifecycle_report_options(
+    rows: Vec<LifecycleReportRow>,
+    args: &ReportArgs,
+    options: ReportQueryOptions,
+) -> Vec<LifecycleReportRow> {
+    if !should_apply_implicit_model_default(args, options) {
+        return rows;
+    }
+
+    let filtered = filter_or_fallback(rows, |row: &LifecycleReportRow| {
+        row.heavy_commit_count >= 3 && row.group_value.as_deref() != Some("human/(unknown)")
+    });
+    limit_rows(sort_lifecycle_rows(filtered), args.limit)
+}
+
+fn should_apply_implicit_model_default(args: &ReportArgs, options: ReportQueryOptions) -> bool {
+    options.implicit_model_default && !args.weekly && matches!(args.group_by, Some(GroupBy::Model))
+}
+
+fn filter_or_fallback<T, F>(rows: Vec<T>, mut predicate: F) -> Vec<T>
+where
+    T: Clone,
+    F: FnMut(&T) -> bool,
+{
+    let filtered = rows
+        .iter()
+        .filter(|row| predicate(row))
+        .cloned()
+        .collect::<Vec<_>>();
+    if filtered.is_empty() { rows } else { filtered }
+}
+
+fn sort_session_rows(mut rows: Vec<SessionReportRow>) -> Vec<SessionReportRow> {
+    rows.sort_by(|left, right| {
+        right
+            .session_count
+            .cmp(&left.session_count)
+            .then_with(|| {
+                ratio_value(&right.no_output_session_rate)
+                    .partial_cmp(&ratio_value(&left.no_output_session_rate))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| left.group_value.cmp(&right.group_value))
+    });
+    rows
+}
+
+fn sort_change_rows(mut rows: Vec<ChangeReportRow>) -> Vec<ChangeReportRow> {
+    rows.sort_by(|left, right| {
+        right
+            .heavy_commit_count
+            .cmp(&left.heavy_commit_count)
+            .then_with(|| {
+                ratio_value(&left.merge_rate)
+                    .partial_cmp(&ratio_value(&right.merge_rate))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| left.group_value.cmp(&right.group_value))
+    });
+    rows
+}
+
+fn sort_lifecycle_rows(mut rows: Vec<LifecycleReportRow>) -> Vec<LifecycleReportRow> {
+    rows.sort_by(|left, right| {
+        right
+            .heavy_commit_count
+            .cmp(&left.heavy_commit_count)
+            .then_with(|| {
+                ratio_value(&right.bug_after_merge_rate)
+                    .partial_cmp(&ratio_value(&left.bug_after_merge_rate))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| left.group_value.cmp(&right.group_value))
+    });
+    rows
+}
+
+fn ratio_value(metric: &RatioMetric) -> f64 {
+    metric.percent().unwrap_or(-1.0)
+}
+
+fn limit_rows<T>(mut rows: Vec<T>, limit: usize) -> Vec<T> {
+    rows.truncate(limit.max(1));
+    rows
 }
 
 pub fn query_event_stream(
@@ -3874,6 +4023,76 @@ mod tests {
     }
 
     #[test]
+    fn implicit_model_default_session_report_filters_small_models() -> Result<()> {
+        let conn = open_test_db()?;
+        for index in 0..5 {
+            conn.execute(
+                "INSERT INTO event_session_quality (
+                    provider, session_id, repo_root, model_name, started_at, ended_at, user_turn_count,
+                    debug_loop_flag, mid_session_error_paste_flag, accepted_output_flag,
+                    first_accepted_change_at, minutes_to_first_accepted_change, session_commit_within_4h_flag
+                 ) VALUES (?1, ?2, '/tmp/repo', 'codex/gpt-5.4', '2026-03-17T09:00:00Z', '2026-03-17T09:30:00Z', 3, 0, 0, 1, '2026-03-17T09:05:00Z', 5.0, 1)",
+                params!["codex", format!("high-{index}")],
+            )?;
+        }
+        for index in 0..3 {
+            conn.execute(
+                "INSERT INTO event_session_quality (
+                    provider, session_id, repo_root, model_name, started_at, ended_at, user_turn_count,
+                    debug_loop_flag, mid_session_error_paste_flag, accepted_output_flag,
+                    first_accepted_change_at, minutes_to_first_accepted_change, session_commit_within_4h_flag
+                 ) VALUES (?1, ?2, '/tmp/repo', 'codex/gpt-5.3-codex', '2026-03-18T09:00:00Z', '2026-03-18T09:30:00Z', 3, 0, 0, 1, '2026-03-18T09:07:00Z', 7.0, 1)",
+                params!["codex", format!("mid-{index}")],
+            )?;
+        }
+        conn.execute(
+            "INSERT INTO event_session_quality (
+                provider, session_id, repo_root, model_name, started_at, ended_at, user_turn_count,
+                debug_loop_flag, mid_session_error_paste_flag, accepted_output_flag,
+                first_accepted_change_at, minutes_to_first_accepted_change, session_commit_within_4h_flag
+             ) VALUES ('cursor', 'low-0', '/tmp/repo', 'cursor/default', '2026-03-19T09:00:00Z', '2026-03-19T09:30:00Z', 2, 0, 0, 1, '2026-03-19T09:03:00Z', 3.0, 0)",
+            [],
+        )?;
+
+        create_reporting_views(&conn)?;
+        let args = ReportArgs {
+            weekly: false,
+            group_by: Some(GroupBy::Model),
+            from: None,
+            to: None,
+            repo: None,
+            all_projects: false,
+            provider: None,
+            task: None,
+            model: None,
+            limit: 50,
+        };
+
+        let filtered = query_session_report_with_options(
+            &conn,
+            &args,
+            ReportQueryOptions {
+                implicit_model_default: true,
+            },
+        )?;
+        assert_eq!(filtered.len(), 2);
+        assert_eq!(filtered[0].group_value.as_deref(), Some("codex/gpt-5.4"));
+        assert_eq!(
+            filtered[1].group_value.as_deref(),
+            Some("codex/gpt-5.3-codex")
+        );
+
+        let explicit = query_session_report(&conn, &args)?;
+        assert_eq!(explicit.len(), 3);
+        assert!(
+            explicit
+                .iter()
+                .any(|row| row.group_value.as_deref() == Some("cursor/default"))
+        );
+        Ok(())
+    }
+
+    #[test]
     fn session_list_rows_use_metadata_project_path_without_ambiguity() -> Result<()> {
         let conn = open_test_db()?;
         upsert_metadata_session_with_model(
@@ -4707,6 +4926,238 @@ mod tests {
         assert_eq!(lifecycle_rows.len(), 1);
         assert_eq!(lifecycle_rows[0].group_value.as_deref(), Some("human"));
         assert_eq!(lifecycle_rows[0].heavy_commit_count, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn implicit_model_default_change_report_filters_human_and_small_models() -> Result<()> {
+        let conn = open_test_db()?;
+        for index in 0..4 {
+            let sha = format!("g54-{index}");
+            conn.execute(
+                "INSERT INTO event_commit_outcome (
+                    repo_root, commit_sha, commit_time, heavy_ai_flag, merged_to_mainline_flag,
+                    reverted_later_flag, total_matched_ai_lines, commit_total_changed_lines
+                 ) VALUES ('/tmp/repo', ?1, '2026-03-18T10:00:00Z', 1, 1, 0, 20, 30)",
+                params![sha],
+            )?;
+            conn.execute(
+                "INSERT INTO event_commit_churn (
+                    repo_root, commit_sha, ai_added_lines_reaching_mainline,
+                    ai_added_lines_removed_within_window, churn_window_days
+                 ) VALUES ('/tmp/repo', ?1, 10, 2, 14)",
+                params![format!("g54-{index}")],
+            )?;
+            conn.execute(
+                "INSERT INTO event_commit_session (
+                    repo_root, commit_sha, provider, session_id, commit_time, model_name,
+                    matched_lines, share_of_commit, share_of_ai
+                 ) VALUES ('/tmp/repo', ?1, 'codex', ?2, '2026-03-18T10:00:00Z', 'codex/gpt-5.4', 20.0, 0.67, 1.0)",
+                params![format!("g54-{index}"), format!("s54-{index}")],
+            )?;
+        }
+        for index in 0..3 {
+            conn.execute(
+                "INSERT INTO event_commit_outcome (
+                    repo_root, commit_sha, commit_time, heavy_ai_flag, merged_to_mainline_flag,
+                    reverted_later_flag, total_matched_ai_lines, commit_total_changed_lines
+                 ) VALUES ('/tmp/repo', ?1, '2026-03-18T11:00:00Z', 1, 0, 0, 18, 28)",
+                params![format!("g53-{index}")],
+            )?;
+            conn.execute(
+                "INSERT INTO event_commit_churn (
+                    repo_root, commit_sha, ai_added_lines_reaching_mainline,
+                    ai_added_lines_removed_within_window, churn_window_days
+                 ) VALUES ('/tmp/repo', ?1, 8, 1, 14)",
+                params![format!("g53-{index}")],
+            )?;
+            conn.execute(
+                "INSERT INTO event_commit_session (
+                    repo_root, commit_sha, provider, session_id, commit_time, model_name,
+                    matched_lines, share_of_commit, share_of_ai
+                 ) VALUES ('/tmp/repo', ?1, 'codex', ?2, '2026-03-18T11:00:00Z', 'codex/gpt-5.3-codex', 18.0, 0.64, 1.0)",
+                params![format!("g53-{index}"), format!("s53-{index}")],
+            )?;
+        }
+        conn.execute(
+            "INSERT INTO event_commit_outcome (
+                repo_root, commit_sha, commit_time, heavy_ai_flag, merged_to_mainline_flag,
+                reverted_later_flag, total_matched_ai_lines, commit_total_changed_lines
+             ) VALUES ('/tmp/repo', 'human-0', '2026-03-18T12:00:00Z', 0, 1, 0, 0, 12)",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO event_commit_churn (
+                repo_root, commit_sha, ai_added_lines_reaching_mainline,
+                ai_added_lines_removed_within_window, churn_window_days
+             ) VALUES ('/tmp/repo', 'human-0', 0, 0, 14)",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO event_commit_session (
+                repo_root, commit_sha, provider, session_id, commit_time, model_name,
+                matched_lines, share_of_commit, share_of_ai
+             ) VALUES ('/tmp/repo', 'human-0', 'human', '__human__', '2026-03-18T12:00:00Z', NULL, 0.0, 1.0, 0.0)",
+            [],
+        )?;
+
+        create_reporting_views(&conn)?;
+        let args = ReportArgs {
+            weekly: false,
+            group_by: Some(GroupBy::Model),
+            from: None,
+            to: None,
+            repo: None,
+            all_projects: false,
+            provider: None,
+            task: None,
+            model: None,
+            limit: 50,
+        };
+
+        let filtered = query_change_report_with_options(
+            &conn,
+            &args,
+            ReportQueryOptions {
+                implicit_model_default: true,
+            },
+        )?;
+        assert_eq!(filtered.len(), 2);
+        assert_eq!(filtered[0].group_value.as_deref(), Some("codex/gpt-5.4"));
+        assert_eq!(
+            filtered[1].group_value.as_deref(),
+            Some("codex/gpt-5.3-codex")
+        );
+
+        let explicit = query_change_report(&conn, &args)?;
+        assert!(
+            explicit
+                .iter()
+                .any(|row| row.group_value.as_deref() == Some("human/(unknown)"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn implicit_model_default_lifecycle_report_filters_human_and_small_models() -> Result<()> {
+        let conn = open_test_db()?;
+        for index in 0..4 {
+            let sha = format!("q54-{index}");
+            conn.execute(
+                "INSERT INTO event_commit_outcome (
+                    repo_root, commit_sha, commit_time, heavy_ai_flag, merged_to_mainline_flag,
+                    reverted_later_flag, total_matched_ai_lines, commit_total_changed_lines
+                 ) VALUES ('/tmp/repo', ?1, '2026-03-19T10:00:00Z', 1, 1, 0, 20, 30)",
+                params![sha],
+            )?;
+            conn.execute(
+                "INSERT INTO event_commit_churn (
+                    repo_root, commit_sha, ai_added_lines_reaching_mainline,
+                    ai_added_lines_removed_within_window, churn_window_days
+                 ) VALUES ('/tmp/repo', ?1, 10, 2, 14)",
+                params![format!("q54-{index}")],
+            )?;
+            conn.execute(
+                "INSERT INTO event_commit_bug_signal (
+                    repo_root, commit_sha, bug_after_merge_flag, first_bug_signal_commit_sha,
+                    first_bug_signal_commit_time, bug_signal_count, window_days, signal_source
+                 ) VALUES ('/tmp/repo', ?1, 1, 'fix54', '2026-03-20T10:00:00Z', 1, 60, 'git_fix_commit')",
+                params![format!("q54-{index}")],
+            )?;
+            conn.execute(
+                "INSERT INTO event_commit_session (
+                    repo_root, commit_sha, provider, session_id, commit_time, model_name,
+                    matched_lines, share_of_commit, share_of_ai
+                 ) VALUES ('/tmp/repo', ?1, 'codex', ?2, '2026-03-19T10:00:00Z', 'codex/gpt-5.4', 20.0, 0.67, 1.0)",
+                params![format!("q54-{index}"), format!("sq54-{index}")],
+            )?;
+        }
+        for index in 0..3 {
+            conn.execute(
+                "INSERT INTO event_commit_outcome (
+                    repo_root, commit_sha, commit_time, heavy_ai_flag, merged_to_mainline_flag,
+                    reverted_later_flag, total_matched_ai_lines, commit_total_changed_lines
+                 ) VALUES ('/tmp/repo', ?1, '2026-03-19T11:00:00Z', 1, 1, 0, 18, 28)",
+                params![format!("q53-{index}")],
+            )?;
+            conn.execute(
+                "INSERT INTO event_commit_churn (
+                    repo_root, commit_sha, ai_added_lines_reaching_mainline,
+                    ai_added_lines_removed_within_window, churn_window_days
+                 ) VALUES ('/tmp/repo', ?1, 8, 1, 14)",
+                params![format!("q53-{index}")],
+            )?;
+            conn.execute(
+                "INSERT INTO event_commit_bug_signal (
+                    repo_root, commit_sha, bug_after_merge_flag, first_bug_signal_commit_sha,
+                    first_bug_signal_commit_time, bug_signal_count, window_days, signal_source
+                 ) VALUES ('/tmp/repo', ?1, 0, NULL, NULL, 0, 60, 'git_fix_commit')",
+                params![format!("q53-{index}")],
+            )?;
+            conn.execute(
+                "INSERT INTO event_commit_session (
+                    repo_root, commit_sha, provider, session_id, commit_time, model_name,
+                    matched_lines, share_of_commit, share_of_ai
+                 ) VALUES ('/tmp/repo', ?1, 'codex', ?2, '2026-03-19T11:00:00Z', 'codex/gpt-5.3-codex', 18.0, 0.64, 1.0)",
+                params![format!("q53-{index}"), format!("sq53-{index}")],
+            )?;
+        }
+        conn.execute(
+            "INSERT INTO event_commit_outcome (
+                repo_root, commit_sha, commit_time, heavy_ai_flag, merged_to_mainline_flag,
+                reverted_later_flag, total_matched_ai_lines, commit_total_changed_lines
+             ) VALUES ('/tmp/repo', 'qhuman-0', '2026-03-19T12:00:00Z', 0, 1, 0, 0, 12)",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO event_commit_churn (
+                repo_root, commit_sha, ai_added_lines_reaching_mainline,
+                ai_added_lines_removed_within_window, churn_window_days
+             ) VALUES ('/tmp/repo', 'qhuman-0', 0, 0, 14)",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO event_commit_session (
+                repo_root, commit_sha, provider, session_id, commit_time, model_name,
+                matched_lines, share_of_commit, share_of_ai
+             ) VALUES ('/tmp/repo', 'qhuman-0', 'human', '__human__', '2026-03-19T12:00:00Z', NULL, 0.0, 1.0, 0.0)",
+            [],
+        )?;
+
+        create_reporting_views(&conn)?;
+        let args = ReportArgs {
+            weekly: false,
+            group_by: Some(GroupBy::Model),
+            from: None,
+            to: None,
+            repo: None,
+            all_projects: false,
+            provider: None,
+            task: None,
+            model: None,
+            limit: 50,
+        };
+
+        let filtered = query_lifecycle_report_with_options(
+            &conn,
+            &args,
+            ReportQueryOptions {
+                implicit_model_default: true,
+            },
+        )?;
+        assert_eq!(filtered.len(), 2);
+        assert_eq!(filtered[0].group_value.as_deref(), Some("codex/gpt-5.4"));
+        assert_eq!(
+            filtered[1].group_value.as_deref(),
+            Some("codex/gpt-5.3-codex")
+        );
+
+        let explicit = query_lifecycle_report(&conn, &args)?;
+        assert!(
+            explicit
+                .iter()
+                .any(|row| row.group_value.as_deref() == Some("human/(unknown)"))
+        );
         Ok(())
     }
 

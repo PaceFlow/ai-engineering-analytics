@@ -3,14 +3,21 @@ source: tests/metrics_regression.rs
 expression: change
 ---
 Delivery Metrics
-Heavy commits = commits where matched AI-attributed lines are at least half of changed lines
-C1 PR reach rate = share of heavy GitHub AI commits that reached a pull request
-C2 merge rate = share of heavy AI commits that later reached mainline
+Commits analyzed: 9
+Heavy commits: 3 (33.33% of commits)
 
-C3 PR merge rate = share of PR-linked heavy GitHub AI commits whose PR merged
+┌────────────────┬───────────────┬─────────────┐
+│ Signal         │ Value         │ Status      │
+├────────────────┼───────────────┼─────────────┤
+│ Mainline Reach │ 100.00% (3/3) │ good        │
+│ PR reach       │ N/A           │ unavailable │
+│ PR merge       │ N/A           │ unavailable │
+└────────────────┴───────────────┴─────────────┘
 
-Commits: 9
-Heavy commits: 3
-C1 PR Reach Rate: N/A
-C2 Merge Rate: 100.00% (3/3)
-C3 PR Merge Rate: N/A
+Legend:
+- Heavy commits: commits where matched AI-attributed lines are at least half of changed lines.
+- PR reach: share of heavy GitHub AI commits that reached a pull request.
+- Mainline reach: share of heavy AI commits that later reached mainline.
+- PR merge: share of PR-linked heavy GitHub AI commits whose PR merged.
+- GitHub-backed PR metrics show N/A until PR sync data is available.
+- Status: higher is better for all delivery signals.

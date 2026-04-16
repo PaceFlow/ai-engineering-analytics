@@ -1,70 +1,93 @@
 use anyhow::Result;
 
 use crate::analytics;
-use crate::cli::{GroupBy, QualityReportArgs};
+use crate::cli::{GroupBy, QualityReportArgs, ReportArgs};
+use crate::commands::report_layout::{
+    ScorecardRow, append_legend, classify_ratio_lower_better, fmt_ratio, fmt_ratio_percent,
+    group_label, render_scorecard, truncate,
+};
 use crate::commands::report_scope;
 use crate::db;
 
 pub fn run(args: QualityReportArgs) -> Result<()> {
     let db = db::open()?;
     analytics::create_reporting_views(&db)?;
-    let report = report_scope::resolve_report_args(&args.report);
-    let rows = analytics::query_lifecycle_report(&db, &report)?;
-    print!("{}", render_quality_report(&rows, &args));
+    let resolved = report_scope::resolve_main_report_args(&args.report, args.overall);
+    let rows = analytics::query_lifecycle_report_with_options(
+        &db,
+        &resolved.report,
+        analytics::ReportQueryOptions {
+            implicit_model_default: resolved.implicit_model_default,
+        },
+    )?;
+    print!("{}", render_quality_report(&rows, &resolved.report));
     Ok(())
 }
 
-fn render_quality_report(
-    rows: &[analytics::LifecycleReportRow],
-    args: &QualityReportArgs,
-) -> String {
+fn render_quality_report(rows: &[analytics::LifecycleReportRow], report: &ReportArgs) -> String {
     let mut out = String::new();
     out.push_str("Quality Metrics\n");
-    out.push_str("L1 code churn rate = share of AI-added lines on heavy AI commits that were later removed within the churn window\n");
-    out.push_str("L3 bug-after-merge rate = share of merged heavy AI commits that drew a later fix-like commit within 60 days\n");
-    out.push_str("L4 revert rate = share of heavy AI commits that were later reverted\n\n");
 
     if rows.is_empty() {
         out.push_str("No quality rows found. Run `paceflow ingest` first.\n");
         return out;
     }
 
-    if !args.report.weekly && args.report.group_by.is_none() {
+    if !report.weekly && report.group_by.is_none() {
         let row = &rows[0];
-        out.push_str(&format!("Heavy commits: {}\n", row.heavy_commit_count));
         out.push_str(&format!(
-            "L1 Code Churn Rate: {}\n",
-            fmt_ratio(&row.code_churn_rate, 2)
+            "Heavy commits analyzed: {}\n\n",
+            row.heavy_commit_count
         ));
-        out.push_str(&format!(
-            "L3 Bug-After-Merge Rate: {}\n",
-            fmt_ratio(&row.bug_after_merge_rate, 2)
-        ));
-        out.push_str(&format!(
-            "L4 Revert Rate: {}\n",
-            fmt_ratio(&row.revert_rate, 2)
-        ));
+        let scorecard = [
+            ScorecardRow {
+                label: "Code churn",
+                value: fmt_ratio(&row.code_churn_rate, 2),
+                status: classify_ratio_lower_better(&row.code_churn_rate, 15.0, 30.0),
+            },
+            ScorecardRow {
+                label: "Bug-after-merge",
+                value: fmt_ratio(&row.bug_after_merge_rate, 2),
+                status: classify_ratio_lower_better(&row.bug_after_merge_rate, 15.0, 30.0),
+            },
+            ScorecardRow {
+                label: "Reverts",
+                value: fmt_ratio(&row.revert_rate, 2),
+                status: classify_ratio_lower_better(&row.revert_rate, 2.0, 5.0),
+            },
+        ];
+        out.push_str(&render_scorecard(&scorecard));
+        append_legend(
+            &mut out,
+            &[
+                "Code churn: share of AI-added lines on heavy AI commits that were later removed within the churn window.",
+                "Bug-after-merge: share of merged heavy AI commits that drew a later fix-like commit within 60 days.",
+                "Reverts: share of heavy AI commits that were later reverted.",
+                "Status: lower is better for all quality signals.",
+            ],
+        );
         return out;
     }
 
-    let show_week = args.report.weekly;
-    let show_group = args.report.group_by.is_some();
-    let show_branch = matches!(args.report.group_by, Some(GroupBy::Task));
+    let show_week = report.weekly;
+    let show_group = report.group_by.is_some();
+    let show_branch = matches!(report.group_by, Some(GroupBy::Task));
 
     let mut headers = vec![];
+    out.push('\n');
     if show_week {
         headers.push(format!("{:<10}", "Week"));
     }
     if show_group {
-        headers.push(format!("{:<28}", "Group"));
+        headers.push(format!("{:<28}", group_label(report.group_by)));
     }
     if show_branch {
         headers.push(format!("{:<26}", "Branch"));
     }
     headers.push(format!("{:>8}", "Heavy"));
-    headers.push(format!("{:>12}", "L1(churn)"));
-    headers.push(format!("{:>10}", "L3(bug)"));
-    headers.push(format!("{:>12}", "L4(revert)"));
+    headers.push(format!("{:>12}", "Churn Rate"));
+    headers.push(format!("{:>10}", "Bug Rate"));
+    headers.push(format!("{:>12}", "Revert Rate"));
     out.push_str(&format!("{}\n", headers.join("  ")));
 
     for row in rows {
@@ -97,38 +120,11 @@ fn render_quality_report(
         out.push_str(&format!("{}\n", cols.join("  ")));
     }
 
-    out
-}
+    append_legend(
+        &mut out,
+        &["Churn Rate, Bug Rate, and Revert Rate = percentage rates."],
+    );
 
-fn fmt_ratio(metric: &analytics::RatioMetric, precision: usize) -> String {
-    match metric.percent() {
-        Some(value) => format!(
-            "{:.*}% ({}/{})",
-            precision, value, metric.numerator, metric.denominator
-        ),
-        None => "N/A".to_string(),
-    }
-}
-
-fn fmt_ratio_percent(metric: &analytics::RatioMetric, precision: usize) -> String {
-    match metric.percent() {
-        Some(value) => format!("{:.*}%", precision, value),
-        None => "N/A".to_string(),
-    }
-}
-
-fn truncate(input: &str, max_len: usize) -> String {
-    if input.chars().count() <= max_len {
-        return input.to_string();
-    }
-    if max_len <= 3 {
-        return "...".to_string();
-    }
-    let mut out = String::new();
-    for ch in input.chars().take(max_len - 3) {
-        out.push(ch);
-    }
-    out.push_str("...");
     out
 }
 
@@ -139,7 +135,7 @@ mod tests {
     use crate::cli::ReportArgs;
 
     #[test]
-    fn render_quality_report_shows_l3_summary_metric() {
+    fn render_quality_report_uses_scorecard_summary_with_footer() {
         let rows = vec![LifecycleReportRow {
             week_start: None,
             group_value: None,
@@ -158,23 +154,29 @@ mod tests {
                 denominator: 3,
             },
         }];
-        let args = QualityReportArgs {
-            report: ReportArgs {
-                weekly: false,
-                group_by: None,
-                from: None,
-                to: None,
-                repo: None,
-                all_projects: false,
-                provider: None,
-                task: None,
-                model: None,
-                limit: 50,
-            },
+        let report = ReportArgs {
+            weekly: false,
+            group_by: None,
+            from: None,
+            to: None,
+            repo: None,
+            all_projects: false,
+            provider: None,
+            task: None,
+            model: None,
+            limit: 50,
         };
 
-        let rendered = render_quality_report(&rows, &args);
-        assert!(rendered.contains("L3 Bug-After-Merge Rate: 33.33% (1/3)"));
+        let rendered = render_quality_report(&rows, &report);
+        assert!(rendered.contains("Heavy commits analyzed: 3"));
+        assert!(rendered.contains("│ Signal"));
+        assert!(rendered.contains("│ Code churn"));
+        assert!(rendered.contains("20.00% (4/20)"));
+        assert!(rendered.contains("33.33% (1/3)"));
+        assert!(rendered.contains("good"));
+        assert!(rendered.contains("watch"));
+        assert!(rendered.contains("Legend:"));
+        assert!(!rendered.contains("L1 code churn rate ="));
     }
 
     #[test]
@@ -197,23 +199,24 @@ mod tests {
                 denominator: 3,
             },
         }];
-        let args = QualityReportArgs {
-            report: ReportArgs {
-                weekly: false,
-                group_by: Some(GroupBy::Provider),
-                from: None,
-                to: None,
-                repo: None,
-                all_projects: false,
-                provider: None,
-                task: None,
-                model: None,
-                limit: 50,
-            },
+        let report = ReportArgs {
+            weekly: false,
+            group_by: Some(GroupBy::Provider),
+            from: None,
+            to: None,
+            repo: None,
+            all_projects: false,
+            provider: None,
+            task: None,
+            model: None,
+            limit: 50,
         };
 
-        let rendered = render_quality_report(&rows, &args);
-        assert!(rendered.contains("L3(bug)"));
+        let rendered = render_quality_report(&rows, &report);
+        assert!(rendered.contains("Churn Rate"));
+        assert!(rendered.contains("Bug Rate"));
+        assert!(rendered.contains("Revert Rate"));
+        assert!(!rendered.contains("L3(bug)"));
         assert!(rendered.contains("33.3%"));
     }
 }

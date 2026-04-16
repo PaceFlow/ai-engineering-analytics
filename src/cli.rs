@@ -1,15 +1,15 @@
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
-const SESSION_AFTER_HELP: &str = "Examples:\n  paceflow session\n  paceflow session --group-by provider\n  paceflow session --list-sessions\n\nMetrics:\n  Average user prompts: average number of user prompts per session.\n  Avg time to first accepted change: minutes from session start to the first accepted code change.\n  Debug loop rate: share of sessions that look like repeated fix-retry cycles.\n  Error paste rate: share of sessions where an error message was pasted mid-session.\n  Session-to-commit rate: share of sessions followed by a commit within 4 hours.\n  No-output session rate: share of sessions with no accepted code changes.";
-const DELIVERY_AFTER_HELP: &str = "Examples:\n  paceflow delivery\n  paceflow delivery --group-by provider\n  paceflow delivery --group-by task --task ABC-123\n\nMetrics:\n  Heavy commits: commits where matched AI-attributed lines are at least half of changed lines.\n  C1 PR reach rate: share of heavy GitHub AI commits that reached a pull request.\n  C2 merge rate: share of heavy AI commits that later reached mainline.\n  C3 PR merge rate: share of PR-linked heavy GitHub AI commits whose PR merged.";
-const QUALITY_AFTER_HELP: &str = "Examples:\n  paceflow quality\n  paceflow quality --group-by provider\n  paceflow quality --group-by task --task ABC-123\n\nMetrics:\n  L1 code churn rate: share of AI-added lines on heavy AI commits that were removed again within the churn window.\n  L3 bug-after-merge rate: share of merged heavy AI commits that drew a later fix-like commit within 60 days.\n  L4 revert rate: share of heavy AI commits that were later reverted.";
+const SESSION_AFTER_HELP: &str = "Examples:\n  paceflow session                 # default: grouped by model\n  paceflow session --model codex/gpt-5.4\n  paceflow session --overall\n  paceflow session --group-by provider\n  paceflow session --list-sessions\n\nMetrics:\n  Average user prompts: average number of user prompts per session.\n  Avg time to first accepted change: minutes from session start to the first accepted code change.\n  Debug loop rate: share of sessions that look like repeated fix-retry cycles.\n  Error paste rate: share of sessions where an error message was pasted mid-session.\n  Session-to-commit rate: share of sessions followed by a commit within 4 hours.\n  No-output session rate: share of sessions with no accepted code changes.";
+const DELIVERY_AFTER_HELP: &str = "Examples:\n  paceflow delivery                # default: grouped by model\n  paceflow delivery --model codex/gpt-5.4\n  paceflow delivery --overall\n  paceflow delivery --group-by provider\n  paceflow delivery --group-by task --task ABC-123\n\nMetrics:\n  Heavy commits: commits where matched AI-attributed lines are at least half of changed lines.\n  PR reach rate: share of heavy GitHub AI commits that reached a pull request.\n  Mainline reach rate: share of heavy AI commits that later reached mainline.\n  PR merge rate: share of PR-linked heavy GitHub AI commits whose PR merged.";
+const QUALITY_AFTER_HELP: &str = "Examples:\n  paceflow quality                 # default: grouped by model\n  paceflow quality --model codex/gpt-5.4\n  paceflow quality --overall\n  paceflow quality --group-by provider\n  paceflow quality --group-by task --task ABC-123\n\nMetrics:\n  Code churn rate: share of AI-added lines on heavy AI commits that were removed again within the churn window.\n  Bug-after-merge rate: share of merged heavy AI commits that drew a later fix-like commit within 60 days.\n  Revert rate: share of heavy AI commits that were later reverted.";
 const GITHUB_AFTER_HELP: &str = "Examples:\n  paceflow github token\n\nGitHub token setup:\n  Use this command to save, replace, or delete the local GitHub token used for PR sync during ingest.";
 
 #[derive(Parser)]
 #[command(
     name = "paceflow",
     about = "Local-first analytics for improving agent-assisted engineering outcomes",
-    after_help = "Quick start:\n  paceflow ingest\n  paceflow session\n  paceflow delivery\n  paceflow quality\n\nStart here:\n  paceflow session       # find noisy or productive sessions\n  paceflow delivery      # see whether AI-heavy work shipped\n  paceflow quality       # see whether accepted code held up\n\nManual validation:\n  paceflow event-stream --stream session-base\n\nDiscover options:\n  paceflow --help\n  paceflow <command> --help"
+    after_help = "Quick start:\n  paceflow ingest\n  paceflow session\n  paceflow delivery\n  paceflow quality\n\nStart here:\n  paceflow session       # default: compare workflow trust by model\n  paceflow delivery      # default: compare ship-rate by model\n  paceflow quality       # default: compare durability by model\n\nManual validation:\n  paceflow event-stream --stream session-base\n\nDiscover options:\n  paceflow --help\n  paceflow <command> --help"
 )]
 pub struct Cli {
     #[arg(short, long, global = true)]
@@ -113,6 +113,9 @@ pub struct ReportArgs {
 pub struct SessionReportArgs {
     #[command(flatten)]
     pub report: ReportArgs,
+    /// Show the overall report instead of the default model-grouped comparison
+    #[arg(long, conflicts_with = "group_by")]
+    pub overall: bool,
     /// List per-session productivity rows instead of KPI aggregations
     #[arg(long)]
     pub list_sessions: bool,
@@ -123,6 +126,9 @@ pub struct SessionReportArgs {
 pub struct DeliveryReportArgs {
     #[command(flatten)]
     pub report: ReportArgs,
+    /// Show the overall report instead of the default model-grouped comparison
+    #[arg(long, conflicts_with = "group_by")]
+    pub overall: bool,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -130,6 +136,9 @@ pub struct DeliveryReportArgs {
 pub struct QualityReportArgs {
     #[command(flatten)]
     pub report: ReportArgs,
+    /// Show the overall report instead of the default model-grouped comparison
+    #[arg(long, conflicts_with = "group_by")]
+    pub overall: bool,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -169,7 +178,7 @@ pub struct EventStreamArgs {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clap::{CommandFactory, Parser};
+    use clap::{CommandFactory, Parser, error::ErrorKind};
 
     #[test]
     fn parses_session_group_by_repo() {
@@ -208,6 +217,24 @@ mod tests {
             Commands::Session(args) => assert!(args.report.all_projects),
             _ => panic!("expected session command"),
         }
+    }
+
+    #[test]
+    fn parses_session_overall_flag() {
+        let cli = Cli::parse_from(["paceflow", "session", "--overall"]);
+        match cli.command {
+            Commands::Session(args) => assert!(args.overall),
+            _ => panic!("expected session command"),
+        }
+    }
+
+    #[test]
+    fn overall_conflicts_with_group_by() {
+        let result =
+            Cli::try_parse_from(["paceflow", "delivery", "--overall", "--group-by", "model"]);
+        assert!(result.is_err());
+        let err = result.err().expect("expected clap conflict");
+        assert_eq!(err.kind(), ErrorKind::ArgumentConflict);
     }
 
     #[test]
@@ -307,9 +334,9 @@ mod tests {
             .expect("write delivery help");
         let delivery_help = String::from_utf8(delivery_buffer).expect("utf8");
         assert!(delivery_help.contains("Heavy commits"));
-        assert!(delivery_help.contains("C1 PR reach rate"));
-        assert!(delivery_help.contains("C2 merge rate"));
-        assert!(delivery_help.contains("C3 PR merge rate"));
+        assert!(delivery_help.contains("PR reach rate"));
+        assert!(delivery_help.contains("Mainline reach rate"));
+        assert!(delivery_help.contains("PR merge rate"));
 
         let mut command = Cli::command();
         let mut quality_buffer = Vec::new();
@@ -319,8 +346,8 @@ mod tests {
             .write_long_help(&mut quality_buffer)
             .expect("write quality help");
         let quality_help = String::from_utf8(quality_buffer).expect("utf8");
-        assert!(quality_help.contains("L1 code churn rate"));
-        assert!(quality_help.contains("L3 bug-after-merge rate"));
-        assert!(quality_help.contains("L4 revert rate"));
+        assert!(quality_help.contains("Code churn rate"));
+        assert!(quality_help.contains("Bug-after-merge rate"));
+        assert!(quality_help.contains("Revert rate"));
     }
 }
