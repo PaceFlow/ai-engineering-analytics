@@ -281,13 +281,13 @@ fn sanitize_codex_session(path: &Path) -> Result<()> {
                                 );
                             }
                         }
-                        "agent_reasoning" => {
-                            if payload.get("text").and_then(Value::as_str).is_some() {
-                                payload.insert(
-                                    "text".to_string(),
-                                    Value::String(SANITIZED_REASONING.to_string()),
-                                );
-                            }
+                        "agent_reasoning"
+                            if payload.get("text").and_then(Value::as_str).is_some() =>
+                        {
+                            payload.insert(
+                                "text".to_string(),
+                                Value::String(SANITIZED_REASONING.to_string()),
+                            );
                         }
                         "task_complete" => {
                             if let Some(message) = payload
