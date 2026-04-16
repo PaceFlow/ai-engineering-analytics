@@ -1,16 +1,14 @@
 # `paceflow` release
 
-This is the first stable public release of `paceflow`.
+This is the `v0.2.0` release of `paceflow`.
 
 Download the archive for your platform from the Assets section below, extract it, and run `paceflow --help`.
 
-Highlights in `v0.1.0`:
+Highlights in `v0.2.0`:
 
-- GitHub-backed delivery metrics for PR reach and PR merge
-- GitHub PR sync with saved token setup flow
-- Bug-after-merge tracking for quality reporting
 - Default model-grouped report views with `--overall` summary mode
-- Streamlined ingest progress output
+- Updated report docs and examples for `--model` filtering and `Mainline Reach`
+- Release metadata and install snippets aligned to the current repository and `v0.2.0`
 
 Quick start:
 
