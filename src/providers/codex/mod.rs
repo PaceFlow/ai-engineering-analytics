@@ -173,26 +173,24 @@ fn ingest_session(path: &PathBuf, db: &Connection) -> Result<usize> {
         let ts = line.timestamp.clone().or_else(|| session_start_ts.clone());
 
         match line.kind.as_str() {
-            "turn_context" => {
-                if session_model.is_none() {
-                    session_model = line
-                        .payload
-                        .get("model")
-                        .and_then(|value| value.as_str())
-                        .map(ToOwned::to_owned);
-                    if session_model.is_some() {
-                        db::upsert_metadata_session_with_model(
-                            db,
-                            "codex",
-                            session_id,
-                            meta.cwd.as_deref(),
-                            session_start_ts.as_deref(),
-                            ts.as_deref().or(session_start_ts.as_deref()),
-                            Some(&source_path),
-                            meta.model_provider.as_deref(),
-                            session_model.as_deref(),
-                        )?;
-                    }
+            "turn_context" if session_model.is_none() => {
+                session_model = line
+                    .payload
+                    .get("model")
+                    .and_then(|value| value.as_str())
+                    .map(ToOwned::to_owned);
+                if session_model.is_some() {
+                    db::upsert_metadata_session_with_model(
+                        db,
+                        "codex",
+                        session_id,
+                        meta.cwd.as_deref(),
+                        session_start_ts.as_deref(),
+                        ts.as_deref().or(session_start_ts.as_deref()),
+                        Some(&source_path),
+                        meta.model_provider.as_deref(),
+                        session_model.as_deref(),
+                    )?;
                 }
             }
             "event_msg" => {

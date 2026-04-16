@@ -2530,10 +2530,8 @@ fn build_session_turns(messages: &[SessionMessage]) -> Vec<SessionTurn> {
                 }
                 current_user = Some(message.content.clone());
             }
-            "assistant" => {
-                if current_user.is_some() {
-                    assistant_parts.push(message.content.as_str());
-                }
+            "assistant" if current_user.is_some() => {
+                assistant_parts.push(message.content.as_str());
             }
             _ => {}
         }
