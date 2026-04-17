@@ -74,7 +74,7 @@ pub fn to_rel_path(repo_root: Option<&Path>, abs_path: &Path) -> Option<String> 
 }
 
 pub fn path_to_string(path: &Path) -> String {
-    normalize_rel_path(path)
+    path.to_string_lossy().to_string()
 }
 
 pub fn strip_file_scheme(uri: &str) -> String {
@@ -276,10 +276,18 @@ mod tests {
     }
 
     #[test]
-    fn path_to_string_normalizes_backslashes() {
+    fn normalize_filesystem_path_normalizes_backslashes() {
         assert_eq!(
-            path_to_string(Path::new(r"C:\dev\paceflow\paceflow-backend")),
+            normalize_filesystem_path(r"C:\dev\paceflow\paceflow-backend"),
             "C:/dev/paceflow/paceflow-backend"
+        );
+    }
+
+    #[test]
+    fn path_to_string_preserves_windows_verbatim_prefix() {
+        assert_eq!(
+            path_to_string(Path::new(r"\\?\C:\dev\paceflow\paceflow-backend")),
+            r"\\?\C:\dev\paceflow\paceflow-backend"
         );
     }
 

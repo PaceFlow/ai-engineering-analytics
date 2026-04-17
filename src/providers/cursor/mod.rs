@@ -544,9 +544,12 @@ fn extract_project_path(data: &ComposerData) -> Option<String> {
     }
 
     if path.extension().is_some() {
-        path.parent().map(path_to_string)
+        path.parent()
+            .map(|parent| normalize_filesystem_path(parent.to_string_lossy().as_ref()))
     } else {
-        Some(path_to_string(&raw_path))
+        Some(normalize_filesystem_path(
+            raw_path.to_string_lossy().as_ref(),
+        ))
     }
 }
 
