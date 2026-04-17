@@ -3,7 +3,9 @@ use std::collections::HashMap;
 use serde_json::Value;
 
 use crate::change_intel::line_hash::hash_line;
-use crate::change_intel::path_resolver::{detect_repo_root, resolve_path, to_rel_path};
+use crate::change_intel::path_resolver::{
+    detect_repo_root, path_to_string, resolve_path, to_rel_path,
+};
 use crate::change_intel::session_context::SessionContext;
 use crate::change_intel::types::{
     ChangeOpCandidate, LineHashCount, LineSide, ParseError, ParseOutcome, PatternParser,
@@ -184,7 +186,7 @@ impl PatternParser for ApplyPatchParser {
 
         for (idx, block) in blocks.into_iter().enumerate() {
             let abs_path = resolve_path(&block.raw_path, None, ctx.session_cwd.as_deref());
-            let abs_path_s = abs_path.to_string_lossy().to_string();
+            let abs_path_s = path_to_string(&abs_path);
             let repo_root = detect_repo_root(&abs_path);
             let rel_path = to_rel_path(repo_root.as_deref(), &abs_path);
 
@@ -198,7 +200,7 @@ impl PatternParser for ApplyPatchParser {
                 call_id: event.call_id.clone(),
                 op_index: idx as i32,
                 timestamp: event.timestamp.clone(),
-                repo_root: repo_root.map(|p| p.to_string_lossy().to_string()),
+                repo_root: repo_root.as_deref().map(path_to_string),
                 abs_path: abs_path_s.clone(),
                 rel_path,
                 write_mode: WriteMode::Patch,

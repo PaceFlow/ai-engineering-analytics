@@ -73,6 +73,10 @@ pub fn to_rel_path(repo_root: Option<&Path>, abs_path: &Path) -> Option<String> 
     Some(normalize_rel_path(rel))
 }
 
+pub fn path_to_string(path: &Path) -> String {
+    normalize_rel_path(path)
+}
+
 pub fn strip_file_scheme(uri: &str) -> String {
     if let Some(p) = uri.strip_prefix("file://localhost/") {
         normalize_file_uri_path(p)
@@ -268,6 +272,14 @@ mod tests {
         assert_eq!(
             strip_file_scheme("file://localhost/c%3A/dev/paceflow/src/main.rs"),
             "C:/dev/paceflow/src/main.rs"
+        );
+    }
+
+    #[test]
+    fn path_to_string_normalizes_backslashes() {
+        assert_eq!(
+            path_to_string(Path::new(r"C:\dev\paceflow\paceflow-backend")),
+            "C:/dev/paceflow/paceflow-backend"
         );
     }
 

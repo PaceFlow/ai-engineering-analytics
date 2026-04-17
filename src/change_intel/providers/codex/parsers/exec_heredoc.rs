@@ -1,7 +1,9 @@
 use serde_json::Value;
 
 use crate::change_intel::line_hash::{diff_with_hashes, hashes_for_text, line_count};
-use crate::change_intel::path_resolver::{detect_repo_root, resolve_path, to_rel_path};
+use crate::change_intel::path_resolver::{
+    detect_repo_root, path_to_string, resolve_path, to_rel_path,
+};
 use crate::change_intel::session_context::SessionContext;
 use crate::change_intel::types::{
     ChangeOpCandidate, LineSide, ParseError, ParseOutcome, PatternParser, ToolCallEvent, WriteMode,
@@ -265,8 +267,7 @@ impl PatternParser for ExecHeredocWriteParser {
                 args.workdir.as_deref(),
                 ctx.session_cwd.as_deref(),
             );
-            ctx.file_cache
-                .insert(abs_path.to_string_lossy().to_string(), content);
+            ctx.file_cache.insert(path_to_string(&abs_path), content);
         }
 
         let segments = match Self::extract_heredoc_segments(&args.cmd) {
@@ -291,7 +292,7 @@ impl PatternParser for ExecHeredocWriteParser {
                 args.workdir.as_deref(),
                 ctx.session_cwd.as_deref(),
             );
-            let abs_path_s = abs_path.to_string_lossy().to_string();
+            let abs_path_s = path_to_string(&abs_path);
             let repo_root = detect_repo_root(&abs_path);
             let rel_path = to_rel_path(repo_root.as_deref(), &abs_path);
 
@@ -336,7 +337,7 @@ impl PatternParser for ExecHeredocWriteParser {
                 call_id: event.call_id.clone(),
                 op_index: idx as i32,
                 timestamp: event.timestamp.clone(),
-                repo_root: repo_root.map(|p| p.to_string_lossy().to_string()),
+                repo_root: repo_root.as_deref().map(path_to_string),
                 abs_path: abs_path_s,
                 rel_path,
                 write_mode: segment.write_mode,

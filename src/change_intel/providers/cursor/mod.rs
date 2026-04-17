@@ -15,7 +15,7 @@ use crate::change_intel::types::{
 };
 use crate::cursor_paths::cursor_state_path;
 use crate::ingest_progress::IngestProgressObserver;
-use crate::path_utils::{normalize_filesystem_path, strip_file_scheme};
+use crate::path_utils::{normalize_filesystem_path, path_to_string, strip_file_scheme};
 
 const CURSOR_CURSOR_NAMESPACE: &str = "cursor_core_v1";
 const INLINE_PARSER_NAME: &str = "cursor_inline_undo_v1";
@@ -805,7 +805,7 @@ fn build_change_op_candidate(
         call_id,
         op_index,
         timestamp: timestamp.or_else(|| session.info.last_seen_at.clone()),
-        repo_root: repo_root.map(|p| p.to_string_lossy().to_string()),
+        repo_root: repo_root.as_deref().map(path_to_string),
         abs_path: abs_path.to_string(),
         rel_path,
         write_mode,
@@ -904,7 +904,7 @@ fn build_inline_change_op(
             .and_then(|v| v.as_i64())
             .and_then(ms_to_iso)
             .or_else(|| session.info.last_seen_at.clone()),
-        repo_root: repo_root.map(|p| p.to_string_lossy().to_string()),
+        repo_root: repo_root.as_deref().map(path_to_string),
         abs_path: abs_path.to_string(),
         rel_path,
         write_mode: WriteMode::Patch,
@@ -964,7 +964,7 @@ fn build_partial_fates_op(
         call_id: call_id.to_string(),
         op_index: 0,
         timestamp: session.info.last_seen_at.clone(),
-        repo_root: repo_root.map(|p| p.to_string_lossy().to_string()),
+        repo_root: repo_root.as_deref().map(path_to_string),
         abs_path: abs_path.to_string(),
         rel_path,
         write_mode: WriteMode::Patch,

@@ -4,7 +4,7 @@ use std::env;
 use std::path::Path;
 
 use crate::change_intel::schema::init_change_intel_schema;
-use crate::path_utils::{detect_repo_root, to_rel_path};
+use crate::path_utils::{detect_repo_root, path_to_string, to_rel_path};
 
 pub fn open() -> Result<Connection> {
     let home = env::var_os("PACEFLOW_HOME")
@@ -583,7 +583,7 @@ fn derive_repo_root(project_path: Option<&str>, file_path: Option<&str>) -> Opti
         if fp_path.is_absolute()
             && let Some(root) = detect_repo_root(fp_path)
         {
-            return Some(root.to_string_lossy().to_string());
+            return Some(path_to_string(&root));
         }
     }
 
@@ -592,7 +592,7 @@ fn derive_repo_root(project_path: Option<&str>, file_path: Option<&str>) -> Opti
         if pp_path.is_absolute()
             && let Some(root) = detect_repo_root(pp_path)
         {
-            return Some(root.to_string_lossy().to_string());
+            return Some(path_to_string(&root));
         }
     }
 

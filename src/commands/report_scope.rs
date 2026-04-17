@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use crate::cli::{GroupBy, ReportArgs};
-use crate::path_utils::detect_repo_root;
+use crate::path_utils::{detect_repo_root, path_to_string};
 
 #[derive(Debug, Clone)]
 pub struct ResolvedMainReportArgs {
@@ -26,7 +26,7 @@ fn resolve_report_args_for_cwd(args: &ReportArgs, cwd: Option<&Path>) -> ReportA
         && let Some(cwd) = cwd
         && let Some(repo_root) = detect_repo_root(cwd)
     {
-        resolved.repo = Some(repo_root.to_string_lossy().into_owned());
+        resolved.repo = Some(path_to_string(&repo_root));
     }
     resolved
 }

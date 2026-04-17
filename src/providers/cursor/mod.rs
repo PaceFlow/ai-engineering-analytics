@@ -10,7 +10,9 @@ use super::utils::diff_line_counts;
 use crate::cursor_paths::{cursor_history_path, cursor_state_path};
 use crate::db;
 use crate::ingest_progress::IngestProgressObserver;
-use crate::path_utils::{detect_repo_root, normalize_filesystem_path, strip_file_scheme};
+use crate::path_utils::{
+    detect_repo_root, normalize_filesystem_path, path_to_string, strip_file_scheme,
+};
 
 pub fn plan_composer_rows() -> Result<Vec<(String, String)>> {
     let vscdb_path = match cursor_vscdb_path()? {
@@ -538,13 +540,13 @@ fn extract_project_path(data: &ComposerData) -> Option<String> {
     let raw_path = common_ancestor_path(&paths).unwrap_or_else(|| PathBuf::from(&paths[0]));
     let path = raw_path.as_path();
     if let Some(root) = detect_repo_root(path) {
-        return Some(root.to_string_lossy().into_owned());
+        return Some(path_to_string(&root));
     }
 
     if path.extension().is_some() {
-        path.parent().map(|p| p.to_string_lossy().into_owned())
+        path.parent().map(path_to_string)
     } else {
-        Some(raw_path.to_string_lossy().into_owned())
+        Some(path_to_string(&raw_path))
     }
 }
 
