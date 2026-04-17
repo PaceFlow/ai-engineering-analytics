@@ -15,7 +15,7 @@ use crate::change_intel::types::{
 };
 use crate::cursor_paths::cursor_state_path;
 use crate::ingest_progress::IngestProgressObserver;
-use crate::path_utils::strip_file_scheme;
+use crate::path_utils::{normalize_filesystem_path, strip_file_scheme};
 
 const CURSOR_CURSOR_NAMESPACE: &str = "cursor_core_v1";
 const INLINE_PARSER_NAME: &str = "cursor_inline_undo_v1";
@@ -1245,7 +1245,7 @@ fn extract_file_path_from_uri_value(uri: &Value) -> Option<String> {
             }
 
             if let Some(fs_path) = map.get("fsPath").and_then(|v| v.as_str()) {
-                return Some(fs_path.to_string());
+                return Some(normalize_filesystem_path(fs_path));
             }
 
             if let Some(external) = map.get("external").and_then(|v| v.as_str()) {
@@ -1253,7 +1253,7 @@ fn extract_file_path_from_uri_value(uri: &Value) -> Option<String> {
             }
 
             if let Some(path) = map.get("path").and_then(|v| v.as_str()) {
-                return Some(path.to_string());
+                return Some(normalize_filesystem_path(path));
             }
 
             None
@@ -1273,7 +1273,7 @@ fn extract_file_path_from_string(raw: &str) -> Option<String> {
     if raw.contains("://") {
         return None;
     }
-    Some(raw.to_string())
+    Some(normalize_filesystem_path(raw))
 }
 
 fn composer_id_from_checkpoint_key(key: &str) -> Option<&str> {
@@ -1428,6 +1428,60 @@ mod tests {
             |r| r.get(0),
         )?;
         assert_eq!(count, 1);
+
+        cleanup(&source);
+        Ok(())
+    }
+
+    #[test]
+    fn inline_diff_ingest_decodes_percent_encoded_windows_file_uri_paths() -> Result<()> {
+        let mut analytics = Connection::open_in_memory()?;
+        init_change_intel_schema(&analytics)?;
+
+        let source = temp_db_path("inline_windows_uri");
+        let rows = vec![
+            (
+                "composerData:c_windows".to_string(),
+                json!({
+                    "composerId": "c_windows",
+                    "createdAt": 1772694178155i64,
+                    "lastUpdatedAt": 1772694194894i64,
+                    "filesChangedCount": 1,
+                    "codeBlockData": {}
+                })
+                .to_string(),
+            ),
+            (
+                "inlineDiffUndoRedo-windows".to_string(),
+                json!({
+                    "composerMetadata": {"composerId": "c_windows"},
+                    "uri": {"scheme": "file", "external": "file:///c%3A/dev/paceflow/README.md"},
+                    "createdAt": 1772694300812i64,
+                    "newTextLines": ["new line"],
+                    "changes": [
+                        {
+                            "removedTextLines": ["old line"],
+                            "addedRange": {"startLineNumber": 1, "endLineNumberExclusive": 2}
+                        }
+                    ]
+                })
+                .to_string(),
+            ),
+        ];
+
+        create_cursor_db(&source, &rows)?;
+
+        let summary = ingest_cursor_code_changes_from_path(&mut analytics, &source, false)?;
+        assert_eq!(summary.ops_upserted, 1);
+
+        let abs_path: String = analytics.query_row(
+            "SELECT abs_path
+             FROM fact_session_code_change
+             WHERE provider='cursor' AND source_kind = 'tool_write'",
+            [],
+            |r| r.get(0),
+        )?;
+        assert_eq!(abs_path, "C:/dev/paceflow/README.md");
 
         cleanup(&source);
         Ok(())

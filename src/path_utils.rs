@@ -1,3 +1,4 @@
+use percent_encoding::percent_decode_str;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -84,11 +85,17 @@ pub fn strip_file_scheme(uri: &str) -> String {
     }
 }
 
+pub fn normalize_filesystem_path(path: &str) -> String {
+    normalize_windows_drive_path(path)
+}
+
 fn normalize_file_uri_path(path: &str) -> String {
-    if path.starts_with('/') || looks_like_windows_drive_path(path) {
-        path.to_string()
+    let decoded = percent_decode_str(path).decode_utf8_lossy();
+    let normalized = normalize_windows_drive_path(&decoded);
+    if normalized.starts_with('/') || looks_like_windows_drive_path(&normalized) {
+        normalized
     } else {
-        format!("/{}", path)
+        format!("/{}", normalized)
     }
 }
 
@@ -98,6 +105,32 @@ fn looks_like_windows_drive_path(path: &str) -> bool {
         && bytes[0].is_ascii_alphabetic()
         && bytes[1] == b':'
         && (bytes[2] == b'/' || bytes[2] == b'\\')
+}
+
+fn normalize_windows_drive_path(path: &str) -> String {
+    let path = path.replace('\\', "/");
+
+    if let Some(without_leading_slash) = path.strip_prefix('/')
+        && looks_like_windows_drive_path(without_leading_slash)
+    {
+        return uppercase_windows_drive_letter(without_leading_slash);
+    }
+
+    if looks_like_windows_drive_path(&path) {
+        return uppercase_windows_drive_letter(&path);
+    }
+
+    path
+}
+
+fn uppercase_windows_drive_letter(path: &str) -> String {
+    let mut chars = path.chars();
+    let drive = chars
+        .next()
+        .expect("windows drive path should start with a drive letter")
+        .to_ascii_uppercase();
+    let rest: String = chars.collect();
+    format!("{drive}{rest}")
 }
 
 fn normalize_rel_path(path: &Path) -> String {
@@ -223,6 +256,18 @@ mod tests {
         assert_eq!(
             strip_file_scheme("file://localhost/C:/Users/alice/code/src/main.rs"),
             "C:/Users/alice/code/src/main.rs"
+        );
+    }
+
+    #[test]
+    fn strip_file_scheme_decodes_percent_encoded_windows_drive_paths() {
+        assert_eq!(
+            strip_file_scheme("file:///c%3A/dev/paceflow/src/main.rs"),
+            "C:/dev/paceflow/src/main.rs"
+        );
+        assert_eq!(
+            strip_file_scheme("file://localhost/c%3A/dev/paceflow/src/main.rs"),
+            "C:/dev/paceflow/src/main.rs"
         );
     }
 

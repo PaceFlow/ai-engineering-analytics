@@ -10,7 +10,7 @@ use super::utils::diff_line_counts;
 use crate::cursor_paths::{cursor_history_path, cursor_state_path};
 use crate::db;
 use crate::ingest_progress::IngestProgressObserver;
-use crate::path_utils::{detect_repo_root, strip_file_scheme};
+use crate::path_utils::{detect_repo_root, normalize_filesystem_path, strip_file_scheme};
 
 pub fn plan_composer_rows() -> Result<Vec<(String, String)>> {
     let vscdb_path = match cursor_vscdb_path()? {
@@ -505,7 +505,7 @@ fn extract_project_path(data: &ComposerData) -> Option<String> {
             if let Some(uri) = &sel.uri
                 && let Some(p) = &uri.fs_path
             {
-                paths.push(p.clone());
+                paths.push(normalize_filesystem_path(p));
             }
         }
     }
@@ -711,7 +711,9 @@ fn model_string_from_candidate(candidate: &str, include_default: bool) -> Option
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_bubble_model_name, extract_model_name};
+    use super::{
+        ComposerData, extract_bubble_model_name, extract_model_name, extract_project_path,
+    };
     use serde_json::json;
 
     #[test]
@@ -774,6 +776,24 @@ mod tests {
         assert_eq!(
             extract_bubble_model_name(&raw).as_deref(),
             Some("gpt-5.2-codex-xhigh")
+        );
+    }
+
+    #[test]
+    fn extract_project_path_decodes_percent_encoded_windows_file_uris() {
+        let data: ComposerData = serde_json::from_value(json!({
+            "composerId": "c1",
+            "conversation": [{"type": 1, "text": "hi"}],
+            "allAttachedFileCodeChunksUris": [
+                "file:///c%3A/dev/paceflow/paceflow-backend/src/lib.rs",
+                "file:///c%3A/dev/paceflow/paceflow-backend/tests/session.rs"
+            ]
+        }))
+        .expect("cursor test fixture should deserialize");
+
+        assert_eq!(
+            extract_project_path(&data).as_deref(),
+            Some("C:/dev/paceflow/paceflow-backend")
         );
     }
 }
