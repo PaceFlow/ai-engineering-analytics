@@ -3,11 +3,17 @@ use chrono::TimeZone;
 use rusqlite::{Connection, OpenFlags, params};
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use super::utils::diff_line_counts;
 use crate::cursor_paths::{cursor_history_path, cursor_state_path};
+pub(crate) mod shared;
+
+use shared::{
+    CursorBubbleRole, CursorSessionGraph, aggregate_file_edits,
+    load_cursor_session_graphs_from_rows, resolve_tool_call_edits,
+};
 use crate::db;
 use crate::ingest_progress::IngestProgressObserver;
 use crate::path_utils::{
@@ -31,9 +37,13 @@ pub fn plan_composer_rows() -> Result<Vec<(String, String)>> {
 
     let rows = stmt
         .query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
         })?
-        .filter_map(|r| r.ok())
+        .filter_map(|row| match row {
+            Ok((key, Some(value))) => Some((key, value)),
+            Ok((_key, None)) => None,
+            Err(_) => None,
+        })
         .collect();
 
     Ok(rows)
@@ -82,9 +92,40 @@ pub fn ingest_planned_sessions(
         eprintln!("[cursor] history index: {} file(s)", history_index.len());
     }
 
+    ingest_planned_sessions_from_source(
+        db,
+        &vscdb,
+        &vscdb_path.to_string_lossy(),
+        composer_rows,
+        &history_index,
+        verbose,
+        progress,
+    )
+}
+
+pub(crate) fn ingest_planned_sessions_from_source(
+    db: &Connection,
+    vscdb: &Connection,
+    source_file: &str,
+    composer_rows: &[(String, String)],
+    history_index: &HistoryIndex,
+    verbose: bool,
+    mut progress: Option<&mut dyn IngestProgressObserver>,
+) -> Result<usize> {
+    let graphs = load_cursor_session_graphs_from_rows(vscdb, source_file, composer_rows)?;
+    let by_session: HashMap<_, _> = graphs
+        .into_iter()
+        .map(|graph| (graph.composer_id.clone(), graph))
+        .collect();
+
     let mut total_rows = 0usize;
-    for (key, value) in composer_rows {
-        match ingest_composer(db, &vscdb, value, &history_index, verbose) {
+    for (key, _value) in composer_rows {
+        let session_id = key.strip_prefix("composerData:").unwrap_or(key);
+        let Some(graph) = by_session.get(session_id) else {
+            continue;
+        };
+
+        match ingest_session_graph(db, graph, history_index, verbose) {
             Ok(0) => {}
             Ok(n) => total_rows += n,
             Err(e) => {
@@ -165,14 +206,14 @@ struct CodeBlock {
 
 // ── History index ─────────────────────────────────────────────────────────────
 
-struct HistoryEntry {
+pub(crate) struct HistoryEntry {
     id: String,
     source: String,
     timestamp: i64,
     dir_path: PathBuf,
 }
 
-type HistoryIndex = HashMap<String, Vec<HistoryEntry>>;
+pub(crate) type HistoryIndex = HashMap<String, Vec<HistoryEntry>>;
 
 fn build_history_index(history_root: &Path) -> HistoryIndex {
     let mut index: HistoryIndex = HashMap::new();
@@ -252,37 +293,35 @@ fn build_history_index(history_root: &Path) -> HistoryIndex {
 // ── Session ingestion ─────────────────────────────────────────────────────────
 
 fn ingest_composer(
+    _db: &Connection,
+    _vscdb: &Connection,
+    _json_text: &str,
+    _history_index: &HistoryIndex,
+    _verbose: bool,
+) -> Result<usize> {
+    Ok(0)
+}
+
+fn ingest_session_graph(
     db: &Connection,
-    vscdb: &Connection,
-    json_text: &str,
+    graph: &CursorSessionGraph,
     history_index: &HistoryIndex,
     verbose: bool,
 ) -> Result<usize> {
-    let raw_json: JsonValue = match serde_json::from_str(json_text) {
-        Ok(value) => value,
-        Err(_) => return Ok(0),
-    };
-    let data: ComposerData = match serde_json::from_str(json_text) {
-        Ok(d) => d,
-        Err(_) => return Ok(0), // binary blob or unrecognised format
-    };
-
-    if data.conversation.is_empty() && data.full_conversation_headers_only.is_empty() {
+    let visible_message_count = graph
+        .messages()
+        .iter()
+        .filter(|bubble| bubble.text.as_deref().is_some_and(|text| !text.is_empty()))
+        .count();
+    if visible_message_count == 0 {
         return Ok(0);
     }
 
-    let session_id = &data.composer_id;
-    let timestamp = data.created_at.map(ms_to_iso);
-    let last_updated = data.last_updated_at.map(ms_to_iso);
-    let project_path = extract_project_path(&data);
-    let mut model_name = extract_model_name(&raw_json);
-    if matches!(model_name.as_deref(), None | Some("default"))
-        && let Some(bubble_model_name) =
-            extract_model_name_from_bubbles(vscdb, session_id, &data.full_conversation_headers_only)
-        && (model_name.is_none() || bubble_model_name != "default")
-    {
-        model_name = Some(bubble_model_name);
-    }
+    let session_id = &graph.composer_id;
+    let timestamp = graph.started_at.clone();
+    let last_updated = graph.ended_at.clone();
+    let project_path = graph.project_path.clone();
+    let model_name = graph.model_name.clone();
 
     if db::session_exists(db, session_id)? {
         db::upsert_metadata_session_with_model(
@@ -299,8 +338,8 @@ fn ingest_composer(
         return Ok(0);
     }
 
-    let session_start_ms = data.created_at.unwrap_or(0);
-    let session_end_ms = data.last_updated_at.unwrap_or(i64::MAX);
+    let session_start_ms = graph.created_at_ms.unwrap_or(0);
+    let session_end_ms = graph.last_updated_at_ms.unwrap_or(i64::MAX);
 
     if verbose {
         eprintln!(
@@ -322,16 +361,14 @@ fn ingest_composer(
     )?;
     let mut written = 1usize;
 
-    // Conversation messages (old schema)
-    let mut events_from_conversation = 0usize;
-    for bubble in &data.conversation {
-        let role = match bubble.bubble_type {
-            Some(1) => "user",
-            Some(2) => "assistant",
-            _ => continue,
+    for bubble in graph.messages() {
+        let role = match bubble.role {
+            Some(CursorBubbleRole::User) => "user",
+            Some(CursorBubbleRole::Assistant) => "assistant",
+            None => continue,
         };
         let text = match &bubble.text {
-            Some(t) if !t.is_empty() => t.clone(),
+            Some(text) if !text.is_empty() => text,
             _ => continue,
         };
         let words = text.split_whitespace().count();
@@ -340,82 +377,64 @@ fn ingest_composer(
             "cursor",
             session_id,
             role,
-            &text,
+            text,
             words as i64,
             timestamp.as_deref(),
         )?;
-        events_from_conversation += 1;
         written += 1;
     }
 
-    // New schema: bubbles stored separately in vscdb
-    if events_from_conversation == 0 && !data.full_conversation_headers_only.is_empty() {
-        for header in &data.full_conversation_headers_only {
-            let role = match header.bubble_type {
-                1 => "user",
-                2 => "assistant",
-                _ => continue,
-            };
-            let key = format!("bubbleId:{}:{}", session_id, header.bubble_id);
-            let text: Option<String> = vscdb
-                .query_row(
-                    "SELECT json_extract(value, '$.text') FROM cursorDiskKV WHERE key = ?1",
-                    params![key],
-                    |row| row.get(0),
-                )
-                .ok()
-                .flatten();
-            let text = match text {
-                Some(t) if !t.is_empty() => t,
-                _ => continue,
-            };
-            let words = text.split_whitespace().count();
-            db::ingest_session_message(
-                db,
-                "cursor",
-                session_id,
-                role,
-                &text,
-                words as i64,
-                timestamp.as_deref(),
-            )?;
-            written += 1;
-        }
-    }
-
-    // Accepted code changes (old schema: codeBlockData)
     let mut loc_events_pushed = 0usize;
-    for (file_uri, blocks) in &data.code_block_data {
-        let accepted_count = blocks
-            .iter()
-            .filter(|b| b.status.as_deref() == Some("accepted"))
-            .count();
-        if accepted_count == 0 {
-            continue;
-        }
-
-        // Strip "file:///" or "file://" prefix
-        let file_path = strip_file_scheme(file_uri);
-
-        let (lines_added, lines_removed) =
-            loc_from_history(&file_path, session_start_ms, session_end_ms, history_index);
-
+    let resolved_file_edits = aggregate_file_edits(&resolve_tool_call_edits(graph));
+    for edit in &resolved_file_edits {
         db::ingest_accepted_code_change(
             db,
             "cursor",
             session_id,
-            &file_path,
-            lines_added,
-            lines_removed,
+            &edit.abs_path,
+            edit.added_lines,
+            edit.removed_lines,
             timestamp.as_deref(),
         )?;
         loc_events_pushed += 1;
         written += 1;
     }
 
-    // LOC fallback for new schema: aggregate counts on composerData object
+    if loc_events_pushed == 0 {
+        let mut fallback_paths: Vec<String> = graph
+            .legacy_targets
+            .iter()
+            .map(|target| target.abs_path.clone())
+            .chain(
+                graph
+                    .partial_targets
+                    .iter()
+                    .map(|target| target.abs_path.clone()),
+            )
+            .collect();
+        let mut seen = HashSet::new();
+        fallback_paths.retain(|path| seen.insert(path.clone()));
+        fallback_paths.sort();
+
+        for file_path in fallback_paths {
+            let (lines_added, lines_removed) =
+                loc_from_history(&file_path, session_start_ms, session_end_ms, history_index);
+            db::ingest_accepted_code_change(
+                db,
+                "cursor",
+                session_id,
+                &file_path,
+                lines_added,
+                lines_removed,
+                timestamp.as_deref(),
+            )?;
+            loc_events_pushed += 1;
+            written += 1;
+        }
+    }
+
     if loc_events_pushed == 0
-        && let (Some(added), Some(removed)) = (data.total_lines_added, data.total_lines_removed)
+        && let (Some(added), Some(removed)) = (graph.total_lines_added, graph.total_lines_removed)
         && (added > 0 || removed > 0)
     {
         db::ingest_accepted_code_change(
@@ -718,8 +737,33 @@ fn model_string_from_candidate(candidate: &str, include_default: bool) -> Option
 mod tests {
     use super::{
         ComposerData, extract_bubble_model_name, extract_model_name, extract_project_path,
+        ingest_planned_sessions_from_source,
     };
+    use crate::db::init_app_schema;
+    use rusqlite::{Connection, params};
     use serde_json::json;
+    use std::collections::HashMap;
+    use tempfile::NamedTempFile;
+
+    fn create_cursor_db(rows: &[(String, String)]) -> NamedTempFile {
+        let file = NamedTempFile::new().expect("temp cursor db should be created");
+        let conn = Connection::open(file.path()).expect("cursor temp db should open");
+        conn.execute_batch(
+            "CREATE TABLE cursorDiskKV (
+                key   TEXT PRIMARY KEY,
+                value TEXT
+            );",
+        )
+        .expect("cursor temp db schema should be created");
+        for (key, value) in rows {
+            conn.execute(
+                "INSERT INTO cursorDiskKV (key, value) VALUES (?1, ?2)",
+                params![key, value],
+            )
+            .expect("cursor temp db row should insert");
+        }
+        file
+    }
 
     #[test]
     fn extracts_default_when_it_is_the_only_model_hint() {
@@ -800,5 +844,207 @@ mod tests {
             extract_project_path(&data).as_deref(),
             Some("C:/dev/paceflow/paceflow-backend")
         );
+    }
+
+    #[test]
+    fn session_ingest_uses_shared_tool_edits_for_latest_style_sessions() {
+        let source = create_cursor_db(&[
+            (
+                "composerData:c_tool".to_string(),
+                json!({
+                    "composerId": "c_tool",
+                    "conversation": [{"type": 1, "text": "refactor these files"}],
+                    "filesChangedCount": 2,
+                    "totalLinesAdded": 3,
+                    "totalLinesRemoved": 2,
+                    "originalFileStates": {
+                        "file:///tmp/repo/src/plan.ts": {
+                            "firstEditBubbleId": "bubble-plan",
+                            "content": "old\n"
+                        },
+                        "file:///tmp/repo/src/assignment.ts": {
+                            "firstEditBubbleId": "bubble-assign",
+                            "content": "before\n"
+                        }
+                    }
+                })
+                .to_string(),
+            ),
+            (
+                "bubbleId:c_tool:bubble-plan".to_string(),
+                json!({
+                    "type": 2,
+                    "text": "",
+                    "toolFormerData": {
+                        "status": "completed",
+                        "name": "edit_file_v2",
+                        "toolCallId": "call-plan",
+                        "params": "{\"relativeWorkspacePath\":\"/tmp/repo/src/plan.ts\",\"streamingContent\":\"@@\\n-old\\n+new\\n+another\\n\"}"
+                    }
+                })
+                .to_string(),
+            ),
+            (
+                "bubbleId:c_tool:bubble-assign".to_string(),
+                json!({
+                    "type": 2,
+                    "text": "",
+                    "toolFormerData": {
+                        "status": "completed",
+                        "name": "edit_file_v2",
+                        "toolCallId": "call-assign",
+                        "params": "{\"relativeWorkspacePath\":\"/tmp/repo/src/assignment.ts\",\"streamingContent\":\"@@\\n-before\\n+after\\n\"}"
+                    }
+                })
+                .to_string(),
+            ),
+        ]);
+
+        let analytics = Connection::open_in_memory().expect("analytics db should open");
+        init_app_schema(&analytics).expect("analytics schema should initialize");
+
+        let rows = vec![(
+            "composerData:c_tool".to_string(),
+            json!({
+                "composerId": "c_tool",
+                "conversation": [{"type": 1, "text": "refactor these files"}],
+                "filesChangedCount": 2,
+                "totalLinesAdded": 3,
+                "totalLinesRemoved": 2,
+                "originalFileStates": {
+                    "file:///tmp/repo/src/plan.ts": {
+                        "firstEditBubbleId": "bubble-plan",
+                        "content": "old\n"
+                    },
+                    "file:///tmp/repo/src/assignment.ts": {
+                        "firstEditBubbleId": "bubble-assign",
+                        "content": "before\n"
+                    }
+                }
+            })
+            .to_string(),
+        )];
+
+        let source_conn = Connection::open(source.path()).expect("cursor temp db should reopen");
+        let written = ingest_planned_sessions_from_source(
+            &analytics,
+            &source_conn,
+            source.path().to_string_lossy().as_ref(),
+            &rows,
+            &HashMap::new(),
+            false,
+            None,
+        )
+        .expect("latest-style session should ingest");
+        assert!(written >= 3);
+
+        let mut stmt = analytics
+            .prepare(
+                "SELECT abs_path, lines_added, lines_removed
+                 FROM fact_session_code_change
+                 WHERE provider='cursor' AND session_id='c_tool' AND source_kind='accepted_change'
+                 ORDER BY abs_path",
+            )
+            .expect("accepted change query should prepare");
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })
+            .expect("accepted change rows should map")
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .expect("accepted change rows should collect");
+
+        assert_eq!(
+            rows,
+            vec![
+                ("/tmp/repo/src/assignment.ts".to_string(), 1, 1),
+                ("/tmp/repo/src/plan.ts".to_string(), 2, 1),
+            ]
+        );
+    }
+
+    #[test]
+    fn session_ingest_uses_shared_apply_patch_edits_for_older_sessions() {
+        let source = create_cursor_db(&[
+            (
+                "composerData:c_patch".to_string(),
+                json!({
+                    "composerId": "c_patch",
+                    "conversation": [{"type": 1, "text": "update the page object"}],
+                    "filesChangedCount": 1,
+                    "originalFileStates": {
+                        "file:///tmp/repo/tests/pages/user-support-po.ts": {
+                            "firstEditBubbleId": "bubble-patch",
+                            "content": "old line\n"
+                        }
+                    }
+                })
+                .to_string(),
+            ),
+            (
+                "bubbleId:c_patch:bubble-patch".to_string(),
+                json!({
+                    "type": 2,
+                    "text": "",
+                    "toolFormerData": {
+                        "status": "completed",
+                        "name": "apply_patch",
+                        "toolCallId": "call-patch",
+                        "params": "{\"relativeWorkspacePath\":\"tests/pages/user-support-po.ts\"}",
+                        "rawArgs": "*** Begin Patch\n*** Update File: tests/pages/user-support-po.ts\n@@\n-old line\n+new line\n*** End Patch"
+                    }
+                })
+                .to_string(),
+            ),
+        ]);
+
+        let analytics = Connection::open_in_memory().expect("analytics db should open");
+        init_app_schema(&analytics).expect("analytics schema should initialize");
+
+        let rows = vec![(
+            "composerData:c_patch".to_string(),
+            json!({
+                "composerId": "c_patch",
+                "conversation": [{"type": 1, "text": "update the page object"}],
+                "filesChangedCount": 1,
+                "originalFileStates": {
+                    "file:///tmp/repo/tests/pages/user-support-po.ts": {
+                        "firstEditBubbleId": "bubble-patch",
+                        "content": "old line\n"
+                    }
+                }
+            })
+            .to_string(),
+        )];
+
+        let source_conn = Connection::open(source.path()).expect("cursor temp db should reopen");
+        ingest_planned_sessions_from_source(
+            &analytics,
+            &source_conn,
+            source.path().to_string_lossy().as_ref(),
+            &rows,
+            &HashMap::new(),
+            false,
+            None,
+        )
+        .expect("older apply_patch session should ingest");
+
+        let row: (String, i64, i64) = analytics
+            .query_row(
+                "SELECT abs_path, lines_added, lines_removed
+                 FROM fact_session_code_change
+                 WHERE provider='cursor' AND session_id='c_patch' AND source_kind='accepted_change'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("older accepted change should be present");
+
+        assert_eq!(row.0, "/tmp/repo/tests/pages/user-support-po.ts");
+        assert_eq!(row.1, 1);
+        assert_eq!(row.2, 1);
     }
 }
