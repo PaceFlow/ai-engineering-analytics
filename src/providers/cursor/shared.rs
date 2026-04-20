@@ -353,7 +353,7 @@ pub(crate) fn aggregate_file_edits(edits: &[ResolvedFileEdit]) -> Vec<Aggregated
     }
 
     let mut out: Vec<_> = by_path.into_values().collect();
-    out.sort_by(|left, right| left.abs_path.cmp(&right.abs_path));
+    out.sort_by_key(|edit| edit.abs_path.clone());
     out
 }
 
@@ -553,9 +553,7 @@ fn populate_bubbles(
     }
 
     for graph in graphs.iter_mut() {
-        graph
-            .bubble_events
-            .sort_by(|left, right| left.order_key.cmp(&right.order_key));
+        graph.bubble_events.sort_by_key(|event| event.order_key);
     }
 
     Ok(())
