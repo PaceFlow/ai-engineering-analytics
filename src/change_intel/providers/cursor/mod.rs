@@ -19,7 +19,7 @@ use crate::providers::cursor::shared::{
     CursorSessionGraph, load_cursor_session_graphs, resolve_tool_call_edits,
 };
 use crate::ingest_progress::IngestProgressObserver;
-use crate::path_utils::{normalize_filesystem_path, path_to_string, strip_file_scheme};
+use crate::path_utils::{normalize_filesystem_path, path_to_string};
 
 const CURSOR_CURSOR_NAMESPACE: &str = "cursor_core_v1";
 const INLINE_PARSER_NAME: &str = "cursor_inline_undo_v1";
@@ -39,6 +39,14 @@ const REPO_CONTENT_SKIP_DIRS: &[&str] = &[
     ".venv",
     "coverage",
 ];
+
+/// `(call_id, timestamp, [(partial_id, payload)])` accumulated per abs_path
+/// when grouping pathless partial fates that resolve to the same file.
+type NewPartialGroup = (String, Option<String>, Vec<(String, Value)>);
+
+/// Ranking tuple returned by `score_new_schema_inline_hint`. Ordered
+/// lexicographically so higher values win in a `max_by_key` / sort.
+type InlineHintScore = (usize, usize, usize, usize, usize);
 
 #[derive(Debug, Clone)]
 struct CandidateSession {
@@ -323,78 +331,6 @@ pub(crate) fn ingest_cursor_code_changes_from_path(
     Ok(summary)
 }
 
-fn collect_candidate_sessions(
-    vscdb: &Connection,
-    source_file: &str,
-) -> Result<HashMap<String, CandidateSession>> {
-    let mut out = HashMap::new();
-
-    let mut stmt =
-        vscdb.prepare("SELECT key, value FROM cursorDiskKV WHERE key LIKE 'composerData:%'")?;
-
-    let rows = stmt.query_map([], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
-    })?;
-
-    for row in rows {
-        let (key, raw) = match row {
-            Ok(row) => row,
-            Err(_) => continue,
-        };
-        let Some(raw) = raw else {
-            continue;
-        };
-        let parsed: Value = match serde_json::from_str(&raw) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-
-        let composer_id = parsed
-            .get("composerId")
-            .and_then(|v| v.as_str())
-            .map(ToOwned::to_owned)
-            .or_else(|| key.strip_prefix("composerData:").map(ToOwned::to_owned));
-        let Some(composer_id) = composer_id else {
-            continue;
-        };
-
-        if !is_candidate_session(&parsed) {
-            continue;
-        }
-
-        let last_seen_at = parsed
-            .get("lastUpdatedAt")
-            .and_then(|v| v.as_i64())
-            .and_then(ms_to_iso);
-
-        let partial_targets = extract_partial_targets(&parsed);
-        let legacy_targets = extract_legacy_targets(&parsed);
-
-        out.insert(
-            composer_id.clone(),
-            CandidateSession {
-                info: SessionInfo {
-                    provider: "cursor".to_string(),
-                    session_id: composer_id,
-                    source_file: source_file.to_string(),
-                    session_cwd: None,
-                    last_seen_at,
-                },
-                checkpoint_paths: HashSet::new(),
-                strong_path_hints: extract_session_strong_path_hints(&parsed),
-                weak_path_hints: extract_session_weak_path_hints(&parsed),
-                original_state_contents: extract_original_state_contents(&parsed),
-                total_lines_added: parsed.get("totalLinesAdded").and_then(|v| v.as_i64()),
-                total_lines_removed: parsed.get("totalLinesRemoved").and_then(|v| v.as_i64()),
-                partial_targets,
-                legacy_targets,
-            },
-        );
-    }
-
-    Ok(out)
-}
-
 fn collect_candidate_sessions_from_graphs(
     graphs: &HashMap<String, CursorSessionGraph>,
 ) -> HashMap<String, CandidateSession> {
@@ -458,144 +394,6 @@ fn collect_candidate_sessions_from_graphs(
     }
 
     sessions
-}
-
-fn populate_checkpoint_paths(
-    vscdb: &Connection,
-    sessions: &mut HashMap<String, CandidateSession>,
-) -> Result<()> {
-    if sessions.is_empty() {
-        return Ok(());
-    }
-
-    let mut stmt =
-        vscdb.prepare("SELECT key, value FROM cursorDiskKV WHERE key LIKE 'checkpointId:%'")?;
-
-    let rows = stmt.query_map([], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
-    })?;
-
-    for row in rows {
-        let (key, raw) = match row {
-            Ok(row) => row,
-            Err(_) => continue,
-        };
-        let Some(raw) = raw else {
-            continue;
-        };
-        let Some(composer_id) = composer_id_from_checkpoint_key(&key) else {
-            continue;
-        };
-
-        let Some(session) = sessions.get_mut(composer_id) else {
-            continue;
-        };
-
-        let parsed: Value = match serde_json::from_str(&raw) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-
-        let files = match parsed.get("files").and_then(|v| v.as_array()) {
-            Some(v) => v,
-            None => continue,
-        };
-
-        for file in files {
-            let abs_path = file.get("uri").and_then(extract_file_path_from_uri_value);
-            if let Some(path) = abs_path {
-                session.checkpoint_paths.insert(path);
-            }
-        }
-    }
-
-    Ok(())
-}
-
-fn extract_session_strong_path_hints(parsed: &Value) -> HashSet<String> {
-    let mut paths = HashSet::new();
-
-    if let Some(selections) = parsed
-        .get("context")
-        .and_then(|v| v.get("fileSelections"))
-        .and_then(|v| v.as_array())
-    {
-        for selection in selections {
-            let Some(path) = selection
-                .get("uri")
-                .and_then(extract_file_path_from_uri_value)
-            else {
-                continue;
-            };
-            if !is_cursor_plan_path(&path) {
-                paths.insert(path);
-            }
-        }
-    }
-
-    if let Some(attached) = parsed
-        .get("allAttachedFileCodeChunksUris")
-        .and_then(|v| v.as_array())
-    {
-        for uri in attached {
-            let Some(uri) = uri.as_str() else {
-                continue;
-            };
-            let path = strip_file_scheme(uri);
-            if !is_cursor_plan_path(&path) {
-                paths.insert(path);
-            }
-        }
-    }
-
-    if let Some(code_block_data) = parsed.get("codeBlockData").and_then(|v| v.as_object()) {
-        for file_key in code_block_data.keys() {
-            let Some(path) = extract_file_path_from_string(file_key) else {
-                continue;
-            };
-            if !is_cursor_plan_path(&path) {
-                paths.insert(path);
-            }
-        }
-    }
-
-    paths
-}
-
-fn extract_session_weak_path_hints(parsed: &Value) -> HashSet<String> {
-    let mut paths = HashSet::new();
-
-    if let Some(original_states) = parsed.get("originalFileStates").and_then(|v| v.as_object()) {
-        for uri in original_states.keys() {
-            let path = strip_file_scheme(uri);
-            if !is_cursor_plan_path(&path) {
-                paths.insert(path);
-            }
-        }
-    }
-
-    paths
-}
-
-fn extract_original_state_contents(parsed: &Value) -> HashMap<String, String> {
-    let mut contents = HashMap::new();
-
-    let Some(original_states) = parsed.get("originalFileStates").and_then(|v| v.as_object()) else {
-        return contents;
-    };
-
-    for (uri, state) in original_states {
-        let path = strip_file_scheme(uri);
-        if is_cursor_plan_path(&path) {
-            continue;
-        }
-        let Some(content) = state.get("content").and_then(|v| v.as_str()) else {
-            continue;
-        };
-        contents.insert(path, content.to_string());
-    }
-
-    contents
 }
 
 fn ingest_tool_call_writes(
@@ -844,8 +642,7 @@ fn ingest_new_schema_partial_fates(
             .cloned()
             .unwrap_or_default();
 
-        let mut grouped_by_path: HashMap<String, (String, Option<String>, Vec<(String, Value)>)> =
-            HashMap::new();
+        let mut grouped_by_path: HashMap<String, NewPartialGroup> = HashMap::new();
         let mut deferred_errors: HashMap<String, (String, Option<String>)> = HashMap::new();
 
         for (partial_id, payload) in partials {
@@ -1017,21 +814,20 @@ fn resolve_new_schema_partial_path(
         }));
     }
 
-    let scored_inline: Vec<((usize, usize, usize, usize, usize), &NewInlineHint)> =
-        inline_candidates
-            .iter()
-            .map(|hint| {
-                (
-                    score_new_schema_inline_hint(
-                        session,
-                        hint,
-                        &removed_lines,
-                        removed_lines.is_empty(),
-                    ),
-                    *hint,
-                )
-            })
-            .collect();
+    let scored_inline: Vec<(InlineHintScore, &NewInlineHint)> = inline_candidates
+        .iter()
+        .map(|hint| {
+            (
+                score_new_schema_inline_hint(
+                    session,
+                    hint,
+                    &removed_lines,
+                    removed_lines.is_empty(),
+                ),
+                *hint,
+            )
+        })
+        .collect();
 
     if let Some((score, hint)) = scored_inline.iter().max_by_key(|(score, _)| *score) {
         let best_score = *score;
@@ -1350,6 +1146,7 @@ fn repo_candidate_paths_from_added_lines(
     out
 }
 
+#[allow(clippy::too_many_arguments)]
 fn score_new_schema_content_candidate(
     session: &CandidateSession,
     abs_path: &str,
@@ -2220,149 +2017,6 @@ fn insert_legacy_parse_error(
     Ok(())
 }
 
-fn extract_partial_targets(parsed: &Value) -> Vec<PartialTarget> {
-    let mut out: HashSet<PartialTarget> = HashSet::new();
-
-    let Some(code_block_data) = parsed.get("codeBlockData").and_then(|v| v.as_object()) else {
-        return Vec::new();
-    };
-
-    for (file_key, value) in code_block_data {
-        let entries: Vec<&Value> = if let Some(list) = value.as_array() {
-            list.iter().collect()
-        } else if let Some(map) = value.as_object() {
-            map.values().collect()
-        } else {
-            Vec::new()
-        };
-
-        for entry in entries {
-            let Some(entry_obj) = entry.as_object() else {
-                continue;
-            };
-            if entry_obj.get("status").and_then(|v| v.as_str()) != Some("accepted") {
-                continue;
-            }
-
-            let Some(partial_id) = entry_obj
-                .get("partialInlineDiffFatesId")
-                .and_then(|v| v.as_str())
-                .map(ToOwned::to_owned)
-            else {
-                continue;
-            };
-
-            let abs_path = entry_obj
-                .get("uri")
-                .and_then(extract_file_path_from_uri_value)
-                .or_else(|| extract_file_path_from_string(file_key));
-
-            let Some(abs_path) = abs_path else {
-                continue;
-            };
-            if is_cursor_plan_path(&abs_path) {
-                continue;
-            }
-
-            out.insert(PartialTarget {
-                partial_id,
-                abs_path,
-            });
-        }
-    }
-
-    out.into_iter().collect()
-}
-
-fn extract_legacy_targets(parsed: &Value) -> Vec<LegacyTarget> {
-    let Some(code_block_data) = parsed.get("codeBlockData").and_then(|v| v.as_object()) else {
-        return Vec::new();
-    };
-
-    let default_timestamp = parsed
-        .get("lastUpdatedAt")
-        .and_then(|v| v.as_i64())
-        .and_then(ms_to_iso)
-        .or_else(|| {
-            parsed
-                .get("createdAt")
-                .and_then(|v| v.as_i64())
-                .and_then(ms_to_iso)
-        });
-
-    let mut targets = Vec::new();
-
-    for (file_key, value) in code_block_data {
-        let entries: Vec<&Value> = if let Some(list) = value.as_array() {
-            list.iter().collect()
-        } else if let Some(map) = value.as_object() {
-            map.values().collect()
-        } else {
-            Vec::new()
-        };
-
-        for entry in entries {
-            let Some(entry_obj) = entry.as_object() else {
-                continue;
-            };
-            if entry_obj.get("status").and_then(|v| v.as_str()) != Some("accepted") {
-                continue;
-            }
-            if entry_obj.get("isNotApplied").and_then(|v| v.as_bool()) == Some(true) {
-                continue;
-            }
-            if entry_obj.get("isNoOp").and_then(|v| v.as_bool()) == Some(true) {
-                continue;
-            }
-
-            let abs_path = entry_obj
-                .get("uri")
-                .and_then(extract_file_path_from_uri_value)
-                .or_else(|| extract_file_path_from_string(file_key));
-            let Some(abs_path) = abs_path else {
-                continue;
-            };
-            if is_cursor_plan_path(&abs_path) {
-                continue;
-            }
-
-            let diff_id = entry_obj
-                .get("diffId")
-                .and_then(|v| v.as_str())
-                .map(ToOwned::to_owned);
-            let content = entry_obj
-                .get("content")
-                .and_then(|v| v.as_str())
-                .map(ToOwned::to_owned);
-
-            if diff_id.is_none() && content.is_none() {
-                continue;
-            }
-
-            targets.push(LegacyTarget {
-                diff_id,
-                abs_path,
-                version: entry_obj
-                    .get("version")
-                    .and_then(|v| v.as_i64())
-                    .unwrap_or(0) as i32,
-                code_block_idx: entry_obj
-                    .get("codeBlockIdx")
-                    .and_then(|v| v.as_i64())
-                    .unwrap_or(0) as i32,
-                timestamp: default_timestamp.clone(),
-                content,
-                bubble_id: entry_obj
-                    .get("bubbleId")
-                    .and_then(|v| v.as_str())
-                    .map(ToOwned::to_owned),
-            });
-        }
-    }
-
-    targets
-}
-
 fn parse_string_array(value: Option<&Value>) -> Vec<String> {
     let Some(value) = value else {
         return Vec::new();
@@ -2420,93 +2074,9 @@ fn is_contentful_content_match_line(line: &str) -> bool {
     trimmed.len() >= 3 && trimmed.chars().any(char::is_alphanumeric)
 }
 
-fn is_candidate_session(parsed: &Value) -> bool {
-    let files_changed = parsed
-        .get("filesChangedCount")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0);
-    let total_added = parsed
-        .get("totalLinesAdded")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0);
-    let total_removed = parsed
-        .get("totalLinesRemoved")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0);
-    let subtitle = parsed
-        .get("subtitle")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_ascii_lowercase();
-
-    files_changed > 0
-        || total_added > 0
-        || total_removed > 0
-        || subtitle.contains("edited ")
-        || subtitle.contains("updated ")
-        || !extract_legacy_targets(parsed).is_empty()
-}
-
-fn extract_file_path_from_uri_value(uri: &Value) -> Option<String> {
-    match uri {
-        Value::Object(map) => {
-            if let Some(scheme) = map.get("scheme").and_then(|v| v.as_str())
-                && scheme != "file"
-            {
-                return None;
-            }
-
-            if let Some(fs_path) = map.get("fsPath").and_then(|v| v.as_str()) {
-                return Some(normalize_filesystem_path(fs_path));
-            }
-
-            if let Some(external) = map.get("external").and_then(|v| v.as_str()) {
-                return extract_file_path_from_string(external);
-            }
-
-            if let Some(path) = map.get("path").and_then(|v| v.as_str()) {
-                return Some(normalize_filesystem_path(path));
-            }
-
-            None
-        }
-        Value::String(s) => extract_file_path_from_string(s),
-        _ => None,
-    }
-}
-
-fn extract_file_path_from_string(raw: &str) -> Option<String> {
-    if raw.starts_with("file://") {
-        return Some(strip_file_scheme(raw));
-    }
-    if raw.starts_with("vscode-notebook-cell:") {
-        return None;
-    }
-    if raw.contains("://") {
-        return None;
-    }
-    Some(normalize_filesystem_path(raw))
-}
-
 fn is_cursor_plan_path(path: &str) -> bool {
     let normalized = normalize_filesystem_path(path);
     normalized.contains("/.cursor/plans/") || normalized.ends_with("/.cursor/plans")
-}
-
-fn composer_id_from_checkpoint_key(key: &str) -> Option<&str> {
-    let mut parts = key.splitn(3, ':');
-    if parts.next()? != "checkpointId" {
-        return None;
-    }
-    parts.next()
-}
-
-fn partial_fates_key_parts(key: &str) -> Option<(&str, &str)> {
-    let mut parts = key.splitn(3, ':');
-    if parts.next()? != "codeBlockPartialInlineDiffFates" {
-        return None;
-    }
-    Some((parts.next()?, parts.next()?))
 }
 
 fn file_signature(path: &Path) -> Result<Option<(i64, i64)>> {
@@ -3170,33 +2740,6 @@ mod tests {
 
         cleanup(&source);
         Ok(())
-    }
-
-    #[test]
-    fn old_cursor_sessions_with_accepted_code_blocks_are_candidates() {
-        let parsed = json!({
-            "composerId": "legacy_sess",
-            "createdAt": 1772694178155i64,
-            "lastUpdatedAt": 1772694194894i64,
-            "codeBlockData": {
-                "file:///tmp/repo/legacy.txt": [
-                    {
-                        "status": "accepted",
-                        "diffId": "legacy-diff",
-                        "version": 0,
-                        "codeBlockIdx": 0,
-                        "uri": {"scheme": "file", "fsPath": "/tmp/repo/legacy.txt"}
-                    }
-                ]
-            }
-        });
-
-        assert!(is_candidate_session(&parsed));
-
-        let targets = extract_legacy_targets(&parsed);
-        assert_eq!(targets.len(), 1);
-        assert_eq!(targets[0].diff_id.as_deref(), Some("legacy-diff"));
-        assert_eq!(targets[0].abs_path, "/tmp/repo/legacy.txt");
     }
 
     #[test]

@@ -82,11 +82,9 @@ impl CursorSessionGraph {
 
 #[derive(Debug, Clone)]
 pub(crate) struct CursorBubbleEvent {
-    pub bubble_id: String,
     pub role: Option<CursorBubbleRole>,
     pub text: Option<String>,
     pub order_key: i64,
-    pub model_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -139,7 +137,6 @@ impl CursorToolCall {
 pub(crate) struct CursorOriginalFileState {
     pub content: Option<String>,
     pub first_edit_bubble_id: Option<String>,
-    pub is_newly_created: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -159,26 +156,6 @@ pub(crate) struct CursorLegacyTarget {
     pub bubble_id: Option<String>,
 }
 
-impl CursorLegacyTarget {
-    pub fn call_id(&self) -> String {
-        self.diff_id
-            .clone()
-            .or_else(|| self.bubble_id.clone())
-            .unwrap_or_else(|| {
-                format!(
-                    "legacy-content:{}:{}:{}",
-                    self.abs_path, self.version, self.code_block_idx
-                )
-            })
-    }
-
-    pub fn op_index(&self) -> i32 {
-        self.version
-            .saturating_mul(1000)
-            .saturating_add(self.code_block_idx.max(0))
-    }
-}
-
 #[derive(Debug, Clone)]
 pub(crate) struct CursorInlineHint {
     pub call_id: String,
@@ -195,17 +172,6 @@ pub(crate) struct CursorInlineUndoRow {
     pub payload: JsonValue,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CursorEvidenceTier {
-    ToolCall,
-    InlineUndo,
-    PartialTarget,
-    NewSchema,
-    LegacyDiff,
-    LegacyContent,
-    SessionTotals,
-}
-
 #[derive(Debug, Clone)]
 pub(crate) struct ResolvedFileEdit {
     pub abs_path: String,
@@ -218,7 +184,6 @@ pub(crate) struct ResolvedFileEdit {
     pub removed_lines: i64,
     pub parser_name: String,
     pub line_hashes: Vec<LineHashCount>,
-    pub evidence_tier: CursorEvidenceTier,
 }
 
 #[derive(Debug, Clone)]
@@ -262,8 +227,6 @@ struct ConversationBubble {
 struct ConversationHeader {
     #[serde(rename = "bubbleId")]
     bubble_id: String,
-    #[serde(rename = "type")]
-    bubble_type: i64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -369,7 +332,6 @@ pub(crate) fn resolve_tool_call_edits(graph: &CursorSessionGraph) -> Vec<Resolve
             removed_lines: removed_lines.len() as i64,
             parser_name: format!("cursor_tool_{}_v1", tool.name),
             line_hashes,
-            evidence_tier: CursorEvidenceTier::ToolCall,
         });
     }
 
@@ -417,11 +379,9 @@ fn build_seed_graph(key: &str, raw: &str, source_file: &str) -> Option<CursorSes
             _ => None,
         };
         conversation_messages.push(CursorBubbleEvent {
-            bubble_id: format!("conversation:{idx}"),
             role,
             text: bubble.text.clone(),
             order_key: idx as i64,
-            model_name: None,
         });
     }
 
@@ -567,11 +527,9 @@ fn populate_bubbles(
             .map(ToOwned::to_owned);
 
         graphs[graph_idx].bubble_events.push(CursorBubbleEvent {
-            bubble_id: bubble_id.to_string(),
             role,
             text: text.clone(),
             order_key,
-            model_name: model_name.clone(),
         });
 
         if graphs[graph_idx].model_name.is_none() {
@@ -884,14 +842,13 @@ fn parse_tool_call(
     dedupe_vec(&mut path_hints);
 
     let mut patch_texts = Vec::new();
-    if name == "edit_file_v2" {
-        if let Some(params_json) = params_json.as_ref()
-            && let Some(streaming) = params_json
-                .get("streamingContent")
-                .and_then(|value| value.as_str())
-        {
-            patch_texts.push(streaming.to_string());
-        }
+    if name == "edit_file_v2"
+        && let Some(params_json) = params_json.as_ref()
+        && let Some(streaming) = params_json
+            .get("streamingContent")
+            .and_then(|value| value.as_str())
+    {
+        patch_texts.push(streaming.to_string());
     }
     if name == "apply_patch" {
         if status.as_deref() == Some("completed")
@@ -903,10 +860,10 @@ fn parse_tool_call(
             collect_result_diff_strings(result_json, &mut patch_texts);
         }
     }
-    if matches!(name.as_str(), "write_file" | "write_file_v2") {
-        if let Some(result_json) = result_json.as_ref() {
-            collect_result_diff_strings(result_json, &mut patch_texts);
-        }
+    if matches!(name.as_str(), "write_file" | "write_file_v2")
+        && let Some(result_json) = result_json.as_ref()
+    {
+        collect_result_diff_strings(result_json, &mut patch_texts);
     }
     dedupe_vec(&mut patch_texts);
 
@@ -1058,10 +1015,6 @@ fn extract_original_file_states(
                     .get("firstEditBubbleId")
                     .and_then(|value| value.as_str())
                     .map(ToOwned::to_owned),
-                is_newly_created: state
-                    .get("isNewlyCreated")
-                    .and_then(|value| value.as_bool())
-                    .unwrap_or(false),
             },
         );
     }
@@ -1503,34 +1456,6 @@ pub(crate) fn parse_string_array(value: Option<&JsonValue>) -> Vec<String> {
         .collect()
 }
 
-pub(crate) fn accepted_partial_fate_lines(
-    payload: &JsonValue,
-) -> std::result::Result<(Vec<String>, Vec<String>), String> {
-    let fates = payload
-        .get("fates")
-        .and_then(|value| value.as_array())
-        .ok_or_else(|| "partial fates payload missing 'fates' array".to_string())?;
-
-    let mut added_lines = Vec::new();
-    let mut removed_lines = Vec::new();
-    for fate in fates {
-        let Some(fate_obj) = fate.as_object() else {
-            continue;
-        };
-        if fate_obj.get("fate").and_then(|value| value.as_str()) != Some("accepted") {
-            continue;
-        }
-        if let Some(added) = fate_obj.get("addedLines") {
-            added_lines.extend(parse_string_array(Some(added)));
-        }
-        if let Some(removed) = fate_obj.get("removedLines") {
-            removed_lines.extend(parse_string_array(Some(removed)));
-        }
-    }
-
-    Ok((added_lines, removed_lines))
-}
-
 pub(crate) fn extract_patch_lines(text: &str) -> (Vec<String>, Vec<String>) {
     let mut added = Vec::new();
     let mut removed = Vec::new();
@@ -1698,7 +1623,6 @@ mod tests {
                 CursorOriginalFileState {
                     content: Some("old\n".to_string()),
                     first_edit_bubble_id: Some("bubble-1".to_string()),
-                    is_newly_created: false,
                 },
             )]),
             partial_targets: Vec::new(),
@@ -1754,16 +1678,4 @@ mod tests {
         assert_eq!(graphs[0].composer_id, "real-session");
     }
 
-    #[test]
-    fn extracts_partial_fate_lines_from_accepted_fates_only() {
-        let payload = json!({
-            "fates": [
-                {"fate": "rejected", "addedLines": ["x"], "removedLines": ["y"]},
-                {"fate": "accepted", "addedLines": ["a"], "removedLines": ["b", "c"]}
-            ]
-        });
-        let (added, removed) = accepted_partial_fate_lines(&payload).expect("payload should parse");
-        assert_eq!(added, vec!["a"]);
-        assert_eq!(removed, vec!["b", "c"]);
-    }
 }

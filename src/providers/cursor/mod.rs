@@ -1,8 +1,6 @@
 use anyhow::{Context, Result};
-use chrono::TimeZone;
-use rusqlite::{Connection, OpenFlags, params};
+use rusqlite::{Connection, OpenFlags};
 use serde::Deserialize;
-use serde_json::Value as JsonValue;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
@@ -10,14 +8,12 @@ use super::utils::diff_line_counts;
 use crate::cursor_paths::{cursor_history_path, cursor_state_path};
 pub(crate) mod shared;
 
+use crate::db;
+use crate::ingest_progress::IngestProgressObserver;
+use crate::path_utils::strip_file_scheme;
 use shared::{
     CursorBubbleRole, CursorSessionGraph, aggregate_file_edits,
     load_cursor_session_graphs_from_rows, resolve_tool_call_edits,
-};
-use crate::db;
-use crate::ingest_progress::IngestProgressObserver;
-use crate::path_utils::{
-    detect_repo_root, normalize_filesystem_path, path_to_string, strip_file_scheme,
 };
 
 pub fn plan_composer_rows() -> Result<Vec<(String, String)>> {
@@ -53,7 +49,7 @@ pub fn ingest_planned_sessions(
     db: &Connection,
     composer_rows: &[(String, String)],
     verbose: bool,
-    mut progress: Option<&mut dyn IngestProgressObserver>,
+    progress: Option<&mut dyn IngestProgressObserver>,
 ) -> Result<usize> {
     if composer_rows.is_empty() {
         return Ok(0);
@@ -143,67 +139,6 @@ pub(crate) fn ingest_planned_sessions_from_source(
     Ok(total_rows)
 }
 
-// ── Serde types ──────────────────────────────────────────────────────────────
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ComposerData {
-    composer_id: String,
-    #[serde(default)]
-    conversation: Vec<ConversationBubble>,
-    #[serde(default)]
-    full_conversation_headers_only: Vec<ConversationHeader>,
-    total_lines_added: Option<i64>,
-    total_lines_removed: Option<i64>,
-    context: Option<ComposerContext>,
-    created_at: Option<i64>,
-    last_updated_at: Option<i64>,
-    #[serde(default)]
-    code_block_data: HashMap<String, Vec<CodeBlock>>,
-    #[serde(default)]
-    all_attached_file_code_chunks_uris: Vec<String>,
-    #[serde(default)]
-    original_file_states: HashMap<String, JsonValue>,
-}
-
-#[derive(Deserialize)]
-struct ConversationBubble {
-    #[serde(rename = "type")]
-    bubble_type: Option<i64>, // 1 = user, 2 = assistant
-    text: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct ConversationHeader {
-    #[serde(rename = "bubbleId")]
-    bubble_id: String,
-    #[serde(rename = "type")]
-    bubble_type: i64,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ComposerContext {
-    #[serde(default)]
-    file_selections: Vec<FileSelection>,
-}
-
-#[derive(Deserialize)]
-struct FileSelection {
-    uri: Option<FileUri>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct FileUri {
-    fs_path: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct CodeBlock {
-    status: Option<String>, // "accepted" | "rejected" | "cancelled"
-}
-
 // ── History index ─────────────────────────────────────────────────────────────
 
 pub(crate) struct HistoryEntry {
@@ -291,16 +226,6 @@ fn build_history_index(history_root: &Path) -> HistoryIndex {
 }
 
 // ── Session ingestion ─────────────────────────────────────────────────────────
-
-fn ingest_composer(
-    _db: &Connection,
-    _vscdb: &Connection,
-    _json_text: &str,
-    _history_index: &HistoryIndex,
-    _verbose: bool,
-) -> Result<usize> {
-    Ok(0)
-}
 
 fn ingest_session_graph(
     db: &Connection,
@@ -507,238 +432,9 @@ fn cursor_history_root() -> Result<Option<PathBuf>> {
     cursor_history_path()
 }
 
-/// Convert millisecond epoch to ISO-8601 string.
-fn ms_to_iso(ms: i64) -> String {
-    let secs = ms / 1000;
-    match chrono::Utc.timestamp_opt(secs, 0) {
-        chrono::LocalResult::Single(dt) => dt.to_rfc3339(),
-        _ => format!("{}", ms),
-    }
-}
-
-/// Return the common ancestor directory of all file paths referenced in the
-/// composer context. Falls back to the first `codeBlockData` key on failure.
-fn extract_project_path(data: &ComposerData) -> Option<String> {
-    let mut paths: Vec<String> = Vec::new();
-
-    if let Some(ctx) = &data.context {
-        for sel in &ctx.file_selections {
-            if let Some(uri) = &sel.uri
-                && let Some(p) = &uri.fs_path
-            {
-                paths.push(normalize_filesystem_path(p));
-            }
-        }
-    }
-
-    // Fallback: use allAttachedFileCodeChunksUris (new-schema sessions)
-    if paths.is_empty() {
-        for uri in &data.all_attached_file_code_chunks_uris {
-            paths.push(strip_file_scheme(uri));
-        }
-    }
-
-    // Fallback: use originalFileStates keys (file URIs of files edited in session)
-    if paths.is_empty() {
-        for uri in data.original_file_states.keys() {
-            paths.push(strip_file_scheme(uri));
-        }
-    }
-
-    // Fallback: use codeBlockData keys (file URIs)
-    if paths.is_empty() {
-        for key in data.code_block_data.keys() {
-            paths.push(strip_file_scheme(key));
-        }
-    }
-
-    if paths.is_empty() {
-        return None;
-    }
-
-    let raw_path = common_ancestor_path(&paths).unwrap_or_else(|| PathBuf::from(&paths[0]));
-    let path = raw_path.as_path();
-    if let Some(root) = detect_repo_root(path) {
-        return Some(path_to_string(&root));
-    }
-
-    if path.extension().is_some() {
-        path.parent()
-            .map(|parent| normalize_filesystem_path(parent.to_string_lossy().as_ref()))
-    } else {
-        Some(normalize_filesystem_path(
-            raw_path.to_string_lossy().as_ref(),
-        ))
-    }
-}
-
-fn common_ancestor_path(paths: &[String]) -> Option<PathBuf> {
-    let mut common: Vec<_> = Path::new(paths.first()?).components().collect();
-
-    for raw_path in paths.iter().skip(1) {
-        let components: Vec<_> = Path::new(raw_path).components().collect();
-        let shared_len = common
-            .iter()
-            .zip(components.iter())
-            .take_while(|(left, right)| left == right)
-            .count();
-        common.truncate(shared_len);
-        if common.is_empty() {
-            break;
-        }
-    }
-
-    if common.is_empty() {
-        return None;
-    }
-
-    let mut out = PathBuf::new();
-    for component in common {
-        out.push(component.as_os_str());
-    }
-
-    Some(out)
-}
-
-fn extract_model_name(raw: &JsonValue) -> Option<String> {
-    const MODEL_KEYS: &[&str] = &[
-        "model",
-        "modelName",
-        "currentModel",
-        "selectedModel",
-        "defaultModel",
-        "defaultModelSlug",
-        "chatModel",
-    ];
-
-    fn visit(value: &JsonValue, include_default: bool) -> Option<String> {
-        match value {
-            JsonValue::Object(map) => {
-                if let Some(candidate) = usage_data_model_key(map, include_default) {
-                    return Some(candidate);
-                }
-                for key in MODEL_KEYS {
-                    if let Some(candidate) = map
-                        .get(*key)
-                        .and_then(|value| model_string_from_value(value, include_default))
-                    {
-                        return Some(candidate);
-                    }
-                }
-                for value in map.values() {
-                    if let Some(candidate) = visit(value, include_default) {
-                        return Some(candidate);
-                    }
-                }
-                None
-            }
-            JsonValue::Array(values) => values
-                .iter()
-                .find_map(|value| visit(value, include_default)),
-            _ => None,
-        }
-    }
-
-    visit(raw, false).or_else(|| visit(raw, true))
-}
-
-fn extract_model_name_from_bubbles(
-    vscdb: &Connection,
-    session_id: &str,
-    headers: &[ConversationHeader],
-) -> Option<String> {
-    headers
-        .iter()
-        .filter(|header| header.bubble_type == 2)
-        .find_map(|header| {
-            let key = format!("bubbleId:{}:{}", session_id, header.bubble_id);
-            let raw: String = vscdb
-                .query_row(
-                    "SELECT value FROM cursorDiskKV WHERE key = ?1",
-                    params![key],
-                    |row| row.get(0),
-                )
-                .ok()?;
-            let bubble: JsonValue = serde_json::from_str(&raw).ok()?;
-            extract_bubble_model_name(&bubble)
-        })
-}
-
-fn extract_bubble_model_name(raw: &JsonValue) -> Option<String> {
-    raw.get("modelInfo")
-        .and_then(|value| value.get("modelName"))
-        .and_then(|value| value.as_str())
-        .and_then(|value| {
-            let trimmed = value.trim();
-            (!trimmed.is_empty()).then(|| trimmed.to_string())
-        })
-}
-
-fn usage_data_model_key(
-    map: &serde_json::Map<String, JsonValue>,
-    include_default: bool,
-) -> Option<String> {
-    map.get("usageData")
-        .and_then(|value| value.as_object())
-        .and_then(|usage_data| {
-            usage_data
-                .keys()
-                .find_map(|key| model_string_from_candidate(key, include_default))
-        })
-}
-
-fn model_string_from_value(value: &JsonValue, include_default: bool) -> Option<String> {
-    match value {
-        JsonValue::String(value) => model_string_from_candidate(value.trim(), include_default),
-        JsonValue::Object(map) => {
-            for key in ["name", "slug", "id", "model"] {
-                if let Some(candidate) = map
-                    .get(key)
-                    .and_then(|value| model_string_from_value(value, include_default))
-                {
-                    return Some(candidate);
-                }
-            }
-            None
-        }
-        _ => None,
-    }
-}
-
-fn model_string_from_candidate(candidate: &str, include_default: bool) -> Option<String> {
-    if candidate.is_empty() {
-        return None;
-    }
-
-    let lowered = candidate.to_ascii_lowercase();
-    if lowered == "default" {
-        return include_default.then(|| "default".to_string());
-    }
-
-    if lowered.contains("gpt")
-        || lowered.contains("claude")
-        || lowered.contains("gemini")
-        || lowered.contains("sonnet")
-        || lowered.contains("haiku")
-        || lowered.contains("opus")
-        || lowered.contains("o1")
-        || lowered.contains("o3")
-        || lowered.contains("deepseek")
-        || lowered.contains("llama")
-        || lowered.contains("qwen")
-    {
-        return Some(candidate.to_string());
-    }
-
-    None
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{
-        ComposerData, extract_bubble_model_name, extract_model_name, extract_project_path,
-        ingest_planned_sessions_from_source,
-    };
+    use super::ingest_planned_sessions_from_source;
     use crate::db::init_app_schema;
     use rusqlite::{Connection, params};
     use serde_json::json;
@@ -763,87 +459,6 @@ mod tests {
             .expect("cursor temp db row should insert");
         }
         file
-    }
-
-    #[test]
-    fn extracts_default_when_it_is_the_only_model_hint() {
-        let raw = json!({
-            "modelConfig": {
-                "modelName": "default"
-            }
-        });
-
-        assert_eq!(extract_model_name(&raw).as_deref(), Some("default"));
-    }
-
-    #[test]
-    fn prefers_usage_data_model_key_over_default_literal() {
-        let raw = json!({
-            "modelConfig": {
-                "modelName": "default"
-            },
-            "usageData": {
-                "claude-3.5-sonnet": {
-                    "costInCents": 4,
-                    "amount": 1
-                }
-            }
-        });
-
-        assert_eq!(
-            extract_model_name(&raw).as_deref(),
-            Some("claude-3.5-sonnet")
-        );
-    }
-
-    #[test]
-    fn extracts_model_from_nested_usage_data_keys() {
-        let raw = json!({
-            "nested": {
-                "usageData": {
-                    "claude-3.7-sonnet-thinking": {
-                        "costInCents": 12
-                    }
-                }
-            }
-        });
-
-        assert_eq!(
-            extract_model_name(&raw).as_deref(),
-            Some("claude-3.7-sonnet-thinking")
-        );
-    }
-
-    #[test]
-    fn extracts_model_from_bubble_model_info() {
-        let raw = json!({
-            "modelInfo": {
-                "modelName": "gpt-5.2-codex-xhigh"
-            }
-        });
-
-        assert_eq!(
-            extract_bubble_model_name(&raw).as_deref(),
-            Some("gpt-5.2-codex-xhigh")
-        );
-    }
-
-    #[test]
-    fn extract_project_path_decodes_percent_encoded_windows_file_uris() {
-        let data: ComposerData = serde_json::from_value(json!({
-            "composerId": "c1",
-            "conversation": [{"type": 1, "text": "hi"}],
-            "allAttachedFileCodeChunksUris": [
-                "file:///c%3A/dev/paceflow/paceflow-backend/src/lib.rs",
-                "file:///c%3A/dev/paceflow/paceflow-backend/tests/session.rs"
-            ]
-        }))
-        .expect("cursor test fixture should deserialize");
-
-        assert_eq!(
-            extract_project_path(&data).as_deref(),
-            Some("C:/dev/paceflow/paceflow-backend")
-        );
     }
 
     #[test]
