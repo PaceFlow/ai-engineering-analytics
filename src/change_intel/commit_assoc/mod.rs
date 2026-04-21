@@ -182,6 +182,9 @@ pub fn run_with_plan(
                 "validate_repo",
                 "path is not a git repository",
             )?;
+            if let Some(observer) = progress.as_mut() {
+                observer.advance(&format!("{} warmup skipped", repo_root));
+            }
             summary.repo_summaries.push(repo_summary);
             continue;
         }
@@ -193,11 +196,17 @@ pub fn run_with_plan(
             repo_summary.errors += 1;
             summary.errors += 1;
             insert_commit_assoc_error(conn, &repo_root, None, stage, message)?;
+            if let Some(observer) = progress.as_mut() {
+                observer.advance(&format!("{} warmup failed", repo_root));
+            }
             summary.repo_summaries.push(repo_summary);
             continue;
         }
 
         if !should_process_repo(repo_plan) {
+            if let Some(observer) = progress.as_mut() {
+                observer.advance(&format!("{} warmup skipped", repo_root));
+            }
             continue;
         }
 
@@ -271,6 +280,9 @@ fn process_repo_plan(
     } else {
         None
     };
+    if let Some(observer) = progress.as_mut() {
+        observer.advance(&format!("{} warmup complete", repo_root));
+    }
 
     for work in &repo_plan.commits {
         repo_summary.commits_scanned += 1;

@@ -14,7 +14,7 @@ pub enum ProviderSessionPlan {
         session_files: Vec<PathBuf>,
     },
     Cursor {
-        composer_rows: Vec<(String, String)>,
+        composer_keys: Vec<String>,
     },
 }
 
@@ -22,7 +22,7 @@ impl ProviderSessionPlan {
     pub fn item_count(&self) -> usize {
         match self {
             Self::Codex { session_files } => session_files.len(),
-            Self::Cursor { composer_rows } => composer_rows.len(),
+            Self::Cursor { composer_keys } => composer_keys.len(),
         }
     }
 }
@@ -47,7 +47,7 @@ impl Provider {
                 session_files: codex::plan_session_files()?,
             }),
             Self::Cursor => Ok(ProviderSessionPlan::Cursor {
-                composer_rows: cursor::plan_composer_rows()?,
+                composer_keys: cursor::plan_composer_rows()?,
             }),
         }
     }
@@ -64,8 +64,8 @@ impl Provider {
             (Self::Codex, ProviderSessionPlan::Codex { session_files }) => {
                 codex::ingest_planned_sessions(db, session_files, verbose, progress)
             }
-            (Self::Cursor, ProviderSessionPlan::Cursor { composer_rows }) => {
-                cursor::ingest_planned_sessions(db, composer_rows, verbose, progress)
+            (Self::Cursor, ProviderSessionPlan::Cursor { composer_keys }) => {
+                cursor::ingest_planned_sessions(db, composer_keys, verbose, progress)
             }
             _ => anyhow::bail!("provider plan mismatch for {}", self.name()),
         }

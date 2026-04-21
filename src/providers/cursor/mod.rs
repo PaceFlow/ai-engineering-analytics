@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::{Connection, OpenFlags, params};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -16,7 +16,7 @@ use shared::{
     load_cursor_session_graphs_from_rows, resolve_tool_call_edits,
 };
 
-pub fn plan_composer_rows() -> Result<Vec<(String, String)>> {
+pub fn plan_composer_rows() -> Result<Vec<String>> {
     let vscdb_path = match cursor_vscdb_path()? {
         Some(path) => path,
         None => return Ok(Vec::new()),
@@ -28,18 +28,11 @@ pub fn plan_composer_rows() -> Result<Vec<(String, String)>> {
     )
     .with_context(|| format!("Failed to open {:?} — is Cursor running?", vscdb_path))?;
 
-    let mut stmt =
-        vscdb.prepare("SELECT key, value FROM cursorDiskKV WHERE key LIKE 'composerData:%'")?;
+    let mut stmt = vscdb.prepare("SELECT key FROM cursorDiskKV WHERE key LIKE 'composerData:%'")?;
 
     let rows = stmt
-        .query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
-        })?
-        .filter_map(|row| match row {
-            Ok((key, Some(value))) => Some((key, value)),
-            Ok((_key, None)) => None,
-            Err(_) => None,
-        })
+        .query_map([], |row| row.get::<_, String>(0))?
+        .filter_map(|row| row.ok())
         .collect();
 
     Ok(rows)
@@ -47,11 +40,11 @@ pub fn plan_composer_rows() -> Result<Vec<(String, String)>> {
 
 pub fn ingest_planned_sessions(
     db: &Connection,
-    composer_rows: &[(String, String)],
+    composer_keys: &[String],
     verbose: bool,
     progress: Option<&mut dyn IngestProgressObserver>,
 ) -> Result<usize> {
-    if composer_rows.is_empty() {
+    if composer_keys.is_empty() {
         return Ok(0);
     }
 
@@ -88,11 +81,28 @@ pub fn ingest_planned_sessions(
         eprintln!("[cursor] history index: {} file(s)", history_index.len());
     }
 
+    // Planning only captures composer keys so we do not pull every large JSON blob into memory
+    // before ingest starts. Values are fetched lazily here when we are ready to process.
+    let composer_rows: Vec<(String, String)> = composer_keys
+        .iter()
+        .filter_map(|key| {
+            let value: Option<String> = vscdb
+                .query_row(
+                    "SELECT value FROM cursorDiskKV WHERE key = ?1",
+                    params![key],
+                    |row| row.get(0),
+                )
+                .ok()
+                .flatten();
+            value.map(|value| (key.clone(), value))
+        })
+        .collect();
+
     ingest_planned_sessions_from_source(
         db,
         &vscdb,
         &vscdb_path.to_string_lossy(),
-        composer_rows,
+        &composer_rows,
         &history_index,
         verbose,
         progress,

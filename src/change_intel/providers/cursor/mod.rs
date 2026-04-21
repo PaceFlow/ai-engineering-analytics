@@ -202,7 +202,15 @@ pub fn ingest_cursor_code_changes_from_sources(
     };
 
     for source in sources {
-        let summary = ingest_cursor_code_changes_from_path(conn, source, verbose)?;
+        let summary = match progress.as_mut() {
+            Some(observer) => ingest_cursor_code_changes_from_path_with_progress(
+                conn,
+                source,
+                verbose,
+                Some(&mut **observer),
+            )?,
+            None => ingest_cursor_code_changes_from_path_with_progress(conn, source, verbose, None)?,
+        };
         combined.sources_discovered += summary.sources_discovered;
         combined.sources_skipped += summary.sources_skipped;
         combined.tool_calls_inspected += summary.tool_calls_inspected;
@@ -213,10 +221,6 @@ pub fn ingest_cursor_code_changes_from_sources(
         combined.legacy_diff_rows_found += summary.legacy_diff_rows_found;
         combined.legacy_ops_upserted += summary.legacy_ops_upserted;
         combined.legacy_parse_errors += summary.legacy_parse_errors;
-
-        if let Some(observer) = progress.as_mut() {
-            observer.advance(&source.to_string_lossy());
-        }
     }
 
     Ok(combined)
@@ -226,6 +230,15 @@ pub(crate) fn ingest_cursor_code_changes_from_path(
     conn: &mut Connection,
     vscdb_path: &Path,
     verbose: bool,
+) -> Result<ProviderCodeChangeSummary> {
+    ingest_cursor_code_changes_from_path_with_progress(conn, vscdb_path, verbose, None)
+}
+
+fn ingest_cursor_code_changes_from_path_with_progress(
+    conn: &mut Connection,
+    vscdb_path: &Path,
+    verbose: bool,
+    mut progress: Option<&mut dyn IngestProgressObserver>,
 ) -> Result<ProviderCodeChangeSummary> {
     let mut summary = ProviderCodeChangeSummary {
         provider: "cursor".to_string(),
@@ -243,6 +256,9 @@ pub(crate) fn ingest_cursor_code_changes_from_path(
             && cursor.file_size == size
         {
             summary.sources_skipped += 1;
+            if let Some(observer) = progress.as_mut() {
+                observer.advance("cursor changes (cached)");
+            }
             return Ok(summary);
         }
     }
@@ -251,14 +267,23 @@ pub(crate) fn ingest_cursor_code_changes_from_path(
         vscdb_path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )?;
+    if let Some(observer) = progress.as_mut() {
+        observer.advance("cursor vscdb opened");
+    }
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
 
     let graphs = load_cursor_session_graphs(&vscdb, &source_file)?;
+    if let Some(observer) = progress.as_mut() {
+        observer.advance("cursor session graphs loaded");
+    }
     let graph_by_session: HashMap<String, CursorSessionGraph> = graphs
         .into_iter()
         .map(|graph| (graph.composer_id.clone(), graph))
         .collect();
     let sessions = collect_candidate_sessions_from_graphs(&graph_by_session);
+    if let Some(observer) = progress.as_mut() {
+        observer.advance("cursor candidate sessions collected");
+    }
 
     for session in sessions.values() {
         storage::upsert_change_session(&tx, &session.info)?;
@@ -318,6 +343,9 @@ pub(crate) fn ingest_cursor_code_changes_from_path(
         &mut summary,
         verbose,
     )?;
+    if let Some(observer) = progress.as_mut() {
+        observer.advance("cursor tool writes parsed");
+    }
 
     let reconcile = storage::reconcile_source_tool_writes(&tx, "cursor", &source_file, &ops)?;
     summary.ops_upserted += reconcile.ops_upserted;
@@ -325,8 +353,14 @@ pub(crate) fn ingest_cursor_code_changes_from_path(
     if let Some((mtime, size)) = sig {
         storage::upsert_ingest_cursor(&tx, CURSOR_CURSOR_NAMESPACE, &source_file, mtime, size)?;
     }
+    if let Some(observer) = progress.as_mut() {
+        observer.advance("cursor tool writes reconciled");
+    }
 
     tx.commit()?;
+    if let Some(observer) = progress.as_mut() {
+        observer.advance("cursor source committed");
+    }
 
     Ok(summary)
 }

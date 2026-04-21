@@ -768,6 +768,9 @@ pub fn refresh_commit_events(
                     shorten_repo(&repo_root)
                 );
             }
+            if let Some(observer) = progress.as_deref_mut() {
+                observer.advance(&format!("{} cache skipped", shorten_repo(&repo_root)));
+            }
             continue;
         }
         let repo_key = sync_identity::repo_key_for_repo_root(Some(&repo_root));
@@ -790,6 +793,9 @@ pub fn refresh_commit_events(
 
         let derived = derive_repo_commit_events(&tx, &repo_root, &repo_commits, verbose)?;
         repos_processed += 1;
+        if let Some(observer) = progress.as_deref_mut() {
+            observer.advance(&format!("{} caches ready", shorten_repo(&repo_root)));
+        }
 
         for (commit_index, commit) in repo_commits.iter().enumerate() {
             let event = derived

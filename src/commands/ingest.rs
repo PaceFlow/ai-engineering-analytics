@@ -269,7 +269,7 @@ pub fn run(verbose: bool) -> Result<()> {
             }
         }
     }
-    if github_summary.repos_considered > 0 {
+    if github_commit_evidence_changed(&github_summary) {
         if verbose {
             println!("\nRe-materializing commit events with GitHub evidence ...");
         }
@@ -284,6 +284,8 @@ pub fn run(verbose: bool) -> Result<()> {
                 commit_refresh.elapsed_ms as f64 / 1000.0
             );
         }
+    } else if verbose && github_summary.repos_considered > 0 {
+        println!("\nSkipping re-materialization: GitHub sync produced no commit evidence changes");
     }
     if let Some(status) = compact_github_status {
         println!("{status}");
@@ -321,8 +323,8 @@ fn estimate_execution_units(
     let estimated_commit_count = existing_commit_count
         .max(planned_work_units)
         .max(estimated_repo_count * 25);
-    let association_units_estimate = estimated_repo_count + estimated_commit_count;
-    let commit_materialization_units_estimate = estimated_commit_count;
+    let association_units_estimate = (estimated_repo_count * 2) + estimated_commit_count;
+    let commit_materialization_units_estimate = estimated_repo_count + estimated_commit_count;
 
     Ok((
         association_units_estimate,
@@ -333,5 +335,20 @@ fn estimate_execution_units(
 fn count_commit_materialization_units(db: &Connection) -> Result<usize> {
     let commit_count: i64 =
         db.query_row("SELECT COUNT(*) FROM fact_commit", [], |row| row.get(0))?;
-    Ok(commit_count.max(0) as usize)
+    let repo_count: i64 = db.query_row(
+        "SELECT COUNT(DISTINCT repo_root)
+         FROM fact_commit
+         WHERE repo_root IS NOT NULL AND TRIM(repo_root) != ''",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok((commit_count.max(0) + repo_count.max(0)) as usize)
+}
+
+fn github_commit_evidence_changed(summary: &github::types::GitHubSyncSummary) -> bool {
+    summary.commit_lookups_completed > 0
+        || summary.open_pull_requests_refreshed > 0
+        || summary.issue_scans_refreshed > 0
+        || summary.issue_fix_pull_requests_upserted > 0
+        || summary.pull_request_removed_hashes_upserted > 0
 }

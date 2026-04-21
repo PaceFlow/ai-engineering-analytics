@@ -7,7 +7,7 @@ pub struct AssociationWorkPlan {
 
 impl AssociationWorkPlan {
     pub fn total_units(&self) -> usize {
-        self.repo_plans.len()
+        (self.repo_plans.len() * 2)
             + self
                 .repo_plans
                 .iter()
