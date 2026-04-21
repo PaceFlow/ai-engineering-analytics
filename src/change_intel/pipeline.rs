@@ -42,6 +42,15 @@ impl ProviderCodeChangePlan {
     pub fn item_count(&self) -> usize {
         self.sources.len()
     }
+
+    pub fn progress_unit_count(&self) -> usize {
+        if self.provider == "cursor" {
+            // Cursor ingestion has several expensive passes over one vscdb source.
+            // Reserve multiple ticks so progress keeps moving during warmup-heavy stages.
+            return self.sources.len().saturating_mul(6);
+        }
+        self.item_count()
+    }
 }
 
 #[derive(Debug, Clone, Default)]

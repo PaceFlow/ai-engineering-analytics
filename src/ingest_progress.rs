@@ -19,7 +19,7 @@ impl ProviderWorkPlan {
     }
 
     pub fn code_change_units(&self) -> usize {
-        self.code_change_plan.item_count()
+        self.code_change_plan.progress_unit_count()
     }
 }
 
@@ -321,7 +321,7 @@ mod tests {
             }],
         };
 
-        assert_eq!(plan.total_units(), 1);
+        assert_eq!(plan.total_units(), 2);
     }
 
     #[test]

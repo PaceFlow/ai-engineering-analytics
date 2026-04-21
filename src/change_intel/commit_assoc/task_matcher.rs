@@ -253,7 +253,7 @@ fn parse_ticket_prefix(segment: &str) -> Option<String> {
     }
 
     let mut i = 0usize;
-    while i < bytes.len() && bytes[i].is_ascii_uppercase() {
+    while i < bytes.len() && bytes[i].is_ascii_alphabetic() {
         i += 1;
     }
     if i == 0 || i >= bytes.len() || bytes[i] != b'-' {
@@ -268,5 +268,35 @@ fn parse_ticket_prefix(segment: &str) -> Option<String> {
         return None;
     }
 
-    Some(segment[..j].to_string())
+    let prefix = segment[..i].to_ascii_uppercase();
+    Some(format!("{}-{}", prefix, &segment[i + 1..j]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{extract_task_key, parse_ticket_prefix};
+
+    #[test]
+    fn parse_ticket_prefix_accepts_lowercase_and_normalizes_to_uppercase() {
+        assert_eq!(
+            parse_ticket_prefix("pac-611-untrack-an-identity"),
+            Some("PAC-611".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_ticket_prefix_keeps_uppercase_ticket_prefixes() {
+        assert_eq!(
+            parse_ticket_prefix("PAC-611-untrack-an-identity"),
+            Some("PAC-611".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_task_key_uses_normalized_ticket_from_branch_segment() {
+        assert_eq!(
+            extract_task_key("feature/pac-611-untrack-an-identity-when-linked-person-gets-deleted"),
+            "PAC-611"
+        );
+    }
 }
