@@ -1,26 +1,37 @@
-# `paceflow` release
+# `paceflow` v0.2.1
 
-This is the `v0.2.0` release of `paceflow`.
+This release focuses on Cursor ingest reliability, newer Cursor session support, and clearer ingest progress.
 
 Download the archive for your platform from the Assets section below, extract it, and run `paceflow --help`.
 
-Highlights in `v0.2.0`:
+## Highlights
 
-- Default model-grouped report views with `--overall` summary mode
-- Updated report docs and examples for `--model` filtering and `Mainline Reach`
-- Release metadata and install snippets aligned to the current repository and `v0.2.0`
+- Unified Cursor session and code-change parsing around a shared `CursorSessionGraph`.
+- Added Cursor tool-call code-change parsers for newer session structures, including explicit file edits from Cursor tool calls.
+- Improved ingest planning and progress output with more granular stages.
+- Reduced repeated materialization work during ingest.
+- Fixed task key extraction used by task and commit association.
 
-Quick start:
+## Fixes
 
-- `paceflow ingest`
-- `paceflow session`
-- `paceflow delivery`
-- `paceflow quality`
+- Fixed task key extraction for branch/task association.
+- Fixed ingest progress test behavior.
+- Removed release-blocking lint warnings.
 
-Requirements:
+## Upgrade Notes
 
-- Git must be installed and available on `PATH`
-- Cursor and/or Codex local session data must exist on the machine
+- No database migration or CLI flag changes are required.
+- Re-run `paceflow ingest` after upgrading to refresh Cursor-derived session and code-change facts.
+- Existing commands continue to work:
+  - `paceflow ingest`
+  - `paceflow session`
+  - `paceflow delivery`
+  - `paceflow quality`
+
+## Requirements
+
+- Git must be installed and available on `PATH`.
+- Cursor and/or Codex local session data must exist on the machine.
 
 If Cursor data lives in a non-standard location, use:
 
