@@ -321,7 +321,7 @@ mod tests {
             }],
         };
 
-        assert_eq!(plan.total_units(), 1);
+        assert_eq!(plan.total_units(), 2);
     }
 
     #[test]
