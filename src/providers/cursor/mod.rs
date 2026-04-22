@@ -1,8 +1,9 @@
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OpenFlags, params};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::time::UNIX_EPOCH;
 
 use super::utils::diff_line_counts;
 use crate::cursor_paths::{cursor_history_path, cursor_state_path};
@@ -208,8 +209,10 @@ pub(crate) fn ingest_planned_sessions_from_source(
 
 // ── History index ─────────────────────────────────────────────────────────────
 
+#[derive(Serialize, Deserialize, Clone)]
 pub(crate) struct HistoryEntry {
     id: String,
+    #[serde(default)]
     source: String,
     timestamp: i64,
     dir_path: PathBuf,
@@ -217,19 +220,90 @@ pub(crate) struct HistoryEntry {
 
 pub(crate) type HistoryIndex = HashMap<String, Vec<HistoryEntry>>;
 
-fn build_history_index(history_root: &Path) -> HistoryIndex {
-    use rayon::prelude::*;
+/// Current disk format version for the history index cache. Bump when the
+/// on-disk shape changes incompatibly.
+const HISTORY_CACHE_VERSION: u32 = 1;
 
-    let dir_iter = match std::fs::read_dir(history_root) {
-        Ok(it) => it,
-        Err(_) => return HistoryIndex::new(),
+#[derive(Serialize, Deserialize)]
+struct HistoryIndexCache {
+    #[serde(rename = "v")]
+    version: u32,
+    // history_root -> (mtime_ms, size) per-dir signature.
+    signatures: HashMap<String, (i128, u64)>,
+    // file_path -> entries, matching `HistoryIndex`.
+    entries: HashMap<String, Vec<HistoryEntry>>,
+}
+
+fn history_cache_path() -> Option<PathBuf> {
+    // Mirrors `db::open_at_home`: honour `PACEFLOW_HOME` first, then `$HOME`.
+    let home = std::env::var_os("PACEFLOW_HOME")
+        .map(PathBuf::from)
+        .or_else(dirs::home_dir)?;
+    let app_dir = home.join(".paceflow");
+    // Best-effort; callers tolerate absence.
+    std::fs::create_dir_all(&app_dir).ok()?;
+    Some(app_dir.join("cursor_history_index.cache.json"))
+}
+
+fn dir_signature(entries_json: &Path) -> Option<(i128, u64)> {
+    // Signatures just need to be stable; the exact unit doesn't matter. We use
+    // signed millis-since-epoch so that clocks which sit before UNIX_EPOCH
+    // (some VMs, some embedded devices) still round-trip uniquely.
+    let meta = std::fs::metadata(entries_json).ok()?;
+    let size = meta.len();
+    let modified = meta.modified().ok()?;
+    let mtime = match modified.duration_since(UNIX_EPOCH) {
+        Ok(d) => d.as_millis() as i128,
+        Err(e) => -(e.duration().as_millis() as i128),
     };
+    Some((mtime, size))
+}
 
-    let dir_paths: Vec<PathBuf> = dir_iter
+fn collect_dir_paths(history_root: &Path) -> Vec<PathBuf> {
+    let Ok(dir_iter) = std::fs::read_dir(history_root) else {
+        return Vec::new();
+    };
+    dir_iter
         .flatten()
         .map(|e| e.path())
         .filter(|p| p.is_dir())
-        .collect();
+        .collect()
+}
+
+fn compute_signatures(dir_paths: &[PathBuf]) -> HashMap<String, (i128, u64)> {
+    dir_paths
+        .iter()
+        .filter_map(|dir| {
+            let entries_json = dir.join("entries.json");
+            let sig = dir_signature(&entries_json)?;
+            Some((dir.to_string_lossy().into_owned(), sig))
+        })
+        .collect()
+}
+
+fn load_history_cache(path: &Path) -> Option<HistoryIndexCache> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    let cache: HistoryIndexCache = serde_json::from_str(&raw).ok()?;
+    if cache.version != HISTORY_CACHE_VERSION {
+        return None;
+    }
+    Some(cache)
+}
+
+fn save_history_cache(path: &Path, cache: &HistoryIndexCache) {
+    // Atomic-ish write: write to tmp, rename over target. Failure is non-fatal -
+    // a missing/corrupt cache just forces a rebuild on the next run.
+    let Ok(json) = serde_json::to_vec(cache) else {
+        return;
+    };
+    let tmp = path.with_extension("cache.json.tmp");
+    if std::fs::write(&tmp, &json).is_ok() {
+        let _ = std::fs::rename(&tmp, path);
+    }
+}
+
+fn build_history_index_fresh(dir_paths: &[PathBuf]) -> HistoryIndex {
+    use rayon::prelude::*;
 
     #[derive(Deserialize)]
     struct EntriesFile {
@@ -245,8 +319,8 @@ fn build_history_index(history_root: &Path) -> HistoryIndex {
         timestamp: Option<i64>,
     }
 
-    // Reading 247 small `entries.json` files serially - each with its own
-    // open/read/parse - is almost entirely syscall-bound. Rayon lets the
+    // Reading ~hundreds of small `entries.json` files serially - each with its
+    // own open/read/parse - is almost entirely syscall-bound. Rayon lets the
     // kernel service those opens concurrently without any shared state.
     let per_dir: Vec<(String, Vec<HistoryEntry>)> = dir_paths
         .par_iter()
@@ -279,14 +353,48 @@ fn build_history_index(history_root: &Path) -> HistoryIndex {
         index.entry(file_path).or_default().extend(entries);
     }
 
-    // Sort each file's entries by timestamp after merging (shouldn't have multiple
-    // dirs per file in practice, but be safe)
     for v in index.values_mut() {
         v.sort_by_key(|e| e.timestamp);
     }
 
     index
 }
+
+fn build_history_index(history_root: &Path) -> HistoryIndex {
+    let dir_paths = collect_dir_paths(history_root);
+    if dir_paths.is_empty() {
+        return HistoryIndex::new();
+    }
+
+    let current_sigs = compute_signatures(&dir_paths);
+
+    // Fast path: cache file exists and every dir's (mtime, size) is unchanged.
+    // The Cursor history directory grows by whole new dirs (one per edited file)
+    // and rarely mutates existing `entries.json` files, so this hits on almost
+    // every repeat run.
+    if let Some(cache_path) = history_cache_path() {
+        if let Some(cache) = load_history_cache(&cache_path) {
+            if cache.signatures == current_sigs {
+                return cache.entries;
+            }
+        }
+
+        let fresh = build_history_index_fresh(&dir_paths);
+        save_history_cache(
+            &cache_path,
+            &HistoryIndexCache {
+                version: HISTORY_CACHE_VERSION,
+                signatures: current_sigs,
+                entries: fresh.clone(),
+            },
+        );
+        return fresh;
+    }
+
+    // No writable home directory - skip the cache, just rebuild.
+    build_history_index_fresh(&dir_paths)
+}
+
 
 // ── Session ingestion ─────────────────────────────────────────────────────────
 
