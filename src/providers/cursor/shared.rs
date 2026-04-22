@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 
 use crate::change_intel::line_hash::hash_line;
 use crate::change_intel::types::{LineHashCount, LineSide, WriteMode};
+use crate::ingest_progress::IngestProgressObserver;
 use crate::path_utils::{
     detect_repo_root, normalize_filesystem_path, path_to_string, strip_file_scheme,
 };
@@ -274,13 +275,17 @@ struct FileUri {
     fs_path: Option<String>,
 }
 
-pub(crate) fn load_cursor_session_graphs_from_rows(
+pub(crate) fn load_cursor_session_graphs_from_rows_with_observer(
     vscdb: &Connection,
     source_file: &str,
     composer_rows: &[(String, String)],
+    mut observer: Option<&mut dyn IngestProgressObserver>,
 ) -> Result<Vec<CursorSessionGraph>> {
     use rayon::prelude::*;
 
+    if let Some(obs) = observer.as_mut() {
+        obs.set_phase("seed graphs");
+    }
     // `build_seed_graph` is pure CPU (`serde_json::from_str` twice on
     // potentially-large composer blobs). The Linux perf-stat showed the
     // ingest pinned at ~1.9 GHz on P-cores with 31-46% frontend-bound and
@@ -306,13 +311,22 @@ pub(crate) fn load_cursor_session_graphs_from_rows(
 
     let session_ids: HashSet<String> = graphs.iter().map(|g| g.composer_id.clone()).collect();
 
-    populate_graph_details(vscdb, &mut graphs, &session_ids)?;
+    populate_graph_details(vscdb, &mut graphs, &session_ids, observer)?;
     Ok(graphs)
 }
 
+#[cfg(test)]
 pub(crate) fn load_cursor_session_graphs(
     vscdb: &Connection,
     source_file: &str,
+) -> Result<Vec<CursorSessionGraph>> {
+    load_cursor_session_graphs_with_observer(vscdb, source_file, None)
+}
+
+pub(crate) fn load_cursor_session_graphs_with_observer(
+    vscdb: &Connection,
+    source_file: &str,
+    observer: Option<&mut dyn IngestProgressObserver>,
 ) -> Result<Vec<CursorSessionGraph>> {
     let mut stmt =
         vscdb.prepare("SELECT key, value FROM cursorDiskKV WHERE key LIKE 'composerData:%'")?;
@@ -327,7 +341,7 @@ pub(crate) fn load_cursor_session_graphs(
         })
         .collect::<std::result::Result<Vec<_>, _>>()?;
 
-    load_cursor_session_graphs_from_rows(vscdb, source_file, &rows)
+    load_cursor_session_graphs_from_rows_with_observer(vscdb, source_file, &rows, observer)
 }
 
 pub(crate) fn resolve_tool_call_edits(graph: &CursorSessionGraph) -> Vec<ResolvedFileEdit> {
@@ -488,6 +502,7 @@ fn populate_graph_details(
     vscdb: &Connection,
     graphs: &mut [CursorSessionGraph],
     session_ids: &HashSet<String>,
+    mut observer: Option<&mut dyn IngestProgressObserver>,
 ) -> Result<()> {
     if graphs.is_empty() {
         return Ok(());
@@ -498,12 +513,36 @@ fn populate_graph_details(
         by_session.insert(graph.composer_id.clone(), idx);
     }
 
+    if let Some(obs) = observer.as_mut() {
+        obs.set_phase("bubbles");
+    }
     populate_bubbles(vscdb, graphs, &by_session)?;
+
+    if let Some(obs) = observer.as_mut() {
+        obs.set_phase("checkpoints");
+    }
     populate_checkpoints(vscdb, graphs, &by_session)?;
+
+    if let Some(obs) = observer.as_mut() {
+        obs.set_phase("inline undo rows");
+    }
     populate_inline_undo_rows(vscdb, graphs, &by_session)?;
+
+    if let Some(obs) = observer.as_mut() {
+        obs.set_phase("inline hints");
+    }
     populate_inline_hints(vscdb, graphs, &by_session)?;
+
+    if let Some(obs) = observer.as_mut() {
+        obs.set_phase("partial fates");
+    }
     populate_partial_fates(vscdb, graphs, &by_session)?;
+
+    if let Some(obs) = observer.as_mut() {
+        obs.set_phase("legacy diffs");
+    }
     populate_legacy_diffs(vscdb, graphs, session_ids, &by_session)?;
+
     Ok(())
 }
 

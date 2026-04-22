@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, OpenFlags, params};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
@@ -14,7 +15,7 @@ use crate::ingest_progress::IngestProgressObserver;
 use crate::path_utils::strip_file_scheme;
 use shared::{
     CursorBubbleRole, CursorSessionGraph, aggregate_file_edits, build_seed_graph,
-    load_cursor_session_graphs_from_rows, resolve_tool_call_edits,
+    load_cursor_session_graphs_from_rows_with_observer, resolve_tool_call_edits,
 };
 
 pub fn plan_composer_rows() -> Result<Vec<String>> {
@@ -43,7 +44,7 @@ pub fn ingest_planned_sessions(
     db: &Connection,
     composer_keys: &[String],
     verbose: bool,
-    progress: Option<&mut dyn IngestProgressObserver>,
+    mut progress: Option<&mut dyn IngestProgressObserver>,
 ) -> Result<usize> {
     if composer_keys.is_empty() {
         return Ok(0);
@@ -66,6 +67,9 @@ pub fn ingest_planned_sessions(
         eprintln!("[cursor] opening {:?}", vscdb_path);
     }
 
+    if let Some(observer) = progress.as_mut() {
+        observer.set_phase("opening vscdb");
+    }
     let vscdb = Connection::open_with_flags(
         &vscdb_path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -75,6 +79,9 @@ pub fn ingest_planned_sessions(
     let history_index = if history_root.as_os_str().is_empty() {
         HashMap::new()
     } else {
+        if let Some(observer) = progress.as_mut() {
+            observer.set_phase("history index");
+        }
         build_history_index(&history_root)
     };
 
@@ -82,6 +89,9 @@ pub fn ingest_planned_sessions(
         eprintln!("[cursor] history index: {} file(s)", history_index.len());
     }
 
+    if let Some(observer) = progress.as_mut() {
+        observer.set_phase("composer rows");
+    }
     // Planning only captures composer keys so we do not pull every large JSON blob into memory
     // before ingest starts. Values are fetched lazily here when we are ready to process.
     let composer_rows: Vec<(String, String)> = composer_keys
@@ -126,6 +136,9 @@ pub(crate) fn ingest_planned_sessions_from_source(
     // nothing else writes to this connection during ingest.
     let tx = db.unchecked_transaction()?;
 
+    if let Some(observer) = progress.as_mut() {
+        observer.set_phase("existing sessions");
+    }
     // Partition composer rows into (already-ingested, new) by batch-querying
     // `metadata_sessions` once. Already-ingested sessions only need a cheap
     // metadata refresh and can skip the expensive `bubbleId:%` scan entirely.
@@ -144,6 +157,9 @@ pub(crate) fn ingest_planned_sessions_from_source(
 
     let mut total_rows = 0usize;
 
+    if let Some(observer) = progress.as_mut() {
+        observer.set_phase("refreshing existing");
+    }
     // Fast path: already-ingested sessions. We only need the small composer JSON
     // (`started_at`, `ended_at`, `project_path`, `model_name`) to refresh metadata;
     // we deliberately skip the per-session bubble scan and graph construction.
@@ -172,14 +188,33 @@ pub(crate) fn ingest_planned_sessions_from_source(
 
     // Slow path: new sessions get the full graph build + ingest.
     if !new_rows.is_empty() {
+        if let Some(observer) = progress.as_mut() {
+            observer.set_phase("seed graphs");
+        }
         let new_row_owned: Vec<(String, String)> =
             new_rows.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-        let graphs = load_cursor_session_graphs_from_rows(vscdb, source_file, &new_row_owned)?;
+        let graphs = match progress.as_mut() {
+            Some(obs) => load_cursor_session_graphs_from_rows_with_observer(
+                vscdb,
+                source_file,
+                &new_row_owned,
+                Some(&mut **obs),
+            )?,
+            None => load_cursor_session_graphs_from_rows_with_observer(
+                vscdb,
+                source_file,
+                &new_row_owned,
+                None,
+            )?,
+        };
         let by_session: HashMap<_, _> = graphs
             .into_iter()
             .map(|graph| (graph.composer_id.clone(), graph))
             .collect();
 
+        if let Some(observer) = progress.as_mut() {
+            observer.set_phase("writing sessions");
+        }
         for (key, _value) in &new_rows {
             let session_id = key.strip_prefix("composerData:").unwrap_or(key.as_str());
             let Some(graph) = by_session.get(session_id) else {
@@ -437,7 +472,10 @@ fn ingest_session_graph(
     let session_start_ms = graph.created_at_ms.unwrap_or(0);
     let session_end_ms = graph.last_updated_at_ms.unwrap_or(i64::MAX);
 
-    if verbose {
+    // Only log per-session progress in non-TTY mode. In TTY mode the progress
+    // bar already shows the current session label, and these eprintln! lines
+    // collide with the `\r`-rewritten bar, making it flicker/wrap.
+    if verbose && !std::io::stderr().is_terminal() {
         eprintln!(
             "[cursor] ingesting session {} ({})",
             &session_id[..session_id.len().min(8)],

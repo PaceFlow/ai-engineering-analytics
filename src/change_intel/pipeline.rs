@@ -45,9 +45,12 @@ impl ProviderCodeChangePlan {
 
     pub fn progress_unit_count(&self) -> usize {
         if self.provider == "cursor" {
-            // Cursor ingestion has several expensive passes over one vscdb source.
-            // Reserve multiple ticks so progress keeps moving during warmup-heavy stages.
-            return self.sources.len().saturating_mul(6);
+            // Cursor ingestion has 9 real sub-phases per vscdb source
+            // (open → graphs → candidates → tool writes → inline undo →
+            //  partial fates old → partial fates new → legacy blocks → commit).
+            // Reserve a tick for each so the progress bar actually moves
+            // during the long warmup-heavy stages instead of going silent.
+            return self.sources.len().saturating_mul(9);
         }
         self.item_count()
     }
