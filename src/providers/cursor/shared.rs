@@ -357,7 +357,11 @@ pub(crate) fn aggregate_file_edits(edits: &[ResolvedFileEdit]) -> Vec<Aggregated
     out
 }
 
-fn build_seed_graph(key: &str, raw: &str, source_file: &str) -> Option<CursorSessionGraph> {
+pub(crate) fn build_seed_graph(
+    key: &str,
+    raw: &str,
+    source_file: &str,
+) -> Option<CursorSessionGraph> {
     let raw_json: JsonValue = serde_json::from_str(raw).ok()?;
     let data: ComposerData = serde_json::from_str(raw).ok()?;
 

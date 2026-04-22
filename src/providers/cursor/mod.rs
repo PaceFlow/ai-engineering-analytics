@@ -12,7 +12,7 @@ use crate::db;
 use crate::ingest_progress::IngestProgressObserver;
 use crate::path_utils::strip_file_scheme;
 use shared::{
-    CursorBubbleRole, CursorSessionGraph, aggregate_file_edits,
+    CursorBubbleRole, CursorSessionGraph, aggregate_file_edits, build_seed_graph,
     load_cursor_session_graphs_from_rows, resolve_tool_call_edits,
 };
 
@@ -118,12 +118,6 @@ pub(crate) fn ingest_planned_sessions_from_source(
     verbose: bool,
     mut progress: Option<&mut dyn IngestProgressObserver>,
 ) -> Result<usize> {
-    let graphs = load_cursor_session_graphs_from_rows(vscdb, source_file, composer_rows)?;
-    let by_session: HashMap<_, _> = graphs
-        .into_iter()
-        .map(|graph| (graph.composer_id.clone(), graph))
-        .collect();
-
     // Batch all per-session writes into a single sqlite transaction. With stock
     // defaults every small insert would trigger its own fsync, which on Linux
     // dominates wall-clock time for ingest (see paceflow.perf-stat.txt).
@@ -131,25 +125,79 @@ pub(crate) fn ingest_planned_sessions_from_source(
     // nothing else writes to this connection during ingest.
     let tx = db.unchecked_transaction()?;
 
-    let mut total_rows = 0usize;
-    for (key, _value) in composer_rows {
-        let session_id = key.strip_prefix("composerData:").unwrap_or(key);
-        let Some(graph) = by_session.get(session_id) else {
-            continue;
-        };
+    // Partition composer rows into (already-ingested, new) by batch-querying
+    // `metadata_sessions` once. Already-ingested sessions only need a cheap
+    // metadata refresh and can skip the expensive `bubbleId:%` scan entirely.
+    let candidate_ids: Vec<&str> = composer_rows
+        .iter()
+        .map(|(key, _)| key.strip_prefix("composerData:").unwrap_or(key.as_str()))
+        .collect();
+    let already_present = db::sessions_present(db, &candidate_ids)?;
 
-        match ingest_session_graph(db, graph, history_index, verbose) {
-            Ok(0) => {}
-            Ok(n) => total_rows += n,
-            Err(e) => {
-                if verbose {
-                    eprintln!("[cursor] skipping session: {}", e);
-                }
+    let (existing_rows, new_rows): (Vec<&(String, String)>, Vec<&(String, String)>) = composer_rows
+        .iter()
+        .partition(|(key, _)| {
+            let sid = key.strip_prefix("composerData:").unwrap_or(key.as_str());
+            already_present.contains(sid)
+        });
+
+    let mut total_rows = 0usize;
+
+    // Fast path: already-ingested sessions. We only need the small composer JSON
+    // (`started_at`, `ended_at`, `project_path`, `model_name`) to refresh metadata;
+    // we deliberately skip the per-session bubble scan and graph construction.
+    for (key, raw) in &existing_rows {
+        if let Some(seed) = build_seed_graph(key, raw, source_file) {
+            if let Err(e) = db::upsert_metadata_session_with_model(
+                db,
+                "cursor",
+                &seed.composer_id,
+                seed.project_path.as_deref(),
+                seed.started_at.as_deref(),
+                seed.ended_at.as_deref().or(seed.started_at.as_deref()),
+                Some("cursor"),
+                Some("cursor"),
+                seed.model_name.as_deref(),
+            ) && verbose
+            {
+                eprintln!("[cursor] metadata refresh failed: {}", e);
             }
         }
 
         if let Some(observer) = progress.as_mut() {
             observer.advance(key);
+        }
+    }
+
+    // Slow path: new sessions get the full graph build + ingest.
+    if !new_rows.is_empty() {
+        let new_row_owned: Vec<(String, String)> =
+            new_rows.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        let graphs = load_cursor_session_graphs_from_rows(vscdb, source_file, &new_row_owned)?;
+        let by_session: HashMap<_, _> = graphs
+            .into_iter()
+            .map(|graph| (graph.composer_id.clone(), graph))
+            .collect();
+
+        for (key, _value) in &new_rows {
+            let session_id = key.strip_prefix("composerData:").unwrap_or(key.as_str());
+            let Some(graph) = by_session.get(session_id) else {
+                continue;
+            };
+
+            match ingest_session_graph(db, graph, history_index, verbose) {
+                Ok(0) => {}
+                Ok(n) => total_rows += n,
+                Err(e) => {
+                    if verbose {
+                        eprintln!("[cursor] skipping session: {}", e);
+                    }
+                }
+            }
+
+            if let Some(observer) = progress.as_mut() {
+                observer.advance(key);
+            }
         }
     }
 
