@@ -10,12 +10,8 @@ use crate::ingest_progress::IngestProgressObserver;
 
 #[derive(Debug, Clone)]
 pub enum ProviderSessionPlan {
-    Codex {
-        session_files: Vec<PathBuf>,
-    },
-    Cursor {
-        composer_keys: Vec<String>,
-    },
+    Codex { session_files: Vec<PathBuf> },
+    Cursor { composer_keys: Vec<String> },
 }
 
 impl ProviderSessionPlan {

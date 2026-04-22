@@ -19,8 +19,29 @@ fn open_at_home(home: &Path) -> Result<Connection> {
     std::fs::create_dir_all(&app_dir)?;
     let db_path = app_dir.join("paceflow.db");
     let conn = Connection::open(db_path)?;
+    tune_connection(&conn)?;
     init_app_schema(&conn)?;
     Ok(conn)
+}
+
+/// Apply performance pragmas to the main paceflow sqlite connection.
+///
+/// Ingest does tens of thousands of small writes and lookups; stock sqlite defaults
+/// (rollback journal + `synchronous=FULL`) mean every statement fsyncs the journal,
+/// which is why `paceflow ingest` can appear I/O-bound on Linux even though the
+/// per-statement work is trivial. WAL + `synchronous=NORMAL` keeps the database
+/// crash-safe for this use case while letting many writes share one fsync.
+pub(crate) fn tune_connection(conn: &Connection) -> Result<()> {
+    // `journal_mode` returns a row; the rest are silent. Use `query_row` for the
+    // first and `execute_batch` for the rest so we stay in a single round-trip.
+    let _: String = conn.query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))?;
+    conn.execute_batch(
+        "PRAGMA synchronous = NORMAL;\n\
+         PRAGMA temp_store = MEMORY;\n\
+         PRAGMA cache_size = -65536;\n\
+         PRAGMA mmap_size = 268435456;",
+    )?;
+    Ok(())
 }
 
 pub(crate) fn init_app_schema(conn: &Connection) -> Result<()> {
@@ -575,6 +596,54 @@ pub fn session_exists(conn: &Connection, session_id: &str) -> Result<bool> {
         |row| row.get(0),
     )?;
     Ok(evidence_count > 0)
+}
+
+/// Batched equivalent of [`session_exists`] for many session_ids at once.
+///
+/// Returns the subset of `candidate_ids` that already exist in `metadata_sessions`.
+/// Provider filtering matches [`session_exists`] (i.e. none), so the same id
+/// ingested under a different provider will still be reported as present.
+///
+/// Candidates are chunked so we never exceed sqlite's compile-time variable
+/// limit, and duplicates are de-duplicated up front to avoid bloating the IN
+/// clause. This lets cursor ingest skip the expensive bubble-scan work for
+/// sessions that were already materialized on a previous run.
+pub fn sessions_present(
+    conn: &Connection,
+    candidate_ids: &[&str],
+) -> Result<std::collections::HashSet<String>> {
+    use std::collections::HashSet;
+
+    let mut present: HashSet<String> = HashSet::new();
+    if candidate_ids.is_empty() {
+        return Ok(present);
+    }
+
+    let mut unique: Vec<&str> = candidate_ids.to_vec();
+    unique.sort_unstable();
+    unique.dedup();
+
+    // Stay well under sqlite's default `SQLITE_MAX_VARIABLE_NUMBER` (32766
+    // on modern builds, 999 on very old ones); 500 is a safe, cache-friendly size.
+    const CHUNK: usize = 500;
+    for chunk in unique.chunks(CHUNK) {
+        let placeholders = std::iter::repeat_n("?", chunk.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT session_id FROM metadata_sessions WHERE session_id IN ({placeholders})"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let params_iter = chunk.iter().map(|s| s as &dyn rusqlite::ToSql);
+        let rows = stmt.query_map(rusqlite::params_from_iter(params_iter), |row| {
+            row.get::<_, String>(0)
+        })?;
+        for row in rows {
+            present.insert(row?);
+        }
+    }
+
+    Ok(present)
 }
 
 fn derive_repo_root(project_path: Option<&str>, file_path: Option<&str>) -> Option<String> {

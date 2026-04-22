@@ -3,11 +3,13 @@ use chrono::TimeZone;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
+use serde_json::value::RawValue;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::change_intel::line_hash::hash_line;
 use crate::change_intel::types::{LineHashCount, LineSide, WriteMode};
+use crate::ingest_progress::IngestProgressObserver;
 use crate::path_utils::{
     detect_repo_root, normalize_filesystem_path, path_to_string, strip_file_scheme,
 };
@@ -223,6 +225,32 @@ struct ConversationBubble {
     text: Option<String>,
 }
 
+/// Minimal shape used by the hot `populate_bubbles` loop.
+///
+/// Bubble JSON values can be multi-hundred-KB each (tool args, streaming
+/// content, etc.). Parsing them into a full `JsonValue` tree just to pull
+/// out three fields was the dominant CPU cost on the Linux perf run
+/// (frontend-bound ~46% on E-cores, 41% LLC-miss on P-cores).
+///
+/// `toolFormerData` is borrowed as `&RawValue` so we only materialize the
+/// heavy tool-call sub-tree when we actually need it.
+#[derive(Deserialize)]
+struct BubbleSlim<'a> {
+    #[serde(rename = "type")]
+    bubble_type: Option<i64>,
+    text: Option<String>,
+    #[serde(rename = "modelInfo")]
+    model_info: Option<ModelInfoSlim>,
+    #[serde(rename = "toolFormerData", borrow, default)]
+    tool_former_data: Option<&'a RawValue>,
+}
+
+#[derive(Deserialize)]
+struct ModelInfoSlim {
+    #[serde(rename = "modelName")]
+    model_name: Option<String>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 struct ConversationHeader {
     #[serde(rename = "bubbleId")]
@@ -247,29 +275,58 @@ struct FileUri {
     fs_path: Option<String>,
 }
 
-pub(crate) fn load_cursor_session_graphs_from_rows(
+pub(crate) fn load_cursor_session_graphs_from_rows_with_observer(
     vscdb: &Connection,
     source_file: &str,
     composer_rows: &[(String, String)],
+    mut observer: Option<&mut dyn IngestProgressObserver>,
 ) -> Result<Vec<CursorSessionGraph>> {
-    let mut graphs = Vec::new();
-    let mut session_ids = HashSet::new();
+    use rayon::prelude::*;
 
-    for (key, raw) in composer_rows {
-        let Some(graph) = build_seed_graph(key, raw, source_file) else {
-            continue;
-        };
-        session_ids.insert(graph.composer_id.clone());
-        graphs.push(graph);
+    if let Some(obs) = observer.as_mut() {
+        obs.set_phase("seed graphs");
     }
+    // `build_seed_graph` is pure CPU (`serde_json::from_str` twice on
+    // potentially-large composer blobs). The Linux perf-stat showed the
+    // ingest pinned at ~1.9 GHz on P-cores with 31-46% frontend-bound and
+    // 41% LLC-miss - i.e. lots of serial JSON parsing - so this is the
+    // cheap parallelism win. No sqlite is touched here; the writer stays
+    // on the main thread.
+    let mut graphs: Vec<CursorSessionGraph> = composer_rows
+        .par_iter()
+        .filter_map(|(key, raw)| build_seed_graph(key, raw, source_file))
+        .collect();
 
-    populate_graph_details(vscdb, &mut graphs, &session_ids)?;
+    // Preserve the previous deterministic ordering (composer_rows order) so
+    // downstream aggregation/snapshot tests don't depend on rayon scheduling.
+    let order: HashMap<&str, usize> = composer_rows
+        .iter()
+        .enumerate()
+        .map(|(i, (key, _))| (key.as_str(), i))
+        .collect();
+    graphs.sort_by_key(|g| {
+        let key = format!("composerData:{}", g.composer_id);
+        order.get(key.as_str()).copied().unwrap_or(usize::MAX)
+    });
+
+    let session_ids: HashSet<String> = graphs.iter().map(|g| g.composer_id.clone()).collect();
+
+    populate_graph_details(vscdb, &mut graphs, &session_ids, observer)?;
     Ok(graphs)
 }
 
+#[cfg(test)]
 pub(crate) fn load_cursor_session_graphs(
     vscdb: &Connection,
     source_file: &str,
+) -> Result<Vec<CursorSessionGraph>> {
+    load_cursor_session_graphs_with_observer(vscdb, source_file, None)
+}
+
+pub(crate) fn load_cursor_session_graphs_with_observer(
+    vscdb: &Connection,
+    source_file: &str,
+    observer: Option<&mut dyn IngestProgressObserver>,
 ) -> Result<Vec<CursorSessionGraph>> {
     let mut stmt =
         vscdb.prepare("SELECT key, value FROM cursorDiskKV WHERE key LIKE 'composerData:%'")?;
@@ -284,7 +341,7 @@ pub(crate) fn load_cursor_session_graphs(
         })
         .collect::<std::result::Result<Vec<_>, _>>()?;
 
-    load_cursor_session_graphs_from_rows(vscdb, source_file, &rows)
+    load_cursor_session_graphs_from_rows_with_observer(vscdb, source_file, &rows, observer)
 }
 
 pub(crate) fn resolve_tool_call_edits(graph: &CursorSessionGraph) -> Vec<ResolvedFileEdit> {
@@ -357,7 +414,11 @@ pub(crate) fn aggregate_file_edits(edits: &[ResolvedFileEdit]) -> Vec<Aggregated
     out
 }
 
-fn build_seed_graph(key: &str, raw: &str, source_file: &str) -> Option<CursorSessionGraph> {
+pub(crate) fn build_seed_graph(
+    key: &str,
+    raw: &str,
+    source_file: &str,
+) -> Option<CursorSessionGraph> {
     let raw_json: JsonValue = serde_json::from_str(raw).ok()?;
     let data: ComposerData = serde_json::from_str(raw).ok()?;
 
@@ -441,6 +502,7 @@ fn populate_graph_details(
     vscdb: &Connection,
     graphs: &mut [CursorSessionGraph],
     session_ids: &HashSet<String>,
+    mut observer: Option<&mut dyn IngestProgressObserver>,
 ) -> Result<()> {
     if graphs.is_empty() {
         return Ok(());
@@ -451,12 +513,36 @@ fn populate_graph_details(
         by_session.insert(graph.composer_id.clone(), idx);
     }
 
+    if let Some(obs) = observer.as_mut() {
+        obs.set_phase("bubbles");
+    }
     populate_bubbles(vscdb, graphs, &by_session)?;
+
+    if let Some(obs) = observer.as_mut() {
+        obs.set_phase("checkpoints");
+    }
     populate_checkpoints(vscdb, graphs, &by_session)?;
+
+    if let Some(obs) = observer.as_mut() {
+        obs.set_phase("inline undo rows");
+    }
     populate_inline_undo_rows(vscdb, graphs, &by_session)?;
+
+    if let Some(obs) = observer.as_mut() {
+        obs.set_phase("inline hints");
+    }
     populate_inline_hints(vscdb, graphs, &by_session)?;
+
+    if let Some(obs) = observer.as_mut() {
+        obs.set_phase("partial fates");
+    }
     populate_partial_fates(vscdb, graphs, &by_session)?;
+
+    if let Some(obs) = observer.as_mut() {
+        obs.set_phase("legacy diffs");
+    }
     populate_legacy_diffs(vscdb, graphs, session_ids, &by_session)?;
+
     Ok(())
 }
 
@@ -478,77 +564,100 @@ fn populate_bubbles(
         })
         .collect();
 
+    // Range-scan `cursorDiskKV` per session instead of doing one
+    // `LIKE 'bubbleId:%'` over every bubble in the database. The old query
+    // also touched bubbles belonging to unrelated (already-ingested, planned-
+    // out) sessions, which on large state DBs is the dominant cost of ingest.
+    //
+    // `key` is the primary key of `cursorDiskKV`, so `>= lower AND < upper`
+    // resolves to a bounded index scan. The upper bound uses `;` (0x3B) which
+    // sorts immediately after `:` (0x3A), covering every `bubbleId:<sid>:*` key.
     let mut stmt =
-        vscdb.prepare("SELECT rowid, key, value FROM cursorDiskKV WHERE key LIKE 'bubbleId:%'")?;
-    let rows = stmt.query_map([], |row| {
-        Ok((
-            row.get::<_, i64>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, Option<String>>(2)?,
-        ))
-    })?;
+        vscdb.prepare("SELECT rowid, key, value FROM cursorDiskKV WHERE key >= ?1 AND key < ?2")?;
 
-    for row in rows {
-        let (rowid, key, raw) = match row {
-            Ok(row) => row,
-            Err(_) => continue,
-        };
-        let Some(raw) = raw else {
-            continue;
-        };
-        let Some((session_id, bubble_id)) = bubble_key_parts(&key) else {
-            continue;
-        };
-        let Some(graph_idx) = by_session.get(session_id).copied() else {
-            continue;
-        };
-        let bubble: JsonValue = match serde_json::from_str(&raw) {
-            Ok(value) => value,
-            Err(_) => continue,
-        };
+    // Iterate session_ids in a stable order so tests that snapshot output stay
+    // deterministic across runs; `by_session` is a HashMap whose iteration order
+    // is randomized.
+    let mut session_ids: Vec<&str> = by_session.keys().map(String::as_str).collect();
+    session_ids.sort_unstable();
 
-        let role = bubble
-            .get("type")
-            .and_then(|value| value.as_i64())
-            .and_then(map_bubble_role);
-        let text = bubble
-            .get("text")
-            .and_then(|value| value.as_str())
-            .map(ToOwned::to_owned);
-        let order_key = header_orders
-            .get(session_id)
-            .and_then(|headers| headers.get(bubble_id))
-            .copied()
-            .unwrap_or(rowid);
-        let model_name = bubble
-            .get("modelInfo")
-            .and_then(|value| value.get("modelName"))
-            .and_then(|value| value.as_str())
-            .map(ToOwned::to_owned);
+    for session_id in session_ids {
+        let graph_idx = by_session[session_id];
+        let lower = format!("bubbleId:{session_id}:");
+        let upper = format!("bubbleId:{session_id};");
+        let rows = stmt.query_map(params![lower, upper], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        })?;
 
-        graphs[graph_idx].bubble_events.push(CursorBubbleEvent {
-            role,
-            text: text.clone(),
-            order_key,
-        });
+        for row in rows {
+            let (rowid, key, raw) = match row {
+                Ok(row) => row,
+                Err(_) => continue,
+            };
+            let Some(raw) = raw else {
+                continue;
+            };
+            // The range predicate guarantees this is a `bubbleId:<session_id>:<bubble_id>`
+            // key, but we still split it to recover `bubble_id` for ordering.
+            let Some((_, bubble_id)) = bubble_key_parts(&key) else {
+                continue;
+            };
 
-        if graphs[graph_idx].model_name.is_none() {
-            graphs[graph_idx].model_name = model_name;
-        }
+            // Fast path: typed deserialize into a slim struct so the majority
+            // of bubbles (no `toolFormerData`) never allocate a full
+            // `JsonValue` tree. Only when `toolFormerData` is present do we
+            // parse that sub-object into `JsonValue` for the tool-call path.
+            let slim: BubbleSlim = match serde_json::from_str(&raw) {
+                Ok(value) => value,
+                Err(_) => continue,
+            };
 
-        if let Some(tool_call) = parse_tool_call(
-            bubble_id,
-            &bubble,
-            graphs[graph_idx].project_path.as_deref(),
-            graphs[graph_idx].last_seen_at(),
-            &graphs[graph_idx].first_edit_path_by_bubble(),
-        ) {
-            for path in &tool_call.path_hints {
-                if !is_cursor_plan_path(path) {
-                    graphs[graph_idx].strong_path_hints.insert(path.clone());
-                }
+            let role = slim.bubble_type.and_then(map_bubble_role);
+            let text = slim.text.clone();
+            let order_key = header_orders
+                .get(session_id)
+                .and_then(|headers| headers.get(bubble_id))
+                .copied()
+                .unwrap_or(rowid);
+            let model_name = slim.model_info.as_ref().and_then(|m| m.model_name.clone());
+
+            graphs[graph_idx].bubble_events.push(CursorBubbleEvent {
+                role,
+                text,
+                order_key,
+            });
+
+            if graphs[graph_idx].model_name.is_none() {
+                graphs[graph_idx].model_name = model_name;
             }
-            graphs[graph_idx].tool_calls.push(tool_call);
+
+            // Tool-call path: parse the `toolFormerData` sub-object lazily.
+            let Some(tool_former_raw) = slim.tool_former_data else {
+                continue;
+            };
+            let tool_former_value: JsonValue = match serde_json::from_str(tool_former_raw.get()) {
+                Ok(value) => value,
+                Err(_) => continue,
+            };
+
+            if let Some(tool_call) = parse_tool_call(
+                bubble_id,
+                &tool_former_value,
+                graphs[graph_idx].project_path.as_deref(),
+                graphs[graph_idx].last_seen_at(),
+                &graphs[graph_idx].first_edit_path_by_bubble(),
+            ) {
+                for path in &tool_call.path_hints {
+                    if !is_cursor_plan_path(path) {
+                        graphs[graph_idx].strong_path_hints.insert(path.clone());
+                    }
+                }
+                graphs[graph_idx].tool_calls.push(tool_call);
+            }
         }
     }
 
@@ -564,43 +673,47 @@ fn populate_checkpoints(
     graphs: &mut [CursorSessionGraph],
     by_session: &HashMap<String, usize>,
 ) -> Result<()> {
+    // See `populate_bubbles` for the rationale behind per-session range scans.
     let mut stmt =
-        vscdb.prepare("SELECT key, value FROM cursorDiskKV WHERE key LIKE 'checkpointId:%'")?;
-    let rows = stmt.query_map([], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
-    })?;
+        vscdb.prepare("SELECT key, value FROM cursorDiskKV WHERE key >= ?1 AND key < ?2")?;
 
-    for row in rows {
-        let (key, raw) = match row {
-            Ok(row) => row,
-            Err(_) => continue,
-        };
-        let Some(raw) = raw else {
-            continue;
-        };
-        let Some(session_id) = composer_id_from_prefixed_key(&key, "checkpointId") else {
-            continue;
-        };
-        let Some(graph_idx) = by_session.get(session_id).copied() else {
-            continue;
-        };
+    let mut session_ids: Vec<&str> = by_session.keys().map(String::as_str).collect();
+    session_ids.sort_unstable();
 
-        let parsed: JsonValue = match serde_json::from_str(&raw) {
-            Ok(value) => value,
-            Err(_) => continue,
-        };
-        let Some(files) = parsed.get("files").and_then(|value| value.as_array()) else {
-            continue;
-        };
-        for file in files {
-            let Some(path) = file.get("uri").and_then(extract_file_path_from_uri_value) else {
+    for session_id in session_ids {
+        let graph_idx = by_session[session_id];
+        let lower = format!("checkpointId:{session_id}:");
+        let upper = format!("checkpointId:{session_id};");
+        let rows = stmt.query_map(params![lower, upper], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+        })?;
+
+        for row in rows {
+            let (_key, raw) = match row {
+                Ok(row) => row,
+                Err(_) => continue,
+            };
+            let Some(raw) = raw else {
                 continue;
             };
-            if is_cursor_plan_path(&path) {
+
+            let parsed: JsonValue = match serde_json::from_str(&raw) {
+                Ok(value) => value,
+                Err(_) => continue,
+            };
+            let Some(files) = parsed.get("files").and_then(|value| value.as_array()) else {
                 continue;
+            };
+            for file in files {
+                let Some(path) = file.get("uri").and_then(extract_file_path_from_uri_value) else {
+                    continue;
+                };
+                if is_cursor_plan_path(&path) {
+                    continue;
+                }
+                graphs[graph_idx].checkpoint_paths.insert(path.clone());
+                graphs[graph_idx].strong_path_hints.insert(path);
             }
-            graphs[graph_idx].checkpoint_paths.insert(path.clone());
-            graphs[graph_idx].strong_path_hints.insert(path);
         }
     }
 
@@ -806,12 +919,15 @@ fn populate_legacy_diffs(
 
 fn parse_tool_call(
     bubble_id: &str,
-    bubble: &JsonValue,
+    tool_former_data: &JsonValue,
     project_path: Option<&str>,
     default_timestamp: Option<String>,
     first_edit_paths: &HashMap<String, String>,
 ) -> Option<CursorToolCall> {
-    let tool = bubble.get("toolFormerData")?.as_object()?;
+    // Callers pass the `toolFormerData` sub-object directly so that the common
+    // "not a tool call" path in `populate_bubbles` can avoid allocating a full
+    // `JsonValue` for the entire bubble.
+    let tool = tool_former_data.as_object()?;
     let name = tool.get("name")?.as_str()?.to_string();
     let status = tool
         .get("status")
@@ -1418,14 +1534,6 @@ fn bubble_key_parts(key: &str) -> Option<(&str, &str)> {
     Some((parts.next()?, parts.next()?))
 }
 
-fn composer_id_from_prefixed_key<'a>(key: &'a str, prefix: &str) -> Option<&'a str> {
-    let mut parts = key.splitn(3, ':');
-    if parts.next()? != prefix {
-        return None;
-    }
-    parts.next()
-}
-
 fn partial_fates_key_parts(key: &str) -> Option<(&str, &str)> {
     let mut parts = key.splitn(3, ':');
     if parts.next()? != "codeBlockPartialInlineDiffFates" {
@@ -1675,5 +1783,4 @@ mod tests {
         assert_eq!(graphs.len(), 1);
         assert_eq!(graphs[0].composer_id, "real-session");
     }
-
 }

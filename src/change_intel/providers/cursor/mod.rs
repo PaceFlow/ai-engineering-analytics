@@ -15,11 +15,11 @@ use crate::change_intel::types::{
     ChangeOpCandidate, LineHashCount, LineSide, ParseError, SessionInfo, WriteMode,
 };
 use crate::cursor_paths::cursor_state_path;
-use crate::providers::cursor::shared::{
-    CursorSessionGraph, load_cursor_session_graphs, resolve_tool_call_edits,
-};
 use crate::ingest_progress::IngestProgressObserver;
 use crate::path_utils::{normalize_filesystem_path, path_to_string};
+use crate::providers::cursor::shared::{
+    CursorSessionGraph, load_cursor_session_graphs_with_observer, resolve_tool_call_edits,
+};
 
 const CURSOR_CURSOR_NAMESPACE: &str = "cursor_core_v1";
 const INLINE_PARSER_NAME: &str = "cursor_inline_undo_v1";
@@ -209,7 +209,9 @@ pub fn ingest_cursor_code_changes_from_sources(
                 verbose,
                 Some(&mut **observer),
             )?,
-            None => ingest_cursor_code_changes_from_path_with_progress(conn, source, verbose, None)?,
+            None => {
+                ingest_cursor_code_changes_from_path_with_progress(conn, source, verbose, None)?
+            }
         };
         combined.sources_discovered += summary.sources_discovered;
         combined.sources_skipped += summary.sources_skipped;
@@ -263,6 +265,9 @@ fn ingest_cursor_code_changes_from_path_with_progress(
         }
     }
 
+    if let Some(observer) = progress.as_mut() {
+        observer.set_phase("opening vscdb");
+    }
     let vscdb = Connection::open_with_flags(
         vscdb_path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -272,26 +277,40 @@ fn ingest_cursor_code_changes_from_path_with_progress(
     }
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
 
-    let graphs = load_cursor_session_graphs(&vscdb, &source_file)?;
     if let Some(observer) = progress.as_mut() {
-        observer.advance("cursor session graphs loaded");
+        observer.set_phase("session graphs");
+    }
+    let graphs = match progress.as_mut() {
+        Some(obs) => {
+            load_cursor_session_graphs_with_observer(&vscdb, &source_file, Some(&mut **obs))?
+        }
+        None => load_cursor_session_graphs_with_observer(&vscdb, &source_file, None)?,
+    };
+    if let Some(observer) = progress.as_mut() {
+        observer.advance("cursor session graphs");
+    }
+
+    if let Some(observer) = progress.as_mut() {
+        observer.set_phase("candidate sessions");
     }
     let graph_by_session: HashMap<String, CursorSessionGraph> = graphs
         .into_iter()
         .map(|graph| (graph.composer_id.clone(), graph))
         .collect();
     let sessions = collect_candidate_sessions_from_graphs(&graph_by_session);
-    if let Some(observer) = progress.as_mut() {
-        observer.advance("cursor candidate sessions collected");
-    }
-
     for session in sessions.values() {
         storage::upsert_change_session(&tx, &session.info)?;
+    }
+    if let Some(observer) = progress.as_mut() {
+        observer.advance("cursor candidate sessions");
     }
 
     let mut seen_paths_by_session: HashMap<String, HashSet<String>> = HashMap::new();
     let mut ops = Vec::new();
 
+    if let Some(observer) = progress.as_mut() {
+        observer.set_phase("tool writes");
+    }
     ingest_tool_call_writes(
         &sessions,
         &graph_by_session,
@@ -299,7 +318,13 @@ fn ingest_cursor_code_changes_from_path_with_progress(
         &mut ops,
         &mut summary,
     );
+    if let Some(observer) = progress.as_mut() {
+        observer.advance("cursor tool writes");
+    }
 
+    if let Some(observer) = progress.as_mut() {
+        observer.set_phase("inline undo rows");
+    }
     ingest_inline_undo_rows(
         &tx,
         &source_file,
@@ -310,7 +335,13 @@ fn ingest_cursor_code_changes_from_path_with_progress(
         &mut summary,
         verbose,
     )?;
+    if let Some(observer) = progress.as_mut() {
+        observer.advance("cursor inline undo rows");
+    }
 
+    if let Some(observer) = progress.as_mut() {
+        observer.set_phase("partial fates (old)");
+    }
     ingest_partial_fates_fallback(
         &tx,
         &vscdb,
@@ -321,7 +352,13 @@ fn ingest_cursor_code_changes_from_path_with_progress(
         &mut summary,
         verbose,
     )?;
+    if let Some(observer) = progress.as_mut() {
+        observer.advance("cursor partial fates (old)");
+    }
 
+    if let Some(observer) = progress.as_mut() {
+        observer.set_phase("partial fates (new)");
+    }
     ingest_new_schema_partial_fates(
         &tx,
         &source_file,
@@ -332,7 +369,13 @@ fn ingest_cursor_code_changes_from_path_with_progress(
         &mut summary,
         verbose,
     )?;
+    if let Some(observer) = progress.as_mut() {
+        observer.advance("cursor partial fates (new)");
+    }
 
+    if let Some(observer) = progress.as_mut() {
+        observer.set_phase("legacy code blocks");
+    }
     ingest_legacy_code_block_fallback(
         &tx,
         &graph_by_session,
@@ -344,22 +387,22 @@ fn ingest_cursor_code_changes_from_path_with_progress(
         verbose,
     )?;
     if let Some(observer) = progress.as_mut() {
-        observer.advance("cursor tool writes parsed");
+        observer.advance("cursor legacy code blocks");
     }
 
+    if let Some(observer) = progress.as_mut() {
+        observer.set_phase("reconciling + commit");
+    }
     let reconcile = storage::reconcile_source_tool_writes(&tx, "cursor", &source_file, &ops)?;
     summary.ops_upserted += reconcile.ops_upserted;
 
     if let Some((mtime, size)) = sig {
         storage::upsert_ingest_cursor(&tx, CURSOR_CURSOR_NAMESPACE, &source_file, mtime, size)?;
     }
-    if let Some(observer) = progress.as_mut() {
-        observer.advance("cursor tool writes reconciled");
-    }
 
     tx.commit()?;
     if let Some(observer) = progress.as_mut() {
-        observer.advance("cursor source committed");
+        observer.advance("cursor committed");
     }
 
     Ok(summary)

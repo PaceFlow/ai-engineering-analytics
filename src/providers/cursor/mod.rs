@@ -1,8 +1,10 @@
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OpenFlags, params};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
+use std::time::UNIX_EPOCH;
 
 use super::utils::diff_line_counts;
 use crate::cursor_paths::{cursor_history_path, cursor_state_path};
@@ -12,8 +14,8 @@ use crate::db;
 use crate::ingest_progress::IngestProgressObserver;
 use crate::path_utils::strip_file_scheme;
 use shared::{
-    CursorBubbleRole, CursorSessionGraph, aggregate_file_edits,
-    load_cursor_session_graphs_from_rows, resolve_tool_call_edits,
+    CursorBubbleRole, CursorSessionGraph, aggregate_file_edits, build_seed_graph,
+    load_cursor_session_graphs_from_rows_with_observer, resolve_tool_call_edits,
 };
 
 pub fn plan_composer_rows() -> Result<Vec<String>> {
@@ -42,7 +44,7 @@ pub fn ingest_planned_sessions(
     db: &Connection,
     composer_keys: &[String],
     verbose: bool,
-    progress: Option<&mut dyn IngestProgressObserver>,
+    mut progress: Option<&mut dyn IngestProgressObserver>,
 ) -> Result<usize> {
     if composer_keys.is_empty() {
         return Ok(0);
@@ -65,6 +67,9 @@ pub fn ingest_planned_sessions(
         eprintln!("[cursor] opening {:?}", vscdb_path);
     }
 
+    if let Some(observer) = progress.as_mut() {
+        observer.set_phase("opening vscdb");
+    }
     let vscdb = Connection::open_with_flags(
         &vscdb_path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -74,6 +79,9 @@ pub fn ingest_planned_sessions(
     let history_index = if history_root.as_os_str().is_empty() {
         HashMap::new()
     } else {
+        if let Some(observer) = progress.as_mut() {
+            observer.set_phase("history index");
+        }
         build_history_index(&history_root)
     };
 
@@ -81,6 +89,9 @@ pub fn ingest_planned_sessions(
         eprintln!("[cursor] history index: {} file(s)", history_index.len());
     }
 
+    if let Some(observer) = progress.as_mut() {
+        observer.set_phase("composer rows");
+    }
     // Planning only captures composer keys so we do not pull every large JSON blob into memory
     // before ingest starts. Values are fetched lazily here when we are ready to process.
     let composer_rows: Vec<(String, String)> = composer_keys
@@ -118,27 +129,54 @@ pub(crate) fn ingest_planned_sessions_from_source(
     verbose: bool,
     mut progress: Option<&mut dyn IngestProgressObserver>,
 ) -> Result<usize> {
-    let graphs = load_cursor_session_graphs_from_rows(vscdb, source_file, composer_rows)?;
-    let by_session: HashMap<_, _> = graphs
-        .into_iter()
-        .map(|graph| (graph.composer_id.clone(), graph))
+    // Batch all per-session writes into a single sqlite transaction. With stock
+    // defaults every small insert would trigger its own fsync, which on Linux
+    // dominates wall-clock time for ingest (see paceflow.perf-stat.txt).
+    // `unchecked_transaction` lets us take a transaction from a shared `&Connection`;
+    // nothing else writes to this connection during ingest.
+    let tx = db.unchecked_transaction()?;
+
+    if let Some(observer) = progress.as_mut() {
+        observer.set_phase("existing sessions");
+    }
+    // Partition composer rows into (already-ingested, new) by batch-querying
+    // `metadata_sessions` once. Already-ingested sessions only need a cheap
+    // metadata refresh and can skip the expensive `bubbleId:%` scan entirely.
+    let candidate_ids: Vec<&str> = composer_rows
+        .iter()
+        .map(|(key, _)| key.strip_prefix("composerData:").unwrap_or(key.as_str()))
         .collect();
+    let already_present = db::sessions_present(db, &candidate_ids)?;
+
+    let (existing_rows, new_rows): (Vec<_>, Vec<_>) = composer_rows.iter().partition(|(key, _)| {
+        let sid = key.strip_prefix("composerData:").unwrap_or(key.as_str());
+        already_present.contains(sid)
+    });
 
     let mut total_rows = 0usize;
-    for (key, _value) in composer_rows {
-        let session_id = key.strip_prefix("composerData:").unwrap_or(key);
-        let Some(graph) = by_session.get(session_id) else {
-            continue;
-        };
 
-        match ingest_session_graph(db, graph, history_index, verbose) {
-            Ok(0) => {}
-            Ok(n) => total_rows += n,
-            Err(e) => {
-                if verbose {
-                    eprintln!("[cursor] skipping session: {}", e);
-                }
-            }
+    if let Some(observer) = progress.as_mut() {
+        observer.set_phase("refreshing existing");
+    }
+    // Fast path: already-ingested sessions. We only need the small composer JSON
+    // (`started_at`, `ended_at`, `project_path`, `model_name`) to refresh metadata;
+    // we deliberately skip the per-session bubble scan and graph construction.
+    for (key, raw) in &existing_rows {
+        if let Some(seed) = build_seed_graph(key, raw, source_file)
+            && let Err(e) = db::upsert_metadata_session_with_model(
+                db,
+                "cursor",
+                &seed.composer_id,
+                seed.project_path.as_deref(),
+                seed.started_at.as_deref(),
+                seed.ended_at.as_deref().or(seed.started_at.as_deref()),
+                Some("cursor"),
+                Some("cursor"),
+                seed.model_name.as_deref(),
+            )
+            && verbose
+        {
+            eprintln!("[cursor] metadata refresh failed: {}", e);
         }
 
         if let Some(observer) = progress.as_mut() {
@@ -146,13 +184,70 @@ pub(crate) fn ingest_planned_sessions_from_source(
         }
     }
 
+    // Slow path: new sessions get the full graph build + ingest.
+    if !new_rows.is_empty() {
+        if let Some(observer) = progress.as_mut() {
+            observer.set_phase("seed graphs");
+        }
+        let new_row_owned: Vec<(String, String)> = new_rows
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        let graphs = match progress.as_mut() {
+            Some(obs) => load_cursor_session_graphs_from_rows_with_observer(
+                vscdb,
+                source_file,
+                &new_row_owned,
+                Some(&mut **obs),
+            )?,
+            None => load_cursor_session_graphs_from_rows_with_observer(
+                vscdb,
+                source_file,
+                &new_row_owned,
+                None,
+            )?,
+        };
+        let by_session: HashMap<_, _> = graphs
+            .into_iter()
+            .map(|graph| (graph.composer_id.clone(), graph))
+            .collect();
+
+        if let Some(observer) = progress.as_mut() {
+            observer.set_phase("writing sessions");
+        }
+        for (key, _value) in &new_rows {
+            let session_id = key.strip_prefix("composerData:").unwrap_or(key.as_str());
+            let Some(graph) = by_session.get(session_id) else {
+                continue;
+            };
+
+            match ingest_session_graph(db, graph, history_index, verbose) {
+                Ok(0) => {}
+                Ok(n) => total_rows += n,
+                Err(e) => {
+                    if verbose {
+                        eprintln!("[cursor] skipping session: {}", e);
+                    }
+                }
+            }
+
+            if let Some(observer) = progress.as_mut() {
+                observer.advance(key);
+            }
+        }
+    }
+
+    tx.commit()?;
+
     Ok(total_rows)
 }
 
 // ── History index ─────────────────────────────────────────────────────────────
 
+#[derive(Serialize, Deserialize, Clone)]
 pub(crate) struct HistoryEntry {
     id: String,
+    #[serde(default)]
     source: String,
     timestamp: i64,
     dir_path: PathBuf,
@@ -160,79 +255,179 @@ pub(crate) struct HistoryEntry {
 
 pub(crate) type HistoryIndex = HashMap<String, Vec<HistoryEntry>>;
 
-fn build_history_index(history_root: &Path) -> HistoryIndex {
-    let mut index: HistoryIndex = HashMap::new();
+/// Current disk format version for the history index cache. Bump when the
+/// on-disk shape changes incompatibly.
+const HISTORY_CACHE_VERSION: u32 = 1;
 
-    let dir_iter = match std::fs::read_dir(history_root) {
-        Ok(it) => it,
-        Err(_) => return index,
+#[derive(Serialize, Deserialize)]
+struct HistoryIndexCache {
+    #[serde(rename = "v")]
+    version: u32,
+    // history_root -> (mtime_ms, size) per-dir signature.
+    signatures: HashMap<String, (i128, u64)>,
+    // file_path -> entries, matching `HistoryIndex`.
+    entries: HashMap<String, Vec<HistoryEntry>>,
+}
+
+fn history_cache_path() -> Option<PathBuf> {
+    // Mirrors `db::open_at_home`: honour `PACEFLOW_HOME` first, then `$HOME`.
+    let home = std::env::var_os("PACEFLOW_HOME")
+        .map(PathBuf::from)
+        .or_else(dirs::home_dir)?;
+    let app_dir = home.join(".paceflow");
+    // Best-effort; callers tolerate absence.
+    std::fs::create_dir_all(&app_dir).ok()?;
+    Some(app_dir.join("cursor_history_index.cache.json"))
+}
+
+fn dir_signature(entries_json: &Path) -> Option<(i128, u64)> {
+    // Signatures just need to be stable; the exact unit doesn't matter. We use
+    // signed millis-since-epoch so that clocks which sit before UNIX_EPOCH
+    // (some VMs, some embedded devices) still round-trip uniquely.
+    let meta = std::fs::metadata(entries_json).ok()?;
+    let size = meta.len();
+    let modified = meta.modified().ok()?;
+    let mtime = match modified.duration_since(UNIX_EPOCH) {
+        Ok(d) => d.as_millis() as i128,
+        Err(e) => -(e.duration().as_millis() as i128),
     };
+    Some((mtime, size))
+}
 
-    for entry in dir_iter.flatten() {
-        let dir_path = entry.path();
-        if !dir_path.is_dir() {
-            continue;
-        }
+fn collect_dir_paths(history_root: &Path) -> Vec<PathBuf> {
+    let Ok(dir_iter) = std::fs::read_dir(history_root) else {
+        return Vec::new();
+    };
+    dir_iter
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_dir())
+        .collect()
+}
 
-        let entries_json = dir_path.join("entries.json");
-        let raw = match std::fs::read_to_string(&entries_json) {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
+fn compute_signatures(dir_paths: &[PathBuf]) -> HashMap<String, (i128, u64)> {
+    dir_paths
+        .iter()
+        .filter_map(|dir| {
+            let entries_json = dir.join("entries.json");
+            let sig = dir_signature(&entries_json)?;
+            Some((dir.to_string_lossy().into_owned(), sig))
+        })
+        .collect()
+}
 
-        #[derive(Deserialize)]
-        struct EntriesFile {
-            resource: Option<String>,
-            #[serde(default)]
-            entries: Vec<RawEntry>,
-        }
+fn load_history_cache(path: &Path) -> Option<HistoryIndexCache> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    let cache: HistoryIndexCache = serde_json::from_str(&raw).ok()?;
+    if cache.version != HISTORY_CACHE_VERSION {
+        return None;
+    }
+    Some(cache)
+}
 
-        #[derive(Deserialize)]
-        struct RawEntry {
-            id: Option<String>,
-            source: Option<String>,
-            timestamp: Option<i64>,
-        }
+fn save_history_cache(path: &Path, cache: &HistoryIndexCache) {
+    // Atomic-ish write: write to tmp, rename over target. Failure is non-fatal -
+    // a missing/corrupt cache just forces a rebuild on the next run.
+    let Ok(json) = serde_json::to_vec(cache) else {
+        return;
+    };
+    let tmp = path.with_extension("cache.json.tmp");
+    if std::fs::write(&tmp, &json).is_ok() {
+        let _ = std::fs::rename(&tmp, path);
+    }
+}
 
-        let parsed: EntriesFile = match serde_json::from_str(&raw) {
-            Ok(p) => p,
-            Err(_) => continue,
-        };
+fn build_history_index_fresh(dir_paths: &[PathBuf]) -> HistoryIndex {
+    use rayon::prelude::*;
 
-        let resource = match parsed.resource {
-            Some(r) => r,
-            None => continue,
-        };
+    #[derive(Deserialize)]
+    struct EntriesFile {
+        resource: Option<String>,
+        #[serde(default)]
+        entries: Vec<RawEntry>,
+    }
 
-        // Strip "file://" prefix to get a plain absolute path
-        let file_path = strip_file_scheme(&resource);
+    #[derive(Deserialize)]
+    struct RawEntry {
+        id: Option<String>,
+        source: Option<String>,
+        timestamp: Option<i64>,
+    }
 
-        let mut entries: Vec<HistoryEntry> = parsed
-            .entries
-            .into_iter()
-            .filter_map(|e| {
-                Some(HistoryEntry {
-                    id: e.id?,
-                    source: e.source.unwrap_or_default(),
-                    timestamp: e.timestamp.unwrap_or(0),
-                    dir_path: dir_path.clone(),
+    // Reading ~hundreds of small `entries.json` files serially - each with its
+    // own open/read/parse - is almost entirely syscall-bound. Rayon lets the
+    // kernel service those opens concurrently without any shared state.
+    let per_dir: Vec<(String, Vec<HistoryEntry>)> = dir_paths
+        .par_iter()
+        .filter_map(|dir_path| {
+            let entries_json = dir_path.join("entries.json");
+            let raw = std::fs::read_to_string(&entries_json).ok()?;
+            let parsed: EntriesFile = serde_json::from_str(&raw).ok()?;
+            let resource = parsed.resource?;
+            let file_path = strip_file_scheme(&resource);
+
+            let mut entries: Vec<HistoryEntry> = parsed
+                .entries
+                .into_iter()
+                .filter_map(|e| {
+                    Some(HistoryEntry {
+                        id: e.id?,
+                        source: e.source.unwrap_or_default(),
+                        timestamp: e.timestamp.unwrap_or(0),
+                        dir_path: dir_path.clone(),
+                    })
                 })
-            })
-            .collect();
+                .collect();
+            entries.sort_by_key(|e| e.timestamp);
+            Some((file_path, entries))
+        })
+        .collect();
 
-        // Sort ascending by timestamp so we can find the "next" entry easily
-        entries.sort_by_key(|e| e.timestamp);
-
+    let mut index: HistoryIndex = HashMap::new();
+    for (file_path, entries) in per_dir {
         index.entry(file_path).or_default().extend(entries);
     }
 
-    // Sort each file's entries by timestamp after merging (shouldn't have multiple
-    // dirs per file in practice, but be safe)
     for v in index.values_mut() {
         v.sort_by_key(|e| e.timestamp);
     }
 
     index
+}
+
+fn build_history_index(history_root: &Path) -> HistoryIndex {
+    let dir_paths = collect_dir_paths(history_root);
+    if dir_paths.is_empty() {
+        return HistoryIndex::new();
+    }
+
+    let current_sigs = compute_signatures(&dir_paths);
+
+    // Fast path: cache file exists and every dir's (mtime, size) is unchanged.
+    // The Cursor history directory grows by whole new dirs (one per edited file)
+    // and rarely mutates existing `entries.json` files, so this hits on almost
+    // every repeat run.
+    if let Some(cache_path) = history_cache_path() {
+        if let Some(cache) = load_history_cache(&cache_path)
+            && cache.signatures == current_sigs
+        {
+            return cache.entries;
+        }
+
+        let fresh = build_history_index_fresh(&dir_paths);
+        save_history_cache(
+            &cache_path,
+            &HistoryIndexCache {
+                version: HISTORY_CACHE_VERSION,
+                signatures: current_sigs,
+                entries: fresh.clone(),
+            },
+        );
+        return fresh;
+    }
+
+    // No writable home directory - skip the cache, just rebuild.
+    build_history_index_fresh(&dir_paths)
 }
 
 // ── Session ingestion ─────────────────────────────────────────────────────────
@@ -276,7 +471,10 @@ fn ingest_session_graph(
     let session_start_ms = graph.created_at_ms.unwrap_or(0);
     let session_end_ms = graph.last_updated_at_ms.unwrap_or(i64::MAX);
 
-    if verbose {
+    // Only log per-session progress in non-TTY mode. In TTY mode the progress
+    // bar already shows the current session label, and these eprintln! lines
+    // collide with the `\r`-rewritten bar, making it flicker/wrap.
+    if verbose && !std::io::stderr().is_terminal() {
         eprintln!(
             "[cursor] ingesting session {} ({})",
             &session_id[..session_id.len().min(8)],
