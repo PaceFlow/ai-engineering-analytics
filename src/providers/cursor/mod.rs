@@ -218,68 +218,64 @@ pub(crate) struct HistoryEntry {
 pub(crate) type HistoryIndex = HashMap<String, Vec<HistoryEntry>>;
 
 fn build_history_index(history_root: &Path) -> HistoryIndex {
-    let mut index: HistoryIndex = HashMap::new();
+    use rayon::prelude::*;
 
     let dir_iter = match std::fs::read_dir(history_root) {
         Ok(it) => it,
-        Err(_) => return index,
+        Err(_) => return HistoryIndex::new(),
     };
 
-    for entry in dir_iter.flatten() {
-        let dir_path = entry.path();
-        if !dir_path.is_dir() {
-            continue;
-        }
+    let dir_paths: Vec<PathBuf> = dir_iter
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_dir())
+        .collect();
 
-        let entries_json = dir_path.join("entries.json");
-        let raw = match std::fs::read_to_string(&entries_json) {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
+    #[derive(Deserialize)]
+    struct EntriesFile {
+        resource: Option<String>,
+        #[serde(default)]
+        entries: Vec<RawEntry>,
+    }
 
-        #[derive(Deserialize)]
-        struct EntriesFile {
-            resource: Option<String>,
-            #[serde(default)]
-            entries: Vec<RawEntry>,
-        }
+    #[derive(Deserialize)]
+    struct RawEntry {
+        id: Option<String>,
+        source: Option<String>,
+        timestamp: Option<i64>,
+    }
 
-        #[derive(Deserialize)]
-        struct RawEntry {
-            id: Option<String>,
-            source: Option<String>,
-            timestamp: Option<i64>,
-        }
+    // Reading 247 small `entries.json` files serially - each with its own
+    // open/read/parse - is almost entirely syscall-bound. Rayon lets the
+    // kernel service those opens concurrently without any shared state.
+    let per_dir: Vec<(String, Vec<HistoryEntry>)> = dir_paths
+        .par_iter()
+        .filter_map(|dir_path| {
+            let entries_json = dir_path.join("entries.json");
+            let raw = std::fs::read_to_string(&entries_json).ok()?;
+            let parsed: EntriesFile = serde_json::from_str(&raw).ok()?;
+            let resource = parsed.resource?;
+            let file_path = strip_file_scheme(&resource);
 
-        let parsed: EntriesFile = match serde_json::from_str(&raw) {
-            Ok(p) => p,
-            Err(_) => continue,
-        };
-
-        let resource = match parsed.resource {
-            Some(r) => r,
-            None => continue,
-        };
-
-        // Strip "file://" prefix to get a plain absolute path
-        let file_path = strip_file_scheme(&resource);
-
-        let mut entries: Vec<HistoryEntry> = parsed
-            .entries
-            .into_iter()
-            .filter_map(|e| {
-                Some(HistoryEntry {
-                    id: e.id?,
-                    source: e.source.unwrap_or_default(),
-                    timestamp: e.timestamp.unwrap_or(0),
-                    dir_path: dir_path.clone(),
+            let mut entries: Vec<HistoryEntry> = parsed
+                .entries
+                .into_iter()
+                .filter_map(|e| {
+                    Some(HistoryEntry {
+                        id: e.id?,
+                        source: e.source.unwrap_or_default(),
+                        timestamp: e.timestamp.unwrap_or(0),
+                        dir_path: dir_path.clone(),
+                    })
                 })
-            })
-            .collect();
+                .collect();
+            entries.sort_by_key(|e| e.timestamp);
+            Some((file_path, entries))
+        })
+        .collect();
 
-        // Sort ascending by timestamp so we can find the "next" entry easily
-        entries.sort_by_key(|e| e.timestamp);
-
+    let mut index: HistoryIndex = HashMap::new();
+    for (file_path, entries) in per_dir {
         index.entry(file_path).or_default().extend(entries);
     }
 

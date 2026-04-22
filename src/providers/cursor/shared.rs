@@ -252,16 +252,32 @@ pub(crate) fn load_cursor_session_graphs_from_rows(
     source_file: &str,
     composer_rows: &[(String, String)],
 ) -> Result<Vec<CursorSessionGraph>> {
-    let mut graphs = Vec::new();
-    let mut session_ids = HashSet::new();
+    use rayon::prelude::*;
 
-    for (key, raw) in composer_rows {
-        let Some(graph) = build_seed_graph(key, raw, source_file) else {
-            continue;
-        };
-        session_ids.insert(graph.composer_id.clone());
-        graphs.push(graph);
-    }
+    // `build_seed_graph` is pure CPU (`serde_json::from_str` twice on
+    // potentially-large composer blobs). The Linux perf-stat showed the
+    // ingest pinned at ~1.9 GHz on P-cores with 31-46% frontend-bound and
+    // 41% LLC-miss - i.e. lots of serial JSON parsing - so this is the
+    // cheap parallelism win. No sqlite is touched here; the writer stays
+    // on the main thread.
+    let mut graphs: Vec<CursorSessionGraph> = composer_rows
+        .par_iter()
+        .filter_map(|(key, raw)| build_seed_graph(key, raw, source_file))
+        .collect();
+
+    // Preserve the previous deterministic ordering (composer_rows order) so
+    // downstream aggregation/snapshot tests don't depend on rayon scheduling.
+    let order: HashMap<&str, usize> = composer_rows
+        .iter()
+        .enumerate()
+        .map(|(i, (key, _))| (key.as_str(), i))
+        .collect();
+    graphs.sort_by_key(|g| {
+        let key = format!("composerData:{}", g.composer_id);
+        order.get(key.as_str()).copied().unwrap_or(usize::MAX)
+    });
+
+    let session_ids: HashSet<String> = graphs.iter().map(|g| g.composer_id.clone()).collect();
 
     populate_graph_details(vscdb, &mut graphs, &session_ids)?;
     Ok(graphs)
