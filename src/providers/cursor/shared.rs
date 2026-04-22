@@ -3,6 +3,7 @@ use chrono::TimeZone;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
+use serde_json::value::RawValue;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
@@ -221,6 +222,32 @@ struct ConversationBubble {
     #[serde(rename = "type")]
     bubble_type: Option<i64>,
     text: Option<String>,
+}
+
+/// Minimal shape used by the hot `populate_bubbles` loop.
+///
+/// Bubble JSON values can be multi-hundred-KB each (tool args, streaming
+/// content, etc.). Parsing them into a full `JsonValue` tree just to pull
+/// out three fields was the dominant CPU cost on the Linux perf run
+/// (frontend-bound ~46% on E-cores, 41% LLC-miss on P-cores).
+///
+/// `toolFormerData` is borrowed as `&RawValue` so we only materialize the
+/// heavy tool-call sub-tree when we actually need it.
+#[derive(Deserialize)]
+struct BubbleSlim<'a> {
+    #[serde(rename = "type")]
+    bubble_type: Option<i64>,
+    text: Option<String>,
+    #[serde(rename = "modelInfo")]
+    model_info: Option<ModelInfoSlim>,
+    #[serde(rename = "toolFormerData", borrow, default)]
+    tool_former_data: Option<&'a RawValue>,
+}
+
+#[derive(Deserialize)]
+struct ModelInfoSlim {
+    #[serde(rename = "modelName")]
+    model_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -541,33 +568,28 @@ fn populate_bubbles(
             let Some((_, bubble_id)) = bubble_key_parts(&key) else {
                 continue;
             };
-            let bubble: JsonValue = match serde_json::from_str(&raw) {
+
+            // Fast path: typed deserialize into a slim struct so the majority
+            // of bubbles (no `toolFormerData`) never allocate a full
+            // `JsonValue` tree. Only when `toolFormerData` is present do we
+            // parse that sub-object into `JsonValue` for the tool-call path.
+            let slim: BubbleSlim = match serde_json::from_str(&raw) {
                 Ok(value) => value,
                 Err(_) => continue,
             };
 
-            let role = bubble
-                .get("type")
-                .and_then(|value| value.as_i64())
-                .and_then(map_bubble_role);
-            let text = bubble
-                .get("text")
-                .and_then(|value| value.as_str())
-                .map(ToOwned::to_owned);
+            let role = slim.bubble_type.and_then(map_bubble_role);
+            let text = slim.text.clone();
             let order_key = header_orders
                 .get(session_id)
                 .and_then(|headers| headers.get(bubble_id))
                 .copied()
                 .unwrap_or(rowid);
-            let model_name = bubble
-                .get("modelInfo")
-                .and_then(|value| value.get("modelName"))
-                .and_then(|value| value.as_str())
-                .map(ToOwned::to_owned);
+            let model_name = slim.model_info.as_ref().and_then(|m| m.model_name.clone());
 
             graphs[graph_idx].bubble_events.push(CursorBubbleEvent {
                 role,
-                text: text.clone(),
+                text,
                 order_key,
             });
 
@@ -575,9 +597,18 @@ fn populate_bubbles(
                 graphs[graph_idx].model_name = model_name;
             }
 
+            // Tool-call path: parse the `toolFormerData` sub-object lazily.
+            let Some(tool_former_raw) = slim.tool_former_data else {
+                continue;
+            };
+            let tool_former_value: JsonValue = match serde_json::from_str(tool_former_raw.get()) {
+                Ok(value) => value,
+                Err(_) => continue,
+            };
+
             if let Some(tool_call) = parse_tool_call(
                 bubble_id,
-                &bubble,
+                &tool_former_value,
                 graphs[graph_idx].project_path.as_deref(),
                 graphs[graph_idx].last_seen_at(),
                 &graphs[graph_idx].first_edit_path_by_bubble(),
@@ -850,12 +881,15 @@ fn populate_legacy_diffs(
 
 fn parse_tool_call(
     bubble_id: &str,
-    bubble: &JsonValue,
+    tool_former_data: &JsonValue,
     project_path: Option<&str>,
     default_timestamp: Option<String>,
     first_edit_paths: &HashMap<String, String>,
 ) -> Option<CursorToolCall> {
-    let tool = bubble.get("toolFormerData")?.as_object()?;
+    // Callers pass the `toolFormerData` sub-object directly so that the common
+    // "not a tool call" path in `populate_bubbles` can avoid allocating a full
+    // `JsonValue` for the entire bubble.
+    let tool = tool_former_data.as_object()?;
     let name = tool.get("name")?.as_str()?.to_string();
     let status = tool
         .get("status")
