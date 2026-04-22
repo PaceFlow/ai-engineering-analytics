@@ -19,8 +19,29 @@ fn open_at_home(home: &Path) -> Result<Connection> {
     std::fs::create_dir_all(&app_dir)?;
     let db_path = app_dir.join("paceflow.db");
     let conn = Connection::open(db_path)?;
+    tune_connection(&conn)?;
     init_app_schema(&conn)?;
     Ok(conn)
+}
+
+/// Apply performance pragmas to the main paceflow sqlite connection.
+///
+/// Ingest does tens of thousands of small writes and lookups; stock sqlite defaults
+/// (rollback journal + `synchronous=FULL`) mean every statement fsyncs the journal,
+/// which is why `paceflow ingest` can appear I/O-bound on Linux even though the
+/// per-statement work is trivial. WAL + `synchronous=NORMAL` keeps the database
+/// crash-safe for this use case while letting many writes share one fsync.
+pub(crate) fn tune_connection(conn: &Connection) -> Result<()> {
+    // `journal_mode` returns a row; the rest are silent. Use `query_row` for the
+    // first and `execute_batch` for the rest so we stay in a single round-trip.
+    let _: String = conn.query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))?;
+    conn.execute_batch(
+        "PRAGMA synchronous = NORMAL;\n\
+         PRAGMA temp_store = MEMORY;\n\
+         PRAGMA cache_size = -65536;\n\
+         PRAGMA mmap_size = 268435456;",
+    )?;
+    Ok(())
 }
 
 pub(crate) fn init_app_schema(conn: &Connection) -> Result<()> {

@@ -124,6 +124,13 @@ pub(crate) fn ingest_planned_sessions_from_source(
         .map(|graph| (graph.composer_id.clone(), graph))
         .collect();
 
+    // Batch all per-session writes into a single sqlite transaction. With stock
+    // defaults every small insert would trigger its own fsync, which on Linux
+    // dominates wall-clock time for ingest (see paceflow.perf-stat.txt).
+    // `unchecked_transaction` lets us take a transaction from a shared `&Connection`;
+    // nothing else writes to this connection during ingest.
+    let tx = db.unchecked_transaction()?;
+
     let mut total_rows = 0usize;
     for (key, _value) in composer_rows {
         let session_id = key.strip_prefix("composerData:").unwrap_or(key);
@@ -145,6 +152,8 @@ pub(crate) fn ingest_planned_sessions_from_source(
             observer.advance(key);
         }
     }
+
+    tx.commit()?;
 
     Ok(total_rows)
 }
