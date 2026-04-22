@@ -482,77 +482,97 @@ fn populate_bubbles(
         })
         .collect();
 
-    let mut stmt =
-        vscdb.prepare("SELECT rowid, key, value FROM cursorDiskKV WHERE key LIKE 'bubbleId:%'")?;
-    let rows = stmt.query_map([], |row| {
-        Ok((
-            row.get::<_, i64>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, Option<String>>(2)?,
-        ))
-    })?;
+    // Range-scan `cursorDiskKV` per session instead of doing one
+    // `LIKE 'bubbleId:%'` over every bubble in the database. The old query
+    // also touched bubbles belonging to unrelated (already-ingested, planned-
+    // out) sessions, which on large state DBs is the dominant cost of ingest.
+    //
+    // `key` is the primary key of `cursorDiskKV`, so `>= lower AND < upper`
+    // resolves to a bounded index scan. The upper bound uses `;` (0x3B) which
+    // sorts immediately after `:` (0x3A), covering every `bubbleId:<sid>:*` key.
+    let mut stmt = vscdb.prepare(
+        "SELECT rowid, key, value FROM cursorDiskKV WHERE key >= ?1 AND key < ?2",
+    )?;
 
-    for row in rows {
-        let (rowid, key, raw) = match row {
-            Ok(row) => row,
-            Err(_) => continue,
-        };
-        let Some(raw) = raw else {
-            continue;
-        };
-        let Some((session_id, bubble_id)) = bubble_key_parts(&key) else {
-            continue;
-        };
-        let Some(graph_idx) = by_session.get(session_id).copied() else {
-            continue;
-        };
-        let bubble: JsonValue = match serde_json::from_str(&raw) {
-            Ok(value) => value,
-            Err(_) => continue,
-        };
+    // Iterate session_ids in a stable order so tests that snapshot output stay
+    // deterministic across runs; `by_session` is a HashMap whose iteration order
+    // is randomized.
+    let mut session_ids: Vec<&str> = by_session.keys().map(String::as_str).collect();
+    session_ids.sort_unstable();
 
-        let role = bubble
-            .get("type")
-            .and_then(|value| value.as_i64())
-            .and_then(map_bubble_role);
-        let text = bubble
-            .get("text")
-            .and_then(|value| value.as_str())
-            .map(ToOwned::to_owned);
-        let order_key = header_orders
-            .get(session_id)
-            .and_then(|headers| headers.get(bubble_id))
-            .copied()
-            .unwrap_or(rowid);
-        let model_name = bubble
-            .get("modelInfo")
-            .and_then(|value| value.get("modelName"))
-            .and_then(|value| value.as_str())
-            .map(ToOwned::to_owned);
+    for session_id in session_ids {
+        let graph_idx = by_session[session_id];
+        let lower = format!("bubbleId:{session_id}:");
+        let upper = format!("bubbleId:{session_id};");
+        let rows = stmt.query_map(params![lower, upper], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        })?;
 
-        graphs[graph_idx].bubble_events.push(CursorBubbleEvent {
-            role,
-            text: text.clone(),
-            order_key,
-        });
+        for row in rows {
+            let (rowid, key, raw) = match row {
+                Ok(row) => row,
+                Err(_) => continue,
+            };
+            let Some(raw) = raw else {
+                continue;
+            };
+            // The range predicate guarantees this is a `bubbleId:<session_id>:<bubble_id>`
+            // key, but we still split it to recover `bubble_id` for ordering.
+            let Some((_, bubble_id)) = bubble_key_parts(&key) else {
+                continue;
+            };
+            let bubble: JsonValue = match serde_json::from_str(&raw) {
+                Ok(value) => value,
+                Err(_) => continue,
+            };
 
-        if graphs[graph_idx].model_name.is_none() {
-            graphs[graph_idx].model_name = model_name;
-        }
+            let role = bubble
+                .get("type")
+                .and_then(|value| value.as_i64())
+                .and_then(map_bubble_role);
+            let text = bubble
+                .get("text")
+                .and_then(|value| value.as_str())
+                .map(ToOwned::to_owned);
+            let order_key = header_orders
+                .get(session_id)
+                .and_then(|headers| headers.get(bubble_id))
+                .copied()
+                .unwrap_or(rowid);
+            let model_name = bubble
+                .get("modelInfo")
+                .and_then(|value| value.get("modelName"))
+                .and_then(|value| value.as_str())
+                .map(ToOwned::to_owned);
 
-        if let Some(tool_call) = parse_tool_call(
-            bubble_id,
-            &bubble,
-            graphs[graph_idx].project_path.as_deref(),
-            graphs[graph_idx].last_seen_at(),
-            &graphs[graph_idx].first_edit_path_by_bubble(),
-        ) {
-            for path in &tool_call.path_hints {
-                if !is_cursor_plan_path(path) {
-                    graphs[graph_idx].strong_path_hints.insert(path.clone());
-                }
+            graphs[graph_idx].bubble_events.push(CursorBubbleEvent {
+                role,
+                text: text.clone(),
+                order_key,
+            });
+
+            if graphs[graph_idx].model_name.is_none() {
+                graphs[graph_idx].model_name = model_name;
             }
-            graphs[graph_idx].tool_calls.push(tool_call);
+
+            if let Some(tool_call) = parse_tool_call(
+                bubble_id,
+                &bubble,
+                graphs[graph_idx].project_path.as_deref(),
+                graphs[graph_idx].last_seen_at(),
+                &graphs[graph_idx].first_edit_path_by_bubble(),
+            ) {
+                for path in &tool_call.path_hints {
+                    if !is_cursor_plan_path(path) {
+                        graphs[graph_idx].strong_path_hints.insert(path.clone());
+                    }
+                }
+                graphs[graph_idx].tool_calls.push(tool_call);
+            }
         }
     }
 
@@ -568,43 +588,47 @@ fn populate_checkpoints(
     graphs: &mut [CursorSessionGraph],
     by_session: &HashMap<String, usize>,
 ) -> Result<()> {
-    let mut stmt =
-        vscdb.prepare("SELECT key, value FROM cursorDiskKV WHERE key LIKE 'checkpointId:%'")?;
-    let rows = stmt.query_map([], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
-    })?;
+    // See `populate_bubbles` for the rationale behind per-session range scans.
+    let mut stmt = vscdb
+        .prepare("SELECT key, value FROM cursorDiskKV WHERE key >= ?1 AND key < ?2")?;
 
-    for row in rows {
-        let (key, raw) = match row {
-            Ok(row) => row,
-            Err(_) => continue,
-        };
-        let Some(raw) = raw else {
-            continue;
-        };
-        let Some(session_id) = composer_id_from_prefixed_key(&key, "checkpointId") else {
-            continue;
-        };
-        let Some(graph_idx) = by_session.get(session_id).copied() else {
-            continue;
-        };
+    let mut session_ids: Vec<&str> = by_session.keys().map(String::as_str).collect();
+    session_ids.sort_unstable();
 
-        let parsed: JsonValue = match serde_json::from_str(&raw) {
-            Ok(value) => value,
-            Err(_) => continue,
-        };
-        let Some(files) = parsed.get("files").and_then(|value| value.as_array()) else {
-            continue;
-        };
-        for file in files {
-            let Some(path) = file.get("uri").and_then(extract_file_path_from_uri_value) else {
+    for session_id in session_ids {
+        let graph_idx = by_session[session_id];
+        let lower = format!("checkpointId:{session_id}:");
+        let upper = format!("checkpointId:{session_id};");
+        let rows = stmt.query_map(params![lower, upper], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+        })?;
+
+        for row in rows {
+            let (_key, raw) = match row {
+                Ok(row) => row,
+                Err(_) => continue,
+            };
+            let Some(raw) = raw else {
                 continue;
             };
-            if is_cursor_plan_path(&path) {
+
+            let parsed: JsonValue = match serde_json::from_str(&raw) {
+                Ok(value) => value,
+                Err(_) => continue,
+            };
+            let Some(files) = parsed.get("files").and_then(|value| value.as_array()) else {
                 continue;
+            };
+            for file in files {
+                let Some(path) = file.get("uri").and_then(extract_file_path_from_uri_value) else {
+                    continue;
+                };
+                if is_cursor_plan_path(&path) {
+                    continue;
+                }
+                graphs[graph_idx].checkpoint_paths.insert(path.clone());
+                graphs[graph_idx].strong_path_hints.insert(path);
             }
-            graphs[graph_idx].checkpoint_paths.insert(path.clone());
-            graphs[graph_idx].strong_path_hints.insert(path);
         }
     }
 
@@ -1420,14 +1444,6 @@ fn bubble_key_parts(key: &str) -> Option<(&str, &str)> {
         return None;
     }
     Some((parts.next()?, parts.next()?))
-}
-
-fn composer_id_from_prefixed_key<'a>(key: &'a str, prefix: &str) -> Option<&'a str> {
-    let mut parts = key.splitn(3, ':');
-    if parts.next()? != prefix {
-        return None;
-    }
-    parts.next()
 }
 
 fn partial_fates_key_parts(key: &str) -> Option<(&str, &str)> {
