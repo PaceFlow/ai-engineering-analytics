@@ -15,11 +15,11 @@ use crate::change_intel::types::{
     ChangeOpCandidate, LineHashCount, LineSide, ParseError, SessionInfo, WriteMode,
 };
 use crate::cursor_paths::cursor_state_path;
+use crate::ingest_progress::IngestProgressObserver;
+use crate::path_utils::{normalize_filesystem_path, path_to_string};
 use crate::providers::cursor::shared::{
     CursorSessionGraph, load_cursor_session_graphs_with_observer, resolve_tool_call_edits,
 };
-use crate::ingest_progress::IngestProgressObserver;
-use crate::path_utils::{normalize_filesystem_path, path_to_string};
 
 const CURSOR_CURSOR_NAMESPACE: &str = "cursor_core_v1";
 const INLINE_PARSER_NAME: &str = "cursor_inline_undo_v1";
@@ -209,7 +209,9 @@ pub fn ingest_cursor_code_changes_from_sources(
                 verbose,
                 Some(&mut **observer),
             )?,
-            None => ingest_cursor_code_changes_from_path_with_progress(conn, source, verbose, None)?,
+            None => {
+                ingest_cursor_code_changes_from_path_with_progress(conn, source, verbose, None)?
+            }
         };
         combined.sources_discovered += summary.sources_discovered;
         combined.sources_skipped += summary.sources_skipped;

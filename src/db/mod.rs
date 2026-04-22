@@ -635,10 +635,9 @@ pub fn sessions_present(
         );
         let mut stmt = conn.prepare(&sql)?;
         let params_iter = chunk.iter().map(|s| s as &dyn rusqlite::ToSql);
-        let rows = stmt.query_map(
-            rusqlite::params_from_iter(params_iter),
-            |row| row.get::<_, String>(0),
-        )?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(params_iter), |row| {
+            row.get::<_, String>(0)
+        })?;
         for row in rows {
             present.insert(row?);
         }

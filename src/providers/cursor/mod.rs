@@ -148,12 +148,10 @@ pub(crate) fn ingest_planned_sessions_from_source(
         .collect();
     let already_present = db::sessions_present(db, &candidate_ids)?;
 
-    let (existing_rows, new_rows): (Vec<&(String, String)>, Vec<&(String, String)>) = composer_rows
-        .iter()
-        .partition(|(key, _)| {
-            let sid = key.strip_prefix("composerData:").unwrap_or(key.as_str());
-            already_present.contains(sid)
-        });
+    let (existing_rows, new_rows): (Vec<_>, Vec<_>) = composer_rows.iter().partition(|(key, _)| {
+        let sid = key.strip_prefix("composerData:").unwrap_or(key.as_str());
+        already_present.contains(sid)
+    });
 
     let mut total_rows = 0usize;
 
@@ -164,8 +162,8 @@ pub(crate) fn ingest_planned_sessions_from_source(
     // (`started_at`, `ended_at`, `project_path`, `model_name`) to refresh metadata;
     // we deliberately skip the per-session bubble scan and graph construction.
     for (key, raw) in &existing_rows {
-        if let Some(seed) = build_seed_graph(key, raw, source_file) {
-            if let Err(e) = db::upsert_metadata_session_with_model(
+        if let Some(seed) = build_seed_graph(key, raw, source_file)
+            && let Err(e) = db::upsert_metadata_session_with_model(
                 db,
                 "cursor",
                 &seed.composer_id,
@@ -175,10 +173,10 @@ pub(crate) fn ingest_planned_sessions_from_source(
                 Some("cursor"),
                 Some("cursor"),
                 seed.model_name.as_deref(),
-            ) && verbose
-            {
-                eprintln!("[cursor] metadata refresh failed: {}", e);
-            }
+            )
+            && verbose
+        {
+            eprintln!("[cursor] metadata refresh failed: {}", e);
         }
 
         if let Some(observer) = progress.as_mut() {
@@ -191,8 +189,10 @@ pub(crate) fn ingest_planned_sessions_from_source(
         if let Some(observer) = progress.as_mut() {
             observer.set_phase("seed graphs");
         }
-        let new_row_owned: Vec<(String, String)> =
-            new_rows.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        let new_row_owned: Vec<(String, String)> = new_rows
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
         let graphs = match progress.as_mut() {
             Some(obs) => load_cursor_session_graphs_from_rows_with_observer(
                 vscdb,
@@ -408,10 +408,10 @@ fn build_history_index(history_root: &Path) -> HistoryIndex {
     // and rarely mutates existing `entries.json` files, so this hits on almost
     // every repeat run.
     if let Some(cache_path) = history_cache_path() {
-        if let Some(cache) = load_history_cache(&cache_path) {
-            if cache.signatures == current_sigs {
-                return cache.entries;
-            }
+        if let Some(cache) = load_history_cache(&cache_path)
+            && cache.signatures == current_sigs
+        {
+            return cache.entries;
         }
 
         let fresh = build_history_index_fresh(&dir_paths);
@@ -429,7 +429,6 @@ fn build_history_index(history_root: &Path) -> HistoryIndex {
     // No writable home directory - skip the cache, just rebuild.
     build_history_index_fresh(&dir_paths)
 }
-
 
 // ── Session ingestion ─────────────────────────────────────────────────────────
 

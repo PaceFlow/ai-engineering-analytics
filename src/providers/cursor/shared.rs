@@ -572,9 +572,8 @@ fn populate_bubbles(
     // `key` is the primary key of `cursorDiskKV`, so `>= lower AND < upper`
     // resolves to a bounded index scan. The upper bound uses `;` (0x3B) which
     // sorts immediately after `:` (0x3A), covering every `bubbleId:<sid>:*` key.
-    let mut stmt = vscdb.prepare(
-        "SELECT rowid, key, value FROM cursorDiskKV WHERE key >= ?1 AND key < ?2",
-    )?;
+    let mut stmt =
+        vscdb.prepare("SELECT rowid, key, value FROM cursorDiskKV WHERE key >= ?1 AND key < ?2")?;
 
     // Iterate session_ids in a stable order so tests that snapshot output stay
     // deterministic across runs; `by_session` is a HashMap whose iteration order
@@ -675,8 +674,8 @@ fn populate_checkpoints(
     by_session: &HashMap<String, usize>,
 ) -> Result<()> {
     // See `populate_bubbles` for the rationale behind per-session range scans.
-    let mut stmt = vscdb
-        .prepare("SELECT key, value FROM cursorDiskKV WHERE key >= ?1 AND key < ?2")?;
+    let mut stmt =
+        vscdb.prepare("SELECT key, value FROM cursorDiskKV WHERE key >= ?1 AND key < ?2")?;
 
     let mut session_ids: Vec<&str> = by_session.keys().map(String::as_str).collect();
     session_ids.sort_unstable();
@@ -1784,5 +1783,4 @@ mod tests {
         assert_eq!(graphs.len(), 1);
         assert_eq!(graphs[0].composer_id, "real-session");
     }
-
 }
