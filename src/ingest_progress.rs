@@ -172,7 +172,13 @@ impl IngestProgress {
             .spawn(move || {
                 let mut last_heartbeat = Instant::now();
                 while !done.load(Ordering::Relaxed) {
-                    thread::sleep(tick);
+                    // `park_timeout` is like `sleep(tick)` except that
+                    // `stop_ticker()` can wake us up immediately via
+                    // `thread().unpark()`. Without this, `Drop` would block
+                    // for the full tick duration — fine in prod (200ms) but
+                    // fatal in tests that use very large intervals to
+                    // "disable" the ticker.
+                    thread::park_timeout(tick);
                     tick_count.fetch_add(1, Ordering::Relaxed);
                     if done.load(Ordering::Relaxed) {
                         break;
@@ -250,6 +256,9 @@ impl IngestProgress {
     fn stop_ticker(&mut self) {
         self.done.store(true, Ordering::Relaxed);
         if let Some(handle) = self.ticker.take() {
+            // Wake the ticker thread out of `park_timeout` so `join` returns
+            // immediately instead of waiting for the full tick interval.
+            handle.thread().unpark();
             let _ = handle.join();
         }
     }
@@ -545,11 +554,21 @@ mod tests {
             Duration::from_secs(3600),
         );
         let before = progress.tick_count();
-        std::thread::sleep(Duration::from_millis(120));
-        let after = progress.tick_count();
-        assert!(
-            after >= before + 2,
-            "expected ticker to fire at least twice, before={before} after={after}"
-        );
+
+        // Poll with a generous upper bound so slow CI schedulers do not flake
+        // the test just because the first few ticks get starved. 2 seconds is
+        // plenty for a 20ms-interval ticker to fire at least twice.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let after = progress.tick_count();
+            if after >= before + 2 {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "ticker did not fire twice within 2s (before={before}, latest={after})"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 }
