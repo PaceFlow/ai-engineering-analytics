@@ -105,6 +105,17 @@ pub fn list_commits_on_ref(repo_root: &str, ref_name: &str) -> Result<Vec<String
     list_from_rev_list(repo_root, &["rev-list".to_string(), ref_name.to_string()])
 }
 
+pub fn list_first_parent_commits(repo_root: &str, ref_name: &str) -> Result<Vec<String>> {
+    list_from_rev_list(
+        repo_root,
+        &[
+            "rev-list".to_string(),
+            "--first-parent".to_string(),
+            ref_name.to_string(),
+        ],
+    )
+}
+
 pub fn merge_base(repo_root: &str, left: &str, right: &str) -> Result<Option<String>> {
     let output = Command::new("git")
         .arg("-C")
