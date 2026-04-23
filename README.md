@@ -281,7 +281,7 @@ The reports are built from normalized session events, matched commit/session att
 - `PR Reach`: share of heavy GitHub AI commits that reached a pull request
 - `Mainline Reach`: share of heavy commits that later reached mainline, including squash-aware content matching
 - `PR Merge`: share of PR-linked heavy GitHub AI commits whose PR merged
-- `vs Staging`: live diff size from `git diff staging...<branch>` for task-grouped rows; computed at render time
+- `± LOC commits` (task-grouped delivery): sum of lines added and removed from ingested per-commit git stats (`fact_commit`) for commits attributed to that task branch
 
 ### Quality Metrics
 
@@ -304,7 +304,7 @@ The reports are built from normalized session events, matched commit/session att
 - `--overall` swaps the default model comparison for the rolled-up one-row summary and conflicts with `--group-by`
 - Provider `human` means a commit had no matched AI session attribution at all
 - Task-grouped rows only show ticket-style task keys such as `ABC-123` and exclude integration branches such as `main`, `staging`, `master`, and `develop`
-- `delivery --group-by task` includes `vs Staging`, derived from `git diff staging...<branch>` for non-integration branches
+- `delivery --group-by task` includes `± LOC commits`, summed from ingested commit line stats for that task branch
 - Local analytics state lives under `~/.paceflow/paceflow.db` by default; override the base home with `PACEFLOW_HOME`
 
 Development notes, profiling setup, and source-oriented workflows live in [DEV.md](DEV.md).

@@ -16,8 +16,9 @@ Heavy commits: 3 (33.33% of commits)
 
 Legend:
 - Heavy commits: commits where matched AI-attributed lines are at least half of changed lines.
-- PR reach: share of heavy GitHub AI commits that reached a pull request.
+- GitHub PR lookup coverage: heavy commits on github.com with completed lookup (resolved or no PR) vs all heavy commits on github.com.
+- PR reach: among completed lookups, share where a pull request existed.
 - Mainline reach: share of heavy AI commits that later reached mainline.
-- PR merge: share of PR-linked heavy GitHub AI commits whose PR merged.
-- GitHub-backed PR metrics show N/A until PR sync data is available.
+- PR merge: among PR-linked commits with completed lookup, share whose PR merged.
+- PR reach / merge show N/A when no GitHub-heavy commits or no completed lookups yet.
 - Status: higher is better for all delivery signals.

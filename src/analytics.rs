@@ -263,10 +263,17 @@ pub struct ChangeReportRow {
     pub repo_root: Option<String>,
     pub commit_count: i64,
     pub heavy_commit_count: i64,
+    /// Heavy commits on `git:github.com/...` remotes (PR metrics denominator for coverage).
+    pub github_pr_heavy_eligible: i64,
+    /// Subset of [`Self::github_pr_heavy_eligible`] with finished PR lookup (`resolved` / `no_pr`).
+    pub github_pr_heavy_ready: i64,
     pub pr_reach_rate: RatioMetric,
     pub merge_rate: RatioMetric,
     pub pr_merge_rate: RatioMetric,
     pub github_pr_metrics_available: bool,
+    /// Sum of `fact_commit.total_added` / `total_removed` for commits in this row (task-grouped delivery).
+    pub task_branch_lines_added: i64,
+    pub task_branch_lines_removed: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -1284,6 +1291,12 @@ pub fn query_change_report_with_options(
         "COUNT(DISTINCT CASE WHEN base.heavy_ai_flag = 1 AND eo.repo_key LIKE 'git:github.com/%' AND pr.pr_opened_flag = 1 THEN base.commit_sha END) AS c3_d"
             .to_string(),
     );
+    select.push(
+        "COALESCE(SUM(fc.total_added), 0) AS task_branch_lines_added".to_string(),
+    );
+    select.push(
+        "COALESCE(SUM(fc.total_removed), 0) AS task_branch_lines_removed".to_string(),
+    );
 
     let mut sql = format!(
         "SELECT {} FROM ({}) base
@@ -1295,7 +1308,10 @@ pub fn query_change_report_with_options(
           AND lu.commit_sha = base.commit_sha
          LEFT JOIN event_commit_pr_outcome pr
            ON pr.repo_root = base.repo_root
-          AND pr.commit_sha = base.commit_sha",
+          AND pr.commit_sha = base.commit_sha
+         LEFT JOIN fact_commit fc
+           ON fc.repo_root = base.repo_root
+          AND fc.commit_sha = base.commit_sha",
         select.join(", "),
         base_sql
     );
@@ -1321,14 +1337,18 @@ pub fn query_change_report_with_options(
             branch_name: row.get(3)?,
             commit_count: row.get(4)?,
             heavy_commit_count: row.get(5)?,
-            pr_reach_rate: ratio_metric(row.get(10)?, row.get(8)?),
+            github_pr_heavy_eligible: row.get(8)?,
+            github_pr_heavy_ready: row.get(9)?,
+            pr_reach_rate: ratio_metric(row.get(10)?, row.get(9)?),
             merge_rate: ratio_metric(row.get(6)?, row.get(7)?),
             pr_merge_rate: ratio_metric(row.get(11)?, row.get(12)?),
             github_pr_metrics_available: {
                 let eligible: i64 = row.get(8)?;
                 let ready: i64 = row.get(9)?;
-                eligible > 0 && eligible == ready
+                eligible > 0 && ready > 0
             },
+            task_branch_lines_added: row.get(13)?,
+            task_branch_lines_removed: row.get(14)?,
         })
     })?;
     let mut out = Vec::new();
@@ -4024,7 +4044,9 @@ mod tests {
 
         assert_eq!(rows.len(), 1);
         assert!(!rows[0].github_pr_metrics_available);
-        assert_eq!(rows[0].pr_reach_rate.denominator, 1);
+        assert_eq!(rows[0].github_pr_heavy_eligible, 1);
+        assert_eq!(rows[0].github_pr_heavy_ready, 0);
+        assert_eq!(rows[0].pr_reach_rate.denominator, 0);
         assert_eq!(rows[0].pr_reach_rate.numerator, 0);
         Ok(())
     }

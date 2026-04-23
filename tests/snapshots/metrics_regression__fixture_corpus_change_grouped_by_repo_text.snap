@@ -4,9 +4,10 @@ expression: change_grouped
 ---
 Delivery Metrics
 
-Repo                           Commits     Heavy    PR Reach   Mainline Reach      PR Merge
-__REPO_PACEFLOW__                    9         3         N/A           100.0%             N/A
+Repo                           Commits     Heavy    PR sync    PR Reach   Mainline Reach      PR Merge
+__REPO_PACEFLOW__                    9         3          —         N/A           100.0%             N/A
 
 Legend:
-- PR Reach, Mainline Reach, and PR Merge = percentage rates.
-- N/A means GitHub PR sync data is unavailable for PR-backed metrics.
+- PR sync = completed GitHub PR lookups / heavy commits on github.com (same scope as PR reach).
+- PR Reach and PR Merge use completed lookups only; sync the rest with `PACEFLOW_GITHUB_TOKEN` and ingest.
+- PR Reach, Mainline Reach, and PR Merge = percentage rates (PR merge N/A when no PR-linked commits in the completed set).
