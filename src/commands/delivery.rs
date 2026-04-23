@@ -1,6 +1,4 @@
 use anyhow::Result;
-use std::collections::HashMap;
-use std::process::Command;
 
 use crate::analytics;
 use crate::cli::{DeliveryReportArgs, GroupBy, ReportArgs};
@@ -10,12 +8,6 @@ use crate::commands::report_layout::{
 };
 use crate::commands::report_scope;
 use crate::db;
-
-#[derive(Debug, Clone, Copy)]
-struct DiffStat {
-    added: i64,
-    removed: i64,
-}
 
 pub fn run(args: DeliveryReportArgs) -> Result<()> {
     let db = db::open()?;
@@ -45,10 +37,18 @@ fn render_delivery_report(rows: &[analytics::ChangeReportRow], report: &ReportAr
         let row = &rows[0];
         out.push_str(&format!("Commits analyzed: {}\n", row.commit_count));
         out.push_str(&format!(
-            "Heavy commits: {} ({})\n\n",
+            "Heavy commits: {} ({})\n",
             row.heavy_commit_count,
             fmt_share(row.heavy_commit_count, row.commit_count)
         ));
+        if row.github_pr_heavy_eligible > 0 {
+            out.push_str(&format!(
+                "GitHub PR lookup coverage: {} / {} heavy GitHub commits (completed lookup)\n\n",
+                row.github_pr_heavy_ready, row.github_pr_heavy_eligible
+            ));
+        } else {
+            out.push('\n');
+        }
 
         let scorecard = [
             ScorecardRow {
@@ -82,17 +82,17 @@ fn render_delivery_report(rows: &[analytics::ChangeReportRow], report: &ReportAr
             &mut out,
             &[
                 "Heavy commits: commits where matched AI-attributed lines are at least half of changed lines.",
-                "PR reach: share of heavy GitHub AI commits that reached a pull request.",
+                "GitHub PR lookup coverage: heavy commits on github.com with completed lookup (resolved or no PR) vs all heavy commits on github.com.",
+                "PR reach: among completed lookups, share where a pull request existed.",
                 "Mainline reach: share of heavy AI commits that later reached mainline.",
-                "PR merge: share of PR-linked heavy GitHub AI commits whose PR merged.",
-                "GitHub-backed PR metrics show N/A until PR sync data is available.",
+                "PR merge: among PR-linked commits with completed lookup, share whose PR merged.",
+                "PR reach / merge show N/A when no GitHub-heavy commits or no completed lookups yet.",
                 "Status: higher is better for all delivery signals.",
             ],
         );
         return out;
     }
 
-    let mut cache = HashMap::new();
     let show_week = report.weekly;
     let show_group = report.group_by.is_some();
     let show_branch = matches!(report.group_by, Some(GroupBy::Task));
@@ -110,11 +110,12 @@ fn render_delivery_report(rows: &[analytics::ChangeReportRow], report: &ReportAr
     }
     headers.push(format!("{:>8}", "Commits"));
     headers.push(format!("{:>8}", "Heavy"));
+    headers.push(format!("{:>9}", "PR sync"));
     headers.push(format!("{:>10}", "PR Reach"));
     headers.push(format!("{:>15}", "Mainline Reach"));
     headers.push(format!("{:>12}", "PR Merge"));
     if show_branch {
-        headers.push(format!("{:>12}", "vs Staging"));
+        headers.push(format!("{:>12}", "± LOC commits"));
     }
     out.push_str(&format!("{}\n", headers.join("  ")));
 
@@ -137,6 +138,7 @@ fn render_delivery_report(rows: &[analytics::ChangeReportRow], report: &ReportAr
         }
         cols.push(format!("{:>8}", row.commit_count));
         cols.push(format!("{:>8}", row.heavy_commit_count));
+        cols.push(format!("{:>9}", fmt_github_pr_lookup_coverage(row)));
         cols.push(format!(
             "{:>10}",
             fmt_optional_ratio_percent(&row.pr_reach_rate, row.github_pr_metrics_available, 1)
@@ -149,25 +151,35 @@ fn render_delivery_report(rows: &[analytics::ChangeReportRow], report: &ReportAr
         if show_branch {
             cols.push(format!(
                 "{:>12}",
-                fmt_diff(
-                    row.repo_root.as_deref(),
-                    row.branch_name.as_deref(),
-                    &mut cache
-                )
+                fmt_task_branch_diff_stat(row.task_branch_lines_added, row.task_branch_lines_removed)
             ));
         }
         out.push_str(&format!("{}\n", cols.join("  ")));
     }
 
-    append_legend(
-        &mut out,
-        &[
-            "PR Reach, Mainline Reach, and PR Merge = percentage rates.",
-            "N/A means GitHub PR sync data is unavailable for PR-backed metrics.",
-        ],
-    );
+    let mut legend: Vec<&'static str> = vec![
+        "PR sync = completed GitHub PR lookups / heavy commits on github.com (same scope as PR reach).",
+        "PR Reach and PR Merge use completed lookups only; sync the rest with `PACEFLOW_GITHUB_TOKEN` and ingest.",
+        "PR Reach, Mainline Reach, and PR Merge = percentage rates (PR merge N/A when no PR-linked commits in the completed set).",
+    ];
+    if matches!(report.group_by, Some(GroupBy::Task)) {
+        legend.push(
+            "± LOC commits: sum of lines added/removed from ingested git stats (`fact_commit`) for commits attributed to this task branch (not git diff vs staging).",
+        );
+    }
+    append_legend(&mut out, &legend);
 
     out
+}
+
+fn fmt_github_pr_lookup_coverage(row: &analytics::ChangeReportRow) -> String {
+    if row.github_pr_heavy_eligible == 0 {
+        return "—".to_string();
+    }
+    format!(
+        "{}/{}",
+        row.github_pr_heavy_ready, row.github_pr_heavy_eligible
+    )
 }
 
 fn fmt_optional_ratio(
@@ -216,106 +228,8 @@ fn fmt_share(numerator: i64, denominator: i64) -> String {
     }
 }
 
-fn fmt_diff(
-    repo_root: Option<&str>,
-    branch_name: Option<&str>,
-    cache: &mut HashMap<(String, String), Option<DiffStat>>,
-) -> String {
-    let (Some(repo_root), Some(branch_name)) = (repo_root, branch_name) else {
-        return "N/A".to_string();
-    };
-    let stat = diff_vs_staging_for_branch(repo_root, branch_name, cache);
-    match stat {
-        Some(value) => format!("+{}/-{}", value.added, value.removed),
-        None => "N/A".to_string(),
-    }
-}
-
-fn diff_vs_staging_for_branch(
-    repo_root: &str,
-    branch_name: &str,
-    cache: &mut HashMap<(String, String), Option<DiffStat>>,
-) -> Option<DiffStat> {
-    if repo_root == "(unknown)" {
-        return None;
-    }
-
-    let key = (repo_root.to_string(), branch_name.to_string());
-    if let Some(cached) = cache.get(&key) {
-        return *cached;
-    }
-
-    let staging_ref = resolve_ref(
-        repo_root,
-        &["refs/heads/staging", "refs/remotes/origin/staging"],
-    );
-    let branch_ref = resolve_ref(
-        repo_root,
-        &[
-            &format!("refs/heads/{branch_name}"),
-            &format!("refs/remotes/origin/{branch_name}"),
-        ],
-    );
-
-    let (Some(staging_ref), Some(branch_ref)) = (staging_ref, branch_ref) else {
-        cache.insert(key, None);
-        return None;
-    };
-
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(repo_root)
-        .arg("diff")
-        .arg("--numstat")
-        .arg("--no-renames")
-        .arg(format!("{staging_ref}...{branch_ref}"))
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        cache.insert(key, None);
-        return None;
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut added = 0i64;
-    let mut removed = 0i64;
-    for line in stdout.lines() {
-        let mut parts = line.splitn(3, '\t');
-        let Some(added_raw) = parts.next() else {
-            continue;
-        };
-        let Some(removed_raw) = parts.next() else {
-            continue;
-        };
-        if let Ok(value) = added_raw.parse::<i64>() {
-            added += value;
-        }
-        if let Ok(value) = removed_raw.parse::<i64>() {
-            removed += value;
-        }
-    }
-
-    let stat = DiffStat { added, removed };
-    cache.insert(key, Some(stat));
-    Some(stat)
-}
-
-fn resolve_ref(repo_root: &str, refs: &[&str]) -> Option<String> {
-    for reference in refs {
-        let output = Command::new("git")
-            .arg("-C")
-            .arg(repo_root)
-            .arg("show-ref")
-            .arg("--verify")
-            .arg("--quiet")
-            .arg(reference)
-            .output()
-            .ok()?;
-        if output.status.success() {
-            return Some((*reference).to_string());
-        }
-    }
-    None
+fn fmt_task_branch_diff_stat(added: i64, removed: i64) -> String {
+    format!("+{}/-{}", added, removed)
 }
 
 #[cfg(test)]
@@ -333,6 +247,8 @@ mod tests {
             repo_root: None,
             commit_count: 4,
             heavy_commit_count: 2,
+            github_pr_heavy_eligible: 2,
+            github_pr_heavy_ready: 2,
             pr_reach_rate: RatioMetric {
                 numerator: 1,
                 denominator: 2,
@@ -346,6 +262,8 @@ mod tests {
                 denominator: 1,
             },
             github_pr_metrics_available: true,
+            task_branch_lines_added: 0,
+            task_branch_lines_removed: 0,
         }];
         let report = ReportArgs {
             weekly: false,
@@ -363,6 +281,7 @@ mod tests {
         let rendered = render_delivery_report(&rows, &report);
         assert!(rendered.contains("Commits analyzed: 4"));
         assert!(rendered.contains("Heavy commits: 2 (50.00% of commits)"));
+        assert!(rendered.contains("GitHub PR lookup coverage: 2 / 2 heavy GitHub commits"));
         assert!(rendered.contains("│ Signal"));
         assert!(rendered.contains("│ Mainline Reach"));
         assert!(rendered.contains("50.00% (1/2)"));
@@ -382,6 +301,8 @@ mod tests {
             repo_root: None,
             commit_count: 4,
             heavy_commit_count: 2,
+            github_pr_heavy_eligible: 2,
+            github_pr_heavy_ready: 0,
             pr_reach_rate: RatioMetric {
                 numerator: 0,
                 denominator: 2,
@@ -395,6 +316,8 @@ mod tests {
                 denominator: 0,
             },
             github_pr_metrics_available: false,
+            task_branch_lines_added: 0,
+            task_branch_lines_removed: 0,
         }];
         let report = ReportArgs {
             weekly: false,
@@ -427,6 +350,8 @@ mod tests {
             repo_root: None,
             commit_count: 4,
             heavy_commit_count: 2,
+            github_pr_heavy_eligible: 2,
+            github_pr_heavy_ready: 0,
             pr_reach_rate: RatioMetric {
                 numerator: 0,
                 denominator: 2,
@@ -440,6 +365,8 @@ mod tests {
                 denominator: 0,
             },
             github_pr_metrics_available: false,
+            task_branch_lines_added: 0,
+            task_branch_lines_removed: 0,
         }];
         let report = ReportArgs {
             weekly: false,
@@ -456,6 +383,9 @@ mod tests {
 
         let rendered = render_delivery_report(&rows, &report);
         assert!(rendered.contains("unavailable"));
-        assert!(rendered.contains("GitHub-backed PR metrics show N/A"));
+        assert!(rendered.contains("GitHub PR lookup coverage: 0 / 2 heavy GitHub commits"));
+        assert!(rendered.contains(
+            "PR reach / merge show N/A when no GitHub-heavy commits or no completed lookups yet.",
+        ));
     }
 }
