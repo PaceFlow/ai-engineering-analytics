@@ -1171,6 +1171,14 @@ pub fn query_session_report_with_options(
             break;
         }
     }
+    if matches!(args.group_by, Some(GroupBy::Task)) {
+        sort_rows_by_task_key_natural(
+            &mut out,
+            |row| row.week_start.as_deref(),
+            |row| row.group_value.as_deref(),
+            |row| row.branch_name.as_deref(),
+        );
+    }
     Ok(apply_session_report_options(out, args, options))
 }
 
@@ -1336,6 +1344,14 @@ pub fn query_change_report_with_options(
             break;
         }
     }
+    if matches!(args.group_by, Some(GroupBy::Task)) {
+        sort_rows_by_task_key_natural(
+            &mut out,
+            |row| row.week_start.as_deref(),
+            |row| row.group_value.as_deref(),
+            |row| row.branch_name.as_deref(),
+        );
+    }
     Ok(apply_change_report_options(out, args, options))
 }
 
@@ -1459,6 +1475,14 @@ pub fn query_lifecycle_report_with_options(
             break;
         }
     }
+    if matches!(args.group_by, Some(GroupBy::Task)) {
+        sort_rows_by_task_key_natural(
+            &mut out,
+            |row| row.week_start.as_deref(),
+            |row| row.group_value.as_deref(),
+            |row| row.branch_name.as_deref(),
+        );
+    }
     Ok(apply_lifecycle_report_options(out, args, options))
 }
 
@@ -1569,6 +1593,56 @@ fn sort_lifecycle_rows(mut rows: Vec<LifecycleReportRow>) -> Vec<LifecycleReport
 
 fn ratio_value(metric: &RatioMetric) -> f64 {
     metric.percent().unwrap_or(-1.0)
+}
+
+/// Returns an ordering key for a task_key that sorts naturally: the prefix is
+/// compared case-insensitively and any trailing digit run is compared
+/// numerically, so `PAC-9 < PAC-10 < PAC-100`. Keys that don't match
+/// `<letters>(-|_)<digits>` fall back to a lexicographic comparison by
+/// pushing them after parseable keys.
+fn task_key_sort_key(key: Option<&str>) -> (bool, String, u64, String) {
+    let raw = key.unwrap_or("").to_string();
+    let bytes = raw.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() && bytes[i].is_ascii_alphabetic() {
+        i += 1;
+    }
+    if i > 0 && i < bytes.len() && (bytes[i] == b'-' || bytes[i] == b'_') {
+        let prefix = raw[..i].to_ascii_uppercase();
+        let rest = &raw[i + 1..];
+        let digit_len = rest.bytes().take_while(|b| b.is_ascii_digit()).count();
+        if digit_len > 0
+            && let Ok(number) = rest[..digit_len].parse::<u64>()
+        {
+            return (false, prefix, number, raw);
+        }
+    }
+    (true, String::new(), u64::MAX, raw)
+}
+
+fn sort_rows_by_task_key_natural<T, FW, FT, FB>(
+    rows: &mut [T],
+    week_of: FW,
+    task_key_of: FT,
+    branch_of: FB,
+) where
+    FW: Fn(&T) -> Option<&str>,
+    FT: Fn(&T) -> Option<&str>,
+    FB: Fn(&T) -> Option<&str>,
+{
+    rows.sort_by(|left, right| {
+        let left_key = (
+            week_of(left).unwrap_or("").to_string(),
+            task_key_sort_key(task_key_of(left)),
+            branch_of(left).unwrap_or("").to_string(),
+        );
+        let right_key = (
+            week_of(right).unwrap_or("").to_string(),
+            task_key_sort_key(task_key_of(right)),
+            branch_of(right).unwrap_or("").to_string(),
+        );
+        left_key.cmp(&right_key)
+    });
 }
 
 fn limit_rows<T>(mut rows: Vec<T>, limit: usize) -> Vec<T> {
@@ -3438,6 +3512,37 @@ mod tests {
         let conn = Connection::open_in_memory()?;
         crate::db::init_app_schema(&conn)?;
         Ok(conn)
+    }
+
+    #[test]
+    fn task_key_sort_key_orders_numbers_naturally_not_lexicographically() {
+        let mut keys = vec!["PAC-100", "PAC-9", "PAC-10", "PAC-1", "PAC-583", "PAC-95"];
+        keys.sort_by_key(|k| task_key_sort_key(Some(k)));
+        assert_eq!(
+            keys,
+            vec!["PAC-1", "PAC-9", "PAC-10", "PAC-95", "PAC-100", "PAC-583"]
+        );
+    }
+
+    #[test]
+    fn task_key_sort_key_groups_prefixes_together_and_uppercases() {
+        let mut keys = vec!["pac-10", "ABC-5", "PAC-2", "abc-100"];
+        keys.sort_by_key(|k| task_key_sort_key(Some(k)));
+        assert_eq!(keys, vec!["ABC-5", "abc-100", "PAC-2", "pac-10"]);
+    }
+
+    #[test]
+    fn task_key_sort_key_pushes_unparseable_keys_to_the_end() {
+        let mut keys = vec!["staging", "PAC-10", "(unknown)", "PAC-1"];
+        keys.sort_by_key(|k| task_key_sort_key(Some(k)));
+        assert_eq!(keys, vec!["PAC-1", "PAC-10", "(unknown)", "staging"]);
+    }
+
+    #[test]
+    fn task_key_sort_key_handles_underscore_separator() {
+        let mut keys = vec!["PAC_837", "PAC-10", "PAC_9"];
+        keys.sort_by_key(|k| task_key_sort_key(Some(k)));
+        assert_eq!(keys, vec!["PAC_9", "PAC-10", "PAC_837"]);
     }
 
     #[test]
