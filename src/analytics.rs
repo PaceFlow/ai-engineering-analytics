@@ -2010,12 +2010,18 @@ fn is_reportable_task(task_key: &Option<String>, branch_name: Option<&str>) -> b
 }
 
 fn refresh_task_session_events(conn: &Connection) -> Result<()> {
+    // Group by the same key as event_task_session's PRIMARY KEY so we can't
+    // ever emit two rows that collide on insert. A single task_key can span
+    // multiple branch names (e.g. `pac-595-foo` and `pac-595-bar` both yield
+    // `PAC-595`); when the same session contributed to commits on both
+    // branches we collapse them into one row here and pick a deterministic
+    // branch_name via MIN.
     let mut stmt = conn.prepare(
         "SELECT
             tc.repo_root,
             MAX(COALESCE(tc.repo_key, cs.repo_key, sq.repo_key)) AS repo_key,
             tc.task_key,
-            tc.branch_name,
+            MIN(tc.branch_name) AS branch_name,
             cs.provider,
             cs.session_id,
             MAX(COALESCE(cs.member_email, sq.member_email, '(unknown)')) AS member_email,
@@ -2045,7 +2051,7 @@ fn refresh_task_session_events(conn: &Connection) -> Result<()> {
          LEFT JOIN event_session_quality sq
            ON sq.provider = cs.provider
           AND sq.session_id = cs.session_id
-         GROUP BY tc.repo_root, tc.task_key, tc.branch_name, cs.provider, cs.session_id",
+         GROUP BY tc.repo_root, tc.task_key, cs.provider, cs.session_id",
     )?;
     let rows = stmt.query_map([], |row| {
         Ok((
