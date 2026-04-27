@@ -141,6 +141,7 @@ pub fn group_label(group_by: Option<GroupBy>) -> &'static str {
         Some(GroupBy::Repo) => "Repo",
         Some(GroupBy::Provider) => "Provider",
         Some(GroupBy::Task) => "Task",
+        Some(GroupBy::Branch) => "Branch",
         Some(GroupBy::Model) => "Model",
         None => "Group",
     }

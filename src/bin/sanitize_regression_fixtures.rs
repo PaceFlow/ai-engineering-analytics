@@ -56,6 +56,8 @@ fn main() -> Result<()> {
         .join("regression")
         .join("home_template");
     let codex_root = fixture_root.join(".codex").join("sessions");
+    let claude_root = fixture_root.join(".claude").join("projects");
+    let claude_file_history_root = fixture_root.join(".claude").join("file-history");
     let cursor_db = fixture_root.join("cursor").join("state.vscdb");
 
     let mut session_files = Vec::new();
@@ -63,6 +65,17 @@ fn main() -> Result<()> {
     session_files.sort();
     for path in session_files {
         sanitize_codex_session(&path)?;
+    }
+    if claude_root.exists() {
+        let mut claude_session_files = Vec::new();
+        collect_jsonl_files(&claude_root, &mut claude_session_files)?;
+        claude_session_files.sort();
+        for path in claude_session_files {
+            sanitize_claude_session(&path)?;
+        }
+    }
+    if claude_file_history_root.exists() {
+        sanitize_claude_file_history(&claude_file_history_root)?;
     }
     sanitize_cursor_db(&cursor_db)?;
     Ok(())
@@ -370,6 +383,120 @@ fn sanitize_codex_session(path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn sanitize_claude_session(path: &Path) -> Result<()> {
+    let content =
+        fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let mut sanitizer = MessageSanitizer::default();
+    let mut new_lines = Vec::new();
+
+    for raw_line in content.lines() {
+        if raw_line.trim().is_empty() {
+            new_lines.push(raw_line.to_string());
+            continue;
+        }
+
+        let mut record: Value = serde_json::from_str(raw_line)
+            .with_context(|| format!("parsing JSONL record in {}", path.display()))?;
+        sanitize_claude_record(&mut record, &mut sanitizer);
+        new_lines.push(serde_json::to_string(&record)?);
+    }
+
+    fs::write(path, format!("{}\n", new_lines.join("\n")))
+        .with_context(|| format!("writing {}", path.display()))?;
+    Ok(())
+}
+
+fn sanitize_claude_record(record: &mut Value, sanitizer: &mut MessageSanitizer) {
+    if let Some(message) = record.get_mut("message") {
+        let role = message
+            .get("role")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        sanitize_claude_message_content(message, &role, sanitizer);
+    }
+
+    if let Some(message) = record
+        .get_mut("data")
+        .and_then(|data| data.get_mut("message"))
+        .and_then(|message| message.get_mut("message"))
+    {
+        let role = message
+            .get("role")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        sanitize_claude_message_content(message, &role, sanitizer);
+    }
+
+    if let Some(prompt) = record
+        .get("data")
+        .and_then(|data| data.get("prompt"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        && let Some(data) = record.get_mut("data").and_then(Value::as_object_mut)
+    {
+        data.insert(
+            "prompt".to_string(),
+            Value::String(sanitizer.user_text(&prompt)),
+        );
+    }
+}
+
+fn sanitize_claude_message_content(
+    message: &mut Value,
+    role: &str,
+    sanitizer: &mut MessageSanitizer,
+) {
+    match message.get_mut("content") {
+        Some(Value::String(text)) => {
+            let replacement = sanitizer.by_role(role, text);
+            *text = replacement;
+        }
+        Some(Value::Array(items)) => {
+            for item in items {
+                let Some(item_type) = item.get("type").and_then(Value::as_str) else {
+                    continue;
+                };
+                match item_type {
+                    "text" => {
+                        if let Some(text) =
+                            item.get("text").and_then(Value::as_str).map(str::to_string)
+                        {
+                            item["text"] = Value::String(sanitizer.by_role(role, &text));
+                        }
+                    }
+                    "tool_result" => {
+                        if let Some(content) = item
+                            .get("content")
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                        {
+                            item["content"] = Value::String(sanitize_tool_output(&content));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn sanitize_claude_file_history(root: &Path) -> Result<()> {
+    for entry in fs::read_dir(root).with_context(|| format!("reading {}", root.display()))? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            sanitize_claude_file_history(&path)?;
+        } else if path.is_file() {
+            fs::write(&path, "Sanitized Claude file-history backup.\n")
+                .with_context(|| format!("writing {}", path.display()))?;
+        }
+    }
+    Ok(())
+}
+
 fn sanitize_cursor_row(key: &str, value: &str, row_index: usize) -> Result<String> {
     let mut parsed: Value =
         serde_json::from_str(value).with_context(|| format!("parsing cursor row for key {key}"))?;
@@ -503,5 +630,25 @@ mod tests {
         assert_eq!(parsed["conversation"][0]["text"], USER_TEMPLATES[0]);
         assert_eq!(parsed["conversation"][1]["text"], ASSISTANT_TEMPLATES[1]);
         Ok(())
+    }
+
+    #[test]
+    fn sanitizes_claude_message_content() {
+        let mut record = serde_json::json!({
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": "private answer"},
+                    {"type": "tool_use", "id": "toolu_1", "name": "Edit", "input": {"file_path": "/tmp/a", "old_string": "a", "new_string": "b"}}
+                ]
+            }
+        });
+        let mut sanitizer = MessageSanitizer::default();
+        sanitize_claude_record(&mut record, &mut sanitizer);
+        assert_eq!(
+            record["message"]["content"][0]["text"],
+            ASSISTANT_TEMPLATES[0]
+        );
     }
 }

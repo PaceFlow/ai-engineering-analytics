@@ -71,6 +71,15 @@ impl TestEnv {
                 &home.to_string_lossy(),
             ],
         )?;
+        copy_claude_sessions(
+            &home,
+            &["__REPO_PACEFLOW__", "__REPO_CURSOR__", "__HOME__"],
+            &[
+                &paceflow_repo.to_string_lossy(),
+                &cursor_dir.to_string_lossy(),
+                &home.to_string_lossy(),
+            ],
+        )?;
         install_cursor_fixture(&home, &paceflow_repo, &cursor_dir)?;
 
         Ok(Self {
@@ -190,6 +199,21 @@ impl TestEnv {
                 1,
                 Some("2026-03-10T11:37:27.402Z"),
                 Some(298.26966628432274),
+                1,
+            ),
+            (
+                "claude",
+                "11111111-2222-4333-8444-555555555555",
+                Some(repo_root),
+                "claude/claude-sonnet-4-5-20250929",
+                "2026-03-10T09:20:21.240Z",
+                "2026-03-10T09:22:10.000Z",
+                1,
+                0,
+                0,
+                1,
+                Some("2026-03-10T09:20:22.240Z"),
+                Some(0.016666666666666666),
                 1,
             ),
         ];
@@ -460,9 +484,9 @@ impl TestEnv {
                 "codex",
                 "019cb311-b93e-7423-aeb4-81249c578638",
                 "codex/gpt-5.3-codex",
-                133.66666666666666,
-                0.05854869323988903,
-                0.9901234567901234,
+                132.66666666666666,
+                0.05811067440984121,
+                0.9827160493827161,
             ),
             (
                 "de8ab41b5cec40dd3dc63fc8bd0ca743cea1d46c",
@@ -472,6 +496,15 @@ impl TestEnv {
                 1.3333333333333333,
                 0.0005840268652358008,
                 0.009876543209876543,
+            ),
+            (
+                "de8ab41b5cec40dd3dc63fc8bd0ca743cea1d46c",
+                "claude",
+                "11111111-2222-4333-8444-555555555555",
+                "claude/claude-sonnet-4-5-20250929",
+                1.0,
+                0.0004380188300477442,
+                0.007407407407407408,
             ),
         ];
 
@@ -598,6 +631,44 @@ fn default_category_reports_group_by_model() -> anyhow::Result<()> {
 }
 
 #[test]
+fn claude_provider_filters_return_rows() -> anyhow::Result<()> {
+    let env = TestEnv::new_seeded_reporting()?;
+
+    let session = env.normalize_output(env.run_paceflow(&[
+        "session",
+        "--provider",
+        "claude",
+        "--overall",
+    ])?);
+    let delivery = env.normalize_output(env.run_paceflow(&[
+        "delivery",
+        "--provider",
+        "claude",
+        "--overall",
+    ])?);
+    let quality = env.normalize_output(env.run_paceflow(&[
+        "quality",
+        "--provider",
+        "claude",
+        "--overall",
+    ])?);
+
+    assert!(session.contains("Session Metrics"));
+    assert!(session.contains("Sessions analyzed: 1"));
+    assert!(!session.contains("No session rows found."));
+
+    assert!(delivery.contains("Delivery Metrics"));
+    assert!(delivery.contains("Commits analyzed:"));
+    assert!(!delivery.contains("No delivery rows found."));
+
+    assert!(quality.contains("Quality Metrics"));
+    assert!(quality.contains("Heavy commits analyzed:"));
+    assert!(!quality.contains("No quality rows found."));
+
+    Ok(())
+}
+
+#[test]
 fn grouped_and_weekly_reports_match_snapshots() -> anyhow::Result<()> {
     let env = TestEnv::new_seeded_reporting()?;
 
@@ -627,6 +698,85 @@ fn grouped_and_weekly_reports_match_snapshots() -> anyhow::Result<()> {
         "fixture_corpus_session_weekly_by_provider_text",
         session_weekly
     );
+
+    Ok(())
+}
+
+#[test]
+fn claude_branch_grouped_reports_match_snapshots() -> anyhow::Result<()> {
+    let env = TestEnv::new_seeded_reporting()?;
+
+    let session = env.normalize_output(env.run_paceflow(&[
+        "session",
+        "--provider",
+        "claude",
+        "--group-by",
+        "branch",
+    ])?);
+    let delivery = env.normalize_output(env.run_paceflow(&[
+        "delivery",
+        "--provider",
+        "claude",
+        "--group-by",
+        "branch",
+    ])?);
+    let quality = env.normalize_output(env.run_paceflow(&[
+        "quality",
+        "--provider",
+        "claude",
+        "--group-by",
+        "branch",
+    ])?);
+
+    assert_snapshot!(
+        "fixture_corpus_session_grouped_by_branch_claude_text",
+        session
+    );
+    assert_snapshot!(
+        "fixture_corpus_delivery_grouped_by_branch_claude_text",
+        delivery
+    );
+    assert_snapshot!(
+        "fixture_corpus_quality_grouped_by_branch_claude_text",
+        quality
+    );
+
+    Ok(())
+}
+
+#[test]
+fn claude_task_grouped_reports_suggest_branch_view_when_only_non_ticket_rows_exist()
+-> anyhow::Result<()> {
+    let env = TestEnv::new_seeded_reporting()?;
+
+    let session = env.normalize_output(env.run_paceflow(&[
+        "session",
+        "--provider",
+        "claude",
+        "--group-by",
+        "task",
+    ])?);
+    let delivery = env.normalize_output(env.run_paceflow(&[
+        "delivery",
+        "--provider",
+        "claude",
+        "--group-by",
+        "task",
+    ])?);
+    let quality = env.normalize_output(env.run_paceflow(&[
+        "quality",
+        "--provider",
+        "claude",
+        "--group-by",
+        "task",
+    ])?);
+
+    assert!(session.contains("No ticket-style task rows matched."));
+    assert!(session.contains("`paceflow session --group-by branch`"));
+    assert!(delivery.contains("No ticket-style task rows matched."));
+    assert!(delivery.contains("`paceflow delivery --group-by branch`"));
+    assert!(quality.contains("No ticket-style task rows matched."));
+    assert!(quality.contains("`paceflow quality --group-by branch`"));
 
     Ok(())
 }
@@ -714,8 +864,10 @@ fn ingest_reports_commit_event_progress() -> anyhow::Result<()> {
     let ingest_output = env.run_paceflow(&["ingest"])?;
 
     assert!(ingest_output.contains("Planning ingest..."));
+    assert!(ingest_output.contains("Stage: claude sessions"));
     assert!(ingest_output.contains("Stage: codex sessions"));
     assert!(ingest_output.contains("Stage: cursor sessions"));
+    assert!(ingest_output.contains("Stage: claude changes"));
     assert!(ingest_output.contains("Stage: codex changes"));
     assert!(ingest_output.contains("Stage: cursor changes"));
     assert!(ingest_output.contains("Stage: Commit Association"));
@@ -737,6 +889,7 @@ fn fixture_corpus_ingest_smoke_is_cross_platform_friendly() -> anyhow::Result<()
     let ingest_output = env.normalize_output(env.run_paceflow(&["ingest"])?);
 
     assert!(ingest_output.contains("Planning ingest..."));
+    assert!(ingest_output.contains("Stage: claude sessions"));
     assert!(ingest_output.contains("Stage: codex sessions"));
     assert!(ingest_output.contains("Stage: cursor sessions"));
     assert!(ingest_output.contains("Stage: Commit Materialization"));
@@ -819,6 +972,29 @@ fn copy_codex_sessions(home: &Path, from: &[&str], to: &[&str]) -> anyhow::Resul
         .join(".codex")
         .join("sessions");
     let dst_root = home.join(".codex").join("sessions");
+    copy_dir_recursive(&src_root, &dst_root)?;
+
+    for path in collect_files(&dst_root)? {
+        let mut content = fs::read_to_string(&path)?;
+        for (from, to) in from.iter().zip(to.iter()) {
+            content = content.replace(from, to);
+        }
+        fs::write(path, content)?;
+    }
+
+    Ok(())
+}
+
+fn copy_claude_sessions(home: &Path, from: &[&str], to: &[&str]) -> anyhow::Result<()> {
+    let src_root = Path::new(FIXTURE_ROOT)
+        .join("home_template")
+        .join(".claude")
+        .join("projects");
+    if !src_root.exists() {
+        return Ok(());
+    }
+
+    let dst_root = home.join(".claude").join("projects");
     copy_dir_recursive(&src_root, &dst_root)?;
 
     for path in collect_files(&dst_root)? {

@@ -1,4 +1,5 @@
 use anyhow::Result;
+use rusqlite::Connection;
 
 use crate::analytics;
 use crate::cli::{GroupBy, QualityReportArgs, ReportArgs};
@@ -13,23 +14,35 @@ pub fn run(args: QualityReportArgs) -> Result<()> {
     let db = db::open()?;
     analytics::create_reporting_views(&db)?;
     let resolved = report_scope::resolve_main_report_args(&args.report, args.overall);
-    let rows = analytics::query_lifecycle_report_with_options(
-        &db,
-        &resolved.report,
-        analytics::ReportQueryOptions {
-            implicit_model_default: resolved.implicit_model_default,
-        },
-    )?;
-    print!("{}", render_quality_report(&rows, &resolved.report));
+    let options = analytics::ReportQueryOptions {
+        implicit_model_default: resolved.implicit_model_default,
+    };
+    let rows = analytics::query_lifecycle_report_with_options(&db, &resolved.report, options)?;
+    let show_branch_hint =
+        rows.is_empty() && task_report_hidden_branch_rows_exist(&db, &resolved.report, options)?;
+    print!(
+        "{}",
+        render_quality_report(&rows, &resolved.report, show_branch_hint)
+    );
     Ok(())
 }
 
-fn render_quality_report(rows: &[analytics::LifecycleReportRow], report: &ReportArgs) -> String {
+fn render_quality_report(
+    rows: &[analytics::LifecycleReportRow],
+    report: &ReportArgs,
+    show_branch_hint: bool,
+) -> String {
     let mut out = String::new();
     out.push_str("Quality Metrics\n");
 
     if rows.is_empty() {
-        out.push_str("No quality rows found. Run `paceflow ingest` first.\n");
+        if show_branch_hint {
+            out.push_str(
+                "No ticket-style task rows matched. Try `paceflow quality --group-by branch` or `--overall`.\n",
+            );
+        } else {
+            out.push_str("No quality rows found. Run `paceflow ingest` first.\n");
+        }
         return out;
     }
 
@@ -128,11 +141,27 @@ fn render_quality_report(rows: &[analytics::LifecycleReportRow], report: &Report
     out
 }
 
+fn task_report_hidden_branch_rows_exist(
+    db: &Connection,
+    report: &ReportArgs,
+    options: analytics::ReportQueryOptions,
+) -> Result<bool> {
+    if !matches!(report.group_by, Some(GroupBy::Task)) || report.task.is_some() {
+        return Ok(false);
+    }
+
+    let mut branch_report = report.clone();
+    branch_report.group_by = Some(GroupBy::Branch);
+    branch_report.task = None;
+    branch_report.limit = 1;
+    Ok(!analytics::query_lifecycle_report_with_options(db, &branch_report, options)?.is_empty())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::analytics::{LifecycleReportRow, RatioMetric};
-    use crate::cli::ReportArgs;
+    use crate::cli::{GroupBy, ReportArgs};
 
     #[test]
     fn render_quality_report_uses_scorecard_summary_with_footer() {
@@ -163,11 +192,12 @@ mod tests {
             all_projects: false,
             provider: None,
             task: None,
+            branch: None,
             model: None,
             limit: 50,
         };
 
-        let rendered = render_quality_report(&rows, &report);
+        let rendered = render_quality_report(&rows, &report, false);
         assert!(rendered.contains("Heavy commits analyzed: 3"));
         assert!(rendered.contains("│ Signal"));
         assert!(rendered.contains("│ Code churn"));
@@ -208,15 +238,38 @@ mod tests {
             all_projects: false,
             provider: None,
             task: None,
+            branch: None,
             model: None,
             limit: 50,
         };
 
-        let rendered = render_quality_report(&rows, &report);
+        let rendered = render_quality_report(&rows, &report, false);
         assert!(rendered.contains("Churn Rate"));
         assert!(rendered.contains("Bug Rate"));
         assert!(rendered.contains("Revert Rate"));
         assert!(!rendered.contains("L3(bug)"));
         assert!(rendered.contains("33.3%"));
+    }
+
+    #[test]
+    fn render_quality_report_suggests_branch_view_for_hidden_task_rows() {
+        let report = ReportArgs {
+            weekly: false,
+            group_by: Some(GroupBy::Task),
+            from: None,
+            to: None,
+            repo: None,
+            all_projects: false,
+            provider: Some("claude".to_string()),
+            task: None,
+            branch: None,
+            model: None,
+            limit: 50,
+        };
+
+        let rendered = render_quality_report(&[], &report, true);
+        assert!(rendered.contains("No ticket-style task rows matched."));
+        assert!(rendered.contains("`paceflow quality --group-by branch`"));
+        assert!(!rendered.contains("Run `paceflow ingest` first."));
     }
 }

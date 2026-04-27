@@ -1,4 +1,5 @@
 use anyhow::Result;
+use rusqlite::Connection;
 
 use crate::analytics;
 use crate::cli::{DeliveryReportArgs, GroupBy, ReportArgs};
@@ -13,23 +14,35 @@ pub fn run(args: DeliveryReportArgs) -> Result<()> {
     let db = db::open()?;
     analytics::create_reporting_views(&db)?;
     let resolved = report_scope::resolve_main_report_args(&args.report, args.overall);
-    let rows = analytics::query_change_report_with_options(
-        &db,
-        &resolved.report,
-        analytics::ReportQueryOptions {
-            implicit_model_default: resolved.implicit_model_default,
-        },
-    )?;
-    print!("{}", render_delivery_report(&rows, &resolved.report));
+    let options = analytics::ReportQueryOptions {
+        implicit_model_default: resolved.implicit_model_default,
+    };
+    let rows = analytics::query_change_report_with_options(&db, &resolved.report, options)?;
+    let show_branch_hint =
+        rows.is_empty() && task_report_hidden_branch_rows_exist(&db, &resolved.report, options)?;
+    print!(
+        "{}",
+        render_delivery_report(&rows, &resolved.report, show_branch_hint)
+    );
     Ok(())
 }
 
-fn render_delivery_report(rows: &[analytics::ChangeReportRow], report: &ReportArgs) -> String {
+fn render_delivery_report(
+    rows: &[analytics::ChangeReportRow],
+    report: &ReportArgs,
+    show_branch_hint: bool,
+) -> String {
     let mut out = String::new();
     out.push_str("Delivery Metrics\n");
 
     if rows.is_empty() {
-        out.push_str("No delivery rows found. Run `paceflow ingest` first.\n");
+        if show_branch_hint {
+            out.push_str(
+                "No ticket-style task rows matched. Try `paceflow delivery --group-by branch` or `--overall`.\n",
+            );
+        } else {
+            out.push_str("No delivery rows found. Run `paceflow ingest` first.\n");
+        }
         return out;
     }
 
@@ -151,7 +164,10 @@ fn render_delivery_report(rows: &[analytics::ChangeReportRow], report: &ReportAr
         if show_branch {
             cols.push(format!(
                 "{:>12}",
-                fmt_task_branch_diff_stat(row.task_branch_lines_added, row.task_branch_lines_removed)
+                fmt_task_branch_diff_stat(
+                    row.task_branch_lines_added,
+                    row.task_branch_lines_removed
+                )
             ));
         }
         out.push_str(&format!("{}\n", cols.join("  ")));
@@ -232,6 +248,22 @@ fn fmt_task_branch_diff_stat(added: i64, removed: i64) -> String {
     format!("+{}/-{}", added, removed)
 }
 
+fn task_report_hidden_branch_rows_exist(
+    db: &Connection,
+    report: &ReportArgs,
+    options: analytics::ReportQueryOptions,
+) -> Result<bool> {
+    if !matches!(report.group_by, Some(GroupBy::Task)) || report.task.is_some() {
+        return Ok(false);
+    }
+
+    let mut branch_report = report.clone();
+    branch_report.group_by = Some(GroupBy::Branch);
+    branch_report.task = None;
+    branch_report.limit = 1;
+    Ok(!analytics::query_change_report_with_options(db, &branch_report, options)?.is_empty())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -274,11 +306,12 @@ mod tests {
             all_projects: false,
             provider: None,
             task: None,
+            branch: None,
             model: None,
             limit: 50,
         };
 
-        let rendered = render_delivery_report(&rows, &report);
+        let rendered = render_delivery_report(&rows, &report, false);
         assert!(rendered.contains("Commits analyzed: 4"));
         assert!(rendered.contains("Heavy commits: 2 (50.00% of commits)"));
         assert!(rendered.contains("GitHub PR lookup coverage: 2 / 2 heavy GitHub commits"));
@@ -328,11 +361,12 @@ mod tests {
             all_projects: false,
             provider: None,
             task: None,
+            branch: None,
             model: None,
             limit: 50,
         };
 
-        let rendered = render_delivery_report(&rows, &report);
+        let rendered = render_delivery_report(&rows, &report, false);
         assert!(rendered.contains("PR Reach"));
         assert!(rendered.contains("Mainline Reach"));
         assert!(rendered.contains("PR Merge"));
@@ -377,15 +411,38 @@ mod tests {
             all_projects: false,
             provider: None,
             task: None,
+            branch: None,
             model: None,
             limit: 50,
         };
 
-        let rendered = render_delivery_report(&rows, &report);
+        let rendered = render_delivery_report(&rows, &report, false);
         assert!(rendered.contains("unavailable"));
         assert!(rendered.contains("GitHub PR lookup coverage: 0 / 2 heavy GitHub commits"));
         assert!(rendered.contains(
             "PR reach / merge show N/A when no GitHub-heavy commits or no completed lookups yet.",
         ));
+    }
+
+    #[test]
+    fn render_delivery_report_suggests_branch_view_for_hidden_task_rows() {
+        let report = ReportArgs {
+            weekly: false,
+            group_by: Some(GroupBy::Task),
+            from: None,
+            to: None,
+            repo: None,
+            all_projects: false,
+            provider: Some("claude".to_string()),
+            task: None,
+            branch: None,
+            model: None,
+            limit: 50,
+        };
+
+        let rendered = render_delivery_report(&[], &report, true);
+        assert!(rendered.contains("No ticket-style task rows matched."));
+        assert!(rendered.contains("`paceflow delivery --group-by branch`"));
+        assert!(!rendered.contains("Run `paceflow ingest` first."));
     }
 }

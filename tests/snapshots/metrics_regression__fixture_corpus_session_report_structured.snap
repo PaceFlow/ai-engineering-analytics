@@ -2,10 +2,10 @@
 source: tests/metrics_regression.rs
 expression: structured_session
 ---
-sessions: "3"
-average_user_prompts: "44.33"
-avg_time_to_first_accepted_change_minutes: 213.58 min
-debug_loop_rate: 0.00% (0/3)
-s6_rate: 66.67% (2/3)
-s9_rate: 66.67% (2/3)
-no_output_session_rate: 0.00% (0/3)
+sessions: "4"
+average_user_prompts: "33.50"
+avg_time_to_first_accepted_change_minutes: 160.19 min
+debug_loop_rate: 0.00% (0/4)
+s6_rate: 50.00% (2/4)
+s9_rate: 75.00% (3/4)
+no_output_session_rate: 0.00% (0/4)

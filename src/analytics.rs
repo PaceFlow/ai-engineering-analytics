@@ -25,9 +25,11 @@ const BUG_AFTER_MERGE_WINDOW_DAYS: i64 = 60;
 const REPORTING_VIEWS_SQL: &str = r#"
 DROP VIEW IF EXISTS view_session_metrics_base;
 DROP VIEW IF EXISTS view_task_session_metrics_base;
+DROP VIEW IF EXISTS view_branch_session_metrics_base;
 DROP VIEW IF EXISTS view_change_metrics_base;
 DROP VIEW IF EXISTS view_commit_session_metrics_base;
 DROP VIEW IF EXISTS view_task_commit_metrics_base;
+DROP VIEW IF EXISTS view_branch_commit_metrics_base;
 DROP VIEW IF EXISTS view_session_productivity;
 
 CREATE VIEW view_session_metrics_base AS
@@ -85,6 +87,47 @@ SELECT
     ts.minutes_to_first_accepted_change,
     ts.commit_within_window_flag
 FROM event_task_session ts;
+
+CREATE VIEW view_branch_session_metrics_base AS
+SELECT
+    tc.repo_root,
+    tc.branch_name,
+    cs.provider,
+    cs.session_id,
+    CASE
+        WHEN NULLIF(TRIM(MAX(cs.model_name)), '') IS NULL THEN cs.provider || '/(unknown)'
+        WHEN MAX(cs.model_name) LIKE cs.provider || '/%' THEN MAX(cs.model_name)
+        ELSE cs.provider || '/' || MAX(cs.model_name)
+    END AS model_name,
+    MAX(sq.started_at) AS started_at,
+    date(
+        MAX(sq.started_at),
+        '-' || ((CAST(strftime('%w', MAX(sq.started_at)) AS INTEGER) + 6) % 7) || ' days'
+    ) AS week_start,
+    SUM(cs.matched_lines) AS attribution_weight,
+    MAX(sq.user_turn_count) AS user_turn_count,
+    MAX(sq.debug_loop_flag) AS debug_loop_flag,
+    MAX(sq.mid_session_error_paste_flag) AS mid_session_error_paste_flag,
+    COALESCE(MAX(sq.accepted_output_flag), 0) AS accepted_output_flag,
+    MAX(sq.first_accepted_change_at) AS first_accepted_change_at,
+    MAX(sq.minutes_to_first_accepted_change) AS minutes_to_first_accepted_change,
+    MAX(
+        CASE
+            WHEN sq.started_at IS NOT NULL
+             AND cs.commit_time IS NOT NULL
+             AND julianday(cs.commit_time) >= julianday(sq.started_at)
+             AND julianday(cs.commit_time) <= julianday(COALESCE(sq.ended_at, sq.started_at), '+4 hours')
+            THEN 1 ELSE 0
+        END
+    ) AS commit_within_window_flag
+FROM event_task_commit tc
+JOIN event_commit_session cs
+  ON cs.repo_root = tc.repo_root
+ AND cs.commit_sha = tc.commit_sha
+LEFT JOIN event_session_quality sq
+  ON sq.provider = cs.provider
+ AND sq.session_id = cs.session_id
+GROUP BY tc.repo_root, tc.branch_name, cs.provider, cs.session_id;
 
 CREATE VIEW view_change_metrics_base AS
 SELECT
@@ -157,6 +200,39 @@ CREATE VIEW view_task_commit_metrics_base AS
 SELECT
     tc.repo_root,
     tc.task_key,
+    tc.branch_name,
+    tc.commit_sha,
+    tc.fallback_flag,
+    tc.confidence,
+    tc.commit_time,
+    date(
+        tc.commit_time,
+        '-' || ((CAST(strftime('%w', tc.commit_time) AS INTEGER) + 6) % 7) || ' days'
+    ) AS week_start,
+    o.heavy_ai_flag,
+    o.merged_to_mainline_flag,
+    o.reverted_later_flag,
+    o.commit_total_changed_lines,
+    c.ai_added_lines_reaching_mainline,
+    c.ai_added_lines_removed_within_window,
+    COALESCE(b.bug_after_merge_flag, 0) AS bug_after_merge_flag,
+    COALESCE(b.bug_signal_count, 0) AS bug_signal_count,
+    b.first_bug_signal_commit_sha,
+    b.first_bug_signal_commit_time
+FROM event_task_commit tc
+LEFT JOIN event_commit_outcome o
+  ON o.repo_root = tc.repo_root
+ AND o.commit_sha = tc.commit_sha
+LEFT JOIN event_commit_churn c
+  ON c.repo_root = tc.repo_root
+ AND c.commit_sha = tc.commit_sha
+LEFT JOIN event_commit_bug_signal b
+  ON b.repo_root = tc.repo_root
+ AND b.commit_sha = tc.commit_sha;
+
+CREATE VIEW view_branch_commit_metrics_base AS
+SELECT
+    tc.repo_root,
     tc.branch_name,
     tc.commit_sha,
     tc.fallback_flag,
@@ -1028,8 +1104,13 @@ pub fn query_session_report_with_options(
     options: ReportQueryOptions,
 ) -> Result<Vec<SessionReportRow>> {
     let use_task_base = matches!(args.group_by, Some(GroupBy::Task)) || args.task.is_some();
+    let use_branch_base =
+        !use_task_base && (matches!(args.group_by, Some(GroupBy::Branch)) || args.branch.is_some());
+    let use_attribution_weight = use_task_base || use_branch_base;
     let source = if use_task_base {
         "view_task_session_metrics_base"
+    } else if use_branch_base {
+        "view_branch_session_metrics_base"
     } else {
         "view_session_metrics_base"
     };
@@ -1063,7 +1144,7 @@ pub fn query_session_report_with_options(
         select.push("NULL AS branch_name".to_string());
     }
 
-    if use_task_base {
+    if use_attribution_weight {
         let weight = "CASE WHEN attribution_weight > 0 THEN attribution_weight ELSE 1 END";
         select.push("COUNT(*) AS session_count".to_string());
         select.push(format!(
@@ -1129,7 +1210,14 @@ pub fn query_session_report_with_options(
     }
 
     let mut sql = format!("SELECT {} FROM {}", select.join(", "), source);
-    let conditions = build_conditions(args, timestamp_col, use_task_base, true, true);
+    let conditions = build_conditions(
+        args,
+        timestamp_col,
+        use_task_base,
+        use_task_base || use_branch_base,
+        true,
+        true,
+    );
     if !conditions.is_empty() {
         sql.push_str(" WHERE ");
         sql.push_str(&conditions.join(" AND "));
@@ -1204,13 +1292,7 @@ pub fn query_change_report_with_options(
     let mut select = vec![];
     let mut group = vec![];
     let mut base_sql = format!("SELECT * FROM {}", source);
-    let conditions = build_conditions(
-        args,
-        timestamp_col,
-        source == "view_task_commit_metrics_base",
-        source != "view_change_metrics_base",
-        true,
-    );
+    let conditions = build_change_report_conditions(args, timestamp_col, source);
     if !conditions.is_empty() {
         base_sql.push_str(" WHERE ");
         base_sql.push_str(&conditions.join(" AND "));
@@ -1222,7 +1304,7 @@ pub fn query_change_report_with_options(
     } else {
         select.push("NULL AS week_start".to_string());
     }
-    if matches!(args.group_by, Some(GroupBy::Task)) {
+    if matches!(args.group_by, Some(GroupBy::Task) | Some(GroupBy::Branch)) {
         select.push("base.repo_root".to_string());
         group.push("base.repo_root".to_string());
     } else {
@@ -1291,12 +1373,8 @@ pub fn query_change_report_with_options(
         "COUNT(DISTINCT CASE WHEN base.heavy_ai_flag = 1 AND eo.repo_key LIKE 'git:github.com/%' AND pr.pr_opened_flag = 1 THEN base.commit_sha END) AS c3_d"
             .to_string(),
     );
-    select.push(
-        "COALESCE(SUM(fc.total_added), 0) AS task_branch_lines_added".to_string(),
-    );
-    select.push(
-        "COALESCE(SUM(fc.total_removed), 0) AS task_branch_lines_removed".to_string(),
-    );
+    select.push("COALESCE(SUM(fc.total_added), 0) AS task_branch_lines_added".to_string());
+    select.push("COALESCE(SUM(fc.total_removed), 0) AS task_branch_lines_removed".to_string());
 
     let mut sql = format!(
         "SELECT {} FROM ({}) base
@@ -1446,13 +1524,7 @@ pub fn query_lifecycle_report_with_options(
     }
 
     let mut sql = format!("SELECT {} FROM {}", select.join(", "), source);
-    let conditions = build_conditions(
-        args,
-        timestamp_col,
-        source == "view_task_commit_metrics_base",
-        source != "view_change_metrics_base",
-        true,
-    );
+    let conditions = build_change_report_conditions(args, timestamp_col, source);
     if !conditions.is_empty() {
         sql.push_str(" WHERE ");
         sql.push_str(&conditions.join(" AND "));
@@ -1980,6 +2052,7 @@ fn session_group_expr(group_by: Option<GroupBy>) -> Option<&'static str> {
         Some(GroupBy::Repo) => Some("COALESCE(repo_root, '(unknown)')"),
         Some(GroupBy::Provider) => Some("provider"),
         Some(GroupBy::Task) => Some("task_key"),
+        Some(GroupBy::Branch) => Some("branch_name"),
         Some(GroupBy::Model) => Some("COALESCE(model_name, '(unknown)')"),
         None => None,
     }
@@ -1990,6 +2063,7 @@ fn change_lifecycle_group_expr(group_by: Option<GroupBy>) -> Option<&'static str
         Some(GroupBy::Repo) => Some("COALESCE(repo_root, '(unknown)')"),
         Some(GroupBy::Provider) => Some("provider"),
         Some(GroupBy::Task) => Some("task_key"),
+        Some(GroupBy::Branch) => Some("branch_name"),
         Some(GroupBy::Model) => Some("COALESCE(model_name, '(unknown)')"),
         None => None,
     }
@@ -2000,6 +2074,7 @@ fn change_report_group_expr(group_by: Option<GroupBy>) -> Option<&'static str> {
         Some(GroupBy::Repo) => Some("COALESCE(base.repo_root, '(unknown)')"),
         Some(GroupBy::Provider) => Some("base.provider"),
         Some(GroupBy::Task) => Some("base.task_key"),
+        Some(GroupBy::Branch) => Some("base.branch_name"),
         Some(GroupBy::Model) => Some("COALESCE(base.model_name, '(unknown)')"),
         None => None,
     }
@@ -2008,6 +2083,8 @@ fn change_report_group_expr(group_by: Option<GroupBy>) -> Option<&'static str> {
 fn change_lifecycle_source(args: &ReportArgs) -> &'static str {
     if matches!(args.group_by, Some(GroupBy::Task)) || args.task.is_some() {
         "view_task_commit_metrics_base"
+    } else if matches!(args.group_by, Some(GroupBy::Branch)) || args.branch.is_some() {
+        "view_branch_commit_metrics_base"
     } else if matches!(args.group_by, Some(GroupBy::Provider | GroupBy::Model))
         || args.provider.is_some()
         || args.model.is_some()
@@ -2022,6 +2099,7 @@ fn build_conditions(
     args: &ReportArgs,
     timestamp_col: &str,
     task_capable: bool,
+    branch_capable: bool,
     provider_capable: bool,
     model_capable: bool,
 ) -> Vec<String> {
@@ -2038,6 +2116,11 @@ fn build_conditions(
         && task_capable
     {
         conditions.push(format!("task_key = {}", sql_literal(task)));
+    }
+    if let Some(branch) = args.branch.as_deref()
+        && branch_capable
+    {
+        conditions.push(format!("branch_name = {}", sql_literal(branch)));
     }
     if let Some(model) = args.model.as_deref()
         && model_capable
@@ -2059,6 +2142,82 @@ fn build_conditions(
             sql_literal(to)
         ));
     }
+    conditions
+}
+
+fn normalized_commit_session_model_expr(alias: &str) -> String {
+    format!(
+        "CASE \
+            WHEN NULLIF(TRIM({alias}.model_name), '') IS NULL THEN {alias}.provider || '/(unknown)' \
+            WHEN {alias}.model_name LIKE {alias}.provider || '/%' THEN {alias}.model_name \
+            ELSE {alias}.provider || '/' || {alias}.model_name \
+         END"
+    )
+}
+
+fn task_commit_session_filter_condition(
+    outer_table: &str,
+    provider: Option<&str>,
+    model: Option<&str>,
+) -> Option<String> {
+    if provider.is_none() && model.is_none() {
+        return None;
+    }
+
+    let mut clauses = vec![
+        format!("cs_filter.repo_root = {outer_table}.repo_root"),
+        format!("cs_filter.commit_sha = {outer_table}.commit_sha"),
+    ];
+    if let Some(provider) = provider {
+        clauses.push(format!("cs_filter.provider = {}", sql_literal(provider)));
+    }
+    if let Some(model) = model {
+        clauses.push(format!(
+            "{} = {}",
+            normalized_commit_session_model_expr("cs_filter"),
+            sql_literal(model)
+        ));
+    }
+
+    Some(format!(
+        "EXISTS (SELECT 1 FROM event_commit_session cs_filter WHERE {})",
+        clauses.join(" AND ")
+    ))
+}
+
+fn build_change_report_conditions(
+    args: &ReportArgs,
+    timestamp_col: &str,
+    source: &str,
+) -> Vec<String> {
+    let task_capable = source == "view_task_commit_metrics_base";
+    let branch_capable = matches!(
+        source,
+        "view_task_commit_metrics_base" | "view_branch_commit_metrics_base"
+    );
+    let direct_provider_capable = source == "view_commit_session_metrics_base";
+    let direct_model_capable = source == "view_commit_session_metrics_base";
+
+    let mut conditions = build_conditions(
+        args,
+        timestamp_col,
+        task_capable,
+        branch_capable,
+        direct_provider_capable,
+        direct_model_capable,
+    );
+
+    if matches!(
+        source,
+        "view_task_commit_metrics_base" | "view_branch_commit_metrics_base"
+    ) && let Some(exists_sql) = task_commit_session_filter_condition(
+        source,
+        args.provider.as_deref(),
+        args.model.as_deref(),
+    ) {
+        conditions.push(exists_sql);
+    }
+
     conditions
 }
 
@@ -2089,6 +2248,18 @@ fn session_list_conditions(args: &ReportArgs) -> Vec<String> {
                    AND ts.task_key = {}
              )",
             sql_literal(task)
+        ));
+    }
+    if let Some(branch) = args.branch.as_deref() {
+        conditions.push(format!(
+            "EXISTS (
+                 SELECT 1
+                 FROM view_branch_session_metrics_base bs
+                 WHERE bs.provider = view_session_productivity.provider
+                   AND bs.session_id = view_session_productivity.session_id
+                   AND bs.branch_name = {}
+             )",
+            sql_literal(branch)
         ));
     }
     conditions
@@ -3798,6 +3969,7 @@ mod tests {
                 all_projects: false,
                 provider: None,
                 task: Some("PAC-1".to_string()),
+                branch: None,
                 model: None,
                 limit: 50,
             },
@@ -3861,6 +4033,7 @@ mod tests {
             all_projects: false,
             provider: None,
             task: None,
+            branch: None,
             model: None,
             limit: 1,
         };
@@ -3877,6 +4050,411 @@ mod tests {
             lifecycle_rows[0].branch_name.as_deref(),
             Some("PAC-1-branch")
         );
+        Ok(())
+    }
+
+    #[test]
+    fn task_grouped_change_and_lifecycle_reports_can_filter_by_provider() -> Result<()> {
+        let conn = open_test_db()?;
+        conn.execute(
+            "INSERT INTO event_task_commit (
+                repo_root, task_key, branch_name, commit_sha, fallback_flag, confidence, commit_time
+             ) VALUES
+                ('/tmp/repo', 'PAC-1', 'PAC-1-branch', 'claude1', 0, 1.0, '2026-03-17T09:02:00Z'),
+                ('/tmp/repo', 'PAC-2', 'PAC-2-branch', 'codex1', 0, 1.0, '2026-03-17T09:03:00Z')",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO event_commit_outcome (
+                repo_root, commit_sha, commit_time, heavy_ai_flag, merged_to_mainline_flag,
+                reverted_later_flag, total_matched_ai_lines, commit_total_changed_lines
+             ) VALUES
+                ('/tmp/repo', 'claude1', '2026-03-17T09:02:00Z', 1, 1, 0, 8, 16),
+                ('/tmp/repo', 'codex1', '2026-03-17T09:03:00Z', 1, 0, 0, 12, 18)",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO event_commit_churn (
+                repo_root, commit_sha, ai_added_lines_reaching_mainline,
+                ai_added_lines_removed_within_window, churn_window_days
+             ) VALUES
+                ('/tmp/repo', 'claude1', 10, 2, 14),
+                ('/tmp/repo', 'codex1', 6, 1, 14)",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO event_commit_session (
+                repo_root, commit_sha, provider, session_id, commit_time, model_name,
+                matched_lines, share_of_commit, share_of_ai
+             ) VALUES
+                ('/tmp/repo', 'claude1', 'claude', 's-claude', '2026-03-17T09:02:00Z', 'claude-opus-4-6', 8.0, 0.5, 1.0),
+                ('/tmp/repo', 'codex1', 'codex', 's-codex', '2026-03-17T09:03:00Z', 'gpt-5.4', 12.0, 0.67, 1.0)",
+            [],
+        )?;
+
+        create_reporting_views(&conn)?;
+        let args = ReportArgs {
+            weekly: false,
+            group_by: Some(GroupBy::Task),
+            from: None,
+            to: None,
+            repo: None,
+            all_projects: false,
+            provider: Some("claude".to_string()),
+            task: None,
+            branch: None,
+            model: None,
+            limit: 10,
+        };
+
+        let change_rows = query_change_report(&conn, &args)?;
+        assert_eq!(change_rows.len(), 1);
+        assert_eq!(change_rows[0].group_value.as_deref(), Some("PAC-1"));
+        assert_eq!(change_rows[0].commit_count, 1);
+
+        let lifecycle_rows = query_lifecycle_report(&conn, &args)?;
+        assert_eq!(lifecycle_rows.len(), 1);
+        assert_eq!(lifecycle_rows[0].group_value.as_deref(), Some("PAC-1"));
+        assert_eq!(lifecycle_rows[0].heavy_commit_count, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn task_grouped_change_and_lifecycle_reports_can_filter_by_model() -> Result<()> {
+        let conn = open_test_db()?;
+        conn.execute(
+            "INSERT INTO event_task_commit (
+                repo_root, task_key, branch_name, commit_sha, fallback_flag, confidence, commit_time
+             ) VALUES
+                ('/tmp/repo', 'PAC-1', 'PAC-1-branch', 'claude1', 0, 1.0, '2026-03-17T09:02:00Z'),
+                ('/tmp/repo', 'PAC-2', 'PAC-2-branch', 'claude2', 0, 1.0, '2026-03-17T09:03:00Z')",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO event_commit_outcome (
+                repo_root, commit_sha, commit_time, heavy_ai_flag, merged_to_mainline_flag,
+                reverted_later_flag, total_matched_ai_lines, commit_total_changed_lines
+             ) VALUES
+                ('/tmp/repo', 'claude1', '2026-03-17T09:02:00Z', 1, 1, 0, 8, 16),
+                ('/tmp/repo', 'claude2', '2026-03-17T09:03:00Z', 1, 1, 0, 7, 14)",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO event_commit_churn (
+                repo_root, commit_sha, ai_added_lines_reaching_mainline,
+                ai_added_lines_removed_within_window, churn_window_days
+             ) VALUES
+                ('/tmp/repo', 'claude1', 10, 2, 14),
+                ('/tmp/repo', 'claude2', 9, 1, 14)",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO event_commit_session (
+                repo_root, commit_sha, provider, session_id, commit_time, model_name,
+                matched_lines, share_of_commit, share_of_ai
+             ) VALUES
+                ('/tmp/repo', 'claude1', 'claude', 's-claude-1', '2026-03-17T09:02:00Z', 'claude-opus-4-6', 8.0, 0.5, 1.0),
+                ('/tmp/repo', 'claude2', 'claude', 's-claude-2', '2026-03-17T09:03:00Z', 'claude-sonnet-4-5-20250929', 7.0, 0.5, 1.0)",
+            [],
+        )?;
+
+        create_reporting_views(&conn)?;
+        let args = ReportArgs {
+            weekly: false,
+            group_by: Some(GroupBy::Task),
+            from: None,
+            to: None,
+            repo: None,
+            all_projects: false,
+            provider: None,
+            task: None,
+            branch: None,
+            model: Some("claude/claude-opus-4-6".to_string()),
+            limit: 10,
+        };
+
+        let change_rows = query_change_report(&conn, &args)?;
+        assert_eq!(change_rows.len(), 1);
+        assert_eq!(change_rows[0].group_value.as_deref(), Some("PAC-1"));
+        assert_eq!(change_rows[0].commit_count, 1);
+
+        let lifecycle_rows = query_lifecycle_report(&conn, &args)?;
+        assert_eq!(lifecycle_rows.len(), 1);
+        assert_eq!(lifecycle_rows[0].group_value.as_deref(), Some("PAC-1"));
+        assert_eq!(lifecycle_rows[0].heavy_commit_count, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn branch_grouped_change_and_lifecycle_reports_can_filter_by_provider() -> Result<()> {
+        let conn = open_test_db()?;
+        conn.execute(
+            "INSERT INTO event_task_commit (
+                repo_root, task_key, branch_name, commit_sha, fallback_flag, confidence, commit_time
+             ) VALUES
+                ('/tmp/repo', 'fix/claude-flow', 'fix/claude-flow', 'claude1', 0, 1.0, '2026-03-17T09:02:00Z'),
+                ('/tmp/repo', 'fix/codex-flow', 'fix/codex-flow', 'codex1', 0, 1.0, '2026-03-17T09:03:00Z')",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO event_commit_outcome (
+                repo_root, commit_sha, commit_time, heavy_ai_flag, merged_to_mainline_flag,
+                reverted_later_flag, total_matched_ai_lines, commit_total_changed_lines
+             ) VALUES
+                ('/tmp/repo', 'claude1', '2026-03-17T09:02:00Z', 1, 1, 0, 8, 16),
+                ('/tmp/repo', 'codex1', '2026-03-17T09:03:00Z', 1, 0, 0, 12, 18)",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO event_commit_churn (
+                repo_root, commit_sha, ai_added_lines_reaching_mainline,
+                ai_added_lines_removed_within_window, churn_window_days
+             ) VALUES
+                ('/tmp/repo', 'claude1', 10, 2, 14),
+                ('/tmp/repo', 'codex1', 6, 1, 14)",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO event_commit_session (
+                repo_root, commit_sha, provider, session_id, commit_time, model_name,
+                matched_lines, share_of_commit, share_of_ai
+             ) VALUES
+                ('/tmp/repo', 'claude1', 'claude', 's-claude', '2026-03-17T09:02:00Z', 'claude-opus-4-6', 8.0, 0.5, 1.0),
+                ('/tmp/repo', 'codex1', 'codex', 's-codex', '2026-03-17T09:03:00Z', 'gpt-5.4', 12.0, 0.67, 1.0)",
+            [],
+        )?;
+
+        create_reporting_views(&conn)?;
+        let args = ReportArgs {
+            weekly: false,
+            group_by: Some(GroupBy::Branch),
+            from: None,
+            to: None,
+            repo: None,
+            all_projects: false,
+            provider: Some("claude".to_string()),
+            task: None,
+            branch: None,
+            model: None,
+            limit: 10,
+        };
+
+        let change_rows = query_change_report(&conn, &args)?;
+        assert_eq!(change_rows.len(), 1);
+        assert_eq!(
+            change_rows[0].group_value.as_deref(),
+            Some("fix/claude-flow")
+        );
+        assert_eq!(change_rows[0].commit_count, 1);
+
+        let lifecycle_rows = query_lifecycle_report(&conn, &args)?;
+        assert_eq!(lifecycle_rows.len(), 1);
+        assert_eq!(
+            lifecycle_rows[0].group_value.as_deref(),
+            Some("fix/claude-flow")
+        );
+        assert_eq!(lifecycle_rows[0].heavy_commit_count, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn branch_grouped_session_report_uses_weighted_attribution() -> Result<()> {
+        let conn = open_test_db()?;
+        conn.execute(
+            "INSERT INTO event_session_quality (
+                provider, session_id, repo_root, model_name, started_at, ended_at, user_turn_count,
+                debug_loop_flag, mid_session_error_paste_flag, accepted_output_flag,
+                first_accepted_change_at, minutes_to_first_accepted_change, session_commit_within_4h_flag
+             ) VALUES
+                ('claude', 's-heavy', '/tmp/repo', 'claude-opus-4-6', '2026-03-17T09:00:00Z', '2026-03-17T09:30:00Z', 2, 0, 0, 1, '2026-03-17T09:05:00Z', 5.0, 1),
+                ('claude', 's-light', '/tmp/repo', 'claude-opus-4-6', '2026-03-17T09:01:00Z', '2026-03-17T09:31:00Z', 10, 0, 0, 1, '2026-03-17T09:06:00Z', 5.0, 1)",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO event_task_commit (
+                repo_root, task_key, branch_name, commit_sha, fallback_flag, confidence, commit_time
+             ) VALUES
+                ('/tmp/repo', 'fix/claude-flow', 'fix/claude-flow', 'c-heavy', 0, 1.0, '2026-03-17T09:20:00Z'),
+                ('/tmp/repo', 'fix/claude-flow', 'fix/claude-flow', 'c-light', 0, 1.0, '2026-03-17T09:21:00Z')",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO event_commit_session (
+                repo_root, commit_sha, provider, session_id, commit_time, model_name,
+                matched_lines, share_of_commit, share_of_ai
+             ) VALUES
+                ('/tmp/repo', 'c-heavy', 'claude', 's-heavy', '2026-03-17T09:20:00Z', 'claude-opus-4-6', 10.0, 0.5, 1.0),
+                ('/tmp/repo', 'c-light', 'claude', 's-light', '2026-03-17T09:21:00Z', 'claude-opus-4-6', 1.0, 0.5, 1.0)",
+            [],
+        )?;
+
+        create_reporting_views(&conn)?;
+        let rows = query_session_report(
+            &conn,
+            &ReportArgs {
+                weekly: false,
+                group_by: Some(GroupBy::Branch),
+                from: None,
+                to: None,
+                repo: None,
+                all_projects: false,
+                provider: Some("claude".to_string()),
+                task: None,
+                branch: None,
+                model: None,
+                limit: 10,
+            },
+        )?;
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].group_value.as_deref(), Some("fix/claude-flow"));
+        assert_eq!(rows[0].session_count, 2);
+        assert!(
+            rows[0]
+                .s2_avg
+                .map(|value| (value - (30.0 / 11.0)).abs() < 0.001)
+                .unwrap_or(false)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn branch_filters_apply_across_reports_with_provider_and_model() -> Result<()> {
+        let conn = open_test_db()?;
+        conn.execute(
+            "INSERT INTO event_session_quality (
+                provider, session_id, repo_root, model_name, started_at, ended_at, user_turn_count,
+                debug_loop_flag, mid_session_error_paste_flag, accepted_output_flag,
+                first_accepted_change_at, minutes_to_first_accepted_change, session_commit_within_4h_flag
+             ) VALUES
+                ('claude', 's-claude', '/tmp/repo', 'claude-opus-4-6', '2026-03-17T09:00:00Z', '2026-03-17T09:30:00Z', 3, 0, 0, 1, '2026-03-17T09:05:00Z', 5.0, 1),
+                ('codex', 's-codex', '/tmp/repo', 'gpt-5.4', '2026-03-17T09:10:00Z', '2026-03-17T09:40:00Z', 6, 1, 0, 1, '2026-03-17T09:15:00Z', 5.0, 1)",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO event_task_commit (
+                repo_root, task_key, branch_name, commit_sha, fallback_flag, confidence, commit_time
+             ) VALUES
+                ('/tmp/repo', 'fix/claude-flow', 'fix/claude-flow', 'claude1', 0, 1.0, '2026-03-17T09:20:00Z'),
+                ('/tmp/repo', 'fix/codex-flow', 'fix/codex-flow', 'codex1', 0, 1.0, '2026-03-17T09:21:00Z')",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO event_commit_outcome (
+                repo_root, commit_sha, commit_time, heavy_ai_flag, merged_to_mainline_flag,
+                reverted_later_flag, total_matched_ai_lines, commit_total_changed_lines
+             ) VALUES
+                ('/tmp/repo', 'claude1', '2026-03-17T09:20:00Z', 1, 1, 0, 8, 16),
+                ('/tmp/repo', 'codex1', '2026-03-17T09:21:00Z', 1, 0, 0, 12, 20)",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO event_commit_churn (
+                repo_root, commit_sha, ai_added_lines_reaching_mainline,
+                ai_added_lines_removed_within_window, churn_window_days
+             ) VALUES
+                ('/tmp/repo', 'claude1', 10, 2, 14),
+                ('/tmp/repo', 'codex1', 8, 1, 14)",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO event_commit_session (
+                repo_root, commit_sha, provider, session_id, commit_time, model_name,
+                matched_lines, share_of_commit, share_of_ai
+             ) VALUES
+                ('/tmp/repo', 'claude1', 'claude', 's-claude', '2026-03-17T09:20:00Z', 'claude-opus-4-6', 8.0, 0.5, 1.0),
+                ('/tmp/repo', 'codex1', 'codex', 's-codex', '2026-03-17T09:21:00Z', 'gpt-5.4', 12.0, 0.6, 1.0)",
+            [],
+        )?;
+
+        create_reporting_views(&conn)?;
+        let args = ReportArgs {
+            weekly: false,
+            group_by: None,
+            from: None,
+            to: None,
+            repo: None,
+            all_projects: false,
+            provider: Some("claude".to_string()),
+            task: None,
+            branch: Some("fix/claude-flow".to_string()),
+            model: Some("claude/claude-opus-4-6".to_string()),
+            limit: 10,
+        };
+
+        let session_rows = query_session_report(&conn, &args)?;
+        assert_eq!(session_rows.len(), 1);
+        assert_eq!(session_rows[0].session_count, 1);
+
+        let change_rows = query_change_report(&conn, &args)?;
+        assert_eq!(change_rows.len(), 1);
+        assert_eq!(change_rows[0].commit_count, 1);
+
+        let lifecycle_rows = query_lifecycle_report(&conn, &args)?;
+        assert_eq!(lifecycle_rows.len(), 1);
+        assert_eq!(lifecycle_rows[0].heavy_commit_count, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn task_grouped_reports_exclude_non_ticket_branches_even_when_branch_data_exists() -> Result<()>
+    {
+        let conn = open_test_db()?;
+        conn.execute(
+            "INSERT INTO event_task_session (
+                repo_root, task_key, branch_name, provider, session_id, model_name, started_at,
+                attribution_weight, commit_within_window_flag, user_turn_count, debug_loop_flag,
+                mid_session_error_paste_flag, accepted_output_flag, first_accepted_change_at,
+                minutes_to_first_accepted_change
+             ) VALUES ('/tmp/repo', 'fix/claude-flow', 'fix/claude-flow', 'claude', 's1', 'claude-opus-4-6', '2026-03-17T09:00:00Z', 1.0, 1, 3, 0, 0, 1, '2026-03-17T09:05:00Z', 5.0)",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO event_task_commit (
+                repo_root, task_key, branch_name, commit_sha, fallback_flag, confidence, commit_time
+             ) VALUES ('/tmp/repo', 'fix/claude-flow', 'fix/claude-flow', 'claude1', 0, 1.0, '2026-03-17T09:20:00Z')",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO event_commit_outcome (
+                repo_root, commit_sha, commit_time, heavy_ai_flag, merged_to_mainline_flag,
+                reverted_later_flag, total_matched_ai_lines, commit_total_changed_lines
+             ) VALUES ('/tmp/repo', 'claude1', '2026-03-17T09:20:00Z', 1, 1, 0, 8, 16)",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO event_commit_churn (
+                repo_root, commit_sha, ai_added_lines_reaching_mainline,
+                ai_added_lines_removed_within_window, churn_window_days
+             ) VALUES ('/tmp/repo', 'claude1', 10, 2, 14)",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO event_commit_session (
+                repo_root, commit_sha, provider, session_id, commit_time, model_name,
+                matched_lines, share_of_commit, share_of_ai
+             ) VALUES ('/tmp/repo', 'claude1', 'claude', 's1', '2026-03-17T09:20:00Z', 'claude-opus-4-6', 8.0, 0.5, 1.0)",
+            [],
+        )?;
+
+        create_reporting_views(&conn)?;
+        let args = ReportArgs {
+            weekly: false,
+            group_by: Some(GroupBy::Task),
+            from: None,
+            to: None,
+            repo: None,
+            all_projects: false,
+            provider: Some("claude".to_string()),
+            task: None,
+            branch: None,
+            model: None,
+            limit: 10,
+        };
+
+        assert!(query_session_report(&conn, &args)?.is_empty());
+        assert!(query_change_report(&conn, &args)?.is_empty());
+        assert!(query_lifecycle_report(&conn, &args)?.is_empty());
         Ok(())
     }
 
@@ -3926,6 +4504,7 @@ mod tests {
                 all_projects: false,
                 provider: None,
                 task: None,
+                branch: None,
                 model: None,
                 limit: 10,
             },
@@ -3989,6 +4568,7 @@ mod tests {
                 all_projects: false,
                 provider: None,
                 task: None,
+                branch: None,
                 model: None,
                 limit: 10,
             },
@@ -4037,6 +4617,7 @@ mod tests {
                 all_projects: false,
                 provider: None,
                 task: None,
+                branch: None,
                 model: None,
                 limit: 10,
             },
@@ -4097,6 +4678,7 @@ mod tests {
                 all_projects: false,
                 provider: None,
                 task: None,
+                branch: None,
                 model: None,
                 limit: 50,
             },
@@ -4147,6 +4729,7 @@ mod tests {
                 all_projects: false,
                 provider: None,
                 task: None,
+                branch: None,
                 model: None,
                 limit: 50,
             },
@@ -4201,6 +4784,7 @@ mod tests {
             all_projects: false,
             provider: None,
             task: None,
+            branch: None,
             model: None,
             limit: 50,
         };
@@ -4263,6 +4847,7 @@ mod tests {
                 all_projects: false,
                 provider: None,
                 task: None,
+                branch: None,
                 model: None,
                 limit: 10,
             },
@@ -5003,6 +5588,7 @@ mod tests {
                 all_projects: false,
                 provider: None,
                 task: None,
+                branch: None,
                 model: None,
                 limit: 10,
             },
@@ -5050,6 +5636,7 @@ mod tests {
             all_projects: false,
             provider: None,
             task: None,
+            branch: None,
             model: None,
             limit: 10,
         };
@@ -5148,6 +5735,7 @@ mod tests {
             all_projects: false,
             provider: None,
             task: None,
+            branch: None,
             model: None,
             limit: 50,
         };
@@ -5271,6 +5859,7 @@ mod tests {
             all_projects: false,
             provider: None,
             task: None,
+            branch: None,
             model: None,
             limit: 50,
         };
@@ -5382,6 +5971,7 @@ mod tests {
                 all_projects: false,
                 provider: Some("human".to_string()),
                 task: None,
+                branch: None,
                 model: None,
                 limit: 10,
             },

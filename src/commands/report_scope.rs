@@ -67,6 +67,7 @@ mod tests {
             all_projects: false,
             provider: None,
             task: None,
+            branch: None,
             model: None,
             limit: 50,
         }

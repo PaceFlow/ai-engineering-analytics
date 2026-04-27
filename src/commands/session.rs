@@ -1,4 +1,5 @@
 use anyhow::Result;
+use rusqlite::Connection;
 use std::io::{IsTerminal, Write};
 use std::process::{Command, Stdio};
 
@@ -16,19 +17,18 @@ pub fn run(args: SessionReportArgs) -> Result<()> {
     let db = db::open()?;
     analytics::create_reporting_views(&db)?;
     let resolved = report_scope::resolve_main_report_args(&args.report, args.overall);
+    let options = analytics::ReportQueryOptions {
+        implicit_model_default: resolved.implicit_model_default,
+    };
 
     let output = if args.list_sessions {
         let rows = analytics::query_session_list_rows(&db, &resolved.report)?;
         render_session_list(&rows)
     } else {
-        let rows = analytics::query_session_report_with_options(
-            &db,
-            &resolved.report,
-            analytics::ReportQueryOptions {
-                implicit_model_default: resolved.implicit_model_default,
-            },
-        )?;
-        render_session_report(&rows, &resolved.report)
+        let rows = analytics::query_session_report_with_options(&db, &resolved.report, options)?;
+        let show_branch_hint = rows.is_empty()
+            && task_report_hidden_branch_rows_exist(&db, &resolved.report, options)?;
+        render_session_report(&rows, &resolved.report, show_branch_hint)
     };
 
     if std::io::stdout().is_terminal() && output.lines().count() > terminal_height() {
@@ -39,12 +39,22 @@ pub fn run(args: SessionReportArgs) -> Result<()> {
     }
 }
 
-fn render_session_report(rows: &[analytics::SessionReportRow], report: &ReportArgs) -> String {
+fn render_session_report(
+    rows: &[analytics::SessionReportRow],
+    report: &ReportArgs,
+    show_branch_hint: bool,
+) -> String {
     let mut out = String::new();
     out.push_str("Session Metrics\n");
 
     if rows.is_empty() {
-        out.push_str("No session rows found. Run `paceflow ingest` first.\n");
+        if show_branch_hint {
+            out.push_str(
+                "No ticket-style task rows matched. Try `paceflow session --group-by branch` or `--overall`.\n",
+            );
+        } else {
+            out.push_str("No session rows found. Run `paceflow ingest` first.\n");
+        }
         return out;
     }
 
@@ -234,6 +244,22 @@ fn render_session_list(rows: &[analytics::SessionListRow]) -> String {
     out
 }
 
+fn task_report_hidden_branch_rows_exist(
+    db: &Connection,
+    report: &ReportArgs,
+    options: analytics::ReportQueryOptions,
+) -> Result<bool> {
+    if !matches!(report.group_by, Some(GroupBy::Task)) || report.task.is_some() {
+        return Ok(false);
+    }
+
+    let mut branch_report = report.clone();
+    branch_report.group_by = Some(GroupBy::Branch);
+    branch_report.task = None;
+    branch_report.limit = 1;
+    Ok(!analytics::query_session_report_with_options(db, &branch_report, options)?.is_empty())
+}
+
 fn shorten_path(path: &str) -> String {
     if let Some(home) = dirs::home_dir() {
         let home_str = home.to_string_lossy();
@@ -342,7 +368,7 @@ fn pipe_to_pager(output: &str) -> Result<()> {
 mod tests {
     use super::{display_project_path, render_session_list, render_session_report};
     use crate::analytics::{RatioMetric, SessionListRow, SessionReportRow};
-    use crate::cli::ReportArgs;
+    use crate::cli::{GroupBy, ReportArgs};
 
     fn row(project_path: &str) -> SessionListRow {
         SessionListRow {
@@ -416,11 +442,12 @@ mod tests {
             all_projects: false,
             provider: None,
             task: None,
+            branch: None,
             model: None,
             limit: 50,
         };
 
-        let rendered = render_session_report(&rows, &report);
+        let rendered = render_session_report(&rows, &report, false);
         assert!(rendered.contains("Sessions analyzed: 411"));
         assert!(rendered.contains("│ Signal"));
         assert!(rendered.contains("│ Time to first change"));
@@ -430,5 +457,27 @@ mod tests {
         assert!(rendered.contains("Legend:"));
         assert!(rendered.contains("Status: lower is better except Sessions to commit."));
         assert!(!rendered.contains("Average user prompts ="));
+    }
+
+    #[test]
+    fn render_session_report_suggests_branch_view_for_hidden_task_rows() {
+        let report = ReportArgs {
+            weekly: false,
+            group_by: Some(GroupBy::Task),
+            from: None,
+            to: None,
+            repo: None,
+            all_projects: false,
+            provider: Some("claude".to_string()),
+            task: None,
+            branch: None,
+            model: None,
+            limit: 50,
+        };
+
+        let rendered = render_session_report(&[], &report, true);
+        assert!(rendered.contains("No ticket-style task rows matched."));
+        assert!(rendered.contains("`paceflow session --group-by branch`"));
+        assert!(!rendered.contains("Run `paceflow ingest` first."));
     }
 }

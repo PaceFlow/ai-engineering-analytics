@@ -3,6 +3,9 @@
     "rollout-2026-03-03T12-40-09-019cb311-b93e-7423-aeb4-81249c578638.jsonl",
     "rollout-2026-03-10T09-39-11-019cd678-8f72-7b43-a07f-d49cdbbb81c9.jsonl"
   ],
+  "claude_sessions": [
+    "project-paceflow/11111111-2222-4333-8444-555555555555.jsonl"
+  ],
   "cursor_visible_session": "b052dae4-a1d2-43f0-a3ba-6faf6a40489e",
   "cursor_change_intel_session": "fe3cc3e4-b074-48a3-8e88-8f8915c89b3f",
   "placeholders": {

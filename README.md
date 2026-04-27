@@ -7,7 +7,7 @@ Local-first CLI for answering the questions that matter after you use coding age
 - Did it hold up?
 - What should I do differently next time?
 
-`paceflow` reads local Codex/Cursor history plus git metadata and turns that evidence into three practical views:
+`paceflow` reads local Claude Code, Codex, and Cursor history plus git metadata and turns that evidence into three practical views:
 
 - `session`: were you getting leverage, or just steering and retrying?
 - `delivery`: did AI-heavy work turn into real commits that reached mainline?
@@ -126,9 +126,11 @@ Useful follow-ups:
 - `paceflow delivery --model codex/gpt-5.4`
 - `paceflow delivery --overall`
 - `paceflow delivery --group-by task`
+- `paceflow delivery --group-by branch`
 - `paceflow quality --model codex/gpt-5.4`
 - `paceflow quality --overall`
 - `paceflow quality --group-by provider`
+- `paceflow quality --group-by branch`
 
 Optional GitHub PR sync setup:
 
@@ -194,6 +196,7 @@ xattr -dr com.apple.quarantine paceflow-aarch64-apple-darwin
 Requirements:
 
 - `git` must be installed and available on `PATH`
+- `paceflow` reads local Claude Code sessions from `~/.claude/projects/*/*.jsonl`
 - `paceflow` reads local Codex sessions from `~/.codex/sessions`
 - `paceflow` reads local Cursor state/history from the OS config directory under `Cursor/User`
 - If Cursor data lives elsewhere, set `PACEFLOW_CURSOR_STATE_PATH` and/or `PACEFLOW_CURSOR_HISTORY_PATH`
@@ -294,17 +297,20 @@ The reports are built from normalized session events, matched commit/session att
 - Repo and weekly rollups use ordinary counts and averages over included sessions or commits
 - Provider/model grouped delivery and quality reports work from commit-session attribution rows so unmatched commits can appear as `human`
 - Task-grouped session reports use attribution-weighted averages and rates
+- Branch-grouped session reports use attribution-weighted averages and rates
 - Task-grouped delivery and quality reports exclude non-ticket task keys plus integration branches such as `main`, `staging`, `master`, and `develop`
 
 ## Notes
 
-- `session`, `delivery`, and `quality` share the same filter interface: `--weekly`, `--group-by`, `--from`, `--to`, `--repo`, `--provider`, `--task`, `--model`, and `--limit`
+- `session`, `delivery`, and `quality` share the same filter interface: `--weekly`, `--group-by`, `--from`, `--to`, `--repo`, `--provider`, `--task`, `--branch`, `--model`, and `--limit`
 - `session`, `delivery`, and `quality` default to `group-by model` when you do not pass `--group-by` or `--overall`
 - `--model` filters the current report to one model without changing the active view
+- Use `--group-by branch` or `--branch <name>` when the work lives on literal branches like `fix/...`, `perf/...`, `codex/...`, or `main`
 - `--overall` swaps the default model comparison for the rolled-up one-row summary and conflicts with `--group-by`
 - Provider `human` means a commit had no matched AI session attribution at all
 - Task-grouped rows only show ticket-style task keys such as `ABC-123` and exclude integration branches such as `main`, `staging`, `master`, and `develop`
 - `delivery --group-by task` includes `± LOC commits`, summed from ingested commit line stats for that task branch
+- `branch` grouping keeps literal branch names and is the right view when task-grouped reports are empty but you know work happened on a non-ticket branch
 - Local analytics state lives under `~/.paceflow/paceflow.db` by default; override the base home with `PACEFLOW_HOME`
 
 Development notes, profiling setup, and source-oriented workflows live in [DEV.md](DEV.md).

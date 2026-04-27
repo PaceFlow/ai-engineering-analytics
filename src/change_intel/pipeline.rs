@@ -7,6 +7,7 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
+use crate::change_intel::providers::claude;
 use crate::change_intel::providers::codex::parsers::apply_patch::ApplyPatchParser;
 use crate::change_intel::providers::codex::parsers::exec_heredoc::ExecHeredocWriteParser;
 use crate::change_intel::providers::cursor;
@@ -69,6 +70,10 @@ pub fn plan_provider_code_changes(provider_name: &str) -> Result<ProviderCodeCha
             provider,
             sources: discover_codex_sources()?,
         }),
+        "claude" => Ok(ProviderCodeChangePlan {
+            provider,
+            sources: crate::providers::claude::plan_session_files()?,
+        }),
         "cursor" => Ok(ProviderCodeChangePlan {
             provider,
             sources: cursor::cursor_vscdb_path()?.into_iter().collect(),
@@ -87,6 +92,9 @@ pub fn ingest_provider_code_changes(
     progress: Option<&mut dyn IngestProgressObserver>,
 ) -> Result<ProviderCodeChangeSummary> {
     match plan.provider.as_str() {
+        "claude" => {
+            claude::ingest_claude_code_changes_from_sources(conn, &plan.sources, verbose, progress)
+        }
         "codex" => ingest_codex_sources(conn, &plan.sources, verbose, progress),
         "cursor" => {
             cursor::ingest_cursor_code_changes_from_sources(conn, &plan.sources, verbose, progress)
@@ -575,20 +583,20 @@ mod tests {
     }
 
     #[test]
-    fn non_codex_provider_returns_noop_summary() -> Result<()> {
+    fn unknown_provider_returns_noop_summary() -> Result<()> {
         let mut conn = Connection::open_in_memory()?;
         init_change_intel_schema(&conn)?;
 
         let summary = ingest_provider_code_changes(
             &mut conn,
             &ProviderCodeChangePlan {
-                provider: "claude".to_string(),
+                provider: "unknown".to_string(),
                 sources: Vec::new(),
             },
             false,
             None,
         )?;
-        assert_eq!(summary.provider, "claude");
+        assert_eq!(summary.provider, "unknown");
         assert_eq!(summary.sources_discovered, 0);
         assert_eq!(summary.ops_upserted, 0);
         Ok(())

@@ -7,6 +7,7 @@ Session Metrics
 Week        Provider                      Sessions     Prompts    First Chg            Loop           Error       To Commit       No Output
 2026-03-02  codex                                1      117.00        342.5            0.0%          100.0%          100.0%            0.0%
 2026-03-02  cursor                               1        1.00          0.0            0.0%            0.0%            0.0%            0.0%
+2026-03-09  claude                               1        1.00          0.0            0.0%            0.0%          100.0%            0.0%
 2026-03-09  codex                                1       15.00        298.3            0.0%          100.0%          100.0%            0.0%
 
 Legend:
