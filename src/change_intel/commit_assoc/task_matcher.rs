@@ -1,9 +1,7 @@
 use anyhow::Result;
 use std::collections::{HashMap, HashSet};
 
-use super::git_scan::{
-    list_commits_on_ref, list_first_parent_commits, list_local_head_branches,
-};
+use super::git_scan::{list_commits_on_ref, list_first_parent_commits, list_local_head_branches};
 use super::types::CommitTaskAttribution;
 
 const INTEGRATION_BRANCHES: [&str; 4] = ["main", "master", "staging", "develop"];
@@ -351,10 +349,7 @@ mod tests {
             &["main", "PAC-123_foo"],
             &[("PAC-123_foo", &["abc"])],
             &[("abc", &["PAC-123_foo", "main"])],
-            &[
-                ("PAC-123_foo", &[("abc", 1)]),
-                ("main", &[("abc", 0)]),
-            ],
+            &[("PAC-123_foo", &[("abc", 1)]), ("main", &[("abc", 0)])],
         );
 
         let attr = attribute_commit_to_task("/tmp/repo", "abc", &ctx).unwrap();
@@ -372,14 +367,8 @@ mod tests {
         // reachable from `main` (merged) and from an unrelated local branch.
         let ctx = build_ctx(
             &["main", "PAC-837_firebase", "other_branch"],
-            &[
-                ("PAC-837_firebase", &["abc"]),
-                ("other_branch", &[]),
-            ],
-            &[(
-                "abc",
-                &["PAC-837_firebase", "main", "other_branch"],
-            )],
+            &[("PAC-837_firebase", &["abc"]), ("other_branch", &[])],
+            &[("abc", &["PAC-837_firebase", "main", "other_branch"])],
             &[
                 ("PAC-837_firebase", &[("abc", 0)]),
                 ("main", &[("abc", 5)]),

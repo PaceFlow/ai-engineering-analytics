@@ -1,3 +1,4 @@
+pub mod claude;
 pub mod codex;
 pub mod cursor;
 pub mod utils;
@@ -10,6 +11,7 @@ use crate::ingest_progress::IngestProgressObserver;
 
 #[derive(Debug, Clone)]
 pub enum ProviderSessionPlan {
+    Claude { session_files: Vec<PathBuf> },
     Codex { session_files: Vec<PathBuf> },
     Cursor { composer_keys: Vec<String> },
 }
@@ -17,6 +19,7 @@ pub enum ProviderSessionPlan {
 impl ProviderSessionPlan {
     pub fn item_count(&self) -> usize {
         match self {
+            Self::Claude { session_files } => session_files.len(),
             Self::Codex { session_files } => session_files.len(),
             Self::Cursor { composer_keys } => composer_keys.len(),
         }
@@ -25,6 +28,7 @@ impl ProviderSessionPlan {
 
 #[derive(Debug, Clone, Copy)]
 pub enum Provider {
+    Claude,
     Codex,
     Cursor,
 }
@@ -32,6 +36,7 @@ pub enum Provider {
 impl Provider {
     pub fn name(&self) -> &str {
         match self {
+            Self::Claude => "claude",
             Self::Codex => "codex",
             Self::Cursor => "cursor",
         }
@@ -39,6 +44,9 @@ impl Provider {
 
     pub fn plan_session_work(&self) -> Result<ProviderSessionPlan> {
         match self {
+            Self::Claude => Ok(ProviderSessionPlan::Claude {
+                session_files: claude::plan_session_files()?,
+            }),
             Self::Codex => Ok(ProviderSessionPlan::Codex {
                 session_files: codex::plan_session_files()?,
             }),
@@ -57,6 +65,9 @@ impl Provider {
         progress: Option<&mut dyn IngestProgressObserver>,
     ) -> Result<usize> {
         match (self, plan) {
+            (Self::Claude, ProviderSessionPlan::Claude { session_files }) => {
+                claude::ingest_planned_sessions(db, session_files, verbose, progress)
+            }
             (Self::Codex, ProviderSessionPlan::Codex { session_files }) => {
                 codex::ingest_planned_sessions(db, session_files, verbose, progress)
             }
@@ -70,5 +81,5 @@ impl Provider {
 
 /// Central registry — add one line here when a new provider is implemented.
 pub fn all_providers() -> Vec<Provider> {
-    vec![Provider::Codex, Provider::Cursor]
+    vec![Provider::Claude, Provider::Codex, Provider::Cursor]
 }

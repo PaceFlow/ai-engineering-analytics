@@ -1,0 +1,12 @@
+---
+source: tests/metrics_regression.rs
+expression: delivery
+---
+Delivery Metrics
+
+Branch                         Commits     Heavy    PR Reach   Mainline Reach      PR Merge    vs Staging
+staging                              1         0         N/A              N/A             N/A           N/A
+
+Legend:
+- PR Reach, Mainline Reach, and PR Merge = percentage rates.
+- N/A means GitHub PR sync data is unavailable for PR-backed metrics.

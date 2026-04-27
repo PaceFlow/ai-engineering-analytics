@@ -3,17 +3,17 @@ source: tests/metrics_regression.rs
 expression: session
 ---
 Session Metrics
-Sessions analyzed: 3
+Sessions analyzed: 4
 
 ┌──────────────────────┬──────────────┬────────┐
 │ Signal               │ Value        │ Status │
 ├──────────────────────┼──────────────┼────────┤
-│ Time to first change │ 213.58 min   │ risk   │
-│ No-output sessions   │ 0.00% (0/3)  │ good   │
-│ Sessions to commit   │ 66.67% (2/3) │ good   │
-│ Error pastes         │ 66.67% (2/3) │ risk   │
-│ Avg prompts          │ 44.33        │ risk   │
-│ Debug loops          │ 0.00% (0/3)  │ good   │
+│ Time to first change │ 160.19 min   │ risk   │
+│ No-output sessions   │ 0.00% (0/4)  │ good   │
+│ Sessions to commit   │ 75.00% (3/4) │ good   │
+│ Error pastes         │ 50.00% (2/4) │ risk   │
+│ Avg prompts          │ 33.50        │ risk   │
+│ Debug loops          │ 0.00% (0/4)  │ good   │
 └──────────────────────┴──────────────┴────────┘
 
 Legend:

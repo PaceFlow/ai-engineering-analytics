@@ -234,6 +234,7 @@ fn query_live_change_report(conn: &Connection) -> Result<Vec<analytics::ChangeRe
             all_projects: false,
             provider: None,
             task: None,
+            branch: None,
             model: None,
             limit: 10,
         },

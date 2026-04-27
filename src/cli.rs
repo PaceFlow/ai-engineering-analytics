@@ -1,8 +1,8 @@
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
-const SESSION_AFTER_HELP: &str = "Examples:\n  paceflow session                 # default: grouped by model\n  paceflow session --model codex/gpt-5.4\n  paceflow session --overall\n  paceflow session --group-by provider\n  paceflow session --list-sessions\n\nMetrics:\n  Average user prompts: average number of user prompts per session.\n  Avg time to first accepted change: minutes from session start to the first accepted code change.\n  Debug loop rate: share of sessions that look like repeated fix-retry cycles.\n  Error paste rate: share of sessions where an error message was pasted mid-session.\n  Session-to-commit rate: share of sessions followed by a commit within 4 hours.\n  No-output session rate: share of sessions with no accepted code changes.";
-const DELIVERY_AFTER_HELP: &str = "Examples:\n  paceflow delivery                # default: grouped by model\n  paceflow delivery --model codex/gpt-5.4\n  paceflow delivery --overall\n  paceflow delivery --group-by provider\n  paceflow delivery --group-by task --task ABC-123\n\nMetrics:\n  Heavy commits: commits where matched AI-attributed lines are at least half of changed lines.\n  PR sync: completed GitHub PR lookups per heavy commit on github.com (see table column).\n  PR reach rate: among completed lookups, share where a pull request existed.\n  Mainline reach rate: share of heavy AI commits that later reached mainline.\n  PR merge rate: among completed PR-linked lookups, share whose PR merged.";
-const QUALITY_AFTER_HELP: &str = "Examples:\n  paceflow quality                 # default: grouped by model\n  paceflow quality --model codex/gpt-5.4\n  paceflow quality --overall\n  paceflow quality --group-by provider\n  paceflow quality --group-by task --task ABC-123\n\nMetrics:\n  Code churn rate: share of AI-added lines on heavy AI commits that were removed again within the churn window.\n  Bug-after-merge rate: share of merged heavy AI commits that drew a later fix-like commit within 60 days.\n  Revert rate: share of heavy AI commits that were later reverted.";
+const SESSION_AFTER_HELP: &str = "Examples:\n  paceflow session                 # default: grouped by model\n  paceflow session --model codex/gpt-5.4\n  paceflow session --overall\n  paceflow session --group-by provider\n  paceflow session --group-by branch\n  paceflow session --branch fix/cursor-new-partial-fate-schema\n  paceflow session --list-sessions\n\nMetrics:\n  Average user prompts: average number of user prompts per session.\n  Avg time to first accepted change: minutes from session start to the first accepted code change.\n  Debug loop rate: share of sessions that look like repeated fix-retry cycles.\n  Error paste rate: share of sessions where an error message was pasted mid-session.\n  Session-to-commit rate: share of sessions followed by a commit within 4 hours.\n  No-output session rate: share of sessions with no accepted code changes.";
+const DELIVERY_AFTER_HELP: &str = "Examples:\n  paceflow delivery                # default: grouped by model\n  paceflow delivery --model codex/gpt-5.4\n  paceflow delivery --overall\n  paceflow delivery --group-by provider\n  paceflow delivery --group-by task --task ABC-123\n  paceflow delivery --group-by branch\n  paceflow delivery --branch fix/cursor-new-partial-fate-schema\n\nMetrics:\n  Heavy commits: commits where matched AI-attributed lines are at least half of changed lines.\n  PR sync: completed GitHub PR lookups per heavy commit on github.com (see table column).\n  PR reach rate: among completed lookups, share where a pull request existed.\n  Mainline reach rate: share of heavy AI commits that later reached mainline.\n  PR merge rate: among completed PR-linked lookups, share whose PR merged.";
+const QUALITY_AFTER_HELP: &str = "Examples:\n  paceflow quality                 # default: grouped by model\n  paceflow quality --model codex/gpt-5.4\n  paceflow quality --overall\n  paceflow quality --group-by provider\n  paceflow quality --group-by task --task ABC-123\n  paceflow quality --group-by branch\n  paceflow quality --branch fix/cursor-new-partial-fate-schema\n\nMetrics:\n  Code churn rate: share of AI-added lines on heavy AI commits that were removed again within the churn window.\n  Bug-after-merge rate: share of merged heavy AI commits that drew a later fix-like commit within 60 days.\n  Revert rate: share of heavy AI commits that were later reverted.";
 const GITHUB_AFTER_HELP: &str = "Examples:\n  paceflow github token\n\nGitHub token setup:\n  Use this command to save, replace, or delete the local GitHub token used for PR sync during ingest.";
 
 #[derive(Parser)]
@@ -53,6 +53,7 @@ pub enum GroupBy {
     Repo,
     Provider,
     Task,
+    Branch,
     Model,
 }
 
@@ -100,6 +101,9 @@ pub struct ReportArgs {
     /// Restrict to a specific task key (ticket format, e.g. ABC-123)
     #[arg(long)]
     pub task: Option<String>,
+    /// Restrict to a specific branch name
+    #[arg(long)]
+    pub branch: Option<String>,
     /// Restrict to a specific model name
     #[arg(long)]
     pub model: Option<String>,
@@ -202,11 +206,29 @@ mod tests {
     }
 
     #[test]
+    fn parses_quality_group_by_branch() {
+        let cli = Cli::parse_from(["paceflow", "quality", "--group-by", "branch"]);
+        match cli.command {
+            Commands::Quality(args) => assert_eq!(args.report.group_by, Some(GroupBy::Branch)),
+            _ => panic!("expected quality command"),
+        }
+    }
+
+    #[test]
     fn parses_quality_model_filter() {
         let cli = Cli::parse_from(["paceflow", "quality", "--model", "gpt-5"]);
         match cli.command {
             Commands::Quality(args) => assert_eq!(args.report.model.as_deref(), Some("gpt-5")),
             _ => panic!("expected quality command"),
+        }
+    }
+
+    #[test]
+    fn parses_report_branch_filter() {
+        let cli = Cli::parse_from(["paceflow", "session", "--branch", "fix/test"]);
+        match cli.command {
+            Commands::Session(args) => assert_eq!(args.report.branch.as_deref(), Some("fix/test")),
+            _ => panic!("expected session command"),
         }
     }
 
