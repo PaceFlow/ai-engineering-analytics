@@ -33,6 +33,8 @@ pub enum Commands {
     #[command(name = "github")]
     /// Manage GitHub token setup for live PR sync
     GitHub(GitHubArgs),
+    /// Open the interactive analytics explorer
+    Tui(TuiArgs),
 }
 
 #[derive(Args, Debug, Clone)]
@@ -40,6 +42,16 @@ pub enum Commands {
 pub struct GitHubArgs {
     #[command(subcommand)]
     pub command: GitHubCommands,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct TuiArgs {
+    /// Show results across all tracked projects instead of defaulting to the current repo
+    #[arg(long)]
+    pub all_projects: bool,
+    /// Max number of grouped rows to load per report
+    #[arg(long, default_value_t = 50)]
+    pub limit: usize,
 }
 
 #[derive(Subcommand, Debug, Clone)]
@@ -320,6 +332,18 @@ mod tests {
                 GitHubCommands::Token => {}
             },
             _ => panic!("expected github command"),
+        }
+    }
+
+    #[test]
+    fn parses_tui_command() {
+        let cli = Cli::parse_from(["paceflow", "tui", "--all-projects", "--limit", "25"]);
+        match cli.command {
+            Commands::Tui(args) => {
+                assert!(args.all_projects);
+                assert_eq!(args.limit, 25);
+            }
+            _ => panic!("expected tui command"),
         }
     }
 

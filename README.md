@@ -114,6 +114,14 @@ paceflow delivery
 paceflow quality
 ```
 
+For interactive exploration, open the terminal dashboard:
+
+```bash
+paceflow tui
+```
+
+The dashboard starts on the last 30 days, shows chart-first Session, Delivery, and Quality views, and lets you switch date presets such as today, this week, last week, and last 30 days.
+
 By default those three views compare outcomes by model. Use `--overall` when you want the rolled-up one-row summary instead.
 Use `--model <provider/name>` when you want to keep the same report but narrow it to one model.
 
@@ -131,6 +139,7 @@ Useful follow-ups:
 - `paceflow quality --overall`
 - `paceflow quality --group-by provider`
 - `paceflow quality --group-by branch`
+- `paceflow tui --all-projects`
 
 Optional GitHub PR sync setup:
 
@@ -303,6 +312,7 @@ The reports are built from normalized session events, matched commit/session att
 ## Notes
 
 - `session`, `delivery`, and `quality` share the same filter interface: `--weekly`, `--group-by`, `--from`, `--to`, `--repo`, `--provider`, `--task`, `--branch`, `--model`, and `--limit`
+- `tui` provides interactive charts over those same reports: `d` cycles date presets, `1-7` switches metrics, `g` cycles breakdowns, `w` toggles over-time weekly charts, `Enter` drills into the selected bucket, and `Backspace` goes back
 - `session`, `delivery`, and `quality` default to `group-by model` when you do not pass `--group-by` or `--overall`
 - `--model` filters the current report to one model without changing the active view
 - Use `--group-by branch` or `--branch <name>` when the work lives on literal branches like `fix/...`, `perf/...`, `codex/...`, or `main`
