@@ -72,6 +72,15 @@ struct PendingToolUse {
     result_error: bool,
 }
 
+#[derive(Debug, Default)]
+struct ParseState {
+    model_name: Option<String>,
+    visible_messages: Vec<ClaudeVisibleMessage>,
+    pending: Vec<PendingToolUse>,
+    pending_by_id: HashMap<String, usize>,
+    tool_call_count: usize,
+}
+
 const CLAUDE_EDIT_PARSER_NAME: &str = "claude_edit_v1";
 const CLAUDE_WRITE_PARSER_NAME: &str = "claude_write_v1";
 
@@ -101,11 +110,7 @@ pub(crate) fn parse_session_file(path: &Path) -> Result<ParsedClaudeSession> {
     let mut session_cwd: Option<String> = None;
     let mut started_at: Option<String> = None;
     let mut ended_at: Option<String> = None;
-    let mut model_name: Option<String> = None;
-    let mut visible_messages = Vec::new();
-    let mut pending = Vec::new();
-    let mut pending_by_id = HashMap::new();
-    let mut tool_call_count = 0usize;
+    let mut state = ParseState::default();
 
     for line_result in reader.lines() {
         let raw = line_result?;
@@ -136,16 +141,7 @@ pub(crate) fn parse_session_file(path: &Path) -> Result<ParsedClaudeSession> {
             .map(ToOwned::to_owned);
         update_time_bounds(&mut started_at, &mut ended_at, outer_timestamp.as_deref());
 
-        process_top_level_record(
-            &parsed,
-            &session_id,
-            &source_file,
-            &mut model_name,
-            &mut visible_messages,
-            &mut pending,
-            &mut pending_by_id,
-            &mut tool_call_count,
-        );
+        process_top_level_record(&parsed, &mut state);
 
         if parsed.get("type").and_then(Value::as_str) == Some("progress")
             && parsed
@@ -155,15 +151,7 @@ pub(crate) fn parse_session_file(path: &Path) -> Result<ParsedClaudeSession> {
                 == Some("agent_progress")
             && let Some(nested) = parsed.get("data").and_then(|value| value.get("message"))
         {
-            process_nested_progress_message(
-                nested,
-                &parsed,
-                &session_id,
-                &source_file,
-                &mut pending,
-                &mut pending_by_id,
-                &mut tool_call_count,
-            );
+            process_nested_progress_message(nested, &parsed, &mut state);
         }
     }
 
@@ -171,7 +159,8 @@ pub(crate) fn parse_session_file(path: &Path) -> Result<ParsedClaudeSession> {
         session_id = fallback_session_id;
     }
 
-    let structured_writes = pending
+    let structured_writes = state
+        .pending
         .into_iter()
         .filter_map(|tool| {
             build_structured_write(tool, &session_id, &source_file, session_cwd.as_deref())
@@ -184,10 +173,10 @@ pub(crate) fn parse_session_file(path: &Path) -> Result<ParsedClaudeSession> {
         session_cwd,
         started_at,
         ended_at,
-        model_name,
-        visible_messages,
+        model_name: state.model_name,
+        visible_messages: state.visible_messages,
         structured_writes,
-        tool_call_count,
+        tool_call_count: state.tool_call_count,
     })
 }
 
@@ -217,16 +206,7 @@ fn discover_top_level_jsonl_files(root: &Path) -> Vec<PathBuf> {
     files
 }
 
-fn process_top_level_record(
-    parsed: &Value,
-    session_id: &str,
-    source_file: &str,
-    model_name: &mut Option<String>,
-    visible_messages: &mut Vec<ClaudeVisibleMessage>,
-    pending: &mut Vec<PendingToolUse>,
-    pending_by_id: &mut HashMap<String, usize>,
-    tool_call_count: &mut usize,
-) {
+fn process_top_level_record(parsed: &Value, state: &mut ParseState) {
     let Some(kind) = parsed.get("type").and_then(Value::as_str) else {
         return;
     };
@@ -245,34 +225,26 @@ fn process_top_level_record(
     match kind {
         "assistant" => {
             if let Some(found_model) = extract_real_model_name(message) {
-                *model_name = Some(found_model);
+                state.model_name = Some(found_model);
             }
             if let Some(text) = extract_assistant_visible_text(message)
                 && !text.trim().is_empty()
             {
-                visible_messages.push(ClaudeVisibleMessage {
+                state.visible_messages.push(ClaudeVisibleMessage {
                     role: ClaudeMessageRole::Assistant,
                     text,
                     timestamp: timestamp.clone(),
                 });
             }
-            register_tool_uses(
-                message,
-                timestamp,
-                session_id,
-                source_file,
-                pending,
-                pending_by_id,
-                tool_call_count,
-            );
+            register_tool_uses(message, timestamp, state);
         }
         "user" => {
-            attach_tool_results(parsed, message, pending, pending_by_id);
+            attach_tool_results(parsed, message, state);
             if !is_meta
                 && let Some(text) = extract_user_visible_text(message)
                 && !should_ignore_user_text(&text)
             {
-                visible_messages.push(ClaudeVisibleMessage {
+                state.visible_messages.push(ClaudeVisibleMessage {
                     role: ClaudeMessageRole::User,
                     text,
                     timestamp,
@@ -283,15 +255,7 @@ fn process_top_level_record(
     }
 }
 
-fn process_nested_progress_message(
-    nested: &Value,
-    outer: &Value,
-    session_id: &str,
-    source_file: &str,
-    pending: &mut Vec<PendingToolUse>,
-    pending_by_id: &mut HashMap<String, usize>,
-    tool_call_count: &mut usize,
-) {
+fn process_nested_progress_message(nested: &Value, outer: &Value, state: &mut ParseState) {
     let Some(kind) = nested.get("type").and_then(Value::as_str) else {
         return;
     };
@@ -305,29 +269,13 @@ fn process_nested_progress_message(
         .map(ToOwned::to_owned);
 
     match kind {
-        "assistant" => register_tool_uses(
-            message,
-            timestamp,
-            session_id,
-            source_file,
-            pending,
-            pending_by_id,
-            tool_call_count,
-        ),
-        "user" => attach_tool_results(outer, message, pending, pending_by_id),
+        "assistant" => register_tool_uses(message, timestamp, state),
+        "user" => attach_tool_results(outer, message, state),
         _ => {}
     }
 }
 
-fn register_tool_uses(
-    message: &Value,
-    timestamp: Option<String>,
-    session_id: &str,
-    source_file: &str,
-    pending: &mut Vec<PendingToolUse>,
-    pending_by_id: &mut HashMap<String, usize>,
-    tool_call_count: &mut usize,
-) {
+fn register_tool_uses(message: &Value, timestamp: Option<String>, state: &mut ParseState) {
     let Some(items) = message.get("content").and_then(Value::as_array) else {
         return;
     };
@@ -344,9 +292,9 @@ fn register_tool_uses(
             continue;
         };
 
-        *tool_call_count += 1;
-        let pending_index = pending.len();
-        pending.push(PendingToolUse {
+        state.tool_call_count += 1;
+        let pending_index = state.pending.len();
+        state.pending.push(PendingToolUse {
             timestamp: timestamp.clone(),
             call_id: call_id.to_string(),
             tool_name: tool_name.to_string(),
@@ -354,17 +302,13 @@ fn register_tool_uses(
             result_payload: None,
             result_error: false,
         });
-        pending_by_id.insert(call_id.to_string(), pending_index);
-        let _ = (session_id, source_file);
+        state
+            .pending_by_id
+            .insert(call_id.to_string(), pending_index);
     }
 }
 
-fn attach_tool_results(
-    outer: &Value,
-    message: &Value,
-    pending: &mut [PendingToolUse],
-    pending_by_id: &HashMap<String, usize>,
-) {
+fn attach_tool_results(outer: &Value, message: &Value, state: &mut ParseState) {
     let Some(items) = message.get("content").and_then(Value::as_array) else {
         return;
     };
@@ -381,10 +325,10 @@ fn attach_tool_results(
         else {
             continue;
         };
-        let Some(index) = pending_by_id.get(tool_use_id).copied() else {
+        let Some(index) = state.pending_by_id.get(tool_use_id).copied() else {
             continue;
         };
-        let Some(tool) = pending.get_mut(index) else {
+        let Some(tool) = state.pending.get_mut(index) else {
             continue;
         };
 

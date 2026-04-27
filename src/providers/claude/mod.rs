@@ -2,7 +2,7 @@ pub(crate) mod shared;
 
 use anyhow::Result;
 use rusqlite::Connection;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::db;
 use crate::ingest_progress::IngestProgressObserver;
@@ -49,7 +49,7 @@ pub fn ingest_planned_sessions(
     Ok(total_rows)
 }
 
-fn ingest_session(path: &PathBuf, db: &Connection) -> Result<usize> {
+fn ingest_session(path: &Path, db: &Connection) -> Result<usize> {
     let parsed = shared::parse_session_file(path)?;
     if parsed.session_id.trim().is_empty() {
         return Ok(0);

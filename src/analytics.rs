@@ -1373,12 +1373,8 @@ pub fn query_change_report_with_options(
         "COUNT(DISTINCT CASE WHEN base.heavy_ai_flag = 1 AND eo.repo_key LIKE 'git:github.com/%' AND pr.pr_opened_flag = 1 THEN base.commit_sha END) AS c3_d"
             .to_string(),
     );
-    select.push(
-        "COALESCE(SUM(fc.total_added), 0) AS task_branch_lines_added".to_string(),
-    );
-    select.push(
-        "COALESCE(SUM(fc.total_removed), 0) AS task_branch_lines_removed".to_string(),
-    );
+    select.push("COALESCE(SUM(fc.total_added), 0) AS task_branch_lines_added".to_string());
+    select.push("COALESCE(SUM(fc.total_removed), 0) AS task_branch_lines_removed".to_string());
 
     let mut sql = format!(
         "SELECT {} FROM ({}) base
