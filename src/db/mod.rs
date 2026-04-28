@@ -483,6 +483,22 @@ pub(crate) fn init_metadata_schema(conn: &Connection) -> Result<()> {
             CHECK (pr_merged_flag IN (0,1))
         );
 
+        CREATE TABLE IF NOT EXISTS fact_sync_event_state (
+            organization_id        TEXT NOT NULL,
+            event_type             TEXT NOT NULL,
+            event_key              TEXT NOT NULL,
+            content_hash           TEXT NOT NULL,
+            last_synced_at         TEXT NOT NULL,
+            last_server_checkpoint TEXT,
+            PRIMARY KEY(organization_id, event_type, event_key)
+        );
+
+        CREATE TABLE IF NOT EXISTS fact_sync_run_state (
+            organization_id         TEXT PRIMARY KEY,
+            last_successful_push_at TEXT NOT NULL,
+            last_server_checkpoint  TEXT
+        );
+
         CREATE INDEX IF NOT EXISTS idx_fact_session_message_session
             ON fact_session_message(provider, session_id, message_index);
         CREATE INDEX IF NOT EXISTS idx_fact_session_change_session
@@ -544,7 +560,11 @@ pub(crate) fn init_metadata_schema(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_event_commit_pr_outcome_repo
             ON event_commit_pr_outcome(repo_root, commit_sha);
         CREATE INDEX IF NOT EXISTS idx_event_commit_pr_outcome_repo_key
-            ON event_commit_pr_outcome(repo_key, commit_sha);",
+            ON event_commit_pr_outcome(repo_key, commit_sha);
+        CREATE INDEX IF NOT EXISTS idx_fact_sync_event_state_org
+            ON fact_sync_event_state(organization_id, event_type);
+        CREATE INDEX IF NOT EXISTS idx_fact_sync_event_state_hash
+            ON fact_sync_event_state(content_hash);",
     )?;
     let _ = conn.execute_batch("ALTER TABLE metadata_sessions ADD COLUMN model_id INTEGER;");
     for statement in [
@@ -1945,6 +1965,8 @@ mod tests {
             "fact_github_pull_request_removed_line_hash",
             "event_commit_pr_outcome",
             "event_commit_bug_signal",
+            "fact_sync_event_state",
+            "fact_sync_run_state",
         ] {
             let count: i64 = conn.query_row(
                 "SELECT COUNT(*)

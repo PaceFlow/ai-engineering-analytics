@@ -4,6 +4,7 @@ const SESSION_AFTER_HELP: &str = "Examples:\n  paceflow session                 
 const DELIVERY_AFTER_HELP: &str = "Examples:\n  paceflow delivery                # default: grouped by model\n  paceflow delivery --model codex/gpt-5.4\n  paceflow delivery --overall\n  paceflow delivery --group-by provider\n  paceflow delivery --group-by task --task ABC-123\n  paceflow delivery --group-by branch\n  paceflow delivery --branch fix/cursor-new-partial-fate-schema\n\nMetrics:\n  Heavy commits: commits where matched AI-attributed lines are at least half of changed lines.\n  PR sync: completed GitHub PR lookups per heavy commit on github.com (see table column).\n  PR reach rate: among completed lookups, share where a pull request existed.\n  Mainline reach rate: share of heavy AI commits that later reached mainline.\n  PR merge rate: among completed PR-linked lookups, share whose PR merged.";
 const QUALITY_AFTER_HELP: &str = "Examples:\n  paceflow quality                 # default: grouped by model\n  paceflow quality --model codex/gpt-5.4\n  paceflow quality --overall\n  paceflow quality --group-by provider\n  paceflow quality --group-by task --task ABC-123\n  paceflow quality --group-by branch\n  paceflow quality --branch fix/cursor-new-partial-fate-schema\n\nMetrics:\n  Code churn rate: share of AI-added lines on heavy AI commits that were removed again within the churn window.\n  Bug-after-merge rate: share of merged heavy AI commits that drew a later fix-like commit within 60 days.\n  Revert rate: share of heavy AI commits that were later reverted.";
 const GITHUB_AFTER_HELP: &str = "Examples:\n  paceflow github token\n\nGitHub token setup:\n  Use this command to save, replace, or delete the local GitHub token used for PR sync during ingest.";
+const SYNC_AFTER_HELP: &str = "Examples:\n  paceflow sync config\n  paceflow sync status\n  paceflow sync push --all-projects\n\nSync setup:\n  Use `paceflow sync config` to authenticate with the PaceFlow backend and choose a default organization.\n  Sync uploads normalized local analytics events so shared org views stay consistent across devices.";
 
 #[derive(Parser)]
 #[command(
@@ -33,6 +34,9 @@ pub enum Commands {
     #[command(name = "github")]
     /// Manage GitHub token setup for live PR sync
     GitHub(GitHubArgs),
+    #[command(name = "sync")]
+    /// Configure and push shared analytics sync to the PaceFlow backend
+    Sync(SyncArgs),
 }
 
 #[derive(Args, Debug, Clone)]
@@ -46,6 +50,48 @@ pub struct GitHubArgs {
 pub enum GitHubCommands {
     /// Save, replace, or delete the local GitHub token
     Token,
+}
+
+#[derive(Args, Debug, Clone)]
+#[command(after_help = SYNC_AFTER_HELP)]
+pub struct SyncArgs {
+    #[command(subcommand)]
+    pub command: SyncCommands,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum SyncCommands {
+    /// Authenticate and save the default PaceFlow organization for sync
+    Config,
+    /// Upload pending normalized analytics events for the current repo or all projects
+    Push(SyncPushArgs),
+    /// Show local pending sync state and remote org sync status
+    Status(SyncStatusArgs),
+    /// Delete saved sync credentials and clear local sync cursors
+    Reset,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct SyncPushArgs {
+    /// Show results across all tracked projects instead of defaulting to the current repo
+    #[arg(long)]
+    pub all_projects: bool,
+    /// Restrict sync to a specific repository root
+    #[arg(long)]
+    pub repo: Option<String>,
+    /// Max number of events to upload per request
+    #[arg(long, default_value_t = 500)]
+    pub batch_size: usize,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct SyncStatusArgs {
+    /// Show results across all tracked projects instead of defaulting to the current repo
+    #[arg(long)]
+    pub all_projects: bool,
+    /// Restrict status to a specific repository root
+    #[arg(long)]
+    pub repo: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -320,6 +366,32 @@ mod tests {
                 GitHubCommands::Token => {}
             },
             _ => panic!("expected github command"),
+        }
+    }
+
+    #[test]
+    fn parses_sync_push_all_projects() {
+        let cli = Cli::parse_from(["paceflow", "sync", "push", "--all-projects"]);
+        match cli.command {
+            Commands::Sync(args) => match args.command {
+                SyncCommands::Push(push) => assert!(push.all_projects),
+                _ => panic!("expected sync push command"),
+            },
+            _ => panic!("expected sync command"),
+        }
+    }
+
+    #[test]
+    fn parses_sync_status_repo_filter() {
+        let cli = Cli::parse_from(["paceflow", "sync", "status", "--repo", "/tmp/repo"]);
+        match cli.command {
+            Commands::Sync(args) => match args.command {
+                SyncCommands::Status(status) => {
+                    assert_eq!(status.repo.as_deref(), Some("/tmp/repo"))
+                }
+                _ => panic!("expected sync status command"),
+            },
+            _ => panic!("expected sync command"),
         }
     }
 

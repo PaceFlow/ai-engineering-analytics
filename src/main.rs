@@ -11,6 +11,7 @@ fn main() -> anyhow::Result<()> {
         Commands::Quality(args) => commands::quality::run(args)?,
         Commands::EventStream(args) => commands::event_stream::run(args)?,
         Commands::GitHub(args) => commands::github::run(args)?,
+        Commands::Sync(args) => commands::sync::run(args)?,
     }
     Ok(())
 }
