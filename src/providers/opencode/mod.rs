@@ -513,7 +513,17 @@ mod tests {
             [],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )?;
-        assert_eq!(change, ("/tmp/repo/src/lib.rs".to_string(), 1, 0));
+        assert_eq!(
+            change,
+            (
+                std::path::Path::new("/tmp/repo")
+                    .join("src/lib.rs")
+                    .to_string_lossy()
+                    .to_string(),
+                1,
+                0
+            )
+        );
         Ok(())
     }
 
