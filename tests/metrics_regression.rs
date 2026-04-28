@@ -81,6 +81,7 @@ impl TestEnv {
             ],
         )?;
         install_cursor_fixture(&home, &paceflow_repo, &cursor_dir)?;
+        install_opencode_fixture(&home, &paceflow_repo, &cursor_dir)?;
 
         Ok(Self {
             _tempdir: tempdir,
@@ -867,9 +868,11 @@ fn ingest_reports_commit_event_progress() -> anyhow::Result<()> {
     assert!(ingest_output.contains("Stage: claude sessions"));
     assert!(ingest_output.contains("Stage: codex sessions"));
     assert!(ingest_output.contains("Stage: cursor sessions"));
+    assert!(ingest_output.contains("Stage: opencode sessions"));
     assert!(ingest_output.contains("Stage: claude changes"));
     assert!(ingest_output.contains("Stage: codex changes"));
     assert!(ingest_output.contains("Stage: cursor changes"));
+    assert!(ingest_output.contains("Stage: opencode changes"));
     assert!(ingest_output.contains("Stage: Commit Association"));
     assert!(ingest_output.contains("Stage: Commit Materialization"));
     assert!(ingest_output.contains("Ingest progress: 100%"));
@@ -892,6 +895,7 @@ fn fixture_corpus_ingest_smoke_is_cross_platform_friendly() -> anyhow::Result<()
     assert!(ingest_output.contains("Stage: claude sessions"));
     assert!(ingest_output.contains("Stage: codex sessions"));
     assert!(ingest_output.contains("Stage: cursor sessions"));
+    assert!(ingest_output.contains("Stage: opencode sessions"));
     assert!(ingest_output.contains("Stage: Commit Materialization"));
     assert!(ingest_output.contains("Rows written:"));
     assert!(!ingest_output.contains("Association summary:"));
@@ -1030,6 +1034,201 @@ fn install_cursor_fixture(
         fs::copy(HOME_TEMPLATE_CURSOR_DB, &db_path)?;
         rewrite_cursor_db(&db_path, home, paceflow_repo, cursor_dir)?;
     }
+    Ok(())
+}
+
+fn install_opencode_fixture(
+    home: &Path,
+    paceflow_repo: &Path,
+    cursor_dir: &Path,
+) -> anyhow::Result<()> {
+    let opencode_dir = home.join(".local").join("share").join("opencode");
+    let diff_dir = opencode_dir.join("storage").join("session_diff");
+    fs::create_dir_all(&diff_dir)?;
+
+    let db_path = opencode_dir.join("opencode.db");
+    let conn = Connection::open(&db_path)?;
+    conn.execute_batch(
+        "CREATE TABLE project (
+            id TEXT PRIMARY KEY,
+            worktree TEXT NOT NULL
+        );
+        CREATE TABLE session (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL,
+            directory TEXT NOT NULL,
+            time_created INTEGER NOT NULL,
+            time_updated INTEGER NOT NULL
+        );
+        CREATE TABLE message (
+            id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            time_created INTEGER NOT NULL,
+            time_updated INTEGER NOT NULL,
+            data TEXT NOT NULL
+        );
+        CREATE TABLE part (
+            id TEXT PRIMARY KEY,
+            message_id TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            time_created INTEGER NOT NULL,
+            time_updated INTEGER NOT NULL,
+            data TEXT NOT NULL
+        );",
+    )?;
+
+    conn.execute(
+        "INSERT INTO project (id, worktree) VALUES ('fixture-paceflow', ?1), ('fixture-cursor', ?2)",
+        (
+            paceflow_repo.to_string_lossy().to_string(),
+            cursor_dir.to_string_lossy().to_string(),
+        ),
+    )?;
+    insert_opencode_session(
+        &conn,
+        "ses_opencode_output",
+        "fixture-paceflow",
+        &paceflow_repo.to_string_lossy(),
+        1_773_576_000_000,
+        1_773_576_120_000,
+    )?;
+    insert_opencode_message(
+        &conn,
+        "msg_opencode_user_output",
+        "ses_opencode_output",
+        1_773_576_000_100,
+        serde_json::json!({
+            "role": "user",
+            "agent": "build",
+            "model": {"providerID": "openai", "modelID": "gpt-5.5-fast"}
+        }),
+    )?;
+    insert_opencode_part(
+        &conn,
+        "prt_opencode_user_output",
+        "msg_opencode_user_output",
+        "ses_opencode_output",
+        1_773_576_000_101,
+        serde_json::json!({"type": "text", "text": "add an opencode fixture file"}),
+    )?;
+    insert_opencode_message(
+        &conn,
+        "msg_opencode_assistant_output",
+        "ses_opencode_output",
+        1_773_576_001_000,
+        serde_json::json!({
+            "role": "assistant",
+            "modelID": "gpt-5.5-fast",
+            "providerID": "openai"
+        }),
+    )?;
+    insert_opencode_part(
+        &conn,
+        "prt_opencode_assistant_output",
+        "msg_opencode_assistant_output",
+        "ses_opencode_output",
+        1_773_576_001_001,
+        serde_json::json!({"type": "text", "text": "Added the fixture file."}),
+    )?;
+    insert_opencode_part(
+        &conn,
+        "prt_opencode_tool_output",
+        "msg_opencode_assistant_output",
+        "ses_opencode_output",
+        1_773_576_001_002,
+        serde_json::json!({"type": "tool", "tool": "apply_patch"}),
+    )?;
+
+    insert_opencode_session(
+        &conn,
+        "ses_opencode_no_output",
+        "fixture-cursor",
+        &cursor_dir.to_string_lossy(),
+        1_773_576_300_000,
+        1_773_576_305_000,
+    )?;
+    insert_opencode_message(
+        &conn,
+        "msg_opencode_user_no_output",
+        "ses_opencode_no_output",
+        1_773_576_300_100,
+        serde_json::json!({
+            "role": "user",
+            "agent": "build",
+            "model": {"providerID": "openai", "modelID": "gpt-5.5-fast"}
+        }),
+    )?;
+    insert_opencode_part(
+        &conn,
+        "prt_opencode_user_no_output",
+        "msg_opencode_user_no_output",
+        "ses_opencode_no_output",
+        1_773_576_300_101,
+        serde_json::json!({"type": "text", "text": "hi"}),
+    )?;
+
+    fs::write(
+        diff_dir.join("ses_opencode_output.json"),
+        serde_json::json!([
+            {
+                "file": "src/opencode_fixture.rs",
+                "status": "added",
+                "additions": 3,
+                "deletions": 0,
+                "patch": "Index: src/opencode_fixture.rs\n===================================================================\n--- src/opencode_fixture.rs\n+++ src/opencode_fixture.rs\n@@ -0,0 +1,3 @@\n+pub fn opencode_fixture() -> &'static str {\n+    \"fixture\"\n+}\n"
+            }
+        ])
+        .to_string(),
+    )?;
+    fs::write(diff_dir.join("ses_opencode_no_output.json"), "[]")?;
+
+    Ok(())
+}
+
+fn insert_opencode_session(
+    conn: &Connection,
+    id: &str,
+    project_id: &str,
+    directory: &str,
+    created: i64,
+    updated: i64,
+) -> anyhow::Result<()> {
+    conn.execute(
+        "INSERT INTO session (id, project_id, directory, time_created, time_updated)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        (id, project_id, directory, created, updated),
+    )?;
+    Ok(())
+}
+
+fn insert_opencode_message(
+    conn: &Connection,
+    id: &str,
+    session_id: &str,
+    created: i64,
+    data: serde_json::Value,
+) -> anyhow::Result<()> {
+    conn.execute(
+        "INSERT INTO message (id, session_id, time_created, time_updated, data)
+         VALUES (?1, ?2, ?3, ?3, ?4)",
+        (id, session_id, created, data.to_string()),
+    )?;
+    Ok(())
+}
+
+fn insert_opencode_part(
+    conn: &Connection,
+    id: &str,
+    message_id: &str,
+    session_id: &str,
+    created: i64,
+    data: serde_json::Value,
+) -> anyhow::Result<()> {
+    conn.execute(
+        "INSERT INTO part (id, message_id, session_id, time_created, time_updated, data)
+         VALUES (?1, ?2, ?3, ?4, ?4, ?5)",
+        (id, message_id, session_id, created, data.to_string()),
+    )?;
     Ok(())
 }
 

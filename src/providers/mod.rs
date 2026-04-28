@@ -1,6 +1,7 @@
 pub mod claude;
 pub mod codex;
 pub mod cursor;
+pub mod opencode;
 pub mod utils;
 
 use anyhow::Result;
@@ -14,6 +15,7 @@ pub enum ProviderSessionPlan {
     Claude { session_files: Vec<PathBuf> },
     Codex { session_files: Vec<PathBuf> },
     Cursor { composer_keys: Vec<String> },
+    Opencode { db_paths: Vec<PathBuf> },
 }
 
 impl ProviderSessionPlan {
@@ -22,6 +24,7 @@ impl ProviderSessionPlan {
             Self::Claude { session_files } => session_files.len(),
             Self::Codex { session_files } => session_files.len(),
             Self::Cursor { composer_keys } => composer_keys.len(),
+            Self::Opencode { db_paths } => db_paths.len(),
         }
     }
 }
@@ -31,6 +34,7 @@ pub enum Provider {
     Claude,
     Codex,
     Cursor,
+    Opencode,
 }
 
 impl Provider {
@@ -39,6 +43,7 @@ impl Provider {
             Self::Claude => "claude",
             Self::Codex => "codex",
             Self::Cursor => "cursor",
+            Self::Opencode => "opencode",
         }
     }
 
@@ -52,6 +57,9 @@ impl Provider {
             }),
             Self::Cursor => Ok(ProviderSessionPlan::Cursor {
                 composer_keys: cursor::plan_composer_rows()?,
+            }),
+            Self::Opencode => Ok(ProviderSessionPlan::Opencode {
+                db_paths: opencode::plan_db_files()?,
             }),
         }
     }
@@ -74,6 +82,9 @@ impl Provider {
             (Self::Cursor, ProviderSessionPlan::Cursor { composer_keys }) => {
                 cursor::ingest_planned_sessions(db, composer_keys, verbose, progress)
             }
+            (Self::Opencode, ProviderSessionPlan::Opencode { db_paths }) => {
+                opencode::ingest_planned_sessions(db, db_paths, verbose, progress)
+            }
             _ => anyhow::bail!("provider plan mismatch for {}", self.name()),
         }
     }
@@ -81,5 +92,10 @@ impl Provider {
 
 /// Central registry — add one line here when a new provider is implemented.
 pub fn all_providers() -> Vec<Provider> {
-    vec![Provider::Claude, Provider::Codex, Provider::Cursor]
+    vec![
+        Provider::Claude,
+        Provider::Codex,
+        Provider::Cursor,
+        Provider::Opencode,
+    ]
 }

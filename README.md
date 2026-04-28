@@ -7,7 +7,7 @@ Local-first CLI for answering the questions that matter after you use coding age
 - Did it hold up?
 - What should I do differently next time?
 
-`paceflow` reads local Claude Code, Codex, and Cursor history plus git metadata and turns that evidence into three practical views:
+`paceflow` reads local Claude Code, Codex, Cursor, and OpenCode history plus git metadata and turns that evidence into three practical views:
 
 - `session`: were you getting leverage, or just steering and retrying?
 - `delivery`: did AI-heavy work turn into real commits that reached mainline?
@@ -199,6 +199,7 @@ Requirements:
 - `paceflow` reads local Claude Code sessions from `~/.claude/projects/*/*.jsonl`
 - `paceflow` reads local Codex sessions from `~/.codex/sessions`
 - `paceflow` reads local Cursor state/history from the OS config directory under `Cursor/User`
+- `paceflow` reads local OpenCode history from `~/.local/share/opencode/opencode.db` and `~/.local/share/opencode/storage/session_diff`
 - If Cursor data lives elsewhere, set `PACEFLOW_CURSOR_STATE_PATH` and/or `PACEFLOW_CURSOR_HISTORY_PATH`
 - To enable GitHub PR sync during ingest, either run `paceflow github token` once or set `PACEFLOW_GITHUB_TOKEN`
 - To enable GitHub-backed PR reach and PR merge metrics for `github.com` repos, set `PACEFLOW_GITHUB_TOKEN` with at least `Pull requests: read`
