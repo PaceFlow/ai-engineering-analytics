@@ -11,6 +11,7 @@ use crate::change_intel::providers::claude;
 use crate::change_intel::providers::codex::parsers::apply_patch::ApplyPatchParser;
 use crate::change_intel::providers::codex::parsers::exec_heredoc::ExecHeredocWriteParser;
 use crate::change_intel::providers::cursor;
+use crate::change_intel::providers::opencode;
 use crate::change_intel::session_context::SessionContext;
 use crate::change_intel::storage;
 use crate::change_intel::types::{PatternParser, SessionInfo, ToolCallEvent};
@@ -78,6 +79,10 @@ pub fn plan_provider_code_changes(provider_name: &str) -> Result<ProviderCodeCha
             provider,
             sources: cursor::cursor_vscdb_path()?.into_iter().collect(),
         }),
+        "opencode" => Ok(ProviderCodeChangePlan {
+            provider,
+            sources: opencode::plan_db_files()?,
+        }),
         _ => Ok(ProviderCodeChangePlan {
             provider,
             ..ProviderCodeChangePlan::default()
@@ -99,6 +104,12 @@ pub fn ingest_provider_code_changes(
         "cursor" => {
             cursor::ingest_cursor_code_changes_from_sources(conn, &plan.sources, verbose, progress)
         }
+        "opencode" => opencode::ingest_opencode_code_changes_from_sources(
+            conn,
+            &plan.sources,
+            verbose,
+            progress,
+        ),
         _ => Ok(ProviderCodeChangeSummary {
             provider: plan.provider.clone(),
             ..ProviderCodeChangeSummary::default()
