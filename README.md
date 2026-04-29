@@ -1,25 +1,20 @@
 # AI Engineering Analytics
 
-Local-first CLI for answering the questions that matter after you use coding agents:
+`paceflow` is a local-first CLI for understanding whether coding-agent work is actually helping.
 
-- Was this work actually useful?
-- Did it ship?
-- Did it hold up?
-- What should I do differently next time?
-
-`paceflow` reads local Claude Code, Codex, Cursor, and OpenCode history plus git metadata and turns that evidence into three practical views:
+It reads local Claude Code, Codex, Cursor, and OpenCode history plus git metadata, then turns that evidence into three practical report views:
 
 - `session`: were you getting leverage, or just steering and retrying?
-- `delivery`: did AI-heavy work turn into real commits that reached mainline?
-- `quality`: did accepted AI-generated code stick, or did it get churned out later?
+- `delivery`: did AI-heavy work turn into commits that reached review or mainline?
+- `quality`: did accepted AI-generated code hold up, or did it churn out later?
 
-The point is not to count prompts or accepted lines for their own sake. The point is to help an individual engineer improve how they work with coding agents.
+The point is not to count prompts or accepted lines for their own sake. The point is to help individual engineers improve how they work with coding agents.
 
-## Why You Should Care
+## What It Does
 
 Most AI coding workflows feel productive in the moment. That does not mean they were useful.
 
-AI Engineering Analytics gives you a local evidence trail for three failure modes that are easy to miss:
+`paceflow` helps spot patterns that are easy to miss:
 
 - sessions that felt busy but produced little accepted output
 - AI-heavy work that never made it to mainline
@@ -27,85 +22,9 @@ AI Engineering Analytics gives you a local evidence trail for three failure mode
 
 If those patterns show up repeatedly, you usually need tighter task slicing, better upfront constraints, earlier validation, or stricter review before accepting generated code.
 
-## What You Learn Quickly
-
-- `paceflow session` compares which models are efficient, noisy, or stuck in loops.
-- `paceflow delivery` compares which models actually turn into shipped change.
-- `paceflow quality` compares which models produce durable code versus cleanup.
-
-## Example: Session Report
-
-```text
-Session Metrics
-Model                         Sessions     Prompts    First Chg            Loop           Error       To Commit       No Output
-codex/gpt-5.4                      33       12.67        237.5            3.0%           15.2%           45.5%           39.4%
-codex/gpt-5.3-codex                12        5.10         42.1            0.0%            8.3%           75.0%           16.7%
-cursor/default                      6        2.30          9.4            0.0%            0.0%           33.3%            0.0%
-Legend:
-- Prompts = avg prompts per session.
-- First Chg = avg minutes to first accepted code change.
-- Loop, Error, To Commit, and No Output = percentage rates.
-```
-
-Why it matters:
-
-- High prompt counts and slow first changes usually mean you are spending too much effort steering the model.
-- High debug-loop or no-output rates usually mean the task was underspecified, too broad, or missing key repo context.
-
-What to do differently:
-
-- Narrow the task before you prompt.
-- Put constraints and acceptance criteria in the first request.
-- Stop a failing retry cycle earlier and verify assumptions manually.
-
-## Example: Delivery Report
-
-```text
-Delivery Metrics
-Model                          Commits     Heavy    PR Reach  Mainline Reach    PR Merge
-codex/gpt-5.4                      50        31       66.7%            96.8%       83.3%
-codex/gpt-5.3-codex                33        18       41.7%            94.4%       80.0%
-Legend:
-- PR Reach, Mainline Reach, and PR Merge = percentage rates.
-```
-
-Why it matters:
-
-- Heavy commits tell you where AI materially influenced the diff instead of just assisting around the edges.
-- PR reach tells you whether AI-heavy work even made it to review as a pull request.
-- Mainline reach tells you whether that work survived review and integration into mainline.
-- PR merge tells you whether PR-linked AI-heavy work actually cleared the PR funnel and merged.
-
-What to do differently:
-
-- If AI-heavy tasks have weak mainline reach, reduce branch size and tighten review before accepting generated code.
-- If a task has large diffs and weak outcomes, split it into smaller units with clearer verification points.
-
-## Example: Quality Report
-
-```text
-Quality Metrics
-Model                            Heavy   Churn Rate   Bug Rate  Revert Rate
-codex/gpt-5.4                       31         19.9%      30.4%         0.0%
-codex/gpt-5.3-codex                 18         53.3%      85.7%         0.0%
-Legend:
-- Churn Rate, Bug Rate, and Revert Rate = percentage rates.
-```
-
-Why it matters:
-
-- Churn means accepted code landed, but was the wrong fit or needed cleanup soon after.
-- Bug-after-merge rate catches code that shipped but triggered later fix work.
-- Reverts are the clearest signal that the workflow created cost, not leverage.
-
-What to do differently:
-
-- Review AI-heavy code more aggressively before merge.
-- Treat generated code as a draft when the surrounding system constraints are unclear.
-
 ## Quick Start
 
-Once `paceflow` is installed, ingest your local history and open the three report views:
+Run `paceflow` from a git repository you want to analyze:
 
 ```bash
 paceflow ingest
@@ -114,32 +33,24 @@ paceflow delivery
 paceflow quality
 ```
 
-By default those three views compare outcomes by model. Use `--overall` when you want the rolled-up one-row summary instead.
-Use `--model <provider/name>` when you want to keep the same report but narrow it to one model.
+The first ingest reads local assistant history, scans git metadata, and creates the local analytics database at `~/.paceflow/paceflow.db`.
 
-Useful follow-ups:
+Use this loop when you are trying the tool for the first time:
 
-- `paceflow session --model codex/gpt-5.4`
-- `paceflow session --overall`
-- `paceflow session --list-sessions`
-- `paceflow session --group-by provider`
-- `paceflow delivery --model codex/gpt-5.4`
-- `paceflow delivery --overall`
-- `paceflow delivery --group-by task`
-- `paceflow delivery --group-by branch`
-- `paceflow quality --model codex/gpt-5.4`
-- `paceflow quality --overall`
-- `paceflow quality --group-by provider`
-- `paceflow quality --group-by branch`
+1. Run `paceflow ingest` after you have local Claude Code, Codex, Cursor, or OpenCode history on the machine.
+2. Run `paceflow session` to see whether sessions are producing accepted code and commits.
+3. Run `paceflow delivery` to see whether AI-heavy commits reached PRs or mainline.
+4. Run `paceflow quality` to see whether AI-heavy code churned, drew follow-up fixes, or was reverted.
+5. Re-run `paceflow ingest` whenever you have new sessions, commits, or GitHub PR metadata to refresh.
 
-Optional GitHub PR sync setup:
+For GitHub PR reach and PR merge metrics, save a token and ingest again:
 
 ```bash
 paceflow github token
 paceflow ingest
 ```
 
-Rerun `paceflow github token` to replace or delete the saved token. For CI or one-off overrides, `PACEFLOW_GITHUB_TOKEN` still takes precedence over the saved local token.
+`PACEFLOW_GITHUB_TOKEN` can be used for CI or one-off overrides.
 
 ## Installation
 
@@ -161,157 +72,130 @@ Supported release targets:
 | Linux x86_64 (glibc) | `paceflow-x86_64-unknown-linux-gnu.tar.gz` |
 | macOS Apple Silicon | `paceflow-aarch64-apple-darwin.tar.gz` |
 
-Windows (PowerShell):
-
-```powershell
-$version = "v0.2.0"
-$asset = "paceflow-x86_64-pc-windows-msvc.zip"
-Invoke-WebRequest `
-  -Uri "https://github.com/PaceFlow/ai-engineering-analytics/releases/download/$version/$asset" `
-  -OutFile $asset
-Expand-Archive .\$asset -DestinationPath .\paceflow
-.\paceflow\paceflow.exe --help
-```
-
-macOS/Linux:
-
-```bash
-version="v0.2.0"
-asset="paceflow-x86_64-unknown-linux-gnu.tar.gz"
-curl -L "https://github.com/PaceFlow/ai-engineering-analytics/releases/download/${version}/${asset}" -o "${asset}"
-tar -xzf "${asset}"
-./paceflow-x86_64-unknown-linux-gnu/paceflow --help
-```
-
-macOS note for internal builds:
-
-- If Gatekeeper blocks `paceflow`, go to `System Settings > Privacy & Security` and click `Open Anyway`, then rerun the binary.
-- Fresh extractions can inherit quarantine from the downloaded archive. If needed, clear quarantine on the extracted folder:
-
-```bash
-xattr -dr com.apple.quarantine paceflow-aarch64-apple-darwin
-./paceflow-aarch64-apple-darwin/paceflow --help
-```
+See [packaging/INSTALL.md](packaging/INSTALL.md) for platform-specific install commands, macOS Gatekeeper notes, and optional path overrides.
 
 Requirements:
 
 - `git` must be installed and available on `PATH`
-- `paceflow` reads local Claude Code sessions from `~/.claude/projects/*/*.jsonl`
-- `paceflow` reads local Codex sessions from `~/.codex/sessions`
-- `paceflow` reads local Cursor state/history from the OS config directory under `Cursor/User`
-- `paceflow` reads local OpenCode history from `~/.local/share/opencode/opencode.db` and `~/.local/share/opencode/storage/session_diff`
-- If Cursor data lives elsewhere, set `PACEFLOW_CURSOR_STATE_PATH` and/or `PACEFLOW_CURSOR_HISTORY_PATH`
-- To enable GitHub PR sync during ingest, either run `paceflow github token` once or set `PACEFLOW_GITHUB_TOKEN`
-- To enable GitHub-backed PR reach and PR merge metrics for `github.com` repos, set `PACEFLOW_GITHUB_TOKEN` with at least `Pull requests: read`
+- local Claude Code, Codex, Cursor, or OpenCode history must exist on the machine you run `paceflow` on
+- GitHub PR sync requires `paceflow github token` or `PACEFLOW_GITHUB_TOKEN`
 
-## Who It's For
+## Reports
 
-This tool is primarily for individual engineers who want to improve how they work with coding agents and editor assistants.
+By default, the three report commands compare outcomes by model.
 
-It can also support team or manager conversations later, but the default framing is personal workflow improvement:
+```bash
+paceflow session
+paceflow delivery
+paceflow quality
+```
 
-- where am I wasting time steering the model?
-- where is AI help actually turning into shipped code?
-- where am I accepting code that does not last?
+Use `--overall` when you want one rolled-up summary row:
 
-## How To Read The Reports
+```bash
+paceflow session --overall
+paceflow delivery --overall
+paceflow quality --overall
+```
 
-Use the reports to answer three practical questions:
+Use `--model <provider/name>` to keep the same report but narrow it to one model:
 
-By default, `session`, `delivery`, and `quality` answer them by comparing models side by side. Use `--overall` if you want the old rolled-up summary instead of the trust comparison view.
+```bash
+paceflow session --model codex/gpt-5.4
+paceflow delivery --model codex/gpt-5.4
+paceflow quality --model codex/gpt-5.4
+```
 
-When you want to stay in the same report but inspect one model only, use `--model <provider/name>`. For example, `paceflow delivery --model codex/gpt-5.4` keeps the delivery view and filters it down to that one model.
+The reports answer three questions:
 
-### 1. Were my sessions actually useful?
+- `session`: which models or providers are efficient, noisy, or stuck in loops?
+- `delivery`: which AI-heavy changes actually turn into shipped work?
+- `quality`: which AI-heavy changes remain durable versus needing cleanup?
 
-- Average user prompts
-- Avg time to first accepted change
-- Debug loop rate
-- Error paste rate
-- No-output session rate
+For metric definitions, status bands, grouped report behavior, and interpretation guidance, see [docs/USER_GUIDE.md](docs/USER_GUIDE.md).
 
-These are workflow-quality signals, not just activity counters.
+## Common Options
 
-### 2. Did the work turn into shipped change?
+`session`, `delivery`, and `quality` share the same filter interface:
 
-- Heavy commits
-- PR reach rate
-- Mainline reach rate
-- PR merge rate
-- Session-to-commit rate
+- `--from YYYY-MM-DD --to YYYY-MM-DD` focuses a time window.
+- `--repo /path/to/repo` analyzes a specific repository.
+- `--all-projects` shows results across all tracked projects instead of defaulting to the current repo.
+- `--provider codex`, `--provider cursor`, `--provider claude`, or `--provider opencode` filters by provider.
+- `--group-by provider`, `--group-by model`, `--group-by branch`, or `--group-by task` changes the comparison dimension.
+- `--branch <name>` or `--task ABC-123` narrows reports to a branch or ticket-like task key.
+- `--limit <n>` controls the number of grouped rows shown.
 
-These tell you whether session effort turned into commits and whether those commits made it into mainline history.
+Useful examples:
 
-### 3. Did the code hold up?
+```bash
+paceflow session --list-sessions
+paceflow session --group-by provider
+paceflow delivery --group-by task
+paceflow delivery --group-by branch
+paceflow quality --group-by provider
+paceflow quality --group-by branch
+```
 
-- Code churn rate
-- Bug-after-merge rate
-- Revert rate
+Use `paceflow <command> --help` to see command-specific options and metric notes.
 
-These are the strongest signals for whether AI-assisted work created durable value or follow-up cleanup.
+## Troubleshooting
 
-### Status Bands
+### Reports Say There Are No Rows
 
-`--overall` summaries attach `good`, `watch`, and `risk` labels using opinionated thresholds so you can scan a rolled-up report before you read the metric definitions in the footer.
+Run a fresh ingest from a repository that has local assistant history and git commits:
 
-- Session: `Avg prompts <4 / <=7 / >7`, `Time to first change <15 / <=45 / >45 min`, `Debug loops <10 / <=25 / >25%`, `Error pastes <10 / <=25 / >25%`, `Sessions to commit >=50 / >=25 / <25%`, `No-output sessions <15 / <=35 / >35%`
-- Delivery: `PR reach >=70 / >=40 / <40%`, `Mainline reach >=75 / >=50 / <50%`, `PR merge >=75 / >=50 / <50%`
-- Quality: `Code churn <15 / <=30 / >30%`, `Bug-after-merge <15 / <=30 / >30%`, `Reverts <2 / <=5 / >5%`
+```bash
+paceflow ingest
+paceflow session --all-projects
+```
 
-## Metric Reference
+If `session --all-projects` has rows but the plain report does not, you are probably running `paceflow` from a repo that has no matched sessions yet. Use `--all-projects`, run from the target repo, or pass `--repo /path/to/repo`.
 
-The reports are built from normalized session events, matched commit/session attribution, and live git history.
+### GitHub PR Metrics Are Empty Or Stale
 
-### Session Metrics
+GitHub PR reach and PR merge metrics need a token and a fresh ingest:
 
-- `Average User Prompts`: average `user_turn_count` across included sessions with at least one non-empty user turn
-- `Avg Time to First Accepted Change`: average minutes between session start and the first accepted code change; sessions without an accepted change are excluded
-- `Debug Loop Rate`: share of sessions flagged as repeated error-fix loops; a session is flagged when the same normalized error signature appears in 5 or more user turns with assistant replies in between
-- `Error Paste Rate`: share of sessions where a user pasted an error-like message after the first user message
-- `Session-to-Commit Rate`: share of sessions with at least one matched commit between session start and session end plus 4 hours
-- `No-Output Session Rate`: share of sessions with user turns but no accepted code-change output
+```bash
+paceflow github token
+paceflow ingest
+paceflow delivery
+```
 
-### Session List Fields
+The saved token lives locally under the `PACEFLOW_HOME` base directory. `PACEFLOW_GITHUB_TOKEN` can be used for CI or one-off overrides.
 
-- `LOC`: total accepted changed lines for the session (`accepted_lines_added + accepted_lines_removed`)
-- `+Lines`: accepted added lines for the session
-- `-Lines`: accepted removed lines for the session
-- `Words/LOC`: user-word count divided by accepted changed lines; if accepted changed lines are zero, this is `N/A`
+### Start Over With A Clean Database
 
-### Delivery Metrics
+If reports look stale, an ingest was interrupted, or you want to rebuild everything from local source data, delete the local analytics database and ingest again.
 
-- `Commits`: count of included commits in the current filter or group
-- `Heavy Commits`: commits where the AI-attributed share of changed lines is at least 50%
-- `PR Reach`: share of heavy GitHub AI commits that reached a pull request
-- `Mainline Reach`: share of heavy commits that later reached mainline, including squash-aware content matching
-- `PR Merge`: share of PR-linked heavy GitHub AI commits whose PR merged
-- `± LOC commits` (task-grouped delivery): sum of lines added and removed from ingested per-commit git stats (`fact_commit`) for commits attributed to that task branch
+```bash
+rm -f ~/.paceflow/paceflow.db ~/.paceflow/paceflow.db-wal ~/.paceflow/paceflow.db-shm
+paceflow ingest
+paceflow session
+```
 
-### Quality Metrics
+If you use a custom `PACEFLOW_HOME`, remove the database under that directory instead:
 
-- `Code Churn Rate`: share of AI-added lines from heavy commits that reached mainline and were removed from mainline within a 14-day window
-- `Bug-After-Merge Rate`: share of merged heavy AI commits that drew at least one later fix-like commit touching the same files within a 60-day window
-- `Revert Rate`: share of heavy commits later reverted by a commit body containing `This reverts commit <sha>`
+```bash
+rm -f "$PACEFLOW_HOME/.paceflow/paceflow.db" "$PACEFLOW_HOME/.paceflow/paceflow.db-wal" "$PACEFLOW_HOME/.paceflow/paceflow.db-shm"
+paceflow ingest
+```
 
-### Grouped Report Weighting
+This only removes Paceflow's derived analytics database. It does not delete Claude Code, Codex, Cursor, OpenCode, git, or GitHub source data.
 
-- Repo and weekly rollups use ordinary counts and averages over included sessions or commits
-- Provider/model grouped delivery and quality reports work from commit-session attribution rows so unmatched commits can appear as `human`
-- Task-grouped session reports use attribution-weighted averages and rates
-- Branch-grouped session reports use attribution-weighted averages and rates
-- Task-grouped delivery and quality reports exclude non-ticket task keys plus integration branches such as `main`, `staging`, `master`, and `develop`
+### Cursor Data Is Missing
 
-## Notes
+Paceflow looks for Cursor state/history in the OS config directory under `Cursor/User`. If your Cursor data lives somewhere else, point Paceflow at it before ingesting:
 
-- `session`, `delivery`, and `quality` share the same filter interface: `--weekly`, `--group-by`, `--from`, `--to`, `--repo`, `--provider`, `--task`, `--branch`, `--model`, and `--limit`
-- `session`, `delivery`, and `quality` default to `group-by model` when you do not pass `--group-by` or `--overall`
-- `--model` filters the current report to one model without changing the active view
-- Use `--group-by branch` or `--branch <name>` when the work lives on literal branches like `fix/...`, `perf/...`, `codex/...`, or `main`
-- `--overall` swaps the default model comparison for the rolled-up one-row summary and conflicts with `--group-by`
-- Provider `human` means a commit had no matched AI session attribution at all
-- Task-grouped rows only show ticket-style task keys such as `ABC-123` and exclude integration branches such as `main`, `staging`, `master`, and `develop`
-- `delivery --group-by task` includes `± LOC commits`, summed from ingested commit line stats for that task branch
-- `branch` grouping keeps literal branch names and is the right view when task-grouped reports are empty but you know work happened on a non-ticket branch
-- Local analytics state lives under `~/.paceflow/paceflow.db` by default; override the base home with `PACEFLOW_HOME`
+```bash
+export PACEFLOW_CURSOR_STATE_PATH=/path/to/state.vscdb
+export PACEFLOW_CURSOR_HISTORY_PATH=/path/to/History
+paceflow ingest
+```
 
-Development notes, profiling setup, and source-oriented workflows live in [DEV.md](DEV.md).
+## More Documentation
+
+- [User Guide](docs/USER_GUIDE.md): report interpretation, metric definitions, status bands, and grouping behavior
+- [Install Notes](packaging/INSTALL.md): release assets, platform commands, and local data requirements
+- [Development Notes](DEV.md): source workflows, tests, profiling, and validation commands
+- [Architecture](docs/ARCHITECTURE.md): ingestion, storage, and analytics pipeline internals
