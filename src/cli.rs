@@ -3,13 +3,14 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 const SESSION_AFTER_HELP: &str = "Examples:\n  paceflow session                 # default: grouped by model\n  paceflow session --model codex/gpt-5.4\n  paceflow session --overall\n  paceflow session --group-by provider\n  paceflow session --group-by branch\n  paceflow session --branch fix/cursor-new-partial-fate-schema\n  paceflow session --list-sessions\n\nMetrics:\n  Average user prompts: average number of user prompts per session.\n  Avg time to first accepted change: minutes from session start to the first accepted code change.\n  Debug loop rate: share of sessions that look like repeated fix-retry cycles.\n  Error paste rate: share of sessions where an error message was pasted mid-session.\n  Session-to-commit rate: share of sessions followed by a commit within 4 hours.\n  No-output session rate: share of sessions with no accepted code changes.";
 const DELIVERY_AFTER_HELP: &str = "Examples:\n  paceflow delivery                # default: grouped by model\n  paceflow delivery --model codex/gpt-5.4\n  paceflow delivery --overall\n  paceflow delivery --group-by provider\n  paceflow delivery --group-by task --task ABC-123\n  paceflow delivery --group-by branch\n  paceflow delivery --branch fix/cursor-new-partial-fate-schema\n\nMetrics:\n  Heavy commits: commits where matched AI-attributed lines are at least half of changed lines.\n  PR sync: completed GitHub PR lookups per heavy commit on github.com (see table column).\n  PR reach rate: among completed lookups, share where a pull request existed.\n  Mainline reach rate: share of heavy AI commits that later reached mainline.\n  PR merge rate: among completed PR-linked lookups, share whose PR merged.";
 const QUALITY_AFTER_HELP: &str = "Examples:\n  paceflow quality                 # default: grouped by model\n  paceflow quality --model codex/gpt-5.4\n  paceflow quality --overall\n  paceflow quality --group-by provider\n  paceflow quality --group-by task --task ABC-123\n  paceflow quality --group-by branch\n  paceflow quality --branch fix/cursor-new-partial-fate-schema\n\nMetrics:\n  Code churn rate: share of AI-added lines on heavy AI commits that were removed again within the churn window.\n  Bug-after-merge rate: share of merged heavy AI commits that drew a later fix-like commit within 60 days.\n  Revert rate: share of heavy AI commits that were later reverted.";
+const COST_AFTER_HELP: &str = "Examples:\n  paceflow cost                    # default: grouped by model\n  paceflow cost --overall\n  paceflow cost --group-by provider\n  paceflow cost --group-by task --task ABC-123\n  paceflow cost --provider=opencode --all-projects   # cross-repo provider totals\n\nScoped reports default to the current git repo (unless --all-projects). Filters such as --provider still apply after that scope.\n\nMetrics:\n  Cost: API-equivalent model cost when token usage can be priced.\n  Cost/accepted LOC: priced session cost divided by accepted changed lines.\n  Coverage: sessions with priced cost over sessions with token usage.";
 const GITHUB_AFTER_HELP: &str = "Examples:\n  paceflow github token\n\nGitHub token setup:\n  Use this command to save, replace, or delete the local GitHub token used for PR sync during ingest.";
 
 #[derive(Parser)]
 #[command(
     name = "paceflow",
     about = "Local-first analytics for improving agent-assisted engineering outcomes",
-    after_help = "Quick start:\n  paceflow ingest\n  paceflow session\n  paceflow delivery\n  paceflow quality\n\nStart here:\n  paceflow session       # default: compare workflow trust by model\n  paceflow delivery      # default: compare ship-rate by model\n  paceflow quality       # default: compare durability by model\n\nManual validation:\n  paceflow event-stream --stream session-base\n\nDiscover options:\n  paceflow --help\n  paceflow <command> --help"
+    after_help = "Quick start:\n  paceflow ingest\n  paceflow session\n  paceflow delivery\n  paceflow quality\n  paceflow cost\n\nStart here:\n  paceflow session       # default: compare workflow trust by model\n  paceflow delivery      # default: compare ship-rate by model\n  paceflow quality       # default: compare durability by model\n  paceflow cost          # default: compare spend by model\n\nManual validation:\n  paceflow event-stream --stream session-base\n\nDiscover options:\n  paceflow --help\n  paceflow <command> --help"
 )]
 pub struct Cli {
     #[arg(short, long, global = true)]
@@ -28,6 +29,8 @@ pub enum Commands {
     Delivery(DeliveryReportArgs),
     /// Show churn, bug-fix, and revert follow-through for heavy AI commits
     Quality(QualityReportArgs),
+    /// Show token usage and estimated cost per useful output
+    Cost(CostReportArgs),
     /// Print analytics-ready base-view rows as NDJSON for manual validation
     EventStream(EventStreamArgs),
     #[command(name = "github")]
@@ -146,6 +149,16 @@ pub struct QualityReportArgs {
 }
 
 #[derive(Args, Debug, Clone)]
+#[command(after_help = COST_AFTER_HELP)]
+pub struct CostReportArgs {
+    #[command(flatten)]
+    pub report: ReportArgs,
+    /// Show the overall report instead of the default model-grouped comparison
+    #[arg(long, conflicts_with = "group_by")]
+    pub overall: bool,
+}
+
+#[derive(Args, Debug, Clone)]
 pub struct EventStreamArgs {
     /// Restrict output to a KPI category
     #[arg(long, value_enum, default_value_t = EventCategory::All)]
@@ -220,6 +233,15 @@ mod tests {
         match cli.command {
             Commands::Quality(args) => assert_eq!(args.report.model.as_deref(), Some("gpt-5")),
             _ => panic!("expected quality command"),
+        }
+    }
+
+    #[test]
+    fn parses_cost_group_by_task() {
+        let cli = Cli::parse_from(["paceflow", "cost", "--group-by", "task"]);
+        match cli.command {
+            Commands::Cost(args) => assert_eq!(args.report.group_by, Some(GroupBy::Task)),
+            _ => panic!("expected cost command"),
         }
     }
 
@@ -346,7 +368,7 @@ mod tests {
     }
 
     #[test]
-    fn delivery_and_quality_help_explain_metrics_and_human_provider_context() {
+    fn delivery_quality_and_cost_help_explain_metrics_and_human_provider_context() {
         let mut command = Cli::command();
         let mut delivery_buffer = Vec::new();
         command
@@ -371,5 +393,17 @@ mod tests {
         assert!(quality_help.contains("Code churn rate"));
         assert!(quality_help.contains("Bug-after-merge rate"));
         assert!(quality_help.contains("Revert rate"));
+
+        let mut command = Cli::command();
+        let mut cost_buffer = Vec::new();
+        command
+            .find_subcommand_mut("cost")
+            .expect("cost subcommand")
+            .write_long_help(&mut cost_buffer)
+            .expect("write cost help");
+        let cost_help = String::from_utf8(cost_buffer).expect("utf8");
+        assert!(cost_help.contains("API-equivalent model cost"));
+        assert!(cost_help.contains("Cost/accepted LOC"));
+        assert!(cost_help.contains("Coverage"));
     }
 }

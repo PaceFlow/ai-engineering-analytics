@@ -4,8 +4,8 @@ use rusqlite::Connection;
 use crate::analytics;
 use crate::cli::{DeliveryReportArgs, GroupBy, ReportArgs};
 use crate::commands::report_layout::{
-    MetricStatus, ScorecardRow, append_legend, classify_ratio_higher_better, fmt_ratio,
-    fmt_ratio_percent, group_label, render_scorecard, truncate,
+    MetricStatus, ScorecardRow, append_legend, classify_lower_better, classify_ratio_higher_better,
+    fmt_ratio, fmt_ratio_percent, group_label, render_scorecard, truncate,
 };
 use crate::commands::report_scope;
 use crate::db;
@@ -89,6 +89,11 @@ fn render_delivery_report(
                     50.0,
                 ),
             },
+            ScorecardRow {
+                label: "Mainline lead",
+                value: fmt_hours(row.avg_commit_to_mainline_hours),
+                status: classify_lower_better(row.avg_commit_to_mainline_hours, 24.0, 72.0),
+            },
         ];
         out.push_str(&render_scorecard(&scorecard));
         append_legend(
@@ -98,6 +103,7 @@ fn render_delivery_report(
                 "GitHub PR lookup coverage: heavy commits on github.com with completed lookup (resolved or no PR) vs all heavy commits on github.com.",
                 "PR reach: among completed lookups, share where a pull request existed.",
                 "Mainline reach: share of heavy AI commits that later reached mainline.",
+                "Mainline lead: average hours from commit time to mainline reach for heavy AI commits that reached mainline.",
                 "PR merge: among PR-linked commits with completed lookup, share whose PR merged.",
                 "PR reach / merge show N/A when no GitHub-heavy commits or no completed lookups yet.",
                 "Status: higher is better for all delivery signals.",
@@ -126,6 +132,7 @@ fn render_delivery_report(
     headers.push(format!("{:>9}", "PR sync"));
     headers.push(format!("{:>10}", "PR Reach"));
     headers.push(format!("{:>15}", "Mainline Reach"));
+    headers.push(format!("{:>13}", "Mainline Lead"));
     headers.push(format!("{:>12}", "PR Merge"));
     if show_branch {
         headers.push(format!("{:>12}", "± LOC commits"));
@@ -158,6 +165,10 @@ fn render_delivery_report(
         ));
         cols.push(format!("{:>15}", fmt_ratio_percent(&row.merge_rate, 1)));
         cols.push(format!(
+            "{:>13}",
+            fmt_hours(row.avg_commit_to_mainline_hours)
+        ));
+        cols.push(format!(
             "{:>14}",
             fmt_optional_ratio_percent(&row.pr_merge_rate, row.github_pr_metrics_available, 1)
         ));
@@ -177,6 +188,7 @@ fn render_delivery_report(
         "PR sync = completed GitHub PR lookups / heavy commits on github.com (same scope as PR reach).",
         "PR Reach and PR Merge use completed lookups only; sync the rest with `PACEFLOW_GITHUB_TOKEN` and ingest.",
         "PR Reach, Mainline Reach, and PR Merge = percentage rates (PR merge N/A when no PR-linked commits in the completed set).",
+        "Mainline Lead = average time from commit to mainline reach for heavy AI commits that reached mainline.",
     ];
     if matches!(report.group_by, Some(GroupBy::Task)) {
         legend.push(
@@ -248,6 +260,15 @@ fn fmt_task_branch_diff_stat(added: i64, removed: i64) -> String {
     format!("+{}/-{}", added, removed)
 }
 
+fn fmt_hours(value: Option<f64>) -> String {
+    match value {
+        Some(hours) if hours < 1.0 => format!("{:.0}m", hours * 60.0),
+        Some(hours) if hours < 24.0 => format!("{hours:.1}h"),
+        Some(hours) => format!("{:.1}d", hours / 24.0),
+        None => "N/A".to_string(),
+    }
+}
+
 fn task_report_hidden_branch_rows_exist(
     db: &Connection,
     report: &ReportArgs,
@@ -294,6 +315,7 @@ mod tests {
                 denominator: 1,
             },
             github_pr_metrics_available: true,
+            avg_commit_to_mainline_hours: Some(2.5),
             task_branch_lines_added: 0,
             task_branch_lines_removed: 0,
         }];
@@ -349,6 +371,7 @@ mod tests {
                 denominator: 0,
             },
             github_pr_metrics_available: false,
+            avg_commit_to_mainline_hours: None,
             task_branch_lines_added: 0,
             task_branch_lines_removed: 0,
         }];
@@ -399,6 +422,7 @@ mod tests {
                 denominator: 0,
             },
             github_pr_metrics_available: false,
+            avg_commit_to_mainline_hours: None,
             task_branch_lines_added: 0,
             task_branch_lines_removed: 0,
         }];

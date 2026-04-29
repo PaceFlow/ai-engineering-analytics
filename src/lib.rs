@@ -2,6 +2,7 @@ pub mod analytics;
 pub mod change_intel;
 pub mod cli;
 pub mod commands;
+pub mod cost;
 pub mod cursor_paths;
 pub mod db;
 pub mod error;

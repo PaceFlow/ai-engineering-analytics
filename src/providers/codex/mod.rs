@@ -132,7 +132,9 @@ fn ingest_session(path: &PathBuf, db: &Connection) -> Result<usize> {
     let source_path = path.to_string_lossy().to_string();
 
     // Avoid duplicating provider-session rows when this session was already loaded.
-    if db::session_exists(db, session_id)? {
+    let already_exists = db::session_exists(db, session_id)?;
+    let usage_already_exists = db::session_usage_exists(db, "codex", session_id)?;
+    if already_exists && usage_already_exists {
         return Ok(0);
     }
 
@@ -144,6 +146,7 @@ fn ingest_session(path: &PathBuf, db: &Connection) -> Result<usize> {
     // file_path -> last known content (before-state for next write)
     let mut file_cache: HashMap<String, String> = HashMap::new();
     let mut session_model: Option<String> = None;
+    let mut latest_usage: Option<CodexTokenUsage> = None;
 
     db::begin_session_with_model(
         db,
@@ -155,7 +158,7 @@ fn ingest_session(path: &PathBuf, db: &Connection) -> Result<usize> {
         meta.model_provider.as_deref(),
         None,
     )?;
-    let mut written = 1usize;
+    let mut written = if already_exists { 0usize } else { 1usize };
 
     // Parse remaining lines
     for line_result in lines {
@@ -194,8 +197,15 @@ fn ingest_session(path: &PathBuf, db: &Connection) -> Result<usize> {
                 }
             }
             "event_msg" => {
+                if !usage_already_exists
+                    && line.payload.get("type").and_then(|v| v.as_str()) == Some("token_count")
+                    && let Some(usage) = parse_codex_token_usage(&line.payload)
+                {
+                    latest_usage = Some(usage);
+                }
                 // Only handle user_message subtype
-                if line.payload.get("type").and_then(|v| v.as_str()) == Some("user_message")
+                if !already_exists
+                    && line.payload.get("type").and_then(|v| v.as_str()) == Some("user_message")
                     && let Some(msg) = line.payload.get("message").and_then(|v| v.as_str())
                 {
                     let content = msg.to_string();
@@ -215,6 +225,9 @@ fn ingest_session(path: &PathBuf, db: &Connection) -> Result<usize> {
                 }
             }
             "response_item" => {
+                if already_exists {
+                    continue;
+                }
                 let role = line
                     .payload
                     .get("role")
@@ -322,7 +335,75 @@ fn ingest_session(path: &PathBuf, db: &Connection) -> Result<usize> {
         }
     }
 
+    if !usage_already_exists && let Some(usage) = latest_usage {
+        db::ingest_session_usage(
+            db,
+            "codex",
+            session_id,
+            session_start_ts.as_deref(),
+            session_model.as_deref(),
+            usage.input_tokens,
+            usage.cached_input_tokens,
+            0,
+            usage.output_tokens,
+            usage.reasoning_output_tokens,
+            usage.total_tokens,
+            None,
+            "estimated_from_tokens",
+        )?;
+        written += 1;
+    }
+
     Ok(written)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CodexTokenUsage {
+    input_tokens: i64,
+    cached_input_tokens: i64,
+    output_tokens: i64,
+    reasoning_output_tokens: i64,
+    total_tokens: i64,
+}
+
+fn parse_codex_token_usage(payload: &Value) -> Option<CodexTokenUsage> {
+    let usage = payload
+        .get("info")
+        .and_then(|info| info.get("total_token_usage"))
+        .or_else(|| {
+            payload
+                .get("info")
+                .and_then(|info| info.get("last_token_usage"))
+        })?;
+    let raw_input_tokens = usage
+        .get("input_tokens")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let cached_input_tokens = usage
+        .get("cached_input_tokens")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let output_tokens = usage
+        .get("output_tokens")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let reasoning_output_tokens = usage
+        .get("reasoning_output_tokens")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let total_tokens = usage
+        .get("total_tokens")
+        .and_then(Value::as_i64)
+        .unwrap_or(raw_input_tokens + output_tokens + reasoning_output_tokens);
+    let input_tokens = raw_input_tokens.saturating_sub(cached_input_tokens);
+
+    Some(CodexTokenUsage {
+        input_tokens,
+        cached_input_tokens,
+        output_tokens,
+        reasoning_output_tokens,
+        total_tokens,
+    })
 }
 
 /// Parse a successful write-like tool call and persist accepted code changes.
@@ -484,4 +565,46 @@ fn parse_unified_diff(diff: &str) -> Vec<(String, i64, i64)> {
     }
 
     results
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn parses_token_count_payload() {
+        let payload = json!({
+            "type": "token_count",
+            "info": {
+                "total_token_usage": {
+                    "input_tokens": 30000,
+                    "cached_input_tokens": 20000,
+                    "output_tokens": 900,
+                    "reasoning_output_tokens": 120,
+                    "total_tokens": 30900
+                },
+                "last_token_usage": {
+                    "input_tokens": 18749,
+                    "cached_input_tokens": 12672,
+                    "output_tokens": 379,
+                    "reasoning_output_tokens": 12,
+                    "total_tokens": 19140
+                }
+            }
+        });
+
+        let usage = parse_codex_token_usage(&payload).expect("usage should parse");
+
+        assert_eq!(
+            usage,
+            CodexTokenUsage {
+                input_tokens: 10000,
+                cached_input_tokens: 20000,
+                output_tokens: 900,
+                reasoning_output_tokens: 120,
+                total_tokens: 30900,
+            }
+        );
+    }
 }

@@ -12,6 +12,7 @@ Heavy commits: 3 (33.33% of commits)
 │ Mainline Reach │ 100.00% (3/3) │ good        │
 │ PR reach       │ N/A           │ unavailable │
 │ PR merge       │ N/A           │ unavailable │
+│ Mainline lead  │ N/A           │ unavailable │
 └────────────────┴───────────────┴─────────────┘
 
 Legend:
@@ -19,6 +20,7 @@ Legend:
 - GitHub PR lookup coverage: heavy commits on github.com with completed lookup (resolved or no PR) vs all heavy commits on github.com.
 - PR reach: among completed lookups, share where a pull request existed.
 - Mainline reach: share of heavy AI commits that later reached mainline.
+- Mainline lead: average hours from commit time to mainline reach for heavy AI commits that reached mainline.
 - PR merge: among PR-linked commits with completed lookup, share whose PR merged.
 - PR reach / merge show N/A when no GitHub-heavy commits or no completed lookups yet.
 - Status: higher is better for all delivery signals.

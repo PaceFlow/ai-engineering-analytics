@@ -182,6 +182,25 @@ pub(crate) fn init_metadata_schema(conn: &Connection) -> Result<()> {
             FOREIGN KEY(code_change_id) REFERENCES fact_session_code_change(id) ON DELETE CASCADE
         );
 
+        CREATE TABLE IF NOT EXISTS fact_session_usage (
+            id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+            provider              TEXT NOT NULL,
+            session_id            TEXT NOT NULL,
+            usage_index           INTEGER NOT NULL,
+            usage_ts              TEXT,
+            model_name            TEXT,
+            input_tokens          INTEGER NOT NULL DEFAULT 0,
+            cached_input_tokens   INTEGER NOT NULL DEFAULT 0,
+            cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+            output_tokens         INTEGER NOT NULL DEFAULT 0,
+            reasoning_tokens      INTEGER NOT NULL DEFAULT 0,
+            total_tokens          INTEGER NOT NULL DEFAULT 0,
+            actual_cost_usd       REAL,
+            cost_source           TEXT NOT NULL DEFAULT 'estimated_from_tokens',
+            created_at            TEXT DEFAULT (datetime('now')),
+            UNIQUE(provider, session_id, usage_index)
+        );
+
         CREATE TABLE IF NOT EXISTS fact_commit (
             id                   INTEGER PRIMARY KEY AUTOINCREMENT,
             repo_root            TEXT NOT NULL,
@@ -373,11 +392,37 @@ pub(crate) fn init_metadata_schema(conn: &Connection) -> Result<()> {
             PRIMARY KEY(provider, session_id)
         );
 
+        CREATE TABLE IF NOT EXISTS event_session_cost (
+            provider                     TEXT NOT NULL,
+            session_id                   TEXT NOT NULL,
+            repo_root                    TEXT,
+            repo_key                     TEXT,
+            member_email                 TEXT NOT NULL DEFAULT '(unknown)',
+            device_id                    TEXT NOT NULL DEFAULT '(unknown)',
+            model_name                   TEXT,
+            started_at                   TEXT,
+            ended_at                     TEXT,
+            accepted_total_changed_lines INTEGER NOT NULL DEFAULT 0,
+            accepted_output_flag         INTEGER NOT NULL DEFAULT 0,
+            input_tokens                 INTEGER NOT NULL DEFAULT 0,
+            cached_input_tokens          INTEGER NOT NULL DEFAULT 0,
+            cache_creation_tokens        INTEGER NOT NULL DEFAULT 0,
+            output_tokens                INTEGER NOT NULL DEFAULT 0,
+            reasoning_tokens             INTEGER NOT NULL DEFAULT 0,
+            total_tokens                 INTEGER NOT NULL DEFAULT 0,
+            estimated_cost_usd           REAL,
+            actual_cost_usd              REAL,
+            cost_source                  TEXT NOT NULL DEFAULT 'tokens_unpriced',
+            PRIMARY KEY(provider, session_id),
+            CHECK (accepted_output_flag IN (0,1))
+        );
+
         CREATE TABLE IF NOT EXISTS event_commit_outcome (
             repo_root                 TEXT NOT NULL,
             repo_key                  TEXT,
             commit_sha                TEXT NOT NULL,
             commit_time               TEXT NOT NULL,
+            mainline_reached_at       TEXT,
             heavy_ai_flag             INTEGER NOT NULL DEFAULT 0,
             merged_to_mainline_flag   INTEGER NOT NULL DEFAULT 0,
             reverted_later_flag       INTEGER NOT NULL DEFAULT 0,
@@ -493,6 +538,8 @@ pub(crate) fn init_metadata_schema(conn: &Connection) -> Result<()> {
             ON fact_session_code_change(repo_root, rel_path, provider);
         CREATE INDEX IF NOT EXISTS idx_fact_session_change_hash
             ON fact_session_code_change_line_hashes(side, line_hash);
+        CREATE INDEX IF NOT EXISTS idx_fact_session_usage_session
+            ON fact_session_usage(provider, session_id, usage_ts);
         CREATE INDEX IF NOT EXISTS idx_fact_commit_repo_time
             ON fact_commit(repo_root, commit_time);
         CREATE INDEX IF NOT EXISTS idx_fact_commit_file_repo_commit
@@ -521,6 +568,8 @@ pub(crate) fn init_metadata_schema(conn: &Connection) -> Result<()> {
             ON event_session_quality(repo_key, member_email, provider, session_id);
         CREATE INDEX IF NOT EXISTS idx_event_session_productivity_sync
             ON event_session_productivity(repo_key, member_email, provider, session_id);
+        CREATE INDEX IF NOT EXISTS idx_event_session_cost_sync
+            ON event_session_cost(repo_key, member_email, provider, session_id);
         CREATE INDEX IF NOT EXISTS idx_event_commit_outcome_repo_key
             ON event_commit_outcome(repo_key, commit_sha);
         CREATE INDEX IF NOT EXISTS idx_event_commit_churn_repo_key
@@ -562,6 +611,7 @@ pub(crate) fn init_metadata_schema(conn: &Connection) -> Result<()> {
         "ALTER TABLE event_session_productivity ADD COLUMN member_email TEXT NOT NULL DEFAULT '(unknown)';",
         "ALTER TABLE event_session_productivity ADD COLUMN device_id TEXT NOT NULL DEFAULT '(unknown)';",
         "ALTER TABLE event_session_productivity ADD COLUMN model_name TEXT;",
+        "ALTER TABLE event_commit_outcome ADD COLUMN mainline_reached_at TEXT;",
         "ALTER TABLE event_commit_outcome ADD COLUMN repo_key TEXT;",
         "ALTER TABLE event_commit_churn ADD COLUMN repo_key TEXT;",
         "ALTER TABLE event_commit_session ADD COLUMN repo_key TEXT;",
@@ -593,6 +643,15 @@ pub fn session_exists(conn: &Connection, session_id: &str) -> Result<bool> {
     let evidence_count: i64 = conn.query_row(
         "SELECT COUNT(*) FROM metadata_sessions WHERE session_id = ?1",
         params![session_id],
+        |row| row.get(0),
+    )?;
+    Ok(evidence_count > 0)
+}
+
+pub fn session_usage_exists(conn: &Connection, provider: &str, session_id: &str) -> Result<bool> {
+    let evidence_count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM fact_session_usage WHERE provider = ?1 AND session_id = ?2",
+        params![provider, session_id],
         |row| row.get(0),
     )?;
     Ok(evidence_count > 0)
@@ -1169,6 +1228,62 @@ pub fn ingest_accepted_code_change(
         lines_added,
         lines_removed,
     )
+}
+
+fn next_usage_index(conn: &Connection, provider: &str, session_id: &str) -> Result<i64> {
+    conn.query_row(
+        "SELECT COALESCE(MAX(usage_index), -1) + 1
+         FROM fact_session_usage
+         WHERE provider = ?1 AND session_id = ?2",
+        params![provider, session_id],
+        |row| row.get(0),
+    )
+    .map_err(Into::into)
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "usage facts map directly to provider token accounting columns"
+)]
+pub fn ingest_session_usage(
+    conn: &Connection,
+    provider: &str,
+    session_id: &str,
+    usage_ts: Option<&str>,
+    model_name: Option<&str>,
+    input_tokens: i64,
+    cached_input_tokens: i64,
+    cache_creation_tokens: i64,
+    output_tokens: i64,
+    reasoning_tokens: i64,
+    total_tokens: i64,
+    actual_cost_usd: Option<f64>,
+    cost_source: &str,
+) -> Result<()> {
+    let usage_index = next_usage_index(conn, provider, session_id)?;
+    conn.execute(
+        "INSERT INTO fact_session_usage (
+            provider, session_id, usage_index, usage_ts, model_name, input_tokens,
+            cached_input_tokens, cache_creation_tokens, output_tokens, reasoning_tokens,
+            total_tokens, actual_cost_usd, cost_source
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+        params![
+            provider,
+            session_id,
+            usage_index,
+            usage_ts,
+            model_name,
+            input_tokens.max(0),
+            cached_input_tokens.max(0),
+            cache_creation_tokens.max(0),
+            output_tokens.max(0),
+            reasoning_tokens.max(0),
+            total_tokens.max(0),
+            actual_cost_usd,
+            cost_source
+        ],
+    )?;
+    Ok(())
 }
 
 fn next_message_index(conn: &Connection, provider: &str, session_id: &str) -> Result<i64> {
@@ -1936,6 +2051,7 @@ mod tests {
         let conn = open_test_db()?;
 
         for table in [
+            "fact_session_usage",
             "fact_github_pull_request",
             "fact_github_pull_request_commit",
             "fact_github_commit_pr_lookup",
@@ -1943,6 +2059,7 @@ mod tests {
             "fact_github_issue",
             "fact_github_issue_fix_pull_request",
             "fact_github_pull_request_removed_line_hash",
+            "event_session_cost",
             "event_commit_pr_outcome",
             "event_commit_bug_signal",
         ] {
@@ -1956,6 +2073,56 @@ mod tests {
             assert_eq!(count, 1, "missing table {table}");
         }
 
+        Ok(())
+    }
+
+    #[test]
+    fn session_usage_rows_are_indexed_per_session() -> Result<()> {
+        let conn = open_test_db()?;
+
+        ingest_session_usage(
+            &conn,
+            "codex",
+            "s1",
+            Some("2026-04-29T10:00:00Z"),
+            Some("codex/gpt-5.5"),
+            10,
+            2,
+            3,
+            4,
+            5,
+            24,
+            None,
+            "estimated_from_tokens",
+        )?;
+        ingest_session_usage(
+            &conn,
+            "codex",
+            "s1",
+            Some("2026-04-29T10:01:00Z"),
+            Some("codex/gpt-5.5"),
+            1,
+            0,
+            0,
+            2,
+            0,
+            3,
+            Some(0.01),
+            "actual",
+        )?;
+
+        let usage_indexes: Vec<i64> = {
+            let mut stmt = conn.prepare(
+                "SELECT usage_index
+                 FROM fact_session_usage
+                 WHERE provider = 'codex' AND session_id = 's1'
+                 ORDER BY usage_index",
+            )?;
+            stmt.query_map([], |row| row.get(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+
+        assert_eq!(usage_indexes, vec![0, 1]);
         Ok(())
     }
 

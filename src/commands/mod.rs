@@ -1,3 +1,4 @@
+pub mod cost;
 pub mod delivery;
 pub mod event_stream;
 pub mod github;

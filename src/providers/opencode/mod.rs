@@ -19,6 +19,7 @@ struct OpenCodeSession {
     ended_at: Option<String>,
     model_name: Option<String>,
     messages: Vec<OpenCodeMessage>,
+    usage_events: Vec<OpenCodeUsageEvent>,
 }
 
 #[derive(Debug, Clone)]
@@ -26,6 +27,17 @@ struct OpenCodeMessage {
     role: String,
     text: String,
     timestamp: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct OpenCodeUsageEvent {
+    input_tokens: i64,
+    cached_input_tokens: i64,
+    cache_creation_tokens: i64,
+    output_tokens: i64,
+    reasoning_tokens: i64,
+    total_tokens: i64,
+    actual_cost_usd: Option<f64>,
 }
 
 #[derive(Debug, Clone)]
@@ -47,6 +59,7 @@ struct MessageRow {
     role: Option<String>,
     timestamp: Option<String>,
     model_name: Option<String>,
+    usage: Option<OpenCodeUsageEvent>,
 }
 
 pub fn plan_db_files() -> Result<Vec<PathBuf>> {
@@ -119,6 +132,7 @@ fn ingest_db(path: &Path, analytics: &Connection) -> Result<usize> {
 
     for session in sessions {
         let already_exists = db::session_exists(analytics, &session.id)?;
+        let usage_already_exists = db::session_usage_exists(analytics, PROVIDER, &session.id)?;
         db::upsert_metadata_session_with_model(
             analytics,
             PROVIDER,
@@ -134,11 +148,44 @@ fn ingest_db(path: &Path, analytics: &Connection) -> Result<usize> {
             session.model_name.as_deref(),
         )?;
 
+        if already_exists && usage_already_exists {
+            continue;
+        }
+
+        if !already_exists {
+            written += 1;
+        }
+        if !usage_already_exists {
+            for usage in &session.usage_events {
+                db::ingest_session_usage(
+                    analytics,
+                    PROVIDER,
+                    &session.id,
+                    session
+                        .ended_at
+                        .as_deref()
+                        .or(session.started_at.as_deref()),
+                    session.model_name.as_deref(),
+                    usage.input_tokens,
+                    usage.cached_input_tokens,
+                    usage.cache_creation_tokens,
+                    usage.output_tokens,
+                    usage.reasoning_tokens,
+                    usage.total_tokens,
+                    usage.actual_cost_usd,
+                    if usage.actual_cost_usd.unwrap_or(0.0) > 0.0 {
+                        "actual"
+                    } else {
+                        "estimated_from_tokens"
+                    },
+                )?;
+                written += 1;
+            }
+        }
         if already_exists {
             continue;
         }
 
-        written += 1;
         for message in &session.messages {
             let words = message.text.split_whitespace().count();
             if words == 0 {
@@ -204,6 +251,10 @@ fn parse_sessions(path: &Path) -> Result<Vec<OpenCodeSession>> {
     for (id, directory, created_ms, updated_ms) in rows {
         let messages = parse_message_rows(&source, &id)?;
         let model_name = latest_model_name(&messages);
+        let usage_events = messages
+            .iter()
+            .filter_map(|message| message.usage)
+            .collect();
         let parts = parse_text_parts(&source, &id)?;
         let visible_messages = build_visible_messages(messages, parts);
         sessions.push(OpenCodeSession {
@@ -213,6 +264,7 @@ fn parse_sessions(path: &Path) -> Result<Vec<OpenCodeSession>> {
             ended_at: ms_to_iso(updated_ms),
             model_name,
             messages: visible_messages,
+            usage_events,
         });
     }
 
@@ -252,16 +304,52 @@ fn parse_message_rows(source: &Connection, session_id: &str) -> Result<Vec<Messa
                     .and_then(Value::as_str)
             })
             .map(ToOwned::to_owned);
+        let usage = parse_opencode_usage(&parsed);
 
         Ok(MessageRow {
             id,
             role,
             timestamp: ms_to_iso(created_ms),
             model_name,
+            usage,
         })
     })?
     .collect::<std::result::Result<Vec<_>, _>>()
     .map_err(Into::into)
+}
+
+fn parse_opencode_usage(parsed: &Value) -> Option<OpenCodeUsageEvent> {
+    if parsed.get("role").and_then(Value::as_str) != Some("assistant") {
+        return None;
+    }
+    let tokens = parsed.get("tokens")?;
+    let input_tokens = tokens.get("input").and_then(Value::as_i64).unwrap_or(0);
+    let output_tokens = tokens.get("output").and_then(Value::as_i64).unwrap_or(0);
+    let reasoning_tokens = tokens.get("reasoning").and_then(Value::as_i64).unwrap_or(0);
+    let cache = tokens.get("cache").unwrap_or(&Value::Null);
+    let cached_input_tokens = cache.get("read").and_then(Value::as_i64).unwrap_or(0);
+    let cache_creation_tokens = cache.get("write").and_then(Value::as_i64).unwrap_or(0);
+    let total_tokens = tokens.get("total").and_then(Value::as_i64).unwrap_or(
+        input_tokens
+            + output_tokens
+            + reasoning_tokens
+            + cached_input_tokens
+            + cache_creation_tokens,
+    );
+    let actual_cost_usd = parsed
+        .get("cost")
+        .and_then(Value::as_f64)
+        .filter(|value| *value > 0.0);
+
+    Some(OpenCodeUsageEvent {
+        input_tokens,
+        cached_input_tokens,
+        cache_creation_tokens,
+        output_tokens,
+        reasoning_tokens,
+        total_tokens,
+        actual_cost_usd,
+    })
 }
 
 fn parse_text_parts(source: &Connection, session_id: &str) -> Result<HashMap<String, Vec<String>>> {
@@ -403,12 +491,42 @@ pub(crate) fn ms_to_iso(ms: i64) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::ingest_db;
+    use super::{OpenCodeUsageEvent, ingest_db, parse_opencode_usage};
     use crate::db::init_app_schema;
     use anyhow::Result;
     use rusqlite::{Connection, params};
     use serde_json::json;
     use tempfile::tempdir;
+
+    #[test]
+    fn parses_assistant_usage_from_message_data() {
+        let usage = parse_opencode_usage(&json!({
+            "role": "assistant",
+            "providerID": "openai",
+            "modelID": "gpt-5.5-fast",
+            "cost": 0.0125,
+            "tokens": {
+                "input": 1199,
+                "output": 28,
+                "reasoning": 3,
+                "cache": {"read": 130560, "write": 7}
+            }
+        }))
+        .expect("usage should parse");
+
+        assert_eq!(
+            usage,
+            OpenCodeUsageEvent {
+                input_tokens: 1199,
+                cached_input_tokens: 130560,
+                cache_creation_tokens: 7,
+                output_tokens: 28,
+                reasoning_tokens: 3,
+                total_tokens: 131797,
+                actual_cost_usd: Some(0.0125),
+            }
+        );
+    }
 
     #[test]
     fn ingests_visible_messages_and_model_from_opencode_db() -> Result<()> {
