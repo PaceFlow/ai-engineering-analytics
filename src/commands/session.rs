@@ -204,7 +204,7 @@ fn render_session_list(rows: &[analytics::SessionListRow]) -> String {
         .max(7);
 
     out.push_str(&format!(
-        "{:<8}  {:<14}  {:<8}  {:<width$}  {:<16}  {:>6}  {:>7}  {:>7}  {:>9}\n",
+        "{:<8}  {:<14}  {:<8}  {:<width$}  {:<16}  {:>6}  {:>7}  {:>7}  {:>9}  {:>10}  {:>9}  {:>9}\n",
         "Provider",
         "Model",
         "Session",
@@ -214,6 +214,9 @@ fn render_session_list(rows: &[analytics::SessionListRow]) -> String {
         "+Lines",
         "-Lines",
         "Words/LOC",
+        "Tokens",
+        "Cost",
+        "Cost/LOC",
         width = project_width
     ));
 
@@ -226,8 +229,13 @@ fn render_session_list(rows: &[analytics::SessionListRow]) -> String {
         let last_active = row.last_active.as_deref().unwrap_or("?");
         let last_active = &last_active[..last_active.len().min(16)];
         let session_short = &row.session_id[..row.session_id.len().min(8)];
+        let cost_per_loc = if row.total_loc > 0 {
+            row.total_cost_usd.map(|cost| cost / row.total_loc as f64)
+        } else {
+            None
+        };
         out.push_str(&format!(
-            "{:<8}  {:<14}  {:<8}  {:<width$}  {:<16}  {:>6}  {:>7}  {:>7}  {:>9}\n",
+            "{:<8}  {:<14}  {:<8}  {:<width$}  {:<16}  {:>6}  {:>7}  {:>7}  {:>9}  {:>10}  {:>9}  {:>9}\n",
             row.provider,
             truncate(&row.model, 14),
             session_short,
@@ -237,11 +245,31 @@ fn render_session_list(rows: &[analytics::SessionListRow]) -> String {
             row.total_added,
             row.total_removed,
             words_per_loc,
+            fmt_token_count(row.total_tokens),
+            fmt_money(row.total_cost_usd),
+            fmt_money(cost_per_loc),
             width = project_width
         ));
     }
 
     out
+}
+
+fn fmt_token_count(value: i64) -> String {
+    if value >= 1_000_000 {
+        format!("{:.1}M", value as f64 / 1_000_000.0)
+    } else if value >= 1_000 {
+        format!("{:.1}K", value as f64 / 1_000.0)
+    } else {
+        value.to_string()
+    }
+}
+
+fn fmt_money(value: Option<f64>) -> String {
+    match value {
+        Some(value) => format!("${value:.4}"),
+        None => "N/A".to_string(),
+    }
 }
 
 fn task_report_hidden_branch_rows_exist(
@@ -381,6 +409,8 @@ mod tests {
             total_loc: 20,
             total_added: 10,
             total_removed: 5,
+            total_tokens: 12_500,
+            total_cost_usd: Some(1.25),
         }
     }
 

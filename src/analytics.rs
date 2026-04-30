@@ -13,6 +13,7 @@ use std::time::Instant;
 use crate::change_intel::commit_assoc::git_scan::load_commit_diff;
 use crate::change_intel::types::LineSide;
 use crate::cli::{EventCategory, EventStreamArgs, EventStreamKind, GroupBy, ReportArgs};
+use crate::cost::pricing::{TokenUsage, estimate_cost_usd};
 use crate::ingest_progress::IngestProgressObserver;
 use crate::sync_identity;
 
@@ -31,6 +32,7 @@ DROP VIEW IF EXISTS view_commit_session_metrics_base;
 DROP VIEW IF EXISTS view_task_commit_metrics_base;
 DROP VIEW IF EXISTS view_branch_commit_metrics_base;
 DROP VIEW IF EXISTS view_session_productivity;
+DROP VIEW IF EXISTS view_session_cost;
 
 CREATE VIEW view_session_metrics_base AS
 SELECT
@@ -134,6 +136,7 @@ SELECT
     o.repo_root,
     o.commit_sha,
     o.commit_time,
+    o.mainline_reached_at,
     date(
         o.commit_time,
         '-' || ((CAST(strftime('%w', o.commit_time) AS INTEGER) + 6) % 7) || ' days'
@@ -168,6 +171,7 @@ SELECT
         ELSE cs.provider || '/' || cs.model_name
     END AS model_name,
     cs.commit_time,
+    o.mainline_reached_at,
     date(
         cs.commit_time,
         '-' || ((CAST(strftime('%w', cs.commit_time) AS INTEGER) + 6) % 7) || ' days'
@@ -205,6 +209,7 @@ SELECT
     tc.fallback_flag,
     tc.confidence,
     tc.commit_time,
+    o.mainline_reached_at,
     date(
         tc.commit_time,
         '-' || ((CAST(strftime('%w', tc.commit_time) AS INTEGER) + 6) % 7) || ' days'
@@ -238,6 +243,7 @@ SELECT
     tc.fallback_flag,
     tc.confidence,
     tc.commit_time,
+    o.mainline_reached_at,
     date(
         tc.commit_time,
         '-' || ((CAST(strftime('%w', tc.commit_time) AS INTEGER) + 6) % 7) || ' days'
@@ -281,6 +287,34 @@ SELECT
     ep.accepted_lines_removed AS total_removed
 FROM event_session_productivity ep
 ORDER BY last_active DESC;
+
+CREATE VIEW view_session_cost AS
+SELECT
+    ec.provider,
+    CASE
+        WHEN NULLIF(TRIM(ec.model_name), '') IS NULL THEN ec.provider || '/(unknown)'
+        WHEN ec.model_name LIKE ec.provider || '/%' THEN ec.model_name
+        ELSE ec.provider || '/' || ec.model_name
+    END AS model_name,
+    ec.session_id,
+    COALESCE(ec.repo_root, '(unknown)') AS repo_root,
+    COALESCE(ec.ended_at, ec.started_at) AS last_active,
+    date(
+        COALESCE(ec.started_at, ec.ended_at),
+        '-' || ((CAST(strftime('%w', COALESCE(ec.started_at, ec.ended_at)) AS INTEGER) + 6) % 7) || ' days'
+    ) AS week_start,
+    ec.accepted_total_changed_lines,
+    ec.accepted_output_flag,
+    ec.input_tokens,
+    ec.cached_input_tokens,
+    ec.cache_creation_tokens,
+    ec.output_tokens,
+    ec.reasoning_tokens,
+    ec.total_tokens,
+    ec.estimated_cost_usd,
+    ec.actual_cost_usd,
+    ec.cost_source
+FROM event_session_cost ec;
 "#;
 
 #[derive(Debug, Clone)]
@@ -315,6 +349,8 @@ pub struct SessionListRow {
     pub total_loc: i64,
     pub total_added: i64,
     pub total_removed: i64,
+    pub total_tokens: i64,
+    pub total_cost_usd: Option<f64>,
 }
 
 #[derive(Debug, Clone)]
@@ -347,6 +383,7 @@ pub struct ChangeReportRow {
     pub merge_rate: RatioMetric,
     pub pr_merge_rate: RatioMetric,
     pub github_pr_metrics_available: bool,
+    pub avg_commit_to_mainline_hours: Option<f64>,
     /// Sum of `fact_commit.total_added` / `total_removed` for commits in this row (task-grouped delivery).
     pub task_branch_lines_added: i64,
     pub task_branch_lines_removed: i64,
@@ -361,6 +398,21 @@ pub struct LifecycleReportRow {
     pub code_churn_rate: RatioMetric,
     pub bug_after_merge_rate: RatioMetric,
     pub revert_rate: RatioMetric,
+}
+
+#[derive(Debug, Clone)]
+pub struct CostReportRow {
+    pub week_start: Option<String>,
+    pub group_value: Option<String>,
+    pub branch_name: Option<String>,
+    pub session_count: i64,
+    pub accepted_session_count: i64,
+    pub priced_session_count: i64,
+    pub usage_session_count: i64,
+    pub accepted_total_changed_lines: i64,
+    pub total_tokens: i64,
+    pub total_cost_usd: Option<f64>,
+    pub mainline_change_count: i64,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -452,6 +504,7 @@ struct IssueLinkedBugSignalCandidate {
 struct DerivedCommitEvent {
     reverted_later: bool,
     merged_to_mainline: bool,
+    mainline_reached_at: Option<DateTime<Utc>>,
     budget: PathHashCounts,
     ai_added_lines_reaching_mainline: i64,
     ai_added_lines_removed_within_window: i64,
@@ -547,6 +600,7 @@ impl MainlineIndex {
 pub fn refresh_session_events(conn: &Connection) -> Result<()> {
     conn.execute("DELETE FROM event_session_quality", [])?;
     conn.execute("DELETE FROM event_session_productivity", [])?;
+    conn.execute("DELETE FROM event_session_cost", [])?;
 
     let messages = load_session_messages(conn)?;
     let device_id = sync_identity::device_id();
@@ -788,6 +842,143 @@ pub fn refresh_session_events(conn: &Connection) -> Result<()> {
         )?;
     }
 
+    refresh_session_cost_events(conn)?;
+
+    Ok(())
+}
+
+fn refresh_session_cost_events(conn: &Connection) -> Result<()> {
+    let mut stmt = conn.prepare(
+        "SELECT
+             ep.provider,
+             ep.session_id,
+             ep.repo_root,
+             ep.repo_key,
+             ep.member_email,
+             ep.device_id,
+             COALESCE(NULLIF(TRIM(MAX(u.model_name)), ''), ep.model_name) AS model_name,
+             ep.started_at,
+             ep.ended_at,
+             ep.accepted_total_changed_lines,
+             CASE WHEN ep.accepted_total_changed_lines > 0 THEN 1 ELSE 0 END AS accepted_output_flag,
+             COALESCE(SUM(u.input_tokens), 0) AS input_tokens,
+             COALESCE(SUM(u.cached_input_tokens), 0) AS cached_input_tokens,
+             COALESCE(SUM(u.cache_creation_tokens), 0) AS cache_creation_tokens,
+             COALESCE(SUM(u.output_tokens), 0) AS output_tokens,
+             COALESCE(SUM(u.reasoning_tokens), 0) AS reasoning_tokens,
+             COALESCE(SUM(u.total_tokens), 0) AS total_tokens,
+             SUM(u.actual_cost_usd) AS actual_cost_usd,
+             MAX(CASE WHEN u.cost_source = 'actual' THEN 1 ELSE 0 END) AS has_actual,
+             MAX(CASE WHEN u.cost_source = 'estimated_text_tokens' THEN 1 ELSE 0 END) AS has_text_estimate
+         FROM event_session_productivity ep
+         LEFT JOIN fact_session_usage u
+           ON u.provider = ep.provider
+          AND u.session_id = ep.session_id
+         GROUP BY
+             ep.provider, ep.session_id, ep.repo_root, ep.repo_key, ep.member_email, ep.device_id,
+             ep.model_name, ep.started_at, ep.ended_at, ep.accepted_total_changed_lines",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, Option<String>>(2)?,
+            row.get::<_, Option<String>>(3)?,
+            row.get::<_, String>(4)?,
+            row.get::<_, String>(5)?,
+            row.get::<_, Option<String>>(6)?,
+            row.get::<_, Option<String>>(7)?,
+            row.get::<_, Option<String>>(8)?,
+            row.get::<_, i64>(9)?,
+            row.get::<_, i64>(10)?,
+            row.get::<_, i64>(11)?,
+            row.get::<_, i64>(12)?,
+            row.get::<_, i64>(13)?,
+            row.get::<_, i64>(14)?,
+            row.get::<_, i64>(15)?,
+            row.get::<_, i64>(16)?,
+            row.get::<_, Option<f64>>(17)?,
+            row.get::<_, i64>(18)?,
+            row.get::<_, i64>(19)?,
+        ))
+    })?;
+
+    for row in rows {
+        let (
+            provider,
+            session_id,
+            repo_root,
+            repo_key,
+            member_email,
+            device_id,
+            model_name,
+            started_at,
+            ended_at,
+            accepted_total_changed_lines,
+            accepted_output_flag,
+            input_tokens,
+            cached_input_tokens,
+            cache_creation_tokens,
+            output_tokens,
+            reasoning_tokens,
+            total_tokens,
+            actual_cost_usd,
+            has_actual,
+            has_text_estimate,
+        ) = row?;
+        let estimated_cost_usd = model_name.as_deref().and_then(|model| {
+            estimate_cost_usd(
+                model,
+                TokenUsage {
+                    input_tokens,
+                    cached_input_tokens,
+                    cache_creation_tokens,
+                    output_tokens,
+                    reasoning_tokens,
+                },
+            )
+        });
+        let cost_source = if has_actual > 0 && actual_cost_usd.unwrap_or(0.0) > 0.0 {
+            "actual"
+        } else if estimated_cost_usd.is_some() && has_text_estimate > 0 {
+            "estimated_text_tokens"
+        } else if estimated_cost_usd.is_some() && total_tokens > 0 {
+            "estimated_from_tokens"
+        } else {
+            "tokens_unpriced"
+        };
+        conn.execute(
+            "INSERT INTO event_session_cost (
+                provider, session_id, repo_root, repo_key, member_email, device_id, model_name,
+                started_at, ended_at, accepted_total_changed_lines, accepted_output_flag,
+                input_tokens, cached_input_tokens, cache_creation_tokens, output_tokens,
+                reasoning_tokens, total_tokens, estimated_cost_usd, actual_cost_usd, cost_source
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
+            params![
+                provider,
+                session_id,
+                repo_root,
+                repo_key,
+                member_email,
+                device_id,
+                model_name,
+                started_at,
+                ended_at,
+                accepted_total_changed_lines,
+                accepted_output_flag,
+                input_tokens,
+                cached_input_tokens,
+                cache_creation_tokens,
+                output_tokens,
+                reasoning_tokens,
+                total_tokens,
+                estimated_cost_usd,
+                actual_cost_usd,
+                cost_source
+            ],
+        )?;
+    }
+
     Ok(())
 }
 
@@ -824,9 +1015,9 @@ pub fn refresh_commit_events(
     let mut repos_processed = 0usize;
     let mut insert_outcome = tx.prepare_cached(
         "INSERT INTO event_commit_outcome (
-            repo_root, repo_key, commit_sha, commit_time, heavy_ai_flag, merged_to_mainline_flag,
+            repo_root, repo_key, commit_sha, commit_time, mainline_reached_at, heavy_ai_flag, merged_to_mainline_flag,
             reverted_later_flag, total_matched_ai_lines, commit_total_changed_lines
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
     )?;
     let mut insert_churn = tx.prepare_cached(
         "INSERT INTO event_commit_churn (
@@ -892,6 +1083,10 @@ pub fn refresh_commit_events(
                 commit
                     .commit_time
                     .to_rfc3339_opts(SecondsFormat::Millis, true),
+                event
+                    .mainline_reached_at
+                    .as_ref()
+                    .map(|value| value.to_rfc3339_opts(SecondsFormat::Millis, true)),
                 commit.heavy_ai as i64,
                 event.merged_to_mainline as i64,
                 event.reverted_later as i64,
@@ -1065,8 +1260,22 @@ pub fn query_session_list_rows(
     args: &ReportArgs,
 ) -> Result<Vec<SessionListRow>> {
     let mut sql = String::from(
-        "SELECT provider, model_name, session_id, project_path, last_active, user_word_count, total_loc, total_added, total_removed
-         FROM view_session_productivity",
+        "SELECT
+            sp.provider,
+            sp.model_name,
+            sp.session_id,
+            sp.project_path,
+            sp.last_active,
+            sp.user_word_count,
+            sp.total_loc,
+            sp.total_added,
+            sp.total_removed,
+            COALESCE(sc.total_tokens, 0),
+            COALESCE(sc.actual_cost_usd, sc.estimated_cost_usd)
+         FROM view_session_productivity sp
+         LEFT JOIN event_session_cost sc
+           ON sc.provider = sp.provider
+          AND sc.session_id = sp.session_id",
     );
     let conditions = session_list_conditions(args);
     if !conditions.is_empty() {
@@ -1088,6 +1297,8 @@ pub fn query_session_list_rows(
             total_loc: row.get(6)?,
             total_added: row.get(7)?,
             total_removed: row.get(8)?,
+            total_tokens: row.get(9)?,
+            total_cost_usd: row.get(10)?,
         })
     })?;
     rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -1375,6 +1586,27 @@ pub fn query_change_report_with_options(
     );
     select.push("COALESCE(SUM(fc.total_added), 0) AS task_branch_lines_added".to_string());
     select.push("COALESCE(SUM(fc.total_removed), 0) AS task_branch_lines_removed".to_string());
+    // Mainline lead: hours from commit_time (branch commit) to a best-known mainline end time.
+    // Prefer a later `mainline_reached_at`; otherwise fall back to a later GitHub `pr_merged_at`.
+    let mainline_end_expr = "CASE
+            WHEN base.mainline_reached_at IS NOT NULL
+             AND julianday(base.mainline_reached_at) > julianday(base.commit_time)
+            THEN base.mainline_reached_at
+            WHEN pr.pr_merged_at IS NOT NULL
+             AND julianday(pr.pr_merged_at) > julianday(base.commit_time)
+            THEN pr.pr_merged_at
+            ELSE base.mainline_reached_at
+         END";
+    select.push(format!(
+        "MAX(CASE
+             WHEN base.heavy_ai_flag = 1
+              AND base.merged_to_mainline_flag = 1
+              AND ({0}) IS NOT NULL
+              AND julianday(({0})) >= julianday(base.commit_time)
+             THEN (julianday(({0})) - julianday(base.commit_time)) * 24.0
+         END) AS avg_commit_to_mainline_hours",
+        mainline_end_expr
+    ));
 
     let mut sql = format!(
         "SELECT {} FROM ({}) base
@@ -1425,6 +1657,7 @@ pub fn query_change_report_with_options(
                 let ready: i64 = row.get(9)?;
                 eligible > 0 && ready > 0
             },
+            avg_commit_to_mainline_hours: row.get(15)?,
             task_branch_lines_added: row.get(13)?,
             task_branch_lines_removed: row.get(14)?,
         })
@@ -1458,6 +1691,156 @@ pub fn query_lifecycle_report(
     args: &ReportArgs,
 ) -> Result<Vec<LifecycleReportRow>> {
     query_lifecycle_report_with_options(conn, args, ReportQueryOptions::default())
+}
+
+pub fn query_cost_report(conn: &Connection, args: &ReportArgs) -> Result<Vec<CostReportRow>> {
+    let use_task_base = matches!(args.group_by, Some(GroupBy::Task)) || args.task.is_some();
+    let use_branch_base =
+        !use_task_base && (matches!(args.group_by, Some(GroupBy::Branch)) || args.branch.is_some());
+    let source = if use_task_base || use_branch_base {
+        "SELECT
+             ec.provider,
+             ec.model_name,
+             ec.session_id,
+             ec.repo_root,
+             ec.started_at,
+             ec.ended_at,
+             ec.accepted_total_changed_lines,
+             ec.accepted_output_flag,
+             ec.total_tokens,
+             ec.estimated_cost_usd,
+             ec.actual_cost_usd,
+             ts.task_key,
+             ts.branch_name,
+             (SELECT COUNT(DISTINCT cs.commit_sha)
+              FROM event_commit_session cs
+              JOIN event_commit_outcome eo
+                ON eo.repo_root = cs.repo_root
+               AND eo.commit_sha = cs.commit_sha
+              WHERE cs.provider = ec.provider
+                AND cs.session_id = ec.session_id
+                AND eo.heavy_ai_flag = 1
+                AND eo.merged_to_mainline_flag = 1) AS mainline_change_count
+         FROM event_session_cost ec
+         JOIN event_task_session ts
+           ON ts.provider = ec.provider
+          AND ts.session_id = ec.session_id"
+    } else {
+        "SELECT
+             ec.provider,
+             ec.model_name,
+             ec.session_id,
+             ec.repo_root,
+             ec.started_at,
+             ec.ended_at,
+             ec.accepted_total_changed_lines,
+             ec.accepted_output_flag,
+             ec.total_tokens,
+             ec.estimated_cost_usd,
+             ec.actual_cost_usd,
+             NULL AS task_key,
+             NULL AS branch_name,
+             (SELECT COUNT(DISTINCT cs.commit_sha)
+              FROM event_commit_session cs
+              JOIN event_commit_outcome eo
+                ON eo.repo_root = cs.repo_root
+               AND eo.commit_sha = cs.commit_sha
+              WHERE cs.provider = ec.provider
+                AND cs.session_id = ec.session_id
+                AND eo.heavy_ai_flag = 1
+                AND eo.merged_to_mainline_flag = 1) AS mainline_change_count
+         FROM event_session_cost ec"
+    };
+    let mut base_sql = format!("SELECT * FROM ({source})");
+    let conditions = build_conditions(
+        args,
+        "COALESCE(started_at, ended_at)",
+        use_task_base,
+        use_task_base || use_branch_base,
+        true,
+        true,
+    );
+    if !conditions.is_empty() {
+        base_sql.push_str(" WHERE ");
+        base_sql.push_str(&conditions.join(" AND "));
+    }
+
+    let mut select = vec![];
+    let mut group = vec![];
+    if args.weekly {
+        select.push(
+            "date(
+                COALESCE(started_at, ended_at),
+                '-' || ((CAST(strftime('%w', COALESCE(started_at, ended_at)) AS INTEGER) + 6) % 7) || ' days'
+            ) AS week_start"
+                .to_string(),
+        );
+        group.push("week_start".to_string());
+    } else {
+        select.push("NULL AS week_start".to_string());
+    }
+    if let Some(group_expr) = session_group_expr(args.group_by) {
+        select.push(format!("{group_expr} AS group_value"));
+        group.push(group_expr.to_string());
+        if matches!(args.group_by, Some(GroupBy::Task)) {
+            select.push("branch_name".to_string());
+            group.push("branch_name".to_string());
+        } else {
+            select.push("NULL AS branch_name".to_string());
+        }
+    } else {
+        select.push("NULL AS group_value".to_string());
+        select.push("NULL AS branch_name".to_string());
+    }
+    select.push("COUNT(DISTINCT session_id) AS session_count".to_string());
+    select.push(
+        "COUNT(DISTINCT CASE WHEN accepted_output_flag = 1 THEN session_id END) AS accepted_session_count"
+            .to_string(),
+    );
+    select.push(
+        "COUNT(DISTINCT CASE WHEN COALESCE(actual_cost_usd, estimated_cost_usd) IS NOT NULL THEN session_id END) AS priced_session_count"
+            .to_string(),
+    );
+    select.push(
+        "COUNT(DISTINCT CASE WHEN total_tokens > 0 THEN session_id END) AS usage_session_count"
+            .to_string(),
+    );
+    select.push(
+        "COALESCE(SUM(accepted_total_changed_lines), 0) AS accepted_total_changed_lines"
+            .to_string(),
+    );
+    select.push("COALESCE(SUM(total_tokens), 0) AS total_tokens".to_string());
+    select.push("SUM(COALESCE(actual_cost_usd, estimated_cost_usd)) AS total_cost_usd".to_string());
+    select.push("COALESCE(SUM(mainline_change_count), 0) AS mainline_change_count".to_string());
+
+    let mut sql = format!("SELECT {} FROM ({})", select.join(", "), base_sql);
+    if !group.is_empty() {
+        sql.push_str(" GROUP BY ");
+        sql.push_str(&group.join(", "));
+        sql.push_str(" ORDER BY ");
+        sql.push_str(&group.join(", "));
+        sql.push_str(&format!(" LIMIT {}", args.limit.max(1)));
+    }
+
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map([], |row| {
+        Ok(CostReportRow {
+            week_start: row.get(0)?,
+            group_value: row.get(1)?,
+            branch_name: row.get(2)?,
+            session_count: row.get(3)?,
+            accepted_session_count: row.get(4)?,
+            priced_session_count: row.get(5)?,
+            usage_session_count: row.get(6)?,
+            accepted_total_changed_lines: row.get(7)?,
+            total_tokens: row.get(8)?,
+            total_cost_usd: row.get(9)?,
+            mainline_change_count: row.get(10)?,
+        })
+    })?;
+
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(Into::into)
 }
 
 pub fn query_lifecycle_report_with_options(
@@ -2224,27 +2607,30 @@ fn build_change_report_conditions(
 fn session_list_conditions(args: &ReportArgs) -> Vec<String> {
     let mut conditions = Vec::new();
     if let Some(repo) = args.repo.as_deref() {
-        conditions.push(format!("repo_root = {}", sql_literal(repo)));
+        conditions.push(format!("sp.repo_root = {}", sql_literal(repo)));
     }
     if let Some(provider) = args.provider.as_deref() {
-        conditions.push(format!("provider = {}", sql_literal(provider)));
+        conditions.push(format!("sp.provider = {}", sql_literal(provider)));
     }
     if let Some(model) = args.model.as_deref() {
-        conditions.push(format!("model_name = {}", sql_literal(model)));
+        conditions.push(format!("sp.model_name = {}", sql_literal(model)));
     }
     if let Some(from) = args.from.as_deref() {
-        conditions.push(format!("date(last_active) >= date({})", sql_literal(from)));
+        conditions.push(format!(
+            "date(sp.last_active) >= date({})",
+            sql_literal(from)
+        ));
     }
     if let Some(to) = args.to.as_deref() {
-        conditions.push(format!("date(last_active) <= date({})", sql_literal(to)));
+        conditions.push(format!("date(sp.last_active) <= date({})", sql_literal(to)));
     }
     if let Some(task) = args.task.as_deref() {
         conditions.push(format!(
             "EXISTS (
                  SELECT 1
                  FROM event_task_session ts
-                 WHERE ts.provider = view_session_productivity.provider
-                   AND ts.session_id = view_session_productivity.session_id
+                 WHERE ts.provider = sp.provider
+                   AND ts.session_id = sp.session_id
                    AND ts.task_key = {}
              )",
             sql_literal(task)
@@ -2255,8 +2641,8 @@ fn session_list_conditions(args: &ReportArgs) -> Vec<String> {
             "EXISTS (
                  SELECT 1
                  FROM view_branch_session_metrics_base bs
-                 WHERE bs.provider = view_session_productivity.provider
-                   AND bs.session_id = view_session_productivity.session_id
+                 WHERE bs.provider = sp.provider
+                   AND bs.session_id = sp.session_id
                    AND bs.branch_name = {}
              )",
             sql_literal(branch)
@@ -2528,10 +2914,65 @@ fn derive_repo_commit_events(
         &mainline_added_events,
         &mainline_removed_events,
     )?;
-    annotate_bug_after_merge_signals(conn, repo_root, commits, &mut derived)?;
     let repo_key = sync_identity::repo_key_for_repo_root(Some(repo_root)).unwrap_or_default();
+    annotate_mainline_reached_at_with_github_pr_merge(conn, &repo_key, commits, &mut derived)?;
+    annotate_bug_after_merge_signals(conn, repo_root, commits, &mut derived)?;
     annotate_issue_linked_bug_after_merge_signals(conn, &repo_key, commits, &mut derived)?;
     Ok(derived)
+}
+
+/// When Git still has `mainline_reached_at` at commit time (e.g. squash, or no merge object), a
+/// resolved GitHub PR's `merged_at` can supply the integration time.
+fn annotate_mainline_reached_at_with_github_pr_merge(
+    conn: &Connection,
+    repo_key: &str,
+    commits: &[CandidateCommit],
+    derived: &mut HashMap<String, DerivedCommitEvent>,
+) -> Result<()> {
+    if repo_key.is_empty() || !repo_key.starts_with("git:github.com/") {
+        return Ok(());
+    }
+
+    let mut stmt = conn.prepare(
+        "SELECT lu.commit_sha, pr.merged_at
+         FROM fact_github_commit_pr_lookup lu
+         INNER JOIN fact_github_pull_request pr
+           ON pr.repo_key = lu.repo_key AND pr.pr_number = lu.owning_pr_number
+         WHERE lu.repo_key = ?1
+           AND lu.status = 'resolved'
+           AND lu.owning_pr_number IS NOT NULL
+           AND pr.merged_at IS NOT NULL",
+    )?;
+    let mut pr_merged_at: HashMap<String, DateTime<Utc>> = HashMap::new();
+    let rows = stmt.query_map(params![repo_key], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    for row in rows {
+        let (sha, raw) = row?;
+        let merged = DateTime::parse_from_rfc3339(&raw)
+            .map_err(|e| anyhow!("invalid PR merged_at for {sha}: {e}"))?
+            .with_timezone(&Utc);
+        pr_merged_at.insert(sha, merged);
+    }
+
+    for commit in commits {
+        let Some(event) = derived.get_mut(&commit.commit_sha) else {
+            continue;
+        };
+        let Some(reached) = event.mainline_reached_at else {
+            continue;
+        };
+        if reached != commit.commit_time {
+            continue;
+        }
+        let Some(merged_at) = pr_merged_at.get(&commit.commit_sha) else {
+            continue;
+        };
+        if *merged_at > commit.commit_time {
+            event.mainline_reached_at = Some(*merged_at);
+        }
+    }
+    Ok(())
 }
 
 #[expect(
@@ -2586,12 +3027,20 @@ fn derive_commit_events_from_preloaded(
         } else {
             budget_total > 0 && is_content_merged_in_index(&budget, &added_index)
         };
+        let mainline_reached_at = if mainline_commit_set.contains(&commit.commit_sha) {
+            Some(commit.commit_time)
+        } else if merged_to_mainline {
+            find_mainline_reached_at(&budget, mainline_added_events, commit.commit_time)
+        } else {
+            None
+        };
 
         out.insert(
             commit.commit_sha.clone(),
             DerivedCommitEvent {
                 reverted_later,
                 merged_to_mainline,
+                mainline_reached_at,
                 budget,
                 ai_added_lines_reaching_mainline: if merged_to_mainline { budget_total } else { 0 },
                 ai_added_lines_removed_within_window: 0,
@@ -3449,6 +3898,30 @@ fn is_content_merged_in_index(budget: &PathHashCounts, index: &MainlineIndex) ->
     matched >= C2_MIN_MATCHED_LINES && ratio >= C2_MIN_RATIO
 }
 
+fn find_mainline_reached_at(
+    budget: &PathHashCounts,
+    mainline_added_events: &[TimedLineHashChange],
+    commit_time: DateTime<Utc>,
+) -> Option<DateTime<Utc>> {
+    let mut reached_at: Option<DateTime<Utc>> = None;
+    for event in mainline_added_events {
+        if event.commit_time < commit_time {
+            continue;
+        }
+        let Some(path_hashes) = budget.get(&event.rel_path) else {
+            continue;
+        };
+        if !path_hashes.contains_key(&event.line_hash) {
+            continue;
+        }
+        reached_at = Some(match reached_at {
+            Some(current) if current <= event.commit_time => current,
+            _ => event.commit_time,
+        });
+    }
+    reached_at
+}
+
 fn load_mainline_hash_events(
     repo_root: &str,
     main_ref: &str,
@@ -3861,6 +4334,7 @@ mod tests {
         DerivedCommitEvent {
             reverted_later: false,
             merged_to_mainline,
+            mainline_reached_at: None,
             budget: PathHashCounts::new(),
             ai_added_lines_reaching_mainline: 0,
             ai_added_lines_removed_within_window: 0,
@@ -3990,6 +4464,80 @@ mod tests {
     }
 
     #[test]
+    fn cost_report_groups_priced_usage_by_task() -> Result<()> {
+        let conn = open_test_db()?;
+        conn.execute(
+            "INSERT INTO event_session_cost (
+                provider, session_id, repo_root, model_name, started_at, ended_at,
+                accepted_output_flag, accepted_total_changed_lines, input_tokens,
+                cached_input_tokens, output_tokens, reasoning_tokens, total_tokens,
+                estimated_cost_usd, actual_cost_usd, cost_source
+             ) VALUES
+                ('codex', 's1', '/tmp/repo', 'codex/gpt-5', '2026-03-17T09:00:00Z', '2026-03-17T09:30:00Z',
+                 1, 20, 1000, 0, 500, 0, 1500, 0.0125, NULL, 'estimated_from_tokens'),
+                ('codex', 's2', '/tmp/repo', 'codex/gpt-5', '2026-03-17T10:00:00Z', '2026-03-17T10:20:00Z',
+                 0, 0, 100, 0, 50, 0, 150, NULL, NULL, 'tokens_unpriced')",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO event_task_session (
+                repo_root, task_key, branch_name, provider, session_id, model_name, started_at,
+                attribution_weight, commit_within_window_flag, user_turn_count, debug_loop_flag,
+                mid_session_error_paste_flag, accepted_output_flag
+             ) VALUES
+                ('/tmp/repo', 'PAC-1', 'PAC-1-branch', 'codex', 's1', 'codex/gpt-5', '2026-03-17T09:00:00Z',
+                 1.0, 1, 3, 0, 0, 1),
+                ('/tmp/repo', 'PAC-1', 'PAC-1-branch', 'codex', 's2', 'codex/gpt-5', '2026-03-17T10:00:00Z',
+                 1.0, 0, 2, 0, 0, 0)",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO event_commit_session (
+                repo_root, commit_sha, provider, session_id, commit_time, model_name,
+                matched_lines, share_of_commit, share_of_ai
+             ) VALUES ('/tmp/repo', 'abc123', 'codex', 's1', '2026-03-17T11:00:00Z', 'codex/gpt-5', 20, 1.0, 1.0)",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO event_commit_outcome (
+                repo_root, commit_sha, commit_time, heavy_ai_flag, merged_to_mainline_flag,
+                reverted_later_flag, total_matched_ai_lines, commit_total_changed_lines
+             ) VALUES ('/tmp/repo', 'abc123', '2026-03-17T11:00:00Z', 1, 1, 0, 20, 20)",
+            [],
+        )?;
+
+        let rows = query_cost_report(
+            &conn,
+            &ReportArgs {
+                weekly: false,
+                group_by: Some(GroupBy::Task),
+                from: None,
+                to: None,
+                repo: None,
+                all_projects: false,
+                provider: None,
+                task: Some("PAC-1".to_string()),
+                branch: None,
+                model: None,
+                limit: 50,
+            },
+        )?;
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].group_value.as_deref(), Some("PAC-1"));
+        assert_eq!(rows[0].branch_name.as_deref(), Some("PAC-1-branch"));
+        assert_eq!(rows[0].session_count, 2);
+        assert_eq!(rows[0].accepted_session_count, 1);
+        assert_eq!(rows[0].priced_session_count, 1);
+        assert_eq!(rows[0].usage_session_count, 2);
+        assert_eq!(rows[0].accepted_total_changed_lines, 20);
+        assert_eq!(rows[0].total_tokens, 1650);
+        assert_eq!(rows[0].total_cost_usd, Some(0.0125));
+        assert_eq!(rows[0].mainline_change_count, 1);
+        Ok(())
+    }
+
+    #[test]
     fn task_grouped_change_and_lifecycle_reports_apply_limit_after_task_filtering() -> Result<()> {
         let conn = open_test_db()?;
         conn.execute(
@@ -4049,6 +4597,183 @@ mod tests {
         assert_eq!(
             lifecycle_rows[0].branch_name.as_deref(),
             Some("PAC-1-branch")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn mainline_lead_ignores_sessions_and_matches_commit_to_mainline_gap() -> Result<()> {
+        let conn = open_test_db()?;
+        let repo_root = "/tmp/repo-mainline-lead";
+        let commit_sha = "abc111feed";
+        let commit_time = "2026-03-17T12:00:00Z";
+        let session_started = "2026-03-17T10:00:00Z";
+
+        conn.execute(
+            "INSERT INTO event_commit_outcome (
+                repo_root, commit_sha, commit_time, mainline_reached_at,
+                heavy_ai_flag, merged_to_mainline_flag, reverted_later_flag,
+                total_matched_ai_lines, commit_total_changed_lines
+             ) VALUES (?1, ?2, ?3, ?4, 1, 1, 0, 10, 20)",
+            params![repo_root, commit_sha, commit_time, commit_time],
+        )?;
+        conn.execute(
+            "INSERT INTO event_commit_churn (
+                repo_root, commit_sha, ai_added_lines_reaching_mainline,
+                ai_added_lines_removed_within_window, churn_window_days
+             ) VALUES (?1, ?2, 10, 0, 14)",
+            params![repo_root, commit_sha],
+        )?;
+
+        crate::db::upsert_metadata_session(
+            &conn,
+            "codex",
+            "sess-mainline-lead",
+            None,
+            Some(session_started),
+            None,
+            None,
+        )?;
+        conn.execute(
+            "INSERT INTO fact_commit_session_match (
+                repo_root, commit_sha, provider, session_id,
+                matched_lines, share_of_commit, share_of_ai
+             ) VALUES (?1, ?2, 'codex', 'sess-mainline-lead', 10.0, 0.5, 1.0)",
+            params![repo_root, commit_sha],
+        )?;
+
+        create_reporting_views(&conn)?;
+
+        let args = ReportArgs {
+            weekly: false,
+            group_by: None,
+            from: None,
+            to: None,
+            repo: None,
+            all_projects: false,
+            provider: None,
+            task: None,
+            branch: None,
+            model: None,
+            limit: 10,
+        };
+        let rows = query_change_report(&conn, &args)?;
+        assert_eq!(rows.len(), 1);
+        let lead = rows[0]
+            .avg_commit_to_mainline_hours
+            .expect("expected mainline lead for heavy merged commit with mainline time");
+        assert!(
+            lead.abs() < 1e-6,
+            "commit and mainline reach at same instant => 0h lead; sessions must not affect; got {lead}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn mainline_reached_at_prefers_github_pr_merged_at_when_on_main_at_commit_time() -> Result<()> {
+        use std::collections::BTreeSet;
+
+        let conn = open_test_db()?;
+        let repo_key = "git:github.com/PaceFlow/pr-merge-lead";
+        conn.execute(
+            "INSERT INTO fact_github_pull_request (
+                repo_key, pr_number, state, draft_flag, created_at, updated_at, closed_at,
+                merged_at, base_ref, head_ref, html_url, removed_hashes_complete_flag
+             ) VALUES
+                (?1, 7, 'closed', 0, '2026-03-20T08:00:00Z', NULL, NULL,
+                 '2026-04-10T16:00:00Z', 'main', 'feature', NULL, 0)",
+            params![repo_key],
+        )?;
+        conn.execute(
+            "INSERT INTO fact_github_commit_pr_lookup (
+                repo_key, commit_sha, status, owning_pr_number, last_checked_at, last_error
+             ) VALUES (?1, 'cafef00d', 'resolved', 7, '2026-04-10T16:00:00Z', NULL)",
+            params![repo_key],
+        )?;
+
+        let commit_time = DateTime::parse_from_rfc3339("2026-03-31T14:05:07Z")?.with_timezone(&Utc);
+        let commits = vec![CandidateCommit {
+            repo_root: "/tmp/pr-merge-lead".into(),
+            commit_sha: "cafef00d".into(),
+            commit_time,
+            heavy_ai: true,
+            matched_total_lines: 10,
+            commit_total_lines: 20,
+        }];
+        let mut derived = HashMap::from([(
+            "cafef00d".into(),
+            DerivedCommitEvent {
+                reverted_later: false,
+                merged_to_mainline: true,
+                mainline_reached_at: Some(commit_time),
+                budget: PathHashCounts::new(),
+                ai_added_lines_reaching_mainline: 0,
+                ai_added_lines_removed_within_window: 0,
+                bug_after_merge: false,
+                first_bug_signal_commit_sha: None,
+                first_bug_signal_commit_time: None,
+                bug_signal_count: 0,
+                bug_signal_sources: BTreeSet::new(),
+            },
+        )]);
+
+        annotate_mainline_reached_at_with_github_pr_merge(&conn, repo_key, &commits, &mut derived)?;
+
+        let expected = DateTime::parse_from_rfc3339("2026-04-10T16:00:00Z")?.with_timezone(&Utc);
+        assert_eq!(
+            derived["cafef00d"].mainline_reached_at,
+            Some(expected),
+            "expected PR merged_at to replace commit-time mainline reach"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn mainline_lead_matches_hours_between_commit_and_mainline_reach() -> Result<()> {
+        let conn = open_test_db()?;
+        let repo_root = "/tmp/repo-mainline-lead-gap";
+        let commit_sha = "deadbeef00";
+        let commit_time = "2026-06-15T12:00:00Z";
+        let mainline_reached = "2026-06-16T12:00:00Z";
+
+        conn.execute(
+            "INSERT INTO event_commit_outcome (
+                repo_root, commit_sha, commit_time, mainline_reached_at,
+                heavy_ai_flag, merged_to_mainline_flag, reverted_later_flag,
+                total_matched_ai_lines, commit_total_changed_lines
+             ) VALUES (?1, ?2, ?3, ?4, 1, 1, 0, 10, 20)",
+            params![repo_root, commit_sha, commit_time, mainline_reached],
+        )?;
+        conn.execute(
+            "INSERT INTO event_commit_churn (
+                repo_root, commit_sha, ai_added_lines_reaching_mainline,
+                ai_added_lines_removed_within_window, churn_window_days
+             ) VALUES (?1, ?2, 10, 0, 14)",
+            params![repo_root, commit_sha],
+        )?;
+
+        create_reporting_views(&conn)?;
+
+        let args = ReportArgs {
+            weekly: false,
+            group_by: None,
+            from: None,
+            to: None,
+            repo: None,
+            all_projects: false,
+            provider: None,
+            task: None,
+            branch: None,
+            model: None,
+            limit: 10,
+        };
+        let rows = query_change_report(&conn, &args)?;
+        let lead = rows[0]
+            .avg_commit_to_mainline_hours
+            .expect("expected mainline lead");
+        assert!(
+            (lead - 24.0).abs() < 1e-3,
+            "expected ~24h from commit to mainline reach; got {lead}"
         );
         Ok(())
     }
@@ -4984,12 +5709,20 @@ mod tests {
         let commit_a = optimized.get("a").unwrap();
         assert!(commit_a.reverted_later);
         assert!(commit_a.merged_to_mainline);
+        assert_eq!(
+            commit_a.mainline_reached_at,
+            Some(parse_ts("2026-03-06T09:00:00Z"))
+        );
         assert_eq!(commit_a.ai_added_lines_reaching_mainline, 35);
         assert_eq!(commit_a.ai_added_lines_removed_within_window, 25);
 
         let commit_b = optimized.get("b").unwrap();
         assert!(!commit_b.reverted_later);
         assert!(commit_b.merged_to_mainline);
+        assert_eq!(
+            commit_b.mainline_reached_at,
+            Some(parse_ts("2026-03-05T10:00:00Z"))
+        );
         assert_eq!(commit_b.ai_added_lines_reaching_mainline, 20);
         assert_eq!(commit_b.ai_added_lines_removed_within_window, 10);
         Ok(())

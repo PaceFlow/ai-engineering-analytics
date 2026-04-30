@@ -56,6 +56,16 @@ impl CursorSessionGraph {
         }
     }
 
+    /// For API-style token estimates, prefer hydrated `bubbleId:*` rows when present.
+    /// Composer `conversation` can be empty while bubbles still hold the real exchange.
+    pub(crate) fn events_for_text_token_estimate(&self) -> &[CursorBubbleEvent] {
+        if !self.bubble_events.is_empty() {
+            &self.bubble_events
+        } else {
+            &self.conversation_messages
+        }
+    }
+
     pub fn first_edit_path_by_bubble(&self) -> HashMap<String, String> {
         let mut out = HashMap::new();
         for (path, state) in &self.original_file_states {
@@ -665,6 +675,21 @@ fn populate_bubbles(
         graph.bubble_events.sort_by_key(|event| event.order_key);
     }
 
+    Ok(())
+}
+
+/// Loads `bubbleId:*` rows for a single session so token estimation and tooling see the full transcript.
+pub(crate) fn hydrate_session_bubbles(
+    vscdb: &Connection,
+    graph: &mut CursorSessionGraph,
+) -> Result<()> {
+    let mut graphs = vec![graph.clone()];
+    let mut by_session = HashMap::new();
+    by_session.insert(graph.composer_id.clone(), 0);
+    populate_bubbles(vscdb, &mut graphs, &by_session)?;
+    if let Some(updated) = graphs.pop() {
+        *graph = updated;
+    }
     Ok(())
 }
 

@@ -58,8 +58,18 @@ pub(crate) struct ParsedClaudeSession {
     pub ended_at: Option<String>,
     pub model_name: Option<String>,
     pub visible_messages: Vec<ClaudeVisibleMessage>,
+    pub usage_events: Vec<ClaudeUsageEvent>,
     pub structured_writes: Vec<ClaudeStructuredWrite>,
     pub tool_call_count: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ClaudeUsageEvent {
+    pub input_tokens: i64,
+    pub cache_creation_input_tokens: i64,
+    pub cache_read_input_tokens: i64,
+    pub output_tokens: i64,
+    pub total_tokens: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -76,6 +86,7 @@ struct PendingToolUse {
 struct ParseState {
     model_name: Option<String>,
     visible_messages: Vec<ClaudeVisibleMessage>,
+    usage_events: Vec<ClaudeUsageEvent>,
     pending: Vec<PendingToolUse>,
     pending_by_id: HashMap<String, usize>,
     tool_call_count: usize,
@@ -175,6 +186,7 @@ pub(crate) fn parse_session_file(path: &Path) -> Result<ParsedClaudeSession> {
         ended_at,
         model_name: state.model_name,
         visible_messages: state.visible_messages,
+        usage_events: state.usage_events,
         structured_writes,
         tool_call_count: state.tool_call_count,
     })
@@ -227,6 +239,9 @@ fn process_top_level_record(parsed: &Value, state: &mut ParseState) {
             if let Some(found_model) = extract_real_model_name(message) {
                 state.model_name = Some(found_model);
             }
+            if let Some(usage) = extract_claude_usage(message) {
+                state.usage_events.push(usage);
+            }
             if let Some(text) = extract_assistant_visible_text(message)
                 && !text.trim().is_empty()
             {
@@ -253,6 +268,36 @@ fn process_top_level_record(parsed: &Value, state: &mut ParseState) {
         }
         _ => {}
     }
+}
+
+fn extract_claude_usage(message: &Value) -> Option<ClaudeUsageEvent> {
+    let usage = message.get("usage")?;
+    let input_tokens = usage
+        .get("input_tokens")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let cache_creation_input_tokens = usage
+        .get("cache_creation_input_tokens")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let cache_read_input_tokens = usage
+        .get("cache_read_input_tokens")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let output_tokens = usage
+        .get("output_tokens")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let total_tokens =
+        input_tokens + cache_creation_input_tokens + cache_read_input_tokens + output_tokens;
+
+    Some(ClaudeUsageEvent {
+        input_tokens,
+        cache_creation_input_tokens,
+        cache_read_input_tokens,
+        output_tokens,
+        total_tokens,
+    })
 }
 
 fn process_nested_progress_message(nested: &Value, outer: &Value, state: &mut ParseState) {
@@ -634,7 +679,7 @@ fn update_time_bounds(
 #[cfg(test)]
 mod tests {
     use super::{
-        ClaudeMessageRole, discover_top_level_jsonl_files, parse_session_file,
+        ClaudeMessageRole, ClaudeUsageEvent, discover_top_level_jsonl_files, parse_session_file,
         should_ignore_user_text, structured_patch_summary,
     };
     use anyhow::Result;
@@ -738,6 +783,47 @@ mod tests {
         );
         assert_eq!(parsed.structured_writes.len(), 1);
         assert_eq!(parsed.structured_writes[0].abs_path, "/tmp/repo/src/lib.rs");
+        Ok(())
+    }
+
+    #[test]
+    fn parser_extracts_usage_events() -> Result<()> {
+        let tempdir = tempdir()?;
+        let path = tempdir.path().join("usage.jsonl");
+        fs::write(
+            &path,
+            json!({
+                "type": "assistant",
+                "timestamp": "2026-04-22T09:00:01Z",
+                "sessionId": "claude-usage",
+                "cwd": "/tmp/repo",
+                "message": {
+                    "model": "claude-opus-4-6",
+                    "role": "assistant",
+                    "usage": {
+                        "input_tokens": 3,
+                        "cache_creation_input_tokens": 1390,
+                        "cache_read_input_tokens": 14316,
+                        "output_tokens": 2
+                    },
+                    "content": [{"type": "text", "text": "done"}]
+                }
+            })
+            .to_string(),
+        )?;
+
+        let parsed = parse_session_file(&path)?;
+
+        assert_eq!(
+            parsed.usage_events,
+            vec![ClaudeUsageEvent {
+                input_tokens: 3,
+                cache_creation_input_tokens: 1390,
+                cache_read_input_tokens: 14316,
+                output_tokens: 2,
+                total_tokens: 15711,
+            }]
+        );
         Ok(())
     }
 

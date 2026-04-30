@@ -9,6 +9,7 @@ fn main() -> anyhow::Result<()> {
         Commands::Session(args) => commands::session::run(args)?,
         Commands::Delivery(args) => commands::delivery::run(args)?,
         Commands::Quality(args) => commands::quality::run(args)?,
+        Commands::Cost(args) => commands::cost::run(args)?,
         Commands::EventStream(args) => commands::event_stream::run(args)?,
         Commands::GitHub(args) => commands::github::run(args)?,
     }

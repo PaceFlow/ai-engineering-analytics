@@ -10,15 +10,16 @@ For the shortest setup path, start with the [README](../README.md).
 
 ## Report Workflow
 
-Use the reports to answer three practical questions:
+Use the reports to answer four practical questions:
 
 ```bash
 paceflow session
 paceflow delivery
 paceflow quality
+paceflow cost
 ```
 
-By default, `session`, `delivery`, and `quality` compare outcomes by model. Use `--overall` for a rolled-up summary, or `--model <provider/name>` to keep the same report but inspect one model only.
+By default, `session`, `delivery`, `quality`, and `cost` compare outcomes by model. Use `--overall` for a rolled-up summary, or `--model <provider/name>` to keep the same report but inspect one model only.
 
 Examples:
 
@@ -27,6 +28,7 @@ paceflow session --model codex/gpt-5.4
 paceflow session --overall
 paceflow delivery --group-by branch
 paceflow quality --group-by provider
+paceflow cost --group-by task
 ```
 
 ## How To Read The Reports
@@ -72,6 +74,22 @@ Key signals:
 
 Churn means accepted code landed but was removed soon after. Bug-after-merge catches merged code that drew later fix work. Reverts are the clearest signal that the workflow created cost, not leverage.
 
+### Cost
+
+`paceflow cost` shows token usage and estimated spend per useful output.
+
+Key signals:
+
+- Sessions with token usage
+- Priced cost coverage
+- Total tokens
+- Total API-equivalent cost
+- Cost per accepted session
+- Cost per accepted LOC
+- Cost per mainline change
+
+Cost uses provider-reported token buckets when available. When a provider does not store token usage, Paceflow estimates text tokens from local session text and applies known model pricing where it can identify the model. Unknown models stay unpriced instead of inventing a dollar value.
+
 ## Status Bands
 
 `--overall` summaries attach `good`, `watch`, and `risk` labels using opinionated thresholds so you can scan a report quickly.
@@ -98,6 +116,8 @@ The reports are built from normalized session events, matched commit/session att
 - `LOC`: total accepted changed lines for the session (`accepted_lines_added + accepted_lines_removed`)
 - `+Lines`: accepted added lines for the session
 - `-Lines`: accepted removed lines for the session
+- `Tokens`: provider-reported tokens, or text-estimated tokens for providers without token counters
+- `Cost`: actual provider cost when present; otherwise API-equivalent estimated model cost when pricing is known
 - `Words/LOC`: user-word count divided by accepted changed lines; if accepted changed lines are zero, this is `N/A`
 
 ### Delivery Metrics
@@ -115,18 +135,29 @@ The reports are built from normalized session events, matched commit/session att
 - `Bug-After-Merge Rate`: share of merged heavy AI commits that drew at least one later fix-like commit touching the same files within a 60-day window
 - `Revert Rate`: share of heavy commits later reverted by a commit body containing `This reverts commit <sha>`
 
+### Cost Metrics
+
+- `Cost`: actual provider cost when present; otherwise API-equivalent estimated model cost from token buckets and known pricing
+- `Tokens`: total input, cache, output, and reasoning tokens captured or estimated for included sessions
+- `$/Session`: total priced cost divided by included sessions
+- `$/Acc Sess`: total priced cost divided by sessions with accepted changed lines
+- `$/LOC`: total priced cost divided by accepted changed lines
+- `$/Mainline`: total priced cost divided by heavy AI changes that reached mainline
+- `Coverage`: sessions with priced cost divided by sessions with token usage
+
 ### Grouped Report Weighting
 
 - Repo and weekly rollups use ordinary counts and averages over included sessions or commits
 - Provider/model grouped delivery and quality reports work from commit-session attribution rows so unmatched commits can appear as `human`
+- Cost reports work from session-cost events and can be grouped by model, provider, task, or branch
 - Task-grouped session reports use attribution-weighted averages and rates
 - Branch-grouped session reports use attribution-weighted averages and rates
 - Task-grouped delivery and quality reports exclude non-ticket task keys plus integration branches such as `main`, `staging`, `master`, and `develop`
 
 ## Options And Grouping Notes
 
-- `session`, `delivery`, and `quality` share the same filter interface: `--weekly`, `--group-by`, `--from`, `--to`, `--repo`, `--provider`, `--task`, `--branch`, `--model`, and `--limit`
-- `session`, `delivery`, and `quality` default to `group-by model` when you do not pass `--group-by` or `--overall`
+- `session`, `delivery`, `quality`, and `cost` share the same filter interface: `--weekly`, `--group-by`, `--from`, `--to`, `--repo`, `--provider`, `--task`, `--branch`, `--model`, and `--limit`
+- `session`, `delivery`, `quality`, and `cost` default to `group-by model` when you do not pass `--group-by` or `--overall`
 - `--model` filters the current report to one model without changing the active view
 - Use `--group-by branch` or `--branch <name>` when the work lives on literal branches like `fix/...`, `perf/...`, `codex/...`, or `main`
 - `--overall` swaps the default model comparison for the rolled-up one-row summary and conflicts with `--group-by`

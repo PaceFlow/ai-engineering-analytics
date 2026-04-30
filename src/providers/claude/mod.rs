@@ -54,12 +54,17 @@ fn ingest_session(path: &Path, db: &Connection) -> Result<usize> {
     if parsed.session_id.trim().is_empty() {
         return Ok(0);
     }
-    if parsed.visible_messages.is_empty() && parsed.structured_writes.is_empty() {
+    if parsed.visible_messages.is_empty()
+        && parsed.structured_writes.is_empty()
+        && parsed.usage_events.is_empty()
+    {
         return Ok(0);
     }
 
     let source_file = parsed.source_file.clone();
-    if db::session_exists(db, &parsed.session_id)? {
+    let already_exists = db::session_exists(db, &parsed.session_id)?;
+    let usage_already_exists = db::session_usage_exists(db, "claude", &parsed.session_id)?;
+    if already_exists {
         db::upsert_metadata_session_with_model(
             db,
             "claude",
@@ -71,7 +76,29 @@ fn ingest_session(path: &Path, db: &Connection) -> Result<usize> {
             Some("claude"),
             parsed.model_name.as_deref(),
         )?;
-        return Ok(0);
+        if usage_already_exists {
+            return Ok(0);
+        }
+        let mut written = 0usize;
+        for usage in parsed.usage_events {
+            db::ingest_session_usage(
+                db,
+                "claude",
+                &parsed.session_id,
+                parsed.ended_at.as_deref().or(parsed.started_at.as_deref()),
+                parsed.model_name.as_deref(),
+                usage.input_tokens,
+                usage.cache_read_input_tokens,
+                usage.cache_creation_input_tokens,
+                usage.output_tokens,
+                0,
+                usage.total_tokens,
+                None,
+                "estimated_from_tokens",
+            )?;
+            written += 1;
+        }
+        return Ok(written);
     }
 
     db::upsert_metadata_session_with_model(
@@ -86,6 +113,25 @@ fn ingest_session(path: &Path, db: &Connection) -> Result<usize> {
         parsed.model_name.as_deref(),
     )?;
     let mut written = 1usize;
+
+    for usage in &parsed.usage_events {
+        db::ingest_session_usage(
+            db,
+            "claude",
+            &parsed.session_id,
+            parsed.ended_at.as_deref().or(parsed.started_at.as_deref()),
+            parsed.model_name.as_deref(),
+            usage.input_tokens,
+            usage.cache_read_input_tokens,
+            usage.cache_creation_input_tokens,
+            usage.output_tokens,
+            0,
+            usage.total_tokens,
+            None,
+            "estimated_from_tokens",
+        )?;
+        written += 1;
+    }
 
     for message in parsed.visible_messages {
         let words = message.text.split_whitespace().count() as i64;

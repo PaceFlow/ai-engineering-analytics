@@ -2,11 +2,12 @@
 
 `paceflow` is a local-first CLI for understanding whether coding-agent work is actually helping.
 
-It reads local Claude Code, Codex, Cursor, and OpenCode history plus git metadata, then turns that evidence into three practical report views:
+It reads local Claude Code, Codex, Cursor, and OpenCode history plus git metadata, then turns that evidence into four practical report views:
 
 - `session`: were you getting leverage, or just steering and retrying?
 - `delivery`: did AI-heavy work turn into commits that reached review or mainline?
 - `quality`: did accepted AI-generated code hold up, or did it churn out later?
+- `cost`: what did useful work cost in tokens, compute estimates, and accepted output?
 
 The point is not to count prompts or accepted lines for their own sake. The point is to help individual engineers improve how they work with coding agents.
 
@@ -19,6 +20,7 @@ Most AI coding workflows feel productive in the moment. That does not mean they 
 - sessions that felt busy but produced little accepted output
 - AI-heavy work that never made it to mainline
 - accepted code that landed quickly and was removed soon after
+- costly sessions that produced little accepted or mainline output
 
 If those patterns show up repeatedly, you usually need tighter task slicing, better upfront constraints, earlier validation, or stricter review before accepting generated code.
 
@@ -31,6 +33,7 @@ paceflow ingest
 paceflow session
 paceflow delivery
 paceflow quality
+paceflow cost
 ```
 
 The first ingest reads local assistant history, scans git metadata, and creates the local analytics database at `~/.paceflow/paceflow.db`.
@@ -41,7 +44,8 @@ Use this loop when you are trying the tool for the first time:
 2. Run `paceflow session` to see whether sessions are producing accepted code and commits.
 3. Run `paceflow delivery` to see whether AI-heavy commits reached PRs or mainline.
 4. Run `paceflow quality` to see whether AI-heavy code churned, drew follow-up fixes, or was reverted.
-5. Re-run `paceflow ingest` whenever you have new sessions, commits, or GitHub PR metadata to refresh.
+5. Run `paceflow cost` to compare API-equivalent cost against accepted and mainline output.
+6. Re-run `paceflow ingest` whenever you have new sessions, commits, or GitHub PR metadata to refresh.
 
 For GitHub PR reach and PR merge metrics, save a token and ingest again:
 
@@ -82,12 +86,13 @@ Requirements:
 
 ## Reports
 
-By default, the three report commands compare outcomes by model.
+By default, the four report commands compare outcomes by model.
 
 ```bash
 paceflow session
 paceflow delivery
 paceflow quality
+paceflow cost
 ```
 
 Use `--overall` when you want one rolled-up summary row:
@@ -96,6 +101,7 @@ Use `--overall` when you want one rolled-up summary row:
 paceflow session --overall
 paceflow delivery --overall
 paceflow quality --overall
+paceflow cost --overall
 ```
 
 Use `--model <provider/name>` to keep the same report but narrow it to one model:
@@ -104,19 +110,21 @@ Use `--model <provider/name>` to keep the same report but narrow it to one model
 paceflow session --model codex/gpt-5.4
 paceflow delivery --model codex/gpt-5.4
 paceflow quality --model codex/gpt-5.4
+paceflow cost --model codex/gpt-5.4
 ```
 
-The reports answer three questions:
+The reports answer four questions:
 
 - `session`: which models or providers are efficient, noisy, or stuck in loops?
 - `delivery`: which AI-heavy changes actually turn into shipped work?
 - `quality`: which AI-heavy changes remain durable versus needing cleanup?
+- `cost`: which sessions or groups produce useful output for the spend?
 
 For metric definitions, status bands, grouped report behavior, and interpretation guidance, see [docs/USER_GUIDE.md](docs/USER_GUIDE.md).
 
 ## Common Options
 
-`session`, `delivery`, and `quality` share the same filter interface:
+`session`, `delivery`, `quality`, and `cost` share the same filter interface:
 
 - `--from YYYY-MM-DD --to YYYY-MM-DD` focuses a time window.
 - `--repo /path/to/repo` analyzes a specific repository.
@@ -135,6 +143,8 @@ paceflow delivery --group-by task
 paceflow delivery --group-by branch
 paceflow quality --group-by provider
 paceflow quality --group-by branch
+paceflow cost --group-by provider
+paceflow cost --group-by task
 ```
 
 Use `paceflow <command> --help` to see command-specific options and metric notes.

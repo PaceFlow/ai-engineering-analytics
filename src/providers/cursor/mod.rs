@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use rusqlite::{Connection, OpenFlags, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::io::IsTerminal;
@@ -15,7 +15,8 @@ use crate::ingest_progress::IngestProgressObserver;
 use crate::path_utils::strip_file_scheme;
 use shared::{
     CursorBubbleRole, CursorSessionGraph, aggregate_file_edits, build_seed_graph,
-    load_cursor_session_graphs_from_rows_with_observer, resolve_tool_call_edits,
+    hydrate_session_bubbles, load_cursor_session_graphs_from_rows_with_observer,
+    resolve_tool_call_edits,
 };
 
 pub fn plan_composer_rows() -> Result<Vec<String>> {
@@ -162,6 +163,7 @@ pub(crate) fn ingest_planned_sessions_from_source(
     // (`started_at`, `ended_at`, `project_path`, `model_name`) to refresh metadata;
     // we deliberately skip the per-session bubble scan and graph construction.
     for (key, raw) in &existing_rows {
+        let session_id = key.strip_prefix("composerData:").unwrap_or(key.as_str());
         if let Some(seed) = build_seed_graph(key, raw, source_file)
             && let Err(e) = db::upsert_metadata_session_with_model(
                 db,
@@ -177,6 +179,29 @@ pub(crate) fn ingest_planned_sessions_from_source(
             && verbose
         {
             eprintln!("[cursor] metadata refresh failed: {}", e);
+        }
+
+        if !db::session_usage_exists(db, "cursor", session_id)?
+            && let Some(mut seed) = build_seed_graph(key, raw, source_file)
+        {
+            match hydrate_session_bubbles(vscdb, &mut seed) {
+                Ok(()) => match ingest_cursor_text_usage(
+                    db,
+                    &seed,
+                    seed.started_at.as_deref(),
+                    seed.model_name.as_deref(),
+                ) {
+                    Ok(n) => total_rows += n,
+                    Err(e) if verbose => {
+                        eprintln!("[cursor] usage backfill failed for {}: {}", session_id, e);
+                    }
+                    Err(_) => {}
+                },
+                Err(e) if verbose => {
+                    eprintln!("[cursor] bubble hydrate failed for {}: {}", session_id, e);
+                }
+                Err(_) => {}
+            }
         }
 
         if let Some(observer) = progress.as_mut() {
@@ -237,9 +262,76 @@ pub(crate) fn ingest_planned_sessions_from_source(
         }
     }
 
+    total_rows += backfill_cursor_sessions_missing_usage(db, vscdb, source_file, verbose)?;
+
     tx.commit()?;
 
     Ok(total_rows)
+}
+
+/// Sessions created only via change_intel (`upsert_metadata_session`) never ran the composer ingest path,
+/// so they have metadata without `fact_session_usage`. Load `composerData:<id>` when present and estimate tokens.
+fn backfill_cursor_sessions_missing_usage(
+    db: &Connection,
+    vscdb: &Connection,
+    source_file: &str,
+    verbose: bool,
+) -> Result<usize> {
+    let mut stmt = db.prepare(
+        "SELECT m.session_id FROM metadata_sessions m
+         WHERE m.provider = 'cursor'
+           AND NOT EXISTS (
+             SELECT 1 FROM fact_session_usage u
+             WHERE u.provider = 'cursor' AND u.session_id = m.session_id
+           )",
+    )?;
+    let ids: Vec<String> = stmt
+        .query_map([], |row| row.get::<_, String>(0))?
+        .filter_map(|row| row.ok())
+        .collect();
+
+    let mut written = 0usize;
+    for session_id in ids {
+        let key = format!("composerData:{session_id}");
+        let raw: Option<String> = vscdb
+            .query_row(
+                "SELECT value FROM cursorDiskKV WHERE key = ?1",
+                params![key],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(raw) = raw else {
+            continue;
+        };
+        let Some(mut seed) = build_seed_graph(&key, &raw, source_file) else {
+            continue;
+        };
+        if let Err(e) = hydrate_session_bubbles(vscdb, &mut seed) {
+            if verbose {
+                eprintln!(
+                    "[cursor] orphan bubble hydrate failed for {}: {}",
+                    session_id, e
+                );
+            }
+            continue;
+        }
+        match ingest_cursor_text_usage(
+            db,
+            &seed,
+            seed.started_at.as_deref(),
+            seed.model_name.as_deref(),
+        ) {
+            Ok(n) => written += n,
+            Err(e) if verbose => {
+                eprintln!(
+                    "[cursor] orphan usage backfill failed for {}: {}",
+                    session_id, e
+                );
+            }
+            Err(_) => {}
+        }
+    }
+    Ok(written)
 }
 
 // ── History index ─────────────────────────────────────────────────────────────
@@ -453,7 +545,9 @@ fn ingest_session_graph(
     let project_path = graph.project_path.clone();
     let model_name = graph.model_name.clone();
 
-    if db::session_exists(db, session_id)? {
+    let already_exists = db::session_exists(db, session_id)?;
+    let usage_already_exists = db::session_usage_exists(db, "cursor", session_id)?;
+    if already_exists {
         db::upsert_metadata_session_with_model(
             db,
             "cursor",
@@ -465,7 +559,10 @@ fn ingest_session_graph(
             Some("cursor"),
             model_name.as_deref(),
         )?;
-        return Ok(0);
+        if usage_already_exists {
+            return Ok(0);
+        }
+        return ingest_cursor_text_usage(db, graph, timestamp.as_deref(), model_name.as_deref());
     }
 
     let session_start_ms = graph.created_at_ms.unwrap_or(0);
@@ -493,6 +590,7 @@ fn ingest_session_graph(
         model_name.as_deref(),
     )?;
     let mut written = 1usize;
+    written += ingest_cursor_text_usage(db, graph, timestamp.as_deref(), model_name.as_deref())?;
 
     for bubble in graph.messages() {
         let role = match bubble.role {
@@ -585,6 +683,52 @@ fn ingest_session_graph(
     Ok(written)
 }
 
+fn ingest_cursor_text_usage(
+    db: &Connection,
+    graph: &CursorSessionGraph,
+    timestamp: Option<&str>,
+    model_name: Option<&str>,
+) -> Result<usize> {
+    let mut input_tokens = 0i64;
+    let mut output_tokens = 0i64;
+    for bubble in graph.events_for_text_token_estimate() {
+        let Some(text) = bubble.text.as_deref() else {
+            continue;
+        };
+        let tokens = estimate_tokens_from_text(text);
+        match bubble.role {
+            Some(CursorBubbleRole::User) => input_tokens += tokens,
+            Some(CursorBubbleRole::Assistant) => output_tokens += tokens,
+            None => {}
+        }
+    }
+    let total_tokens = input_tokens + output_tokens;
+    if total_tokens <= 0 {
+        return Ok(0);
+    }
+
+    db::ingest_session_usage(
+        db,
+        "cursor",
+        &graph.composer_id,
+        timestamp,
+        model_name,
+        input_tokens,
+        0,
+        0,
+        output_tokens,
+        0,
+        total_tokens,
+        None,
+        "estimated_text_tokens",
+    )?;
+    Ok(1)
+}
+
+fn estimate_tokens_from_text(text: &str) -> i64 {
+    ((text.chars().count() as f64) / 4.0).round().max(0.0) as i64
+}
+
 // ── LOC from File History ─────────────────────────────────────────────────────
 
 fn loc_from_history(
@@ -642,12 +786,19 @@ fn cursor_history_root() -> Result<Option<PathBuf>> {
 
 #[cfg(test)]
 mod tests {
-    use super::ingest_planned_sessions_from_source;
+    use super::{estimate_tokens_from_text, ingest_planned_sessions_from_source};
     use crate::db::init_app_schema;
     use rusqlite::{Connection, params};
     use serde_json::json;
     use std::collections::HashMap;
     use tempfile::NamedTempFile;
+
+    #[test]
+    fn estimates_text_tokens_with_four_chars_per_token() {
+        assert_eq!(estimate_tokens_from_text("12345678"), 2);
+        assert_eq!(estimate_tokens_from_text("1234567890"), 3);
+        assert_eq!(estimate_tokens_from_text(""), 0);
+    }
 
     fn create_cursor_db(rows: &[(String, String)]) -> NamedTempFile {
         let file = NamedTempFile::new().expect("temp cursor db should be created");
