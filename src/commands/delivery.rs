@@ -103,7 +103,7 @@ fn render_delivery_report(
                 "GitHub PR lookup coverage: heavy commits on github.com with completed lookup (resolved or no PR) vs all heavy commits on github.com.",
                 "PR reach: among completed lookups, share where a pull request existed.",
                 "Mainline reach: share of heavy AI commits that later reached mainline.",
-                "Mainline lead: average hours from commit time to mainline reach for heavy AI commits that reached mainline.",
+                "Mainline lead: maximum hours from commit time to mainline reach for heavy merged commits (prefer later mainline_reached_at, else later PR merged_at).",
                 "PR merge: among PR-linked commits with completed lookup, share whose PR merged.",
                 "PR reach / merge show N/A when no GitHub-heavy commits or no completed lookups yet.",
                 "Status: higher is better for all delivery signals.",
@@ -188,7 +188,7 @@ fn render_delivery_report(
         "PR sync = completed GitHub PR lookups / heavy commits on github.com (same scope as PR reach).",
         "PR Reach and PR Merge use completed lookups only; sync the rest with `PACEFLOW_GITHUB_TOKEN` and ingest.",
         "PR Reach, Mainline Reach, and PR Merge = percentage rates (PR merge N/A when no PR-linked commits in the completed set).",
-        "Mainline Lead = average time from commit to mainline reach for heavy AI commits that reached mainline.",
+        "Mainline Lead = maximum commit-to-mainline hours in the group; use mainline_reached_at when it is later than commit time, otherwise use PR merged_at when later.",
     ];
     if matches!(report.group_by, Some(GroupBy::Task)) {
         legend.push(
@@ -261,10 +261,15 @@ fn fmt_task_branch_diff_stat(added: i64, removed: i64) -> String {
 }
 
 fn fmt_hours(value: Option<f64>) -> String {
+    fn trunc_to(value: f64, decimals: u32) -> f64 {
+        let factor = 10_f64.powi(decimals as i32);
+        (value * factor).trunc() / factor
+    }
+
     match value {
-        Some(hours) if hours < 1.0 => format!("{:.0}m", hours * 60.0),
-        Some(hours) if hours < 24.0 => format!("{hours:.1}h"),
-        Some(hours) => format!("{:.1}d", hours / 24.0),
+        Some(hours) if hours < 1.0 => format!("{}m", (hours * 60.0).trunc() as i64),
+        Some(hours) if hours < 24.0 => format!("{:.1}h", trunc_to(hours, 1)),
+        Some(hours) => format!("{:.1}d", trunc_to(hours / 24.0, 1)),
         None => "N/A".to_string(),
     }
 }

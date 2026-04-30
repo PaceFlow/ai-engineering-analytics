@@ -1586,15 +1586,27 @@ pub fn query_change_report_with_options(
     );
     select.push("COALESCE(SUM(fc.total_added), 0) AS task_branch_lines_added".to_string());
     select.push("COALESCE(SUM(fc.total_removed), 0) AS task_branch_lines_removed".to_string());
-    select.push(
-        "AVG(CASE
+    // Mainline lead: hours from commit_time (branch commit) to a best-known mainline end time.
+    // Prefer a later `mainline_reached_at`; otherwise fall back to a later GitHub `pr_merged_at`.
+    let mainline_end_expr = "CASE
+            WHEN base.mainline_reached_at IS NOT NULL
+             AND julianday(base.mainline_reached_at) > julianday(base.commit_time)
+            THEN base.mainline_reached_at
+            WHEN pr.pr_merged_at IS NOT NULL
+             AND julianday(pr.pr_merged_at) > julianday(base.commit_time)
+            THEN pr.pr_merged_at
+            ELSE base.mainline_reached_at
+         END";
+    select.push(format!(
+        "MAX(CASE
              WHEN base.heavy_ai_flag = 1
               AND base.merged_to_mainline_flag = 1
-              AND base.mainline_reached_at IS NOT NULL
-             THEN (julianday(base.mainline_reached_at) - julianday(base.commit_time)) * 24.0
-         END) AS avg_commit_to_mainline_hours"
-            .to_string(),
-    );
+              AND ({0}) IS NOT NULL
+              AND julianday(({0})) >= julianday(base.commit_time)
+             THEN (julianday(({0})) - julianday(base.commit_time)) * 24.0
+         END) AS avg_commit_to_mainline_hours",
+        mainline_end_expr
+    ));
 
     let mut sql = format!(
         "SELECT {} FROM ({}) base
@@ -2902,10 +2914,65 @@ fn derive_repo_commit_events(
         &mainline_added_events,
         &mainline_removed_events,
     )?;
-    annotate_bug_after_merge_signals(conn, repo_root, commits, &mut derived)?;
     let repo_key = sync_identity::repo_key_for_repo_root(Some(repo_root)).unwrap_or_default();
+    annotate_mainline_reached_at_with_github_pr_merge(conn, &repo_key, commits, &mut derived)?;
+    annotate_bug_after_merge_signals(conn, repo_root, commits, &mut derived)?;
     annotate_issue_linked_bug_after_merge_signals(conn, &repo_key, commits, &mut derived)?;
     Ok(derived)
+}
+
+/// When Git still has `mainline_reached_at` at commit time (e.g. squash, or no merge object), a
+/// resolved GitHub PR's `merged_at` can supply the integration time.
+fn annotate_mainline_reached_at_with_github_pr_merge(
+    conn: &Connection,
+    repo_key: &str,
+    commits: &[CandidateCommit],
+    derived: &mut HashMap<String, DerivedCommitEvent>,
+) -> Result<()> {
+    if repo_key.is_empty() || !repo_key.starts_with("git:github.com/") {
+        return Ok(());
+    }
+
+    let mut stmt = conn.prepare(
+        "SELECT lu.commit_sha, pr.merged_at
+         FROM fact_github_commit_pr_lookup lu
+         INNER JOIN fact_github_pull_request pr
+           ON pr.repo_key = lu.repo_key AND pr.pr_number = lu.owning_pr_number
+         WHERE lu.repo_key = ?1
+           AND lu.status = 'resolved'
+           AND lu.owning_pr_number IS NOT NULL
+           AND pr.merged_at IS NOT NULL",
+    )?;
+    let mut pr_merged_at: HashMap<String, DateTime<Utc>> = HashMap::new();
+    let rows = stmt.query_map(params![repo_key], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    for row in rows {
+        let (sha, raw) = row?;
+        let merged = DateTime::parse_from_rfc3339(&raw)
+            .map_err(|e| anyhow!("invalid PR merged_at for {sha}: {e}"))?
+            .with_timezone(&Utc);
+        pr_merged_at.insert(sha, merged);
+    }
+
+    for commit in commits {
+        let Some(event) = derived.get_mut(&commit.commit_sha) else {
+            continue;
+        };
+        let Some(reached) = event.mainline_reached_at else {
+            continue;
+        };
+        if reached != commit.commit_time {
+            continue;
+        }
+        let Some(merged_at) = pr_merged_at.get(&commit.commit_sha) else {
+            continue;
+        };
+        if *merged_at > commit.commit_time {
+            event.mainline_reached_at = Some(*merged_at);
+        }
+    }
+    Ok(())
 }
 
 #[expect(
@@ -4530,6 +4597,183 @@ mod tests {
         assert_eq!(
             lifecycle_rows[0].branch_name.as_deref(),
             Some("PAC-1-branch")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn mainline_lead_ignores_sessions_and_matches_commit_to_mainline_gap() -> Result<()> {
+        let conn = open_test_db()?;
+        let repo_root = "/tmp/repo-mainline-lead";
+        let commit_sha = "abc111feed";
+        let commit_time = "2026-03-17T12:00:00Z";
+        let session_started = "2026-03-17T10:00:00Z";
+
+        conn.execute(
+            "INSERT INTO event_commit_outcome (
+                repo_root, commit_sha, commit_time, mainline_reached_at,
+                heavy_ai_flag, merged_to_mainline_flag, reverted_later_flag,
+                total_matched_ai_lines, commit_total_changed_lines
+             ) VALUES (?1, ?2, ?3, ?4, 1, 1, 0, 10, 20)",
+            params![repo_root, commit_sha, commit_time, commit_time],
+        )?;
+        conn.execute(
+            "INSERT INTO event_commit_churn (
+                repo_root, commit_sha, ai_added_lines_reaching_mainline,
+                ai_added_lines_removed_within_window, churn_window_days
+             ) VALUES (?1, ?2, 10, 0, 14)",
+            params![repo_root, commit_sha],
+        )?;
+
+        crate::db::upsert_metadata_session(
+            &conn,
+            "codex",
+            "sess-mainline-lead",
+            None,
+            Some(session_started),
+            None,
+            None,
+        )?;
+        conn.execute(
+            "INSERT INTO fact_commit_session_match (
+                repo_root, commit_sha, provider, session_id,
+                matched_lines, share_of_commit, share_of_ai
+             ) VALUES (?1, ?2, 'codex', 'sess-mainline-lead', 10.0, 0.5, 1.0)",
+            params![repo_root, commit_sha],
+        )?;
+
+        create_reporting_views(&conn)?;
+
+        let args = ReportArgs {
+            weekly: false,
+            group_by: None,
+            from: None,
+            to: None,
+            repo: None,
+            all_projects: false,
+            provider: None,
+            task: None,
+            branch: None,
+            model: None,
+            limit: 10,
+        };
+        let rows = query_change_report(&conn, &args)?;
+        assert_eq!(rows.len(), 1);
+        let lead = rows[0]
+            .avg_commit_to_mainline_hours
+            .expect("expected mainline lead for heavy merged commit with mainline time");
+        assert!(
+            lead.abs() < 1e-6,
+            "commit and mainline reach at same instant => 0h lead; sessions must not affect; got {lead}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn mainline_reached_at_prefers_github_pr_merged_at_when_on_main_at_commit_time() -> Result<()> {
+        use std::collections::BTreeSet;
+
+        let conn = open_test_db()?;
+        let repo_key = "git:github.com/PaceFlow/pr-merge-lead";
+        conn.execute(
+            "INSERT INTO fact_github_pull_request (
+                repo_key, pr_number, state, draft_flag, created_at, updated_at, closed_at,
+                merged_at, base_ref, head_ref, html_url, removed_hashes_complete_flag
+             ) VALUES
+                (?1, 7, 'closed', 0, '2026-03-20T08:00:00Z', NULL, NULL,
+                 '2026-04-10T16:00:00Z', 'main', 'feature', NULL, 0)",
+            params![repo_key],
+        )?;
+        conn.execute(
+            "INSERT INTO fact_github_commit_pr_lookup (
+                repo_key, commit_sha, status, owning_pr_number, last_checked_at, last_error
+             ) VALUES (?1, 'cafef00d', 'resolved', 7, '2026-04-10T16:00:00Z', NULL)",
+            params![repo_key],
+        )?;
+
+        let commit_time = DateTime::parse_from_rfc3339("2026-03-31T14:05:07Z")?.with_timezone(&Utc);
+        let commits = vec![CandidateCommit {
+            repo_root: "/tmp/pr-merge-lead".into(),
+            commit_sha: "cafef00d".into(),
+            commit_time,
+            heavy_ai: true,
+            matched_total_lines: 10,
+            commit_total_lines: 20,
+        }];
+        let mut derived = HashMap::from([(
+            "cafef00d".into(),
+            DerivedCommitEvent {
+                reverted_later: false,
+                merged_to_mainline: true,
+                mainline_reached_at: Some(commit_time),
+                budget: PathHashCounts::new(),
+                ai_added_lines_reaching_mainline: 0,
+                ai_added_lines_removed_within_window: 0,
+                bug_after_merge: false,
+                first_bug_signal_commit_sha: None,
+                first_bug_signal_commit_time: None,
+                bug_signal_count: 0,
+                bug_signal_sources: BTreeSet::new(),
+            },
+        )]);
+
+        annotate_mainline_reached_at_with_github_pr_merge(&conn, repo_key, &commits, &mut derived)?;
+
+        let expected = DateTime::parse_from_rfc3339("2026-04-10T16:00:00Z")?.with_timezone(&Utc);
+        assert_eq!(
+            derived["cafef00d"].mainline_reached_at,
+            Some(expected),
+            "expected PR merged_at to replace commit-time mainline reach"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn mainline_lead_matches_hours_between_commit_and_mainline_reach() -> Result<()> {
+        let conn = open_test_db()?;
+        let repo_root = "/tmp/repo-mainline-lead-gap";
+        let commit_sha = "deadbeef00";
+        let commit_time = "2026-06-15T12:00:00Z";
+        let mainline_reached = "2026-06-16T12:00:00Z";
+
+        conn.execute(
+            "INSERT INTO event_commit_outcome (
+                repo_root, commit_sha, commit_time, mainline_reached_at,
+                heavy_ai_flag, merged_to_mainline_flag, reverted_later_flag,
+                total_matched_ai_lines, commit_total_changed_lines
+             ) VALUES (?1, ?2, ?3, ?4, 1, 1, 0, 10, 20)",
+            params![repo_root, commit_sha, commit_time, mainline_reached],
+        )?;
+        conn.execute(
+            "INSERT INTO event_commit_churn (
+                repo_root, commit_sha, ai_added_lines_reaching_mainline,
+                ai_added_lines_removed_within_window, churn_window_days
+             ) VALUES (?1, ?2, 10, 0, 14)",
+            params![repo_root, commit_sha],
+        )?;
+
+        create_reporting_views(&conn)?;
+
+        let args = ReportArgs {
+            weekly: false,
+            group_by: None,
+            from: None,
+            to: None,
+            repo: None,
+            all_projects: false,
+            provider: None,
+            task: None,
+            branch: None,
+            model: None,
+            limit: 10,
+        };
+        let rows = query_change_report(&conn, &args)?;
+        let lead = rows[0]
+            .avg_commit_to_mainline_hours
+            .expect("expected mainline lead");
+        assert!(
+            (lead - 24.0).abs() < 1e-3,
+            "expected ~24h from commit to mainline reach; got {lead}"
         );
         Ok(())
     }
