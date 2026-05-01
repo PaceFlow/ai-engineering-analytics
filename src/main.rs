@@ -12,6 +12,7 @@ fn main() -> anyhow::Result<()> {
         Commands::Cost(args) => commands::cost::run(args)?,
         Commands::EventStream(args) => commands::event_stream::run(args)?,
         Commands::GitHub(args) => commands::github::run(args)?,
+        Commands::Sync(args) => commands::sync::run(args)?,
     }
     Ok(())
 }
