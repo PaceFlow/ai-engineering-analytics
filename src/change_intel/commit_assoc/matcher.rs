@@ -2,6 +2,7 @@ use anyhow::{Result, anyhow};
 use rusqlite::{Connection, params};
 use std::collections::HashMap;
 
+use crate::change_intel::lockfiles::is_lock_file;
 use crate::change_intel::types::LineSide;
 
 use super::types::{CommitAttribution, GitCommitDiff, SessionAttributionRow};
@@ -89,10 +90,16 @@ pub fn compute_commit_attribution(
     commit: &GitCommitDiff,
     preload: &RepoMatchPreload,
 ) -> Result<(CommitAttribution, Vec<SessionAttributionRow>)> {
-    let total_added: i64 = commit.file_diffs.iter().map(|file| file.added_lines).sum();
+    let total_added: i64 = commit
+        .file_diffs
+        .iter()
+        .filter(|file| !is_lock_file(&file.rel_path))
+        .map(|file| file.added_lines)
+        .sum();
     let total_removed: i64 = commit
         .file_diffs
         .iter()
+        .filter(|file| !is_lock_file(&file.rel_path))
         .map(|file| file.removed_lines)
         .sum();
     let commit_total = total_added + total_removed;
@@ -197,6 +204,7 @@ fn build_commit_files(commit: &GitCommitDiff) -> Vec<FileCommitRows> {
     let mut files: Vec<FileCommitRows> = commit
         .file_diffs
         .iter()
+        .filter(|file| !is_lock_file(&file.rel_path))
         .map(|file| {
             let rows: Vec<CommitHashRow> = file
                 .line_hashes
@@ -488,6 +496,71 @@ mod tests {
                 .iter()
                 .all(|row| row.provider != HUMAN_PROVIDER)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn heavy_ai_classification_ignores_lock_files() -> Result<()> {
+        let commit = GitCommitDiff {
+            commit_sha: "abc123".to_string(),
+            parent_sha: Some("def456".to_string()),
+            commit_time: "2026-03-18T10:00:00Z".to_string(),
+            subject: "feature with regenerated lock".to_string(),
+            file_diffs: vec![
+                GitFileDiff {
+                    rel_path: "src/foo.rs".to_string(),
+                    change_type: "M".to_string(),
+                    added_lines: 50,
+                    removed_lines: 0,
+                    line_hashes: vec![LineHashCount {
+                        side: LineSide::Added,
+                        line_hash: "src_hash".to_string(),
+                        count: 50,
+                    }],
+                },
+                GitFileDiff {
+                    rel_path: "package-lock.json".to_string(),
+                    change_type: "M".to_string(),
+                    added_lines: 5000,
+                    removed_lines: 0,
+                    line_hashes: vec![LineHashCount {
+                        side: LineSide::Added,
+                        line_hash: "lock_hash".to_string(),
+                        count: 5000,
+                    }],
+                },
+            ],
+        };
+
+        let mut preload = RepoMatchPreload::default();
+        preload.session_availability.insert(
+            (
+                "src/foo.rs".to_string(),
+                LineSide::Added,
+                "src_hash".to_string(),
+            ),
+            vec![SessionAvailability {
+                provider: "codex".to_string(),
+                session_id: "s1".to_string(),
+                avail: 50,
+            }],
+        );
+
+        let (attribution, session_rows) = compute_commit_attribution(&commit, &preload)?;
+
+        assert_eq!(attribution.matched_total_lines, 50);
+        assert_eq!(attribution.matched_added_lines, 50);
+        assert_eq!(attribution.matched_removed_lines, 0);
+        assert!(
+            (attribution.ai_share - 1.0).abs() < f64::EPSILON,
+            "expected ai_share = 1.0 when lock file is excluded, got {}",
+            attribution.ai_share
+        );
+        assert!(attribution.heavy_ai);
+
+        assert_eq!(session_rows.len(), 1);
+        assert_eq!(session_rows[0].provider, "codex");
+        assert_eq!(session_rows[0].session_id, "s1");
         Ok(())
     }
 }

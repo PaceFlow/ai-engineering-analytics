@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::process::Command;
 
 use crate::change_intel::line_hash::hash_line;
+use crate::change_intel::lockfiles::is_lock_file;
 use crate::change_intel::types::{LineHashCount, LineSide};
 
 use super::types::{GitCommitDiff, GitFileDiff};
@@ -422,6 +423,10 @@ fn finalize_file_diff(file: Option<WorkingFileDiff>) -> Option<GitFileDiff> {
         return None;
     }
 
+    if is_lock_file(&rel_path) {
+        return None;
+    }
+
     let line_hashes = file
         .hash_counts
         .into_iter()
@@ -439,4 +444,75 @@ fn finalize_file_diff(file: Option<WorkingFileDiff>) -> Option<GitFileDiff> {
         removed_lines: file.removed_lines,
         line_hashes,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_patch_skips_lock_files() {
+        let patch = "\
+diff --git a/Cargo.lock b/Cargo.lock
+index aaaaaaa..bbbbbbb 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -1,0 +1,3 @@
++name = \"x\"
++version = \"0.1.0\"
++source = \"registry+https://example.com\"
+diff --git a/src/foo.rs b/src/foo.rs
+index ccccccc..ddddddd 100644
+--- a/src/foo.rs
++++ b/src/foo.rs
+@@ -1,1 +1,2 @@
+-old line
++new line
++another new line
+";
+
+        let diffs = parse_patch_file_diffs(patch);
+
+        assert_eq!(diffs.len(), 1, "expected lock file to be filtered out");
+        let foo = &diffs[0];
+        assert_eq!(foo.rel_path, "src/foo.rs");
+        assert_eq!(foo.added_lines, 2);
+        assert_eq!(foo.removed_lines, 1);
+
+        let added_hash = hash_line("new line");
+        assert!(
+            foo.line_hashes
+                .iter()
+                .any(|h| h.side == LineSide::Added && h.line_hash == added_hash),
+            "expected source-file hashes to be retained"
+        );
+
+        let lock_hash = hash_line("name = \"x\"");
+        assert!(
+            !foo.line_hashes.iter().any(|h| h.line_hash == lock_hash),
+            "expected lock-file hashes to be excluded entirely"
+        );
+    }
+
+    #[test]
+    fn parse_patch_skips_nested_lock_files() {
+        let patch = "\
+diff --git a/frontend/package-lock.json b/frontend/package-lock.json
+index aaaaaaa..bbbbbbb 100644
+--- a/frontend/package-lock.json
++++ b/frontend/package-lock.json
+@@ -1,0 +1,1 @@
++{\"name\": \"x\"}
+diff --git a/src/main.rs b/src/main.rs
+index ccccccc..ddddddd 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -1,0 +1,1 @@
++fn main() {}
+";
+
+        let diffs = parse_patch_file_diffs(patch);
+        assert_eq!(diffs.len(), 1);
+        assert_eq!(diffs[0].rel_path, "src/main.rs");
+    }
 }
