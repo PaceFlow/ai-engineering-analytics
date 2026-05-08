@@ -103,7 +103,7 @@ fn render_delivery_report(
                 "GitHub PR lookup coverage: heavy commits on github.com with completed lookup (resolved or no PR) vs all heavy commits on github.com.",
                 "PR reach: among completed lookups, share where a pull request existed.",
                 "Mainline reach: share of heavy AI commits that later reached mainline.",
-                "Mainline lead: maximum hours from commit time to mainline reach for heavy merged commits (prefer later mainline_reached_at, else later PR merged_at).",
+                "Mainline lead: average hours from commit time to mainline reach for heavy merged commits (prefer later mainline_reached_at, else later PR merged_at).",
                 "PR merge: among PR-linked commits with completed lookup, share whose PR merged.",
                 "PR reach / merge show N/A when no GitHub-heavy commits or no completed lookups yet.",
                 "Status: higher is better for all delivery signals.",
@@ -188,7 +188,7 @@ fn render_delivery_report(
         "PR sync = completed GitHub PR lookups / heavy commits on github.com (same scope as PR reach).",
         "PR Reach and PR Merge use completed lookups only; sync the rest with `PACEFLOW_GITHUB_TOKEN` and ingest.",
         "PR Reach, Mainline Reach, and PR Merge = percentage rates (PR merge N/A when no PR-linked commits in the completed set).",
-        "Mainline Lead = maximum commit-to-mainline hours in the group; use mainline_reached_at when it is later than commit time, otherwise use PR merged_at when later.",
+        "Mainline Lead = average commit-to-mainline hours in the group; use mainline_reached_at when it is later than commit time, otherwise use PR merged_at when later.",
     ];
     if matches!(report.group_by, Some(GroupBy::Task)) {
         legend.push(

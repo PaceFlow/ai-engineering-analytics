@@ -1586,7 +1586,7 @@ pub fn query_change_report_with_options(
     );
     select.push("COALESCE(SUM(fc.total_added), 0) AS task_branch_lines_added".to_string());
     select.push("COALESCE(SUM(fc.total_removed), 0) AS task_branch_lines_removed".to_string());
-    // Mainline lead: hours from commit_time (branch commit) to a best-known mainline end time.
+    // Mainline lead: average hours from commit_time (branch commit) to a best-known mainline end time.
     // Prefer a later `mainline_reached_at`; otherwise fall back to a later GitHub `pr_merged_at`.
     let mainline_end_expr = "CASE
             WHEN base.mainline_reached_at IS NOT NULL
@@ -1598,7 +1598,7 @@ pub fn query_change_report_with_options(
             ELSE base.mainline_reached_at
          END";
     select.push(format!(
-        "MAX(CASE
+        "AVG(CASE
              WHEN base.heavy_ai_flag = 1
               AND base.merged_to_mainline_flag = 1
               AND ({0}) IS NOT NULL
@@ -4729,10 +4729,11 @@ mod tests {
     }
 
     #[test]
-    fn mainline_lead_matches_hours_between_commit_and_mainline_reach() -> Result<()> {
+    fn mainline_lead_averages_hours_between_commit_and_mainline_reach() -> Result<()> {
         let conn = open_test_db()?;
         let repo_root = "/tmp/repo-mainline-lead-gap";
         let commit_sha = "deadbeef00";
+        let second_commit_sha = "feedface00";
         let commit_time = "2026-06-15T12:00:00Z";
         let mainline_reached = "2026-06-16T12:00:00Z";
 
@@ -4741,15 +4742,25 @@ mod tests {
                 repo_root, commit_sha, commit_time, mainline_reached_at,
                 heavy_ai_flag, merged_to_mainline_flag, reverted_later_flag,
                 total_matched_ai_lines, commit_total_changed_lines
-             ) VALUES (?1, ?2, ?3, ?4, 1, 1, 0, 10, 20)",
-            params![repo_root, commit_sha, commit_time, mainline_reached],
+             ) VALUES
+                (?1, ?2, ?4, ?5, 1, 1, 0, 10, 20),
+                (?1, ?3, ?4, '2026-06-16T00:00:00Z', 1, 1, 0, 10, 20)",
+            params![
+                repo_root,
+                commit_sha,
+                second_commit_sha,
+                commit_time,
+                mainline_reached
+            ],
         )?;
         conn.execute(
             "INSERT INTO event_commit_churn (
                 repo_root, commit_sha, ai_added_lines_reaching_mainline,
                 ai_added_lines_removed_within_window, churn_window_days
-             ) VALUES (?1, ?2, 10, 0, 14)",
-            params![repo_root, commit_sha],
+             ) VALUES
+                (?1, ?2, 10, 0, 14),
+                (?1, ?3, 10, 0, 14)",
+            params![repo_root, commit_sha, second_commit_sha],
         )?;
 
         create_reporting_views(&conn)?;
@@ -4772,8 +4783,8 @@ mod tests {
             .avg_commit_to_mainline_hours
             .expect("expected mainline lead");
         assert!(
-            (lead - 24.0).abs() < 1e-3,
-            "expected ~24h from commit to mainline reach; got {lead}"
+            (lead - 18.0).abs() < 1e-3,
+            "expected average of 24h and 12h commit-to-mainline leads; got {lead}"
         );
         Ok(())
     }

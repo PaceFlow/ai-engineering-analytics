@@ -9,6 +9,7 @@ use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use crate::path_utils::detect_repo_root;
 
@@ -23,6 +24,8 @@ pub struct SavedSyncConfig {
     pub base_url: String,
     pub organization_id: String,
     pub organization_name: Option<String>,
+    #[serde(default)]
+    pub member_email: Option<String>,
     pub token: String,
 }
 
@@ -39,6 +42,7 @@ pub struct ResolvedSyncConfig {
     pub organization_id: String,
     pub organization_id_source: SyncConfigSource,
     pub organization_name: Option<String>,
+    pub member_email: Option<String>,
     pub token: String,
     pub token_source: SyncConfigSource,
 }
@@ -56,8 +60,12 @@ pub struct AccountMeResponse {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-struct LoginResponse {
-    token: String,
+pub struct PersonSyncLinkVerifyResponse {
+    pub token: String,
+    pub organization_id: String,
+    #[serde(default)]
+    pub organization_name: Option<String>,
+    pub member_email: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -139,27 +147,49 @@ pub struct SyncApiClient {
 
 impl SyncApiClient {
     pub fn new(base_url: impl Into<String>, token: Option<String>) -> Result<Self> {
+        // Disable idle connection pooling to avoid reqwest/hyper "connection closed before
+        // message completed" errors when an HTTP keep-alive connection goes stale during
+        // interactive pauses (for example, while the user types a verification code between
+        // person-link request and verify calls).
+        let client = Client::builder()
+            .pool_max_idle_per_host(0)
+            .connect_timeout(Duration::from_secs(15))
+            .build()?;
         Ok(Self {
-            client: Client::builder().build()?,
+            client,
             base_url: normalize_base_url(&base_url.into())?,
             token: token.map(normalized_non_empty).transpose()?,
         })
     }
 
-    pub async fn login(&self, email: &str, password: &str) -> Result<String> {
-        let response: LoginResponse = self
+    pub async fn request_person_link(&self, organization_id: &str, email: &str) -> Result<()> {
+        let _: serde_json::Value = self
             .send_json(
                 self.client
-                    .post(self.url("/api/v1/auth/token"))
-                    .json(&json!({ "username": email, "password": password })),
+                    .post(self.url(&format!(
+                        "/api/v1/organizations/{organization_id}/sync/person-link/request"
+                    )))
+                    .json(&json!({ "email": email })),
             )
             .await?;
-        normalized_non_empty(response.token)
+        Ok(())
     }
 
-    pub async fn account_me(&self) -> Result<AccountMeResponse> {
-        self.send_json(self.with_auth(self.client.get(self.url("/api/v1/account/me"))))
-            .await
+    pub async fn verify_person_link(
+        &self,
+        organization_id: &str,
+        email: &str,
+        code: &str,
+        device_id: &str,
+    ) -> Result<PersonSyncLinkVerifyResponse> {
+        self.send_json(
+            self.client
+                .post(self.url(&format!(
+                    "/api/v1/organizations/{organization_id}/sync/person-link/verify"
+                )))
+                .json(&json!({ "email": email, "code": code, "device_id": device_id })),
+        )
+        .await
     }
 
     pub async fn push_events(
@@ -298,6 +328,7 @@ pub fn resolved_sync_config() -> Result<Option<ResolvedSyncConfig>> {
         organization_id,
         organization_id_source,
         organization_name,
+        member_email: saved.and_then(|cfg| cfg.member_email.clone()),
         token,
         token_source,
     }))
@@ -333,6 +364,7 @@ pub fn collect_sync_events(conn: &Connection, scope: &SyncScope) -> Result<Vec<L
     let mut events = Vec::new();
     collect_session_quality_events(conn, scope, &mut events)?;
     collect_session_productivity_events(conn, scope, &mut events)?;
+    collect_session_cost_events(conn, scope, &mut events)?;
     collect_commit_outcome_events(conn, scope, &mut events)?;
     collect_commit_churn_events(conn, scope, &mut events)?;
     collect_commit_bug_signal_events(conn, scope, &mut events)?;
@@ -483,12 +515,13 @@ fn collect_session_quality_events(
     output: &mut Vec<LocalSyncEvent>,
 ) -> Result<()> {
     let mut stmt = conn.prepare(
-        "SELECT repo_key, member_email, device_id, provider, session_id, model_name, started_at, ended_at,
-                user_turn_count, debug_loop_flag, mid_session_error_paste_flag, accepted_output_flag,
-                first_accepted_change_at, minutes_to_first_accepted_change, session_commit_within_4h_flag
+        "SELECT repo_key, member_email, MAX(device_id), provider, session_id, MAX(model_name), MIN(started_at), MAX(ended_at),
+                MAX(user_turn_count), MAX(debug_loop_flag), MAX(mid_session_error_paste_flag), MAX(accepted_output_flag),
+                MIN(first_accepted_change_at), MIN(minutes_to_first_accepted_change), MAX(session_commit_within_4h_flag)
          FROM event_session_quality
          WHERE repo_key IS NOT NULL AND repo_key != ''
-           AND (?1 IS NULL OR repo_root = ?1)",
+           AND (?1 IS NULL OR repo_root = ?1)
+         GROUP BY repo_key, member_email, provider, session_id",
     )?;
     let rows = stmt.query_map(params![scope.repo_root.as_deref()], |row| {
         let repo_key: String = row.get(0)?;
@@ -533,11 +566,12 @@ fn collect_session_productivity_events(
     output: &mut Vec<LocalSyncEvent>,
 ) -> Result<()> {
     let mut stmt = conn.prepare(
-        "SELECT repo_key, member_email, device_id, provider, session_id, model_name, started_at, ended_at,
-                accepted_lines_added, accepted_lines_removed, accepted_total_changed_lines, user_word_count
+        "SELECT repo_key, member_email, MAX(device_id), provider, session_id, MAX(model_name), MIN(started_at), MAX(ended_at),
+                MAX(accepted_lines_added), MAX(accepted_lines_removed), MAX(accepted_total_changed_lines), MAX(user_word_count)
          FROM event_session_productivity
          WHERE repo_key IS NOT NULL AND repo_key != ''
-           AND (?1 IS NULL OR repo_root = ?1)",
+           AND (?1 IS NULL OR repo_root = ?1)
+         GROUP BY repo_key, member_email, provider, session_id",
     )?;
     let rows = stmt.query_map(params![scope.repo_root.as_deref()], |row| {
         let repo_key: String = row.get(0)?;
@@ -573,17 +607,78 @@ fn collect_session_productivity_events(
     append_query_rows(rows, output)
 }
 
+fn collect_session_cost_events(
+    conn: &Connection,
+    scope: &SyncScope,
+    output: &mut Vec<LocalSyncEvent>,
+) -> Result<()> {
+    let mut stmt = conn.prepare(
+        "SELECT repo_key, member_email, MAX(device_id), provider, session_id, MAX(model_name), MIN(started_at), MAX(ended_at),
+                MAX(accepted_total_changed_lines), MAX(accepted_output_flag), MAX(input_tokens), MAX(cached_input_tokens),
+                MAX(cache_creation_tokens), MAX(output_tokens), MAX(reasoning_tokens), MAX(total_tokens), MAX(estimated_cost_usd),
+                MAX(actual_cost_usd), MAX(cost_source)
+         FROM event_session_cost
+         WHERE repo_key IS NOT NULL AND repo_key != ''
+           AND (?1 IS NULL OR repo_root = ?1)
+         GROUP BY repo_key, member_email, provider, session_id",
+    )?;
+    let rows = stmt.query_map(params![scope.repo_root.as_deref()], |row| {
+        let repo_key: String = row.get(0)?;
+        let member_email: String = row.get(1)?;
+        let provider: String = row.get(3)?;
+        let session_id: String = row.get(4)?;
+        Ok(build_local_sync_event(
+            "event_session_cost",
+            format!(
+                "{}|{}|{}|{}",
+                repo_key,
+                stable_key_part(Some(member_email.clone())),
+                provider,
+                session_id
+            ),
+            Some(repo_key),
+            Some(member_email),
+            row.get(2)?,
+            row.get(6)?,
+            json!({
+                "provider": provider,
+                "session_id": session_id,
+                "model_name": row.get::<_, Option<String>>(5)?,
+                "started_at": row.get::<_, Option<String>>(6)?,
+                "ended_at": row.get::<_, Option<String>>(7)?,
+                "accepted_total_changed_lines": row.get::<_, i64>(8)?,
+                "accepted_output_flag": row.get::<_, i64>(9)?,
+                "input_tokens": row.get::<_, i64>(10)?,
+                "cached_input_tokens": row.get::<_, i64>(11)?,
+                "cache_creation_tokens": row.get::<_, i64>(12)?,
+                "output_tokens": row.get::<_, i64>(13)?,
+                "reasoning_tokens": row.get::<_, i64>(14)?,
+                "total_tokens": row.get::<_, i64>(15)?,
+                "estimated_cost_usd": row.get::<_, Option<f64>>(16)?,
+                "actual_cost_usd": row.get::<_, Option<f64>>(17)?,
+                "cost_source": row.get::<_, String>(18)?,
+            }),
+        ))
+    })?;
+    append_query_rows(rows, output)
+}
+
 fn collect_commit_outcome_events(
     conn: &Connection,
     scope: &SyncScope,
     output: &mut Vec<LocalSyncEvent>,
 ) -> Result<()> {
     let mut stmt = conn.prepare(
-        "SELECT repo_key, commit_sha, commit_time, heavy_ai_flag, merged_to_mainline_flag,
-                reverted_later_flag, total_matched_ai_lines, commit_total_changed_lines
-         FROM event_commit_outcome
-         WHERE repo_key IS NOT NULL AND repo_key != ''
-           AND (?1 IS NULL OR repo_root = ?1)",
+        "SELECT o.repo_key, o.commit_sha, MIN(o.commit_time), MAX(o.mainline_reached_at), MAX(o.heavy_ai_flag),
+                MAX(o.merged_to_mainline_flag), MAX(o.reverted_later_flag), MAX(o.total_matched_ai_lines),
+                MAX(o.commit_total_changed_lines), MAX(COALESCE(c.total_added, 0)), MAX(COALESCE(c.total_removed, 0))
+         FROM event_commit_outcome o
+         LEFT JOIN fact_commit c
+           ON c.repo_root = o.repo_root
+          AND c.commit_sha = o.commit_sha
+         WHERE o.repo_key IS NOT NULL AND o.repo_key != ''
+           AND (?1 IS NULL OR o.repo_root = ?1)
+         GROUP BY o.repo_key, o.commit_sha",
     )?;
     let rows = stmt.query_map(params![scope.repo_root.as_deref()], |row| {
         let repo_key: String = row.get(0)?;
@@ -598,11 +693,14 @@ fn collect_commit_outcome_events(
             json!({
                 "commit_sha": commit_sha,
                 "commit_time": row.get::<_, String>(2)?,
-                "heavy_ai_flag": row.get::<_, i64>(3)?,
-                "merged_to_mainline_flag": row.get::<_, i64>(4)?,
-                "reverted_later_flag": row.get::<_, i64>(5)?,
-                "total_matched_ai_lines": row.get::<_, i64>(6)?,
-                "commit_total_changed_lines": row.get::<_, i64>(7)?,
+                "mainline_reached_at": row.get::<_, Option<String>>(3)?,
+                "heavy_ai_flag": row.get::<_, i64>(4)?,
+                "merged_to_mainline_flag": row.get::<_, i64>(5)?,
+                "reverted_later_flag": row.get::<_, i64>(6)?,
+                "total_matched_ai_lines": row.get::<_, i64>(7)?,
+                "commit_total_changed_lines": row.get::<_, i64>(8)?,
+                "lines_added": row.get::<_, i64>(9)?,
+                "lines_removed": row.get::<_, i64>(10)?,
             }),
         ))
     })?;
@@ -615,11 +713,12 @@ fn collect_commit_churn_events(
     output: &mut Vec<LocalSyncEvent>,
 ) -> Result<()> {
     let mut stmt = conn.prepare(
-        "SELECT repo_key, commit_sha, ai_added_lines_reaching_mainline,
-                ai_added_lines_removed_within_window, churn_window_days
+        "SELECT repo_key, commit_sha, MAX(ai_added_lines_reaching_mainline),
+                MAX(ai_added_lines_removed_within_window), MAX(churn_window_days)
          FROM event_commit_churn
          WHERE repo_key IS NOT NULL AND repo_key != ''
-           AND (?1 IS NULL OR repo_root = ?1)",
+           AND (?1 IS NULL OR repo_root = ?1)
+         GROUP BY repo_key, commit_sha",
     )?;
     let rows = stmt.query_map(params![scope.repo_root.as_deref()], |row| {
         let repo_key: String = row.get(0)?;
@@ -648,11 +747,12 @@ fn collect_commit_bug_signal_events(
     output: &mut Vec<LocalSyncEvent>,
 ) -> Result<()> {
     let mut stmt = conn.prepare(
-        "SELECT repo_key, commit_sha, bug_after_merge_flag, first_bug_signal_commit_sha,
-                first_bug_signal_commit_time, bug_signal_count, window_days, signal_source
+        "SELECT repo_key, commit_sha, MAX(bug_after_merge_flag), MAX(first_bug_signal_commit_sha),
+                MIN(first_bug_signal_commit_time), MAX(bug_signal_count), MAX(window_days), MAX(signal_source)
          FROM event_commit_bug_signal
          WHERE repo_key IS NOT NULL AND repo_key != ''
-           AND (?1 IS NULL OR repo_root = ?1)",
+           AND (?1 IS NULL OR repo_root = ?1)
+         GROUP BY repo_key, commit_sha",
     )?;
     let rows = stmt.query_map(params![scope.repo_root.as_deref()], |row| {
         let repo_key: String = row.get(0)?;
@@ -684,11 +784,12 @@ fn collect_commit_session_events(
     output: &mut Vec<LocalSyncEvent>,
 ) -> Result<()> {
     let mut stmt = conn.prepare(
-        "SELECT repo_key, member_email, device_id, provider, session_id, commit_sha, commit_time,
-                model_name, matched_lines, share_of_commit, share_of_ai
+        "SELECT repo_key, member_email, MAX(device_id), provider, session_id, commit_sha, MIN(commit_time),
+                MAX(model_name), MAX(matched_lines), MAX(share_of_commit), MAX(share_of_ai)
          FROM event_commit_session
          WHERE repo_key IS NOT NULL AND repo_key != ''
-           AND (?1 IS NULL OR repo_root = ?1)",
+           AND (?1 IS NULL OR repo_root = ?1)
+         GROUP BY repo_key, member_email, provider, session_id, commit_sha",
     )?;
     let rows = stmt.query_map(params![scope.repo_root.as_deref()], |row| {
         let repo_key: String = row.get(0)?;
@@ -731,10 +832,11 @@ fn collect_task_commit_events(
     output: &mut Vec<LocalSyncEvent>,
 ) -> Result<()> {
     let mut stmt = conn.prepare(
-        "SELECT repo_key, task_key, branch_name, commit_sha, fallback_flag, confidence, commit_time
+        "SELECT repo_key, task_key, MAX(branch_name), commit_sha, MIN(fallback_flag), MAX(confidence), MIN(commit_time)
          FROM event_task_commit
          WHERE repo_key IS NOT NULL AND repo_key != ''
-           AND (?1 IS NULL OR repo_root = ?1)",
+           AND (?1 IS NULL OR repo_root = ?1)
+         GROUP BY repo_key, task_key, commit_sha",
     )?;
     let rows = stmt.query_map(params![scope.repo_root.as_deref()], |row| {
         let repo_key: String = row.get(0)?;
@@ -766,13 +868,14 @@ fn collect_task_session_events(
     output: &mut Vec<LocalSyncEvent>,
 ) -> Result<()> {
     let mut stmt = conn.prepare(
-        "SELECT repo_key, task_key, branch_name, provider, session_id, member_email, device_id,
-                model_name, started_at, attribution_weight, commit_within_window_flag,
-                user_turn_count, debug_loop_flag, mid_session_error_paste_flag, accepted_output_flag,
-                first_accepted_change_at, minutes_to_first_accepted_change
+        "SELECT repo_key, task_key, MAX(branch_name), provider, session_id, member_email, MAX(device_id),
+                MAX(model_name), MIN(started_at), MAX(attribution_weight), MAX(commit_within_window_flag),
+                MAX(user_turn_count), MAX(debug_loop_flag), MAX(mid_session_error_paste_flag), MAX(accepted_output_flag),
+                MIN(first_accepted_change_at), MIN(minutes_to_first_accepted_change)
          FROM event_task_session
          WHERE repo_key IS NOT NULL AND repo_key != ''
-           AND (?1 IS NULL OR repo_root = ?1)",
+           AND (?1 IS NULL OR repo_root = ?1)
+         GROUP BY repo_key, task_key, member_email, provider, session_id",
     )?;
     let rows = stmt.query_map(params![scope.repo_root.as_deref()], |row| {
         let repo_key: String = row.get(0)?;
@@ -821,11 +924,12 @@ fn collect_commit_pr_outcome_events(
     output: &mut Vec<LocalSyncEvent>,
 ) -> Result<()> {
     let mut stmt = conn.prepare(
-        "SELECT repo_key, commit_sha, lookup_status, pr_number, pr_opened_flag, pr_merged_flag,
-                pr_created_at, pr_merged_at
+        "SELECT repo_key, commit_sha, MAX(lookup_status), MAX(pr_number), MAX(pr_opened_flag), MAX(pr_merged_flag),
+                MIN(pr_created_at), MAX(pr_merged_at)
          FROM event_commit_pr_outcome
          WHERE repo_key IS NOT NULL AND repo_key != ''
-           AND (?1 IS NULL OR repo_root = ?1)",
+           AND (?1 IS NULL OR repo_root = ?1)
+         GROUP BY repo_key, commit_sha",
     )?;
     let rows = stmt.query_map(params![scope.repo_root.as_deref()], |row| {
         let repo_key: String = row.get(0)?;
@@ -1079,6 +1183,7 @@ mod tests {
             base_url: "https://api.example.com".to_string(),
             organization_id: "01TESTORG".to_string(),
             organization_name: Some("Example Org".to_string()),
+            member_email: Some("dev@example.com".to_string()),
             token: "token-123".to_string(),
         };
         save_sync_config(&config)?;
@@ -1099,6 +1204,7 @@ mod tests {
             base_url: "https://saved.example.com".to_string(),
             organization_id: "01SAVEDORG".to_string(),
             organization_name: Some("Saved Org".to_string()),
+            member_email: Some("saved@example.com".to_string()),
             token: "saved-token".to_string(),
         })?;
 
@@ -1162,11 +1268,37 @@ mod tests {
             ],
         )?;
         conn.execute(
+            "INSERT INTO event_session_cost (
+                provider, session_id, repo_root, repo_key, member_email, device_id, model_name,
+                started_at, ended_at, accepted_total_changed_lines, accepted_output_flag,
+                input_tokens, cached_input_tokens, cache_creation_tokens, output_tokens,
+                reasoning_tokens, total_tokens, estimated_cost_usd, actual_cost_usd, cost_source
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 12, 1, 1000, 200, 300, 400, 50, 1950, 0.0123, NULL, 'estimated')",
+            params![
+                "cursor",
+                "sess-1",
+                repo_root,
+                repo_key,
+                "dev@paceflow.io",
+                "device:test",
+                "gpt-5",
+                "2026-01-15T00:00:00Z",
+                "2026-01-15T00:10:00Z",
+            ],
+        )?;
+        conn.execute(
             "INSERT INTO event_commit_outcome (
-                repo_root, repo_key, commit_sha, commit_time, heavy_ai_flag, merged_to_mainline_flag,
+                repo_root, repo_key, commit_sha, commit_time, mainline_reached_at, heavy_ai_flag, merged_to_mainline_flag,
                 reverted_later_flag, total_matched_ai_lines, commit_total_changed_lines
-            ) VALUES (?1, ?2, 'abc123', '2026-01-16T00:00:00Z', 1, 1, 0, 42, 60)",
+            ) VALUES (?1, ?2, 'abc123', '2026-01-16T00:00:00Z', '2026-01-16T03:00:00Z', 1, 1, 0, 42, 60)",
             params![repo_root, repo_key],
+        )?;
+        conn.execute(
+            "INSERT INTO fact_commit (
+                repo_root, commit_sha, parent_sha, commit_time, subject, total_added, total_removed,
+                matched_total_lines, matched_added_lines, matched_removed_lines, ai_share, heavy_ai
+            ) VALUES (?1, 'abc123', NULL, '2026-01-16T00:00:00Z', 'sync test commit', 17, 5, 42, 38, 4, 0.7, 1)",
+            params![repo_root],
         )?;
         conn.execute(
             "INSERT INTO event_commit_churn (
@@ -1222,7 +1354,7 @@ mod tests {
             },
         )?;
 
-        assert_eq!(events.len(), 9);
+        assert_eq!(events.len(), 10);
         let keys = events
             .iter()
             .map(|event| (event.event_type.as_str(), event.event_key.as_str()))
@@ -1236,9 +1368,30 @@ mod tests {
             Some(&"git:github.com/PaceFlow/ai-engineering-analytics|dev@paceflow.io|cursor|sess-1")
         );
         assert_eq!(
+            keys.get("event_session_cost"),
+            Some(&"git:github.com/PaceFlow/ai-engineering-analytics|dev@paceflow.io|cursor|sess-1")
+        );
+        assert_eq!(
             keys.get("event_commit_outcome"),
             Some(&"git:github.com/PaceFlow/ai-engineering-analytics|abc123")
         );
+        let cost_event = events
+            .iter()
+            .find(|event| event.event_type == "event_session_cost")
+            .expect("session cost sync event");
+        assert_eq!(cost_event.payload["total_tokens"], json!(1950));
+        assert_eq!(cost_event.payload["estimated_cost_usd"], json!(0.0123));
+        assert_eq!(cost_event.payload["cost_source"], json!("estimated"));
+        let outcome_event = events
+            .iter()
+            .find(|event| event.event_type == "event_commit_outcome")
+            .expect("commit outcome sync event");
+        assert_eq!(
+            outcome_event.payload["mainline_reached_at"],
+            json!("2026-01-16T03:00:00Z")
+        );
+        assert_eq!(outcome_event.payload["lines_added"], json!(17));
+        assert_eq!(outcome_event.payload["lines_removed"], json!(5));
         assert_eq!(
             keys.get("event_commit_churn"),
             Some(&"git:github.com/PaceFlow/ai-engineering-analytics|abc123")
@@ -1297,13 +1450,137 @@ mod tests {
     }
 
     #[test]
-    fn api_client_handles_login_and_org_status() -> Result<()> {
+    fn pending_sync_events_converge_with_duplicate_remote_event_keys() -> Result<()> {
+        let mut conn = open_sync_test_db()?;
+        let repo_key = "git:github.com/PaceFlow/ai-engineering-analytics";
+        conn.execute(
+            "INSERT INTO event_commit_outcome (
+                repo_root, repo_key, commit_sha, commit_time, mainline_reached_at, heavy_ai_flag, merged_to_mainline_flag,
+                reverted_later_flag, total_matched_ai_lines, commit_total_changed_lines
+            ) VALUES
+                ('/tmp/repo-a', ?1, 'abc123', '2026-01-16T00:00:00Z', '2026-01-16T02:00:00Z', 1, 1, 0, 42, 60),
+                ('/tmp/repo-b', ?1, 'abc123', '2026-01-15T23:00:00Z', '2026-01-16T03:00:00Z', 0, 1, 1, 43, 61)",
+            params![repo_key],
+        )?;
+        conn.execute(
+            "INSERT INTO fact_commit (
+                repo_root, commit_sha, parent_sha, commit_time, subject, total_added, total_removed,
+                matched_total_lines, matched_added_lines, matched_removed_lines, ai_share, heavy_ai
+            ) VALUES
+                ('/tmp/repo-a', 'abc123', NULL, '2026-01-16T00:00:00Z', 'a', 10, 2, 42, 40, 2, 0.7, 1),
+                ('/tmp/repo-b', 'abc123', NULL, '2026-01-15T23:00:00Z', 'b', 12, 3, 43, 41, 2, 0.7, 1)",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO event_commit_churn (
+                repo_root, repo_key, commit_sha, ai_added_lines_reaching_mainline,
+                ai_added_lines_removed_within_window, churn_window_days
+            ) VALUES
+                ('/tmp/repo-a', ?1, 'abc123', 8, 1, 14),
+                ('/tmp/repo-b', ?1, 'abc123', 9, 2, 30)",
+            params![repo_key],
+        )?;
+        conn.execute(
+            "INSERT INTO event_commit_bug_signal (
+                repo_root, repo_key, commit_sha, bug_after_merge_flag, first_bug_signal_commit_sha,
+                first_bug_signal_commit_time, bug_signal_count, window_days, signal_source
+            ) VALUES
+                ('/tmp/repo-a', ?1, 'abc123', 0, NULL, NULL, 0, 60, 'none'),
+                ('/tmp/repo-b', ?1, 'abc123', 1, 'fix123', '2026-01-17T00:00:00Z', 2, 60, 'git_fix_commit')",
+            params![repo_key],
+        )?;
+        conn.execute(
+            "INSERT INTO event_commit_pr_outcome (
+                repo_root, repo_key, commit_sha, lookup_status, pr_number, pr_opened_flag,
+                pr_merged_flag, pr_created_at, pr_merged_at
+            ) VALUES
+                ('/tmp/repo-a', ?1, 'abc123', 'resolved', 7, 1, 0, '2026-01-16T01:00:00Z', NULL),
+                ('/tmp/repo-b', ?1, 'abc123', 'resolved', 7, 1, 1, '2026-01-16T01:00:00Z', '2026-01-16T04:00:00Z')",
+            params![repo_key],
+        )?;
+        conn.execute(
+            "INSERT INTO event_commit_session (
+                repo_root, repo_key, commit_sha, provider, session_id, member_email, device_id,
+                commit_time, model_name, matched_lines, share_of_commit, share_of_ai
+            ) VALUES
+                ('/tmp/repo-a', ?1, 'abc123', 'cursor', 'sess-1', 'dev@paceflow.io', 'device:a',
+                 '2026-01-16T00:00:00Z', 'gpt-4', 20.0, 0.5, 0.6),
+                ('/tmp/repo-b', ?1, 'abc123', 'cursor', 'sess-1', 'dev@paceflow.io', 'device:b',
+                 '2026-01-15T23:00:00Z', 'gpt-5', 24.0, 0.6, 0.8)",
+            params![repo_key],
+        )?;
+        conn.execute(
+            "INSERT INTO event_task_commit (
+                repo_root, repo_key, task_key, branch_name, commit_sha, fallback_flag, confidence, commit_time
+            ) VALUES
+                ('/tmp/repo-a', ?1, 'PAC-101', 'feature/a', 'abc123', 1, 0.7, '2026-01-16T00:00:00Z'),
+                ('/tmp/repo-b', ?1, 'PAC-101', 'feature/b', 'abc123', 0, 0.9, '2026-01-15T23:00:00Z')",
+            params![repo_key],
+        )?;
+        conn.execute(
+            "INSERT INTO event_task_session (
+                repo_root, repo_key, task_key, branch_name, provider, session_id, member_email, device_id,
+                model_name, started_at, attribution_weight, commit_within_window_flag, user_turn_count,
+                debug_loop_flag, mid_session_error_paste_flag, accepted_output_flag,
+                first_accepted_change_at, minutes_to_first_accepted_change
+            ) VALUES
+                ('/tmp/repo-a', ?1, 'PAC-101', 'feature/a', 'cursor', 'sess-1', 'dev@paceflow.io',
+                 'device:a', 'gpt-4', '2026-01-15T00:00:00Z', 0.5, 0, 3, 0, 0, 0,
+                 '2026-01-15T00:05:00Z', 5.0),
+                ('/tmp/repo-b', ?1, 'PAC-101', 'feature/b', 'cursor', 'sess-1', 'dev@paceflow.io',
+                 'device:b', 'gpt-5', '2026-01-14T23:00:00Z', 0.8, 1, 4, 1, 1, 1,
+                 '2026-01-15T00:01:00Z', 1.0)",
+            params![repo_key],
+        )?;
+        let scope = SyncScope { repo_root: None };
+
+        let pending = pending_sync_events(&conn, "org-A", &scope)?;
+        let counts = grouped_event_counts(&pending);
+        assert_eq!(counts.get("event_commit_outcome"), Some(&1));
+        assert_eq!(counts.get("event_commit_churn"), Some(&1));
+        assert_eq!(counts.get("event_commit_bug_signal"), Some(&1));
+        assert_eq!(counts.get("event_commit_pr_outcome"), Some(&1));
+        assert_eq!(counts.get("event_commit_session"), Some(&1));
+        assert_eq!(counts.get("event_task_commit"), Some(&1));
+        assert_eq!(counts.get("event_task_session"), Some(&1));
+
+        let outcome_event = pending
+            .iter()
+            .filter(|event| event.event_type == "event_commit_outcome")
+            .next()
+            .expect("outcome event");
+        assert_eq!(outcome_event.payload["heavy_ai_flag"], json!(1));
+        assert_eq!(outcome_event.payload["merged_to_mainline_flag"], json!(1));
+        assert_eq!(outcome_event.payload["reverted_later_flag"], json!(1));
+        assert_eq!(
+            outcome_event.payload["commit_time"],
+            json!("2026-01-15T23:00:00Z")
+        );
+        assert_eq!(
+            outcome_event.payload["mainline_reached_at"],
+            json!("2026-01-16T03:00:00Z")
+        );
+        assert_eq!(outcome_event.payload["lines_added"], json!(12));
+        assert_eq!(outcome_event.payload["lines_removed"], json!(3));
+
+        mark_synced_events(&mut conn, "org-A", &pending, "checkpoint-1")?;
+        assert!(
+            pending_sync_events(&conn, "org-A", &scope)?.is_empty(),
+            "pending sync should converge after marking the canonical event key synced"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn api_client_handles_person_link_and_org_status() -> Result<()> {
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let addr = listener.local_addr()?;
         thread::spawn(move || {
             for (index, body) in [
-                json_response("{\"token\":\"abc123\"}"),
-                json_response("{\"organizations\":[{\"id\":\"01ORG\",\"name\":\"Example Org\"}]}"),
+                json_response("{\"message\":\"If this email belongs to an enabled person, a verification code has been sent.\"}"),
+                json_response(
+                    "{\"token\":\"abc123\",\"organization_id\":\"01ORG\",\"organization_name\":\"Example Org\",\"member_email\":\"dev@example.com\"}"
+                ),
                 json_response(
                     "{\"organization_id\":\"01ORG\",\"organization_name\":\"Example Org\",\"total_events\":3,\"last_event_at\":null}"
                 ),
@@ -1327,13 +1604,17 @@ mod tests {
             .build()?;
         let base_url = format!("http://{}", addr);
         let unauthenticated = SyncApiClient::new(base_url.clone(), None)?;
-        let token = runtime.block_on(unauthenticated.login("dev@paceflow.io", "secret"))?;
-        assert_eq!(token, "abc123");
+        runtime.block_on(unauthenticated.request_person_link("01ORG", "dev@example.com"))?;
+        let linked = runtime.block_on(unauthenticated.verify_person_link(
+            "01ORG",
+            "dev@example.com",
+            "123456",
+            "device:test",
+        ))?;
+        assert_eq!(linked.token, "abc123");
+        assert_eq!(linked.member_email, "dev@example.com");
 
-        let authenticated = SyncApiClient::new(base_url, Some(token))?;
-        let account = runtime.block_on(authenticated.account_me())?;
-        assert_eq!(account.organizations.len(), 1);
-        assert_eq!(account.organizations[0].id, "01ORG");
+        let authenticated = SyncApiClient::new(base_url, Some(linked.token))?;
 
         let status = runtime.block_on(authenticated.status("01ORG"))?;
         assert_eq!(status.total_events, 3);
