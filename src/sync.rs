@@ -4,7 +4,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -116,6 +116,24 @@ pub struct RemoteSyncStatus {
     pub last_event_at: Option<String>,
 }
 
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct SyncRepositoryListResponse {
+    pub organization_id: String,
+    #[serde(default)]
+    pub repositories: Vec<SyncRepositoryRef>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct SyncRepositoryRef {
+    pub repo_key: String,
+    pub provider: String,
+    pub repo_name: String,
+    #[serde(default)]
+    pub last_seen_at: Option<String>,
+    #[serde(default)]
+    pub sources: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct LocalSyncEvent {
     pub event_type: String,
@@ -137,6 +155,13 @@ pub struct SyncScope {
 pub struct SyncRunState {
     pub last_successful_push_at: String,
     pub last_server_checkpoint: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct EligibleSyncEvents {
+    pub eligible: Vec<LocalSyncEvent>,
+    pub skipped: Vec<LocalSyncEvent>,
+    pub skipped_repo_keys: BTreeSet<String>,
 }
 
 pub struct SyncApiClient {
@@ -209,6 +234,13 @@ impl SyncApiClient {
     pub async fn status(&self, organization_id: &str) -> Result<RemoteSyncStatus> {
         self.send_json(self.with_auth(self.client.get(self.url(&format!(
             "/api/v1/organizations/{organization_id}/sync/status"
+        )))))
+        .await
+    }
+
+    pub async fn repositories(&self, organization_id: &str) -> Result<SyncRepositoryListResponse> {
+        self.send_json(self.with_auth(self.client.get(self.url(&format!(
+            "/api/v1/organizations/{organization_id}/sync/repositories"
         )))))
         .await
     }
@@ -411,6 +443,46 @@ pub fn grouped_event_counts(events: &[LocalSyncEvent]) -> BTreeMap<String, usize
         *counts.entry(event.event_type.clone()).or_default() += 1;
     }
     counts
+}
+
+pub fn partition_eligible_sync_events(
+    events: Vec<LocalSyncEvent>,
+    allowlist: &SyncRepositoryListResponse,
+) -> EligibleSyncEvents {
+    let allowed_repo_keys = allowlist
+        .repositories
+        .iter()
+        .filter_map(|repository| repo_match_key(&repository.repo_key))
+        .collect::<BTreeSet<_>>();
+    let mut eligible = Vec::new();
+    let mut skipped = Vec::new();
+    let mut skipped_repo_keys = BTreeSet::new();
+
+    for event in events {
+        let is_allowed = event
+            .repo_key
+            .as_deref()
+            .and_then(repo_match_key)
+            .is_some_and(|repo_key| allowed_repo_keys.contains(&repo_key));
+        if is_allowed {
+            eligible.push(event);
+        } else {
+            if let Some(repo_key) = event
+                .repo_key
+                .as_ref()
+                .filter(|repo_key| !repo_key.is_empty())
+            {
+                skipped_repo_keys.insert(repo_key.clone());
+            }
+            skipped.push(event);
+        }
+    }
+
+    EligibleSyncEvents {
+        eligible,
+        skipped,
+        skipped_repo_keys,
+    }
 }
 
 pub fn mark_synced_events(
@@ -1086,6 +1158,20 @@ fn stable_key_part(value: Option<String>) -> String {
         .unwrap_or_else(|| "(unknown)".to_string())
 }
 
+fn repo_match_key(repo_key: &str) -> Option<String> {
+    let repo_key = repo_key
+        .trim()
+        .trim_end_matches('/')
+        .trim_end_matches(".git");
+    if repo_key.is_empty() {
+        return None;
+    }
+    repo_key
+        .strip_prefix("git:")
+        .filter(|value| value.split('/').count() >= 3)
+        .map(|value| format!("git:{}", value.to_ascii_lowercase()))
+}
+
 fn write_secret_file(path: &Path, contents: &[u8]) -> Result<()> {
     let mut options = OpenOptions::new();
     options.create(true).truncate(true).write(true);
@@ -1450,6 +1536,68 @@ mod tests {
     }
 
     #[test]
+    fn sync_repository_filter_matches_repo_keys_case_insensitively() {
+        let events = vec![
+            test_sync_event("git:github.com/PaceFlow/webapp", "abc123"),
+            test_sync_event("git:github.com/personal/weekend", "def456"),
+        ];
+        let allowlist = SyncRepositoryListResponse {
+            organization_id: "01ORG".to_string(),
+            repositories: vec![SyncRepositoryRef {
+                repo_key: "git:github.com/paceflow/WEBAPP".to_string(),
+                provider: "github".to_string(),
+                repo_name: "WEBAPP".to_string(),
+                last_seen_at: None,
+                sources: vec!["pull_request".to_string()],
+            }],
+        };
+
+        let partitioned = partition_eligible_sync_events(events, &allowlist);
+
+        assert_eq!(partitioned.eligible.len(), 1);
+        assert_eq!(partitioned.skipped.len(), 1);
+        assert_eq!(
+            partitioned
+                .skipped_repo_keys
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec!["git:github.com/personal/weekend".to_string()]
+        );
+    }
+
+    #[test]
+    fn skipped_sync_events_are_not_marked_as_synced() -> Result<()> {
+        let mut conn = open_sync_test_db()?;
+        let work = test_sync_event("git:github.com/PaceFlow/webapp", "abc123");
+        let personal = test_sync_event("git:github.com/personal/weekend", "def456");
+        let allowlist = SyncRepositoryListResponse {
+            organization_id: "01ORG".to_string(),
+            repositories: vec![SyncRepositoryRef {
+                repo_key: "git:github.com/paceflow/webapp".to_string(),
+                provider: "github".to_string(),
+                repo_name: "webapp".to_string(),
+                last_seen_at: None,
+                sources: vec!["pull_request".to_string()],
+            }],
+        };
+        let partitioned =
+            partition_eligible_sync_events(vec![work.clone(), personal.clone()], &allowlist);
+
+        mark_synced_events(&mut conn, "org-A", &partitioned.eligible, "checkpoint-1")?;
+
+        assert_eq!(
+            synced_content_hash(&conn, "org-A", &work.event_type, &work.event_key)?,
+            Some(work.content_hash)
+        );
+        assert_eq!(
+            synced_content_hash(&conn, "org-A", &personal.event_type, &personal.event_key)?,
+            None
+        );
+        Ok(())
+    }
+
+    #[test]
     fn pending_sync_events_converge_with_duplicate_remote_event_keys() -> Result<()> {
         let mut conn = open_sync_test_db()?;
         let repo_key = "git:github.com/PaceFlow/ai-engineering-analytics";
@@ -1546,8 +1694,7 @@ mod tests {
 
         let outcome_event = pending
             .iter()
-            .filter(|event| event.event_type == "event_commit_outcome")
-            .next()
+            .find(|event| event.event_type == "event_commit_outcome")
             .expect("outcome event");
         assert_eq!(outcome_event.payload["heavy_ai_flag"], json!(1));
         assert_eq!(outcome_event.payload["merged_to_mainline_flag"], json!(1));
@@ -1572,7 +1719,7 @@ mod tests {
     }
 
     #[test]
-    fn api_client_handles_person_link_and_org_status() -> Result<()> {
+    fn api_client_handles_person_link_org_repositories_and_org_status() -> Result<()> {
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let addr = listener.local_addr()?;
         thread::spawn(move || {
@@ -1580,6 +1727,9 @@ mod tests {
                 json_response("{\"message\":\"If this email belongs to an enabled person, a verification code has been sent.\"}"),
                 json_response(
                     "{\"token\":\"abc123\",\"organization_id\":\"01ORG\",\"organization_name\":\"Example Org\",\"member_email\":\"dev@example.com\"}"
+                ),
+                json_response(
+                    "{\"organization_id\":\"01ORG\",\"repositories\":[{\"repo_key\":\"git:github.com/PaceFlow/webapp\",\"provider\":\"github\",\"repo_name\":\"webapp\",\"last_seen_at\":\"2026-05-08T10:15:00\",\"sources\":[\"pull_request\"]}]}"
                 ),
                 json_response(
                     "{\"organization_id\":\"01ORG\",\"organization_name\":\"Example Org\",\"total_events\":3,\"last_event_at\":null}"
@@ -1593,7 +1743,7 @@ mod tests {
                 let _ = std::io::Read::read(&mut stream, &mut buf);
                 std::io::Write::write_all(&mut stream, body.as_bytes()).expect("write");
                 std::io::Write::flush(&mut stream).expect("flush");
-                if index == 2 {
+                if index == 3 {
                     break;
                 }
             }
@@ -1616,6 +1766,13 @@ mod tests {
 
         let authenticated = SyncApiClient::new(base_url, Some(linked.token))?;
 
+        let repositories = runtime.block_on(authenticated.repositories("01ORG"))?;
+        assert_eq!(repositories.repositories.len(), 1);
+        assert_eq!(
+            repositories.repositories[0].repo_key,
+            "git:github.com/PaceFlow/webapp"
+        );
+
         let status = runtime.block_on(authenticated.status("01ORG"))?;
         assert_eq!(status.total_events, 3);
         assert_eq!(status.organization_name.as_deref(), Some("Example Org"));
@@ -1627,6 +1784,18 @@ mod tests {
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
             body.len(),
             body
+        )
+    }
+
+    fn test_sync_event(repo_key: &str, commit_sha: &str) -> LocalSyncEvent {
+        build_local_sync_event(
+            "event_commit_outcome",
+            format!("{repo_key}|{commit_sha}"),
+            Some(repo_key.to_string()),
+            Some("dev@paceflow.io".to_string()),
+            Some("device:test".to_string()),
+            Some("2026-01-16T00:00:00Z".to_string()),
+            json!({"commit_sha": commit_sha}),
         )
     }
 }

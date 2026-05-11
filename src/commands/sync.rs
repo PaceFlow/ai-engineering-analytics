@@ -6,7 +6,7 @@ use crate::db;
 use crate::sync::{
     SavedSyncConfig, SyncApiClient, SyncConfigSource, delete_saved_sync_config, env_override_keys,
     grouped_event_counts, last_sync_run_state, load_saved_sync_config, make_push_request,
-    mark_synced_events, normalized_base_url, pending_sync_counts, pending_sync_events,
+    mark_synced_events, normalized_base_url, partition_eligible_sync_events, pending_sync_events,
     reset_local_sync_state, resolve_sync_scope, resolved_sync_config, save_sync_config,
 };
 use crate::sync_identity;
@@ -59,10 +59,36 @@ fn run_push(args: SyncPushArgs) -> Result<()> {
 
     let runtime = new_runtime()?;
     let client = SyncApiClient::new(config.base_url.clone(), Some(config.token.clone()))?;
+    let allowlist = runtime.block_on(client.repositories(&config.organization_id))?;
+    let partitioned = partition_eligible_sync_events(pending, &allowlist);
+
+    if !partitioned.skipped.is_empty() {
+        println!(
+            "Skipping {} pending sync events from {} repos not recognized by PaceFlow.",
+            partitioned.skipped.len(),
+            partitioned.skipped_repo_keys.len()
+        );
+    }
+
+    if partitioned.eligible.is_empty() {
+        println!(
+            "No eligible org project sync events found. Skipped {} pending sync events from {} repos not recognized by PaceFlow.",
+            partitioned.skipped.len(),
+            partitioned.skipped_repo_keys.len()
+        );
+        return Ok(());
+    }
+
+    println!(
+        "Uploading {} eligible org project sync events.",
+        partitioned.eligible.len()
+    );
+    print_event_counts("Eligible", &grouped_event_counts(&partitioned.eligible));
+
     let batch_size = args.batch_size.max(1);
     let mut uploaded = 0usize;
 
-    for chunk in pending.chunks(batch_size) {
+    for chunk in partitioned.eligible.chunks(batch_size) {
         let request = make_push_request(chunk);
         let response = runtime.block_on(client.push_events(&config.organization_id, &request))?;
         if response.rejected > 0 || response.accepted != chunk.len() {
@@ -93,7 +119,8 @@ fn run_status(args: SyncStatusArgs) -> Result<()> {
 
     let scope = resolve_sync_scope(args.repo.as_deref(), args.all_projects)?;
     let conn = db::open()?;
-    let counts = pending_sync_counts(&conn, &config.organization_id, &scope)?;
+    let pending = pending_sync_events(&conn, &config.organization_id, &scope)?;
+    let counts = grouped_event_counts(&pending);
 
     println!("Sync Configuration");
     println!(
@@ -127,6 +154,24 @@ fn run_status(args: SyncStatusArgs) -> Result<()> {
 
     let runtime = new_runtime()?;
     let client = SyncApiClient::new(config.base_url.clone(), Some(config.token.clone()))?;
+    match runtime.block_on(client.repositories(&config.organization_id)) {
+        Ok(allowlist) => {
+            let partitioned = partition_eligible_sync_events(pending.clone(), &allowlist);
+            println!("\nOrg Project Eligibility");
+            println!("Recognized Repositories: {}", allowlist.repositories.len());
+            println!("Eligible Pending Events: {}", partitioned.eligible.len());
+            println!("Skipped Pending Events: {}", partitioned.skipped.len());
+            println!(
+                "Skipped Repositories: {}",
+                partitioned.skipped_repo_keys.len()
+            );
+        }
+        Err(err) => {
+            println!("\nOrg Project Eligibility");
+            println!("Warning: could not load recognized repositories: {err}");
+        }
+    }
+
     match runtime.block_on(client.status(&config.organization_id)) {
         Ok(remote) => {
             println!("\nRemote Status");

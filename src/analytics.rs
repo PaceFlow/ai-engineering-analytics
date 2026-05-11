@@ -1714,6 +1714,10 @@ pub fn query_cost_report(conn: &Connection, args: &ReportArgs) -> Result<Vec<Cos
              ts.branch_name,
              (SELECT COUNT(DISTINCT cs.commit_sha)
               FROM event_commit_session cs
+              WHERE cs.provider = ec.provider
+                AND cs.session_id = ec.session_id) AS commit_count,
+             (SELECT COUNT(DISTINCT cs.commit_sha)
+              FROM event_commit_session cs
               JOIN event_commit_outcome eo
                 ON eo.repo_root = cs.repo_root
                AND eo.commit_sha = cs.commit_sha
@@ -1740,6 +1744,10 @@ pub fn query_cost_report(conn: &Connection, args: &ReportArgs) -> Result<Vec<Cos
              ec.actual_cost_usd,
              NULL AS task_key,
              NULL AS branch_name,
+             (SELECT COUNT(DISTINCT cs.commit_sha)
+              FROM event_commit_session cs
+              WHERE cs.provider = ec.provider
+                AND cs.session_id = ec.session_id) AS commit_count,
              (SELECT COUNT(DISTINCT cs.commit_sha)
               FROM event_commit_session cs
               JOIN event_commit_outcome eo
@@ -1812,11 +1820,13 @@ pub fn query_cost_report(conn: &Connection, args: &ReportArgs) -> Result<Vec<Cos
     select.push("COALESCE(SUM(total_tokens), 0) AS total_tokens".to_string());
     select.push("SUM(COALESCE(actual_cost_usd, estimated_cost_usd)) AS total_cost_usd".to_string());
     select.push("COALESCE(SUM(mainline_change_count), 0) AS mainline_change_count".to_string());
+    select.push("COALESCE(SUM(commit_count), 0) AS commit_count".to_string());
 
     let mut sql = format!("SELECT {} FROM ({})", select.join(", "), base_sql);
     if !group.is_empty() {
         sql.push_str(" GROUP BY ");
         sql.push_str(&group.join(", "));
+        sql.push_str(" HAVING commit_count > 0");
         sql.push_str(" ORDER BY ");
         sql.push_str(&group.join(", "));
         sql.push_str(&format!(" LIMIT {}", args.limit.max(1)));
@@ -4534,6 +4544,53 @@ mod tests {
         assert_eq!(rows[0].total_tokens, 1650);
         assert_eq!(rows[0].total_cost_usd, Some(0.0125));
         assert_eq!(rows[0].mainline_change_count, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn cost_report_grouped_by_model_hides_models_without_commits() -> Result<()> {
+        let conn = open_test_db()?;
+        conn.execute(
+            "INSERT INTO event_session_cost (
+                provider, session_id, repo_root, model_name, started_at, ended_at,
+                accepted_output_flag, accepted_total_changed_lines, input_tokens,
+                cached_input_tokens, output_tokens, reasoning_tokens, total_tokens,
+                estimated_cost_usd, actual_cost_usd, cost_source
+             ) VALUES
+                ('claude', 'empty', '/tmp/repo', 'claude/(unknown)', '2026-03-17T09:00:00Z', '2026-03-17T09:10:00Z',
+                 0, 0, 100, 0, 50, 0, 150, NULL, NULL, 'tokens_unpriced'),
+                ('codex', 'with-commit', '/tmp/repo', 'codex/gpt-5', '2026-03-17T10:00:00Z', '2026-03-17T10:20:00Z',
+                 1, 20, 1000, 0, 500, 0, 1500, 0.0125, NULL, 'estimated_from_tokens')",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO event_commit_session (
+                repo_root, commit_sha, provider, session_id, commit_time, model_name,
+                matched_lines, share_of_commit, share_of_ai
+             ) VALUES ('/tmp/repo', 'abc123', 'codex', 'with-commit', '2026-03-17T11:00:00Z', 'codex/gpt-5', 20, 1.0, 1.0)",
+            [],
+        )?;
+
+        let rows = query_cost_report(
+            &conn,
+            &ReportArgs {
+                weekly: false,
+                group_by: Some(GroupBy::Model),
+                from: None,
+                to: None,
+                repo: None,
+                all_projects: false,
+                provider: None,
+                task: None,
+                branch: None,
+                model: None,
+                limit: 50,
+            },
+        )?;
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].group_value.as_deref(), Some("codex/gpt-5"));
+        assert_eq!(rows[0].session_count, 1);
         Ok(())
     }
 
