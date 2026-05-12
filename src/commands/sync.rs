@@ -11,6 +11,8 @@ use crate::sync::{
 };
 use crate::sync_identity;
 
+const DEFAULT_SYNC_API_BASE_URL: &str = "http://localhost:8443";
+
 pub fn run(args: SyncArgs) -> Result<()> {
     match args.command {
         SyncCommands::Config => run_config(),
@@ -240,7 +242,7 @@ fn prompt_existing_config_flow() -> Result<()> {
 }
 
 fn prompt_sync_configuration() -> Result<SavedSyncConfig> {
-    let base_url = normalized_base_url(&prompt_line("PaceFlow base URL: ")?)?;
+    let base_url = prompt_sync_api_base_url()?;
     let organization_id =
         parse_organization_setup_input(&prompt_line("PaceFlow organization ID or setup URL: ")?)?;
     let email = prompt_line("PaceFlow person email: ")?;
@@ -264,6 +266,20 @@ fn prompt_sync_configuration() -> Result<SavedSyncConfig> {
         member_email: Some(linked.member_email),
         token: linked.token,
     })
+}
+
+fn prompt_sync_api_base_url() -> Result<String> {
+    print!("PaceFlow API base URL [{DEFAULT_SYNC_API_BASE_URL}]: ");
+    io::stdout().flush()?;
+    normalize_prompted_sync_api_base_url(&read_line()?)
+}
+
+fn normalize_prompted_sync_api_base_url(raw: &str) -> Result<String> {
+    let value = raw.trim();
+    if value.is_empty() {
+        return normalized_base_url(DEFAULT_SYNC_API_BASE_URL);
+    }
+    normalized_base_url(value)
 }
 
 fn parse_organization_setup_input(raw: &str) -> Result<String> {
@@ -337,4 +353,38 @@ fn new_runtime() -> Result<tokio::runtime::Runtime> {
         .enable_all()
         .build()
         .map_err(Into::into)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_sync_api_base_url_uses_local_backend_default() -> Result<()> {
+        assert_eq!(
+            normalize_prompted_sync_api_base_url("")?,
+            DEFAULT_SYNC_API_BASE_URL
+        );
+        assert_eq!(
+            normalize_prompted_sync_api_base_url("   ")?,
+            DEFAULT_SYNC_API_BASE_URL
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn sync_api_base_url_still_accepts_explicit_url() -> Result<()> {
+        assert_eq!(
+            normalize_prompted_sync_api_base_url("http://localhost:3000/")?,
+            "http://localhost:3000"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn sync_api_base_url_rejects_non_url_values() {
+        let err = normalize_prompted_sync_api_base_url("localhost:8443")
+            .expect_err("missing scheme should fail");
+        assert!(err.to_string().contains("http:// or https://"));
+    }
 }

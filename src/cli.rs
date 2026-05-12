@@ -6,6 +6,7 @@ const QUALITY_AFTER_HELP: &str = "Examples:\n  paceflow quality                 
 const COST_AFTER_HELP: &str = "Examples:\n  paceflow cost                    # default: grouped by model\n  paceflow cost --overall\n  paceflow cost --group-by provider\n  paceflow cost --group-by task --task ABC-123\n  paceflow cost --provider=opencode --all-projects   # cross-repo provider totals\n\nScoped reports default to the current git repo (unless --all-projects). Filters such as --provider still apply after that scope.\n\nMetrics:\n  Cost: API-equivalent model cost when token usage can be priced.\n  Cost/accepted LOC: priced session cost divided by accepted changed lines.\n  Coverage: sessions with priced cost over sessions with token usage.";
 const GITHUB_AFTER_HELP: &str = "Examples:\n  paceflow github token\n\nGitHub token setup:\n  Use this command to save, replace, or delete the local GitHub token used for PR sync during ingest.";
 const SYNC_AFTER_HELP: &str = "Examples:\n  paceflow sync config\n  paceflow sync status\n  paceflow sync push --all-projects\n\nSync setup:\n  Use `paceflow sync config` to authenticate with the PaceFlow backend and choose a default organization.\n  Sync uploads normalized local analytics events so shared org views stay consistent across devices.";
+const HOOKS_AFTER_HELP: &str = "Examples:\n  paceflow hooks install\n  paceflow hooks status\n  paceflow hooks uninstall\n\nHook setup:\n  Paceflow-managed hooks only verify that the CLI is installed and sync is configured locally.";
 
 #[derive(Parser)]
 #[command(
@@ -40,6 +41,9 @@ pub enum Commands {
     #[command(name = "sync")]
     /// Configure and push shared analytics sync to the PaceFlow backend
     Sync(SyncArgs),
+    #[command(name = "hooks")]
+    /// Install and manage Paceflow git hooks
+    Hooks(HooksArgs),
 }
 
 #[derive(Args, Debug, Clone)]
@@ -72,6 +76,33 @@ pub enum SyncCommands {
     Status(SyncStatusArgs),
     /// Delete saved sync credentials and clear local sync cursors
     Reset,
+}
+
+#[derive(Args, Debug, Clone)]
+#[command(after_help = HOOKS_AFTER_HELP)]
+pub struct HooksArgs {
+    #[command(subcommand)]
+    pub command: HooksCommands,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum HooksCommands {
+    /// Install the Paceflow-managed pre-commit setup gate
+    Install(HooksRepoArgs),
+    /// Remove the Paceflow-managed pre-commit setup gate
+    Uninstall(HooksRepoArgs),
+    /// Show whether the Paceflow-managed pre-commit hook is installed
+    Status(HooksRepoArgs),
+    /// Run the local-only pre-commit setup gate
+    #[command(name = "pre-commit")]
+    PreCommit(HooksRepoArgs),
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct HooksRepoArgs {
+    /// Restrict hook management to a specific repository root or path inside a repository
+    #[arg(long)]
+    pub repo: Option<String>,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -414,6 +445,62 @@ mod tests {
                 _ => panic!("expected sync status command"),
             },
             _ => panic!("expected sync command"),
+        }
+    }
+
+    #[test]
+    fn parses_hooks_install_repo_filter() {
+        let cli = Cli::parse_from(["paceflow", "hooks", "install", "--repo", "/tmp/repo"]);
+        match cli.command {
+            Commands::Hooks(args) => match args.command {
+                HooksCommands::Install(hooks) => {
+                    assert_eq!(hooks.repo.as_deref(), Some("/tmp/repo"))
+                }
+                _ => panic!("expected hooks install command"),
+            },
+            _ => panic!("expected hooks command"),
+        }
+    }
+
+    #[test]
+    fn parses_hooks_pre_commit_repo_filter() {
+        let cli = Cli::parse_from(["paceflow", "hooks", "pre-commit", "--repo", "/tmp/repo"]);
+        match cli.command {
+            Commands::Hooks(args) => match args.command {
+                HooksCommands::PreCommit(hooks) => {
+                    assert_eq!(hooks.repo.as_deref(), Some("/tmp/repo"))
+                }
+                _ => panic!("expected hooks pre-commit command"),
+            },
+            _ => panic!("expected hooks command"),
+        }
+    }
+
+    #[test]
+    fn parses_hooks_status_repo_filter() {
+        let cli = Cli::parse_from(["paceflow", "hooks", "status", "--repo", "/tmp/repo"]);
+        match cli.command {
+            Commands::Hooks(args) => match args.command {
+                HooksCommands::Status(hooks) => {
+                    assert_eq!(hooks.repo.as_deref(), Some("/tmp/repo"))
+                }
+                _ => panic!("expected hooks status command"),
+            },
+            _ => panic!("expected hooks command"),
+        }
+    }
+
+    #[test]
+    fn parses_hooks_uninstall_repo_filter() {
+        let cli = Cli::parse_from(["paceflow", "hooks", "uninstall", "--repo", "/tmp/repo"]);
+        match cli.command {
+            Commands::Hooks(args) => match args.command {
+                HooksCommands::Uninstall(hooks) => {
+                    assert_eq!(hooks.repo.as_deref(), Some("/tmp/repo"))
+                }
+                _ => panic!("expected hooks uninstall command"),
+            },
+            _ => panic!("expected hooks command"),
         }
     }
 

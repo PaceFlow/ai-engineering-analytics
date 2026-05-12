@@ -78,6 +78,8 @@ Supported release targets:
 
 See [packaging/INSTALL.md](packaging/INSTALL.md) for platform-specific install commands, macOS Gatekeeper notes, and optional path overrides.
 
+If team hooks or setup scripts will call `paceflow`, make sure the binary is available on `PATH`; see [Add `paceflow` To `PATH`](packaging/INSTALL.md#add-paceflow-to-path).
+
 Requirements:
 
 - `git` must be installed and available on `PATH`
