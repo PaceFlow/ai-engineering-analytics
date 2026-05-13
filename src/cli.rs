@@ -7,13 +7,14 @@ const COST_AFTER_HELP: &str = "Examples:\n  paceflow cost                    # d
 const GITHUB_AFTER_HELP: &str = "Examples:\n  paceflow github token\n\nGitHub token setup:\n  Use this command to save, replace, or delete the local GitHub token used for PR sync during ingest.";
 const SYNC_AFTER_HELP: &str = "Examples:\n  paceflow sync config\n  paceflow sync status\n  paceflow sync push --all-projects\n  paceflow sync schedule install\n\nSync setup:\n  Use `paceflow sync config` to authenticate with the PaceFlow backend and choose a default organization.\n  Sync uploads normalized local analytics events so shared org views stay consistent across devices.";
 const SYNC_SCHEDULE_AFTER_HELP: &str = "Examples:\n  paceflow sync schedule install\n  paceflow sync schedule status\n  paceflow sync schedule uninstall\n  paceflow sync schedule run\n\nSchedule setup:\n  Installs a user-level Paceflow schedule that runs ingest and sync push --all-projects every 6 hours.";
-const HOOKS_AFTER_HELP: &str = "Examples:\n  paceflow hooks install\n  paceflow hooks status\n  paceflow hooks uninstall\n\nHook setup:\n  Paceflow-managed hooks verify that sync is configured locally and that the periodic sync schedule can be installed.";
+const HOOKS_AFTER_HELP: &str = "Examples:\n  paceflow hooks install                         # install the pre-commit setup gate in the current repo\n  paceflow hooks install --repo /path/to/repo    # install in a specific repo\n  paceflow hooks status\n  paceflow hooks pre-commit --repo .             # dry-run the gate against the current repo\n  paceflow hooks uninstall\n\nHook setup:\n  Paceflow-managed hooks verify that sync is configured locally and that the periodic sync schedule can be installed.\n  The pre-commit gate fails the commit if `paceflow sync config` has not been run (or the PACEFLOW_SYNC_* env vars are not set), and installs the periodic sync schedule on first use.";
+const TOP_LEVEL_AFTER_HELP: &str = "Quick start:\n  paceflow ingest\n  paceflow session\n  paceflow delivery\n  paceflow quality\n  paceflow cost\n\nStart here:\n  paceflow session       # default: compare workflow trust by model\n  paceflow delivery      # default: compare ship-rate by model\n  paceflow quality       # default: compare durability by model\n  paceflow cost          # default: compare spend by model\n\nTeam setup:\n  paceflow github token              # save the GitHub token used for PR sync\n  paceflow sync config               # authenticate and pick a default PaceFlow org\n  paceflow sync schedule install     # install the 6-hour ingest + push schedule\n  paceflow hooks install             # install the pre-commit setup gate in this repo\n\nManual validation:\n  paceflow event-stream --stream session-base\n\nDiscover options:\n  paceflow --help\n  paceflow <command> --help";
 
 #[derive(Parser)]
 #[command(
     name = "paceflow",
     about = "Local-first analytics for improving agent-assisted engineering outcomes",
-    after_help = "Quick start:\n  paceflow ingest\n  paceflow session\n  paceflow delivery\n  paceflow quality\n  paceflow cost\n\nStart here:\n  paceflow session       # default: compare workflow trust by model\n  paceflow delivery      # default: compare ship-rate by model\n  paceflow quality       # default: compare durability by model\n  paceflow cost          # default: compare spend by model\n\nManual validation:\n  paceflow event-stream --stream session-base\n\nDiscover options:\n  paceflow --help\n  paceflow <command> --help"
+    after_help = TOP_LEVEL_AFTER_HELP
 )]
 pub struct Cli {
     #[arg(short, long, global = true)]
@@ -571,6 +572,38 @@ mod tests {
         assert!(help.contains("Average user prompts"));
         assert!(help.contains("Debug loop rate"));
         assert!(help.contains("Session-to-commit rate"));
+    }
+
+    #[test]
+    fn top_level_help_advertises_team_setup_commands() {
+        let mut command = Cli::command();
+        let mut buffer = Vec::new();
+        command
+            .write_long_help(&mut buffer)
+            .expect("write top-level help");
+        let help = String::from_utf8(buffer).expect("utf8");
+
+        assert!(help.contains("Team setup:"));
+        assert!(help.contains("paceflow github token"));
+        assert!(help.contains("paceflow sync config"));
+        assert!(help.contains("paceflow sync schedule install"));
+        assert!(help.contains("paceflow hooks install"));
+    }
+
+    #[test]
+    fn hooks_help_documents_pre_commit_dry_run_and_sync_prereq() {
+        let mut command = Cli::command();
+        let mut buffer = Vec::new();
+        command
+            .find_subcommand_mut("hooks")
+            .expect("hooks subcommand")
+            .write_long_help(&mut buffer)
+            .expect("write hooks help");
+        let help = String::from_utf8(buffer).expect("utf8");
+
+        assert!(help.contains("paceflow hooks install"));
+        assert!(help.contains("paceflow hooks pre-commit --repo ."));
+        assert!(help.contains("paceflow sync config"));
     }
 
     #[test]
