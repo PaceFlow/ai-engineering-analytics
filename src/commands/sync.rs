@@ -1,7 +1,7 @@
 use anyhow::{Result, anyhow, bail};
 use std::io::{self, Write};
 
-use crate::cli::{SyncArgs, SyncCommands, SyncPushArgs, SyncStatusArgs};
+use crate::cli::{SyncArgs, SyncCommands, SyncPushArgs, SyncScheduleCommands, SyncStatusArgs};
 use crate::db;
 use crate::sync::{
     SavedSyncConfig, SyncApiClient, SyncConfigSource, delete_saved_sync_config, env_override_keys,
@@ -10,6 +10,10 @@ use crate::sync::{
     reset_local_sync_state, resolve_sync_scope, resolved_sync_config, save_sync_config,
 };
 use crate::sync_identity;
+use crate::sync_schedule::{
+    ScheduleInstallOutcome, ScheduleState, current_backend, install_or_update_schedule,
+    run_scheduled_sync, schedule_status, uninstall_schedule,
+};
 
 const DEFAULT_SYNC_API_BASE_URL: &str = "http://localhost:8443";
 
@@ -18,6 +22,7 @@ pub fn run(args: SyncArgs) -> Result<()> {
         SyncCommands::Config => run_config(),
         SyncCommands::Push(args) => run_push(args),
         SyncCommands::Status(args) => run_status(args),
+        SyncCommands::Schedule(args) => run_schedule(args.command),
         SyncCommands::Reset => run_reset(),
     }
 }
@@ -111,6 +116,55 @@ fn run_push(args: SyncPushArgs) -> Result<()> {
 
     println!("Uploaded {uploaded} sync events.");
     Ok(())
+}
+
+fn run_schedule(command: SyncScheduleCommands) -> Result<()> {
+    match command {
+        SyncScheduleCommands::Install => {
+            let mut backend = current_backend();
+            match install_or_update_schedule(backend.as_mut())? {
+                ScheduleInstallOutcome::Installed => {
+                    println!("Installed Paceflow periodic sync schedule.")
+                }
+                ScheduleInstallOutcome::Updated => {
+                    println!("Updated Paceflow periodic sync schedule.")
+                }
+                ScheduleInstallOutcome::AlreadyInstalled => {
+                    println!("Paceflow periodic sync schedule is already installed.")
+                }
+            }
+            Ok(())
+        }
+        SyncScheduleCommands::Status => {
+            let backend = current_backend();
+            let status = schedule_status(backend.as_ref())?;
+            match status.state {
+                ScheduleState::Missing => println!(
+                    "Paceflow periodic sync schedule is not installed ({:?}).",
+                    status.backend
+                ),
+                ScheduleState::Installed(_) => println!(
+                    "Paceflow periodic sync schedule is installed ({:?}).",
+                    status.backend
+                ),
+                ScheduleState::NonPaceflowArtifact => println!(
+                    "A non-Paceflow schedule exists where the periodic sync schedule would be installed ({:?}).",
+                    status.backend
+                ),
+            }
+            Ok(())
+        }
+        SyncScheduleCommands::Uninstall => {
+            let mut backend = current_backend();
+            if uninstall_schedule(backend.as_mut())? {
+                println!("Removed Paceflow periodic sync schedule.");
+            } else {
+                println!("Paceflow periodic sync schedule is not installed.");
+            }
+            Ok(())
+        }
+        SyncScheduleCommands::Run => run_scheduled_sync(),
+    }
 }
 
 fn run_status(args: SyncStatusArgs) -> Result<()> {

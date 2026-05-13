@@ -5,8 +5,9 @@ const DELIVERY_AFTER_HELP: &str = "Examples:\n  paceflow delivery               
 const QUALITY_AFTER_HELP: &str = "Examples:\n  paceflow quality                 # default: grouped by model\n  paceflow quality --model codex/gpt-5.4\n  paceflow quality --overall\n  paceflow quality --group-by provider\n  paceflow quality --group-by task --task ABC-123\n  paceflow quality --group-by branch\n  paceflow quality --branch fix/cursor-new-partial-fate-schema\n\nMetrics:\n  Code churn rate: share of AI-added lines on heavy AI commits that were removed again within the churn window.\n  Bug-after-merge rate: share of merged heavy AI commits that drew a later fix-like commit within 60 days.\n  Revert rate: share of heavy AI commits that were later reverted.";
 const COST_AFTER_HELP: &str = "Examples:\n  paceflow cost                    # default: grouped by model\n  paceflow cost --overall\n  paceflow cost --group-by provider\n  paceflow cost --group-by task --task ABC-123\n  paceflow cost --provider=opencode --all-projects   # cross-repo provider totals\n\nScoped reports default to the current git repo (unless --all-projects). Filters such as --provider still apply after that scope.\n\nMetrics:\n  Cost: API-equivalent model cost when token usage can be priced.\n  Cost/accepted LOC: priced session cost divided by accepted changed lines.\n  Coverage: sessions with priced cost over sessions with token usage.";
 const GITHUB_AFTER_HELP: &str = "Examples:\n  paceflow github token\n\nGitHub token setup:\n  Use this command to save, replace, or delete the local GitHub token used for PR sync during ingest.";
-const SYNC_AFTER_HELP: &str = "Examples:\n  paceflow sync config\n  paceflow sync status\n  paceflow sync push --all-projects\n\nSync setup:\n  Use `paceflow sync config` to authenticate with the PaceFlow backend and choose a default organization.\n  Sync uploads normalized local analytics events so shared org views stay consistent across devices.";
-const HOOKS_AFTER_HELP: &str = "Examples:\n  paceflow hooks install\n  paceflow hooks status\n  paceflow hooks uninstall\n\nHook setup:\n  Paceflow-managed hooks only verify that the CLI is installed and sync is configured locally.";
+const SYNC_AFTER_HELP: &str = "Examples:\n  paceflow sync config\n  paceflow sync status\n  paceflow sync push --all-projects\n  paceflow sync schedule install\n\nSync setup:\n  Use `paceflow sync config` to authenticate with the PaceFlow backend and choose a default organization.\n  Sync uploads normalized local analytics events so shared org views stay consistent across devices.";
+const SYNC_SCHEDULE_AFTER_HELP: &str = "Examples:\n  paceflow sync schedule install\n  paceflow sync schedule status\n  paceflow sync schedule uninstall\n  paceflow sync schedule run\n\nSchedule setup:\n  Installs a user-level Paceflow schedule that runs ingest and sync push --all-projects every 6 hours.";
+const HOOKS_AFTER_HELP: &str = "Examples:\n  paceflow hooks install\n  paceflow hooks status\n  paceflow hooks uninstall\n\nHook setup:\n  Paceflow-managed hooks verify that sync is configured locally and that the periodic sync schedule can be installed.";
 
 #[derive(Parser)]
 #[command(
@@ -74,8 +75,29 @@ pub enum SyncCommands {
     Push(SyncPushArgs),
     /// Show local pending sync state and remote org sync status
     Status(SyncStatusArgs),
+    /// Install, inspect, or run the periodic all-projects sync schedule
+    Schedule(SyncScheduleArgs),
     /// Delete saved sync credentials and clear local sync cursors
     Reset,
+}
+
+#[derive(Args, Debug, Clone)]
+#[command(after_help = SYNC_SCHEDULE_AFTER_HELP)]
+pub struct SyncScheduleArgs {
+    #[command(subcommand)]
+    pub command: SyncScheduleCommands,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum SyncScheduleCommands {
+    /// Install or update the user-level periodic all-projects sync schedule
+    Install,
+    /// Show whether the periodic all-projects sync schedule is installed
+    Status,
+    /// Remove the Paceflow-managed periodic all-projects sync schedule
+    Uninstall,
+    /// Run one scheduled ingest and all-projects sync push pass
+    Run,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -445,6 +467,31 @@ mod tests {
                 _ => panic!("expected sync status command"),
             },
             _ => panic!("expected sync command"),
+        }
+    }
+
+    #[test]
+    fn parses_sync_schedule_commands() {
+        for (command, expected) in [
+            ("install", "install"),
+            ("status", "status"),
+            ("uninstall", "uninstall"),
+            ("run", "run"),
+        ] {
+            let cli = Cli::parse_from(["paceflow", "sync", "schedule", command]);
+            match cli.command {
+                Commands::Sync(args) => match args.command {
+                    SyncCommands::Schedule(schedule) => match (schedule.command, expected) {
+                        (SyncScheduleCommands::Install, "install") => {}
+                        (SyncScheduleCommands::Status, "status") => {}
+                        (SyncScheduleCommands::Uninstall, "uninstall") => {}
+                        (SyncScheduleCommands::Run, "run") => {}
+                        _ => panic!("unexpected sync schedule command"),
+                    },
+                    _ => panic!("expected sync schedule command"),
+                },
+                _ => panic!("expected sync command"),
+            }
         }
     }
 

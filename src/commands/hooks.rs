@@ -6,6 +6,7 @@ use std::process::Command;
 use crate::cli::{HooksArgs, HooksCommands, HooksRepoArgs};
 use crate::path_utils::detect_repo_root;
 use crate::sync::resolved_sync_config;
+use crate::sync_schedule::{ScheduleBackend, current_backend, install_or_update_schedule};
 
 const PACEFLOW_HOOK_MARKER: &str = "PACEFLOW_MANAGED_PRE_COMMIT_HOOK";
 
@@ -19,8 +20,17 @@ pub fn run(args: HooksArgs) -> Result<()> {
 }
 
 fn run_pre_commit(args: HooksRepoArgs) -> Result<()> {
+    let mut backend = current_backend();
+    run_pre_commit_with_backend(args, backend.as_mut())
+}
+
+fn run_pre_commit_with_backend(
+    args: HooksRepoArgs,
+    backend: &mut dyn ScheduleBackend,
+) -> Result<()> {
     let _repo_root = resolve_repo_root(args.repo.as_deref())?;
-    check_sync_configured()
+    check_sync_configured()?;
+    ensure_schedule_installed(backend)
 }
 
 fn install_hook(repo: Option<&str>) -> Result<()> {
@@ -112,6 +122,14 @@ fn check_sync_configured() -> Result<()> {
     }
 }
 
+fn ensure_schedule_installed(backend: &mut dyn ScheduleBackend) -> Result<()> {
+    install_or_update_schedule(backend).map(|_| ()).map_err(|err| {
+        anyhow!(
+            "paceflow periodic sync schedule is not installed and could not be configured: {err}\nRun: paceflow sync schedule install"
+        )
+    })
+}
+
 fn resolve_repo_root(repo: Option<&str>) -> Result<PathBuf> {
     let candidate = match repo {
         Some(repo) => PathBuf::from(repo),
@@ -196,6 +214,10 @@ mod tests {
         SYNC_BASE_URL_ENV_VAR, SYNC_ORGANIZATION_ID_ENV_VAR, SYNC_TOKEN_ENV_VAR, SavedSyncConfig,
         save_sync_config,
     };
+    use crate::sync_schedule::{
+        ScheduleBackend, ScheduleBackendKind, ScheduleDefinition, ScheduleState,
+        expected_definition_with_exe,
+    };
     use anyhow::Result;
     use std::ffi::{OsStr, OsString};
     use std::fs;
@@ -263,6 +285,50 @@ mod tests {
             ScopedEnvVar::unset(SYNC_ORGANIZATION_ID_ENV_VAR),
             ScopedEnvVar::unset(SYNC_TOKEN_ENV_VAR),
         ]
+    }
+
+    #[derive(Debug)]
+    struct FakeScheduleBackend {
+        state: ScheduleState,
+        installs: usize,
+    }
+
+    impl FakeScheduleBackend {
+        fn new(state: ScheduleState) -> Self {
+            Self { state, installs: 0 }
+        }
+    }
+
+    impl ScheduleBackend for FakeScheduleBackend {
+        fn kind(&self) -> ScheduleBackendKind {
+            ScheduleBackendKind::LinuxSystemd
+        }
+
+        fn state(&self) -> Result<ScheduleState> {
+            Ok(self.state.clone())
+        }
+
+        fn install(&mut self, expected: &ScheduleDefinition) -> Result<()> {
+            self.state = ScheduleState::Installed(expected.clone());
+            self.installs += 1;
+            Ok(())
+        }
+
+        fn uninstall(&mut self) -> Result<()> {
+            self.state = ScheduleState::Missing;
+            Ok(())
+        }
+    }
+
+    fn save_valid_sync_config() -> Result<()> {
+        save_sync_config(&SavedSyncConfig {
+            base_url: "https://api.example.com".to_string(),
+            organization_id: "org-1".to_string(),
+            organization_name: Some("Example".to_string()),
+            member_email: Some("dev@example.com".to_string()),
+            token: "token-1".to_string(),
+        })?;
+        Ok(())
     }
 
     #[test]
@@ -391,6 +457,84 @@ mod tests {
         let err = check_sync_configured().expect_err("should reject malformed base URL");
 
         assert!(err.to_string().contains("sync base URL must start"));
+        Ok(())
+    }
+
+    #[test]
+    fn pre_commit_installs_missing_schedule_after_sync_config_check() -> Result<()> {
+        let _guard = lock_env();
+        let tempdir = tempdir()?;
+        let repo = tempdir.path().join("repo");
+        init_repo(&repo)?;
+        let _home = ScopedEnvVar::set("PACEFLOW_HOME", tempdir.path());
+        let _sync_env = unset_sync_env();
+        save_valid_sync_config()?;
+        let mut backend = FakeScheduleBackend::new(ScheduleState::Missing);
+
+        run_pre_commit_with_backend(
+            HooksRepoArgs {
+                repo: Some(repo.to_string_lossy().to_string()),
+            },
+            &mut backend,
+        )?;
+
+        assert_eq!(backend.installs, 1);
+        assert_eq!(
+            backend.state,
+            ScheduleState::Installed(expected_definition_with_exe(
+                ScheduleBackendKind::LinuxSystemd,
+                std::env::current_exe()?
+            ))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn pre_commit_passes_when_schedule_is_already_installed() -> Result<()> {
+        let _guard = lock_env();
+        let tempdir = tempdir()?;
+        let repo = tempdir.path().join("repo");
+        init_repo(&repo)?;
+        let _home = ScopedEnvVar::set("PACEFLOW_HOME", tempdir.path());
+        let _sync_env = unset_sync_env();
+        save_valid_sync_config()?;
+        let mut backend =
+            FakeScheduleBackend::new(ScheduleState::Installed(expected_definition_with_exe(
+                ScheduleBackendKind::LinuxSystemd,
+                std::env::current_exe()?,
+            )));
+
+        run_pre_commit_with_backend(
+            HooksRepoArgs {
+                repo: Some(repo.to_string_lossy().to_string()),
+            },
+            &mut backend,
+        )?;
+
+        assert_eq!(backend.installs, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn pre_commit_missing_sync_blocks_before_schedule_install() -> Result<()> {
+        let _guard = lock_env();
+        let tempdir = tempdir()?;
+        let repo = tempdir.path().join("repo");
+        init_repo(&repo)?;
+        let _home = ScopedEnvVar::set("PACEFLOW_HOME", tempdir.path());
+        let _sync_env = unset_sync_env();
+        let mut backend = FakeScheduleBackend::new(ScheduleState::Missing);
+
+        let err = run_pre_commit_with_backend(
+            HooksRepoArgs {
+                repo: Some(repo.to_string_lossy().to_string()),
+            },
+            &mut backend,
+        )
+        .expect_err("missing sync should block");
+
+        assert!(err.to_string().contains("paceflow sync is not configured"));
+        assert_eq!(backend.installs, 0);
         Ok(())
     }
 }

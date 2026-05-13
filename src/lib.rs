@@ -12,3 +12,4 @@ pub mod path_utils;
 pub mod providers;
 pub mod sync;
 pub mod sync_identity;
+pub mod sync_schedule;
