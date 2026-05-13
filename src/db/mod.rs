@@ -528,6 +528,22 @@ pub(crate) fn init_metadata_schema(conn: &Connection) -> Result<()> {
             CHECK (pr_merged_flag IN (0,1))
         );
 
+        CREATE TABLE IF NOT EXISTS fact_sync_event_state (
+            organization_id        TEXT NOT NULL,
+            event_type             TEXT NOT NULL,
+            event_key              TEXT NOT NULL,
+            content_hash           TEXT NOT NULL,
+            last_synced_at         TEXT NOT NULL,
+            last_server_checkpoint TEXT,
+            PRIMARY KEY(organization_id, event_type, event_key)
+        );
+
+        CREATE TABLE IF NOT EXISTS fact_sync_run_state (
+            organization_id         TEXT PRIMARY KEY,
+            last_successful_push_at TEXT NOT NULL,
+            last_server_checkpoint  TEXT
+        );
+
         CREATE INDEX IF NOT EXISTS idx_fact_session_message_session
             ON fact_session_message(provider, session_id, message_index);
         CREATE INDEX IF NOT EXISTS idx_fact_session_change_session
@@ -593,7 +609,11 @@ pub(crate) fn init_metadata_schema(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_event_commit_pr_outcome_repo
             ON event_commit_pr_outcome(repo_root, commit_sha);
         CREATE INDEX IF NOT EXISTS idx_event_commit_pr_outcome_repo_key
-            ON event_commit_pr_outcome(repo_key, commit_sha);",
+            ON event_commit_pr_outcome(repo_key, commit_sha);
+        CREATE INDEX IF NOT EXISTS idx_fact_sync_event_state_org
+            ON fact_sync_event_state(organization_id, event_type);
+        CREATE INDEX IF NOT EXISTS idx_fact_sync_event_state_hash
+            ON fact_sync_event_state(content_hash);",
     )?;
     let _ = conn.execute_batch("ALTER TABLE metadata_sessions ADD COLUMN model_id INTEGER;");
     for statement in [
@@ -1780,48 +1800,8 @@ pub fn upsert_fact_task_commit_assignment(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::ffi::{OsStr, OsString};
-    use std::sync::{Mutex, MutexGuard, OnceLock};
+    use crate::test_support::{ScopedEnvVar, lock_env};
     use tempfile::tempdir;
-
-    fn env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-    }
-
-    fn lock_env() -> MutexGuard<'static, ()> {
-        env_lock()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
-    struct ScopedEnvVar {
-        key: &'static str,
-        original: Option<OsString>,
-    }
-
-    impl ScopedEnvVar {
-        fn set(key: &'static str, value: impl AsRef<OsStr>) -> Self {
-            let original = std::env::var_os(key);
-            unsafe {
-                std::env::set_var(key, value);
-            }
-            Self { key, original }
-        }
-    }
-
-    impl Drop for ScopedEnvVar {
-        fn drop(&mut self) {
-            match &self.original {
-                Some(value) => unsafe {
-                    std::env::set_var(self.key, value);
-                },
-                None => unsafe {
-                    std::env::remove_var(self.key);
-                },
-            }
-        }
-    }
 
     fn open_test_db() -> Result<Connection> {
         let conn = Connection::open_in_memory()?;
@@ -2062,6 +2042,8 @@ mod tests {
             "event_session_cost",
             "event_commit_pr_outcome",
             "event_commit_bug_signal",
+            "fact_sync_event_state",
+            "fact_sync_run_state",
         ] {
             let count: i64 = conn.query_row(
                 "SELECT COUNT(*)

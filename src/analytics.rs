@@ -1586,7 +1586,7 @@ pub fn query_change_report_with_options(
     );
     select.push("COALESCE(SUM(fc.total_added), 0) AS task_branch_lines_added".to_string());
     select.push("COALESCE(SUM(fc.total_removed), 0) AS task_branch_lines_removed".to_string());
-    // Mainline lead: hours from commit_time (branch commit) to a best-known mainline end time.
+    // Mainline lead: average hours from commit_time (branch commit) to a best-known mainline end time.
     // Prefer a later `mainline_reached_at`; otherwise fall back to a later GitHub `pr_merged_at`.
     let mainline_end_expr = "CASE
             WHEN base.mainline_reached_at IS NOT NULL
@@ -1598,7 +1598,7 @@ pub fn query_change_report_with_options(
             ELSE base.mainline_reached_at
          END";
     select.push(format!(
-        "MAX(CASE
+        "AVG(CASE
              WHEN base.heavy_ai_flag = 1
               AND base.merged_to_mainline_flag = 1
               AND ({0}) IS NOT NULL
@@ -1714,6 +1714,10 @@ pub fn query_cost_report(conn: &Connection, args: &ReportArgs) -> Result<Vec<Cos
              ts.branch_name,
              (SELECT COUNT(DISTINCT cs.commit_sha)
               FROM event_commit_session cs
+              WHERE cs.provider = ec.provider
+                AND cs.session_id = ec.session_id) AS commit_count,
+             (SELECT COUNT(DISTINCT cs.commit_sha)
+              FROM event_commit_session cs
               JOIN event_commit_outcome eo
                 ON eo.repo_root = cs.repo_root
                AND eo.commit_sha = cs.commit_sha
@@ -1740,6 +1744,10 @@ pub fn query_cost_report(conn: &Connection, args: &ReportArgs) -> Result<Vec<Cos
              ec.actual_cost_usd,
              NULL AS task_key,
              NULL AS branch_name,
+             (SELECT COUNT(DISTINCT cs.commit_sha)
+              FROM event_commit_session cs
+              WHERE cs.provider = ec.provider
+                AND cs.session_id = ec.session_id) AS commit_count,
              (SELECT COUNT(DISTINCT cs.commit_sha)
               FROM event_commit_session cs
               JOIN event_commit_outcome eo
@@ -1812,11 +1820,13 @@ pub fn query_cost_report(conn: &Connection, args: &ReportArgs) -> Result<Vec<Cos
     select.push("COALESCE(SUM(total_tokens), 0) AS total_tokens".to_string());
     select.push("SUM(COALESCE(actual_cost_usd, estimated_cost_usd)) AS total_cost_usd".to_string());
     select.push("COALESCE(SUM(mainline_change_count), 0) AS mainline_change_count".to_string());
+    select.push("COALESCE(SUM(commit_count), 0) AS commit_count".to_string());
 
     let mut sql = format!("SELECT {} FROM ({})", select.join(", "), base_sql);
     if !group.is_empty() {
         sql.push_str(" GROUP BY ");
         sql.push_str(&group.join(", "));
+        sql.push_str(" HAVING commit_count > 0");
         sql.push_str(" ORDER BY ");
         sql.push_str(&group.join(", "));
         sql.push_str(&format!(" LIMIT {}", args.limit.max(1)));
@@ -4538,6 +4548,53 @@ mod tests {
     }
 
     #[test]
+    fn cost_report_grouped_by_model_hides_models_without_commits() -> Result<()> {
+        let conn = open_test_db()?;
+        conn.execute(
+            "INSERT INTO event_session_cost (
+                provider, session_id, repo_root, model_name, started_at, ended_at,
+                accepted_output_flag, accepted_total_changed_lines, input_tokens,
+                cached_input_tokens, output_tokens, reasoning_tokens, total_tokens,
+                estimated_cost_usd, actual_cost_usd, cost_source
+             ) VALUES
+                ('claude', 'empty', '/tmp/repo', 'claude/(unknown)', '2026-03-17T09:00:00Z', '2026-03-17T09:10:00Z',
+                 0, 0, 100, 0, 50, 0, 150, NULL, NULL, 'tokens_unpriced'),
+                ('codex', 'with-commit', '/tmp/repo', 'codex/gpt-5', '2026-03-17T10:00:00Z', '2026-03-17T10:20:00Z',
+                 1, 20, 1000, 0, 500, 0, 1500, 0.0125, NULL, 'estimated_from_tokens')",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO event_commit_session (
+                repo_root, commit_sha, provider, session_id, commit_time, model_name,
+                matched_lines, share_of_commit, share_of_ai
+             ) VALUES ('/tmp/repo', 'abc123', 'codex', 'with-commit', '2026-03-17T11:00:00Z', 'codex/gpt-5', 20, 1.0, 1.0)",
+            [],
+        )?;
+
+        let rows = query_cost_report(
+            &conn,
+            &ReportArgs {
+                weekly: false,
+                group_by: Some(GroupBy::Model),
+                from: None,
+                to: None,
+                repo: None,
+                all_projects: false,
+                provider: None,
+                task: None,
+                branch: None,
+                model: None,
+                limit: 50,
+            },
+        )?;
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].group_value.as_deref(), Some("codex/gpt-5"));
+        assert_eq!(rows[0].session_count, 1);
+        Ok(())
+    }
+
+    #[test]
     fn task_grouped_change_and_lifecycle_reports_apply_limit_after_task_filtering() -> Result<()> {
         let conn = open_test_db()?;
         conn.execute(
@@ -4729,10 +4786,11 @@ mod tests {
     }
 
     #[test]
-    fn mainline_lead_matches_hours_between_commit_and_mainline_reach() -> Result<()> {
+    fn mainline_lead_averages_hours_between_commit_and_mainline_reach() -> Result<()> {
         let conn = open_test_db()?;
         let repo_root = "/tmp/repo-mainline-lead-gap";
         let commit_sha = "deadbeef00";
+        let second_commit_sha = "feedface00";
         let commit_time = "2026-06-15T12:00:00Z";
         let mainline_reached = "2026-06-16T12:00:00Z";
 
@@ -4741,15 +4799,25 @@ mod tests {
                 repo_root, commit_sha, commit_time, mainline_reached_at,
                 heavy_ai_flag, merged_to_mainline_flag, reverted_later_flag,
                 total_matched_ai_lines, commit_total_changed_lines
-             ) VALUES (?1, ?2, ?3, ?4, 1, 1, 0, 10, 20)",
-            params![repo_root, commit_sha, commit_time, mainline_reached],
+             ) VALUES
+                (?1, ?2, ?4, ?5, 1, 1, 0, 10, 20),
+                (?1, ?3, ?4, '2026-06-16T00:00:00Z', 1, 1, 0, 10, 20)",
+            params![
+                repo_root,
+                commit_sha,
+                second_commit_sha,
+                commit_time,
+                mainline_reached
+            ],
         )?;
         conn.execute(
             "INSERT INTO event_commit_churn (
                 repo_root, commit_sha, ai_added_lines_reaching_mainline,
                 ai_added_lines_removed_within_window, churn_window_days
-             ) VALUES (?1, ?2, 10, 0, 14)",
-            params![repo_root, commit_sha],
+             ) VALUES
+                (?1, ?2, 10, 0, 14),
+                (?1, ?3, 10, 0, 14)",
+            params![repo_root, commit_sha, second_commit_sha],
         )?;
 
         create_reporting_views(&conn)?;
@@ -4772,8 +4840,8 @@ mod tests {
             .avg_commit_to_mainline_hours
             .expect("expected mainline lead");
         assert!(
-            (lead - 24.0).abs() < 1e-3,
-            "expected ~24h from commit to mainline reach; got {lead}"
+            (lead - 18.0).abs() < 1e-3,
+            "expected average of 24h and 12h commit-to-mainline leads; got {lead}"
         );
         Ok(())
     }

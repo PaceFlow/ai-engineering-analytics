@@ -43,6 +43,49 @@ tar -xzf "${asset}"
 
 For macOS Apple Silicon, use `paceflow-aarch64-apple-darwin.tar.gz` as the asset name.
 
+## Add `paceflow` To `PATH`
+
+Git hooks and team setup scripts call `paceflow` by name, so the binary must be available on `PATH`.
+
+macOS/Linux, for a downloaded release:
+
+```bash
+mkdir -p ~/.local/bin
+cp ./paceflow-x86_64-unknown-linux-gnu/paceflow ~/.local/bin/paceflow
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc
+exec zsh
+paceflow --help
+```
+
+For macOS Apple Silicon, replace `paceflow-x86_64-unknown-linux-gnu` with `paceflow-aarch64-apple-darwin`. If you use Bash, append the `PATH` line to `~/.bashrc` instead of `~/.zshrc`.
+
+macOS/Linux, for a local development build:
+
+```bash
+cargo build
+export PATH="$(pwd)/target/debug:$PATH"
+paceflow --help
+```
+
+Windows PowerShell, for a downloaded release:
+
+```powershell
+$installDir = "$env:USERPROFILE\bin\paceflow"
+New-Item -ItemType Directory -Force -Path $installDir | Out-Null
+Copy-Item .\paceflow\paceflow.exe $installDir
+[Environment]::SetEnvironmentVariable(
+  "Path",
+  [Environment]::GetEnvironmentVariable("Path", "User") + ";$installDir",
+  "User"
+)
+```
+
+Open a new PowerShell window, then verify:
+
+```powershell
+paceflow --help
+```
+
 ## Build From Source
 
 ```bash
