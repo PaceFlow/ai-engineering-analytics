@@ -113,30 +113,28 @@ pub fn current_backend() -> Box<dyn ScheduleBackend> {
     current_backend_with_home(home)
 }
 
+#[cfg(target_os = "macos")]
 pub fn current_backend_with_home(home: PathBuf) -> Box<dyn ScheduleBackend> {
-    #[cfg(target_os = "macos")]
-    {
-        Box::new(LaunchdBackend::new(home))
-    }
+    Box::new(LaunchdBackend::new(home))
+}
 
-    #[cfg(target_os = "windows")]
-    {
-        return Box::new(WindowsTaskBackend::new());
-    }
+#[cfg(target_os = "windows")]
+pub fn current_backend_with_home(_home: PathBuf) -> Box<dyn ScheduleBackend> {
+    Box::new(WindowsTaskBackend::new())
+}
 
-    #[cfg(all(unix, not(target_os = "macos")))]
-    {
-        if systemd_user_available() {
-            Box::new(SystemdBackend::new(home))
-        } else {
-            Box::new(CronBackend::new())
-        }
-    }
-
-    #[cfg(not(any(unix, target_os = "windows")))]
-    {
+#[cfg(all(unix, not(target_os = "macos")))]
+pub fn current_backend_with_home(home: PathBuf) -> Box<dyn ScheduleBackend> {
+    if systemd_user_available() {
+        Box::new(SystemdBackend::new(home))
+    } else {
         Box::new(CronBackend::new())
     }
+}
+
+#[cfg(not(any(unix, target_os = "windows")))]
+pub fn current_backend_with_home(_home: PathBuf) -> Box<dyn ScheduleBackend> {
+    Box::new(CronBackend::new())
 }
 
 pub fn schedule_status(backend: &dyn ScheduleBackend) -> Result<ScheduleStatus> {
@@ -714,11 +712,29 @@ fn shell_quote_command(expected: &ScheduleDefinition) -> String {
 
 #[cfg(any(target_os = "macos", all(unix, not(target_os = "macos"))))]
 fn shell_quote(value: &str) -> String {
+    if !value.is_empty() && value.chars().all(is_shell_safe_char) {
+        return value.to_string();
+    }
     format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+#[cfg(any(target_os = "macos", all(unix, not(target_os = "macos"))))]
+fn is_shell_safe_char(c: char) -> bool {
+    matches!(
+        c,
+        'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' | '.' | '/' | '+' | '=' | ':' | ',' | '@'
+    )
 }
 
 #[cfg(target_os = "windows")]
 fn shell_quote(value: &str) -> String {
+    if !value.is_empty()
+        && !value
+            .chars()
+            .any(|c| c.is_whitespace() || c == '"' || c == '\\')
+    {
+        return value.to_string();
+    }
     format!("\"{}\"", value.replace('"', "\\\""))
 }
 
@@ -732,6 +748,7 @@ fn escape_xml(value: &str) -> String {
         .replace('\'', "&apos;")
 }
 
+#[cfg(any(target_os = "macos", all(unix, not(target_os = "macos"))))]
 fn remove_if_exists(path: &Path) -> Result<()> {
     match fs::remove_file(path) {
         Ok(()) => Ok(()),
@@ -743,49 +760,9 @@ fn remove_if_exists(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::ffi::{OsStr, OsString};
+    use crate::test_support::{ScopedEnvVar, lock_env};
     use std::fs;
-    use std::sync::{Mutex, MutexGuard, OnceLock};
     use tempfile::tempdir;
-
-    fn env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-    }
-
-    fn lock_env() -> MutexGuard<'static, ()> {
-        env_lock()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
-    struct ScopedEnvVar {
-        key: &'static str,
-        original: Option<OsString>,
-    }
-
-    impl ScopedEnvVar {
-        fn set(key: &'static str, value: impl AsRef<OsStr>) -> Self {
-            let original = std::env::var_os(key);
-            unsafe {
-                std::env::set_var(key, value);
-            }
-            Self { key, original }
-        }
-    }
-
-    impl Drop for ScopedEnvVar {
-        fn drop(&mut self) {
-            match &self.original {
-                Some(value) => unsafe {
-                    std::env::set_var(self.key, value);
-                },
-                None => unsafe {
-                    std::env::remove_var(self.key);
-                },
-            }
-        }
-    }
 
     #[derive(Debug)]
     struct FakeBackend {
@@ -795,6 +772,7 @@ mod tests {
         uninstall_count: usize,
     }
 
+    #[cfg(unix)]
     fn fake_exe() -> PathBuf {
         PathBuf::from("/tmp/paceflow test/bin/paceflow")
     }
