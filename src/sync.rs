@@ -366,7 +366,10 @@ pub fn resolved_sync_config() -> Result<Option<ResolvedSyncConfig>> {
     }))
 }
 
-pub fn env_override_keys() -> &'static [&'static str] {
+/// Returns the environment variable names consulted as a fallback when no
+/// saved value is present for the corresponding sync field. Saved values
+/// always win when set, so these are fallbacks, not overrides.
+pub fn sync_env_fallback_keys() -> &'static [&'static str] {
     &[
         SYNC_BASE_URL_ENV_VAR,
         SYNC_ORGANIZATION_ID_ENV_VAR,
@@ -1096,19 +1099,19 @@ fn resolve_sync_field(
     env_key: &str,
     saved: Option<&str>,
 ) -> Result<(Option<String>, SyncConfigSource)> {
+    if let Some(saved) = saved {
+        return Ok((
+            Some(normalized_non_empty(saved.to_string())?),
+            SyncConfigSource::Saved,
+        ));
+    }
+
     if let Some(value) = env::var(env_key)
         .ok()
         .map(normalized_non_empty)
         .transpose()?
     {
         return Ok((Some(value), SyncConfigSource::Environment));
-    }
-
-    if let Some(saved) = saved {
-        return Ok((
-            Some(normalized_non_empty(saved.to_string())?),
-            SyncConfigSource::Saved,
-        ));
     }
 
     Ok((None, SyncConfigSource::Saved))
@@ -1231,7 +1234,7 @@ mod tests {
     }
 
     #[test]
-    fn resolved_sync_config_prefers_env_over_saved_values() -> Result<()> {
+    fn resolved_sync_config_prefers_saved_over_env_values() -> Result<()> {
         let _guard = lock_env();
         let tempdir = tempdir()?;
         let _paceflow_home = ScopedEnvVar::set("PACEFLOW_HOME", tempdir.path());
@@ -1247,6 +1250,30 @@ mod tests {
         })?;
 
         let resolved = resolved_sync_config()?.expect("resolved config");
+        assert_eq!(resolved.base_url, "https://saved.example.com");
+        assert_eq!(resolved.organization_id, "01SAVEDORG");
+        assert_eq!(resolved.token, "saved-token");
+        assert_eq!(resolved.base_url_source, SyncConfigSource::Saved);
+        assert_eq!(resolved.organization_id_source, SyncConfigSource::Saved);
+        assert_eq!(resolved.token_source, SyncConfigSource::Saved);
+        assert_eq!(
+            resolved.organization_name.as_deref(),
+            Some("Saved Org"),
+            "saved organization_name should propagate when the saved org_id wins"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolved_sync_config_falls_back_to_env_when_field_is_not_saved() -> Result<()> {
+        let _guard = lock_env();
+        let tempdir = tempdir()?;
+        let _paceflow_home = ScopedEnvVar::set("PACEFLOW_HOME", tempdir.path());
+        let _env_base = ScopedEnvVar::set(SYNC_BASE_URL_ENV_VAR, "https://env.example.com");
+        let _env_org = ScopedEnvVar::set(SYNC_ORGANIZATION_ID_ENV_VAR, "01ENVORG");
+        let _env_token = ScopedEnvVar::set(SYNC_TOKEN_ENV_VAR, "env-token");
+
+        let resolved = resolved_sync_config()?.expect("resolved config");
         assert_eq!(resolved.base_url, "https://env.example.com");
         assert_eq!(resolved.organization_id, "01ENVORG");
         assert_eq!(resolved.token, "env-token");
@@ -1256,7 +1283,6 @@ mod tests {
             SyncConfigSource::Environment
         );
         assert_eq!(resolved.token_source, SyncConfigSource::Environment);
-        assert_eq!(resolved.organization_name, None);
         Ok(())
     }
 

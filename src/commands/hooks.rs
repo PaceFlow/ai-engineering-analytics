@@ -378,13 +378,33 @@ mod tests {
     }
 
     #[test]
-    fn pre_commit_check_accepts_env_over_saved_sync_config() -> Result<()> {
+    fn pre_commit_check_uses_saved_over_env_when_both_present() -> Result<()> {
         let _guard = lock_env();
         let tempdir = tempdir()?;
         let _home = ScopedEnvVar::set("PACEFLOW_HOME", tempdir.path());
-        let _base = ScopedEnvVar::set(SYNC_BASE_URL_ENV_VAR, "https://api.example.com");
-        let _org = ScopedEnvVar::set(SYNC_ORGANIZATION_ID_ENV_VAR, "org-1");
-        let _token = ScopedEnvVar::set(SYNC_TOKEN_ENV_VAR, "token-1");
+        let _base = ScopedEnvVar::set(SYNC_BASE_URL_ENV_VAR, "https://env.example.com");
+        let _org = ScopedEnvVar::set(SYNC_ORGANIZATION_ID_ENV_VAR, "env-org");
+        let _token = ScopedEnvVar::set(SYNC_TOKEN_ENV_VAR, "env-token");
+        save_sync_config(&SavedSyncConfig {
+            base_url: "https://saved.example.com".to_string(),
+            organization_id: "saved-org".to_string(),
+            organization_name: Some("Saved".to_string()),
+            member_email: Some("saved@example.com".to_string()),
+            token: "saved-token".to_string(),
+        })?;
+
+        check_sync_configured()?;
+        Ok(())
+    }
+
+    #[test]
+    fn pre_commit_check_surfaces_malformed_saved_base_url_even_when_env_is_valid() -> Result<()> {
+        let _guard = lock_env();
+        let tempdir = tempdir()?;
+        let _home = ScopedEnvVar::set("PACEFLOW_HOME", tempdir.path());
+        let _base = ScopedEnvVar::set(SYNC_BASE_URL_ENV_VAR, "https://env.example.com");
+        let _org = ScopedEnvVar::set(SYNC_ORGANIZATION_ID_ENV_VAR, "env-org");
+        let _token = ScopedEnvVar::set(SYNC_TOKEN_ENV_VAR, "env-token");
         save_sync_config(&SavedSyncConfig {
             base_url: "not-a-url".to_string(),
             organization_id: "saved-org".to_string(),
@@ -393,7 +413,8 @@ mod tests {
             token: "saved-token".to_string(),
         })?;
 
-        check_sync_configured()?;
+        let err = check_sync_configured().expect_err("malformed saved base URL should win");
+        assert!(err.to_string().contains("sync base URL must start"));
         Ok(())
     }
 

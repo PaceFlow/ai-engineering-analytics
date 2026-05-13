@@ -4,10 +4,11 @@ use std::io::{self, Write};
 use crate::cli::{SyncArgs, SyncCommands, SyncPushArgs, SyncScheduleCommands, SyncStatusArgs};
 use crate::db;
 use crate::sync::{
-    SavedSyncConfig, SyncApiClient, SyncConfigSource, delete_saved_sync_config, env_override_keys,
+    SavedSyncConfig, SyncApiClient, SyncConfigSource, delete_saved_sync_config,
     grouped_event_counts, last_sync_run_state, load_saved_sync_config, make_push_request,
     mark_synced_events, normalized_base_url, partition_eligible_sync_events, pending_sync_events,
     reset_local_sync_state, resolve_sync_scope, resolved_sync_config, save_sync_config,
+    sync_env_fallback_keys,
 };
 use crate::sync_identity;
 use crate::sync_schedule::{
@@ -353,7 +354,7 @@ fn parse_organization_setup_input(raw: &str) -> Result<String> {
 }
 
 fn print_env_override_notice() {
-    let active = env_override_keys()
+    let active = sync_env_fallback_keys()
         .iter()
         .copied()
         .filter(|key| std::env::var(key).ok().is_some())
@@ -363,7 +364,8 @@ fn print_env_override_notice() {
     }
 
     println!(
-        "{} will continue to override the saved sync configuration.",
+        "{} is currently set but will be ignored because a saved sync configuration is now present. \
+         Unset it (or run `paceflow sync reset`) if you intended to use the environment value.",
         active.join(", ")
     );
 }

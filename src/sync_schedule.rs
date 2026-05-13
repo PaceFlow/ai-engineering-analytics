@@ -286,7 +286,7 @@ impl ScheduleBackend for LaunchdBackend {
     }
 
     fn state(&self) -> Result<ScheduleState> {
-        state_from_file(&self.plist_path(), ScheduleBackendKind::MacOsLaunchd)
+        read_managed_file_state(&self.plist_path(), parse_launchd_definition)
     }
 
     fn install(&mut self, expected: &ScheduleDefinition) -> Result<()> {
@@ -294,8 +294,17 @@ impl ScheduleBackend for LaunchdBackend {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
+        // Unload any previous registration before rewriting the file. We don't care if this fails
+        // (e.g. the agent was never loaded, or `launchctl unload` returns a spurious error 5 on
+        // modern macOS) — the subsequent load is what actually matters. Silence stderr/stdout so
+        // diagnostic warnings don't surface to the user.
+        let _ = Command::new("launchctl")
+            .arg("unload")
+            .arg(&path)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
         fs::write(&path, launchd_plist(expected))?;
-        let _ = Command::new("launchctl").arg("unload").arg(&path).status();
         let status = Command::new("launchctl")
             .arg("load")
             .arg(&path)
@@ -309,7 +318,12 @@ impl ScheduleBackend for LaunchdBackend {
 
     fn uninstall(&mut self) -> Result<()> {
         let path = self.plist_path();
-        let _ = Command::new("launchctl").arg("unload").arg(&path).status();
+        let _ = Command::new("launchctl")
+            .arg("unload")
+            .arg(&path)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
         remove_if_exists(&path)
     }
 }
@@ -347,17 +361,19 @@ impl ScheduleBackend for SystemdBackend {
 
     fn state(&self) -> Result<ScheduleState> {
         let service_state =
-            state_from_file(&self.service_path(), ScheduleBackendKind::LinuxSystemd)?;
-        let timer_state = state_from_file(&self.timer_path(), ScheduleBackendKind::LinuxSystemd)?;
+            read_managed_file_state(&self.service_path(), parse_systemd_definition)?;
+        let timer_state = read_managed_file_state(&self.timer_path(), |_| ScheduleDefinition {
+            backend: ScheduleBackendKind::LinuxSystemd,
+            exe: PathBuf::from("(timer)"),
+            args: Vec::new(),
+            interval_seconds: SCHEDULE_INTERVAL_SECONDS,
+        })?;
         match (service_state, timer_state) {
             (ScheduleState::Missing, ScheduleState::Missing) => Ok(ScheduleState::Missing),
             (ScheduleState::NonPaceflowArtifact, _) | (_, ScheduleState::NonPaceflowArtifact) => {
                 Ok(ScheduleState::NonPaceflowArtifact)
             }
-            (ScheduleState::Installed(service), ScheduleState::Installed(timer))
-                if service == expected_definition(ScheduleBackendKind::LinuxSystemd)?
-                    && timer == expected_definition(ScheduleBackendKind::LinuxSystemd)? =>
-            {
+            (ScheduleState::Installed(service), ScheduleState::Installed(_)) => {
                 Ok(ScheduleState::Installed(service))
             }
             _ => Ok(ScheduleState::Installed(ScheduleDefinition {
@@ -409,18 +425,7 @@ impl ScheduleBackend for CronBackend {
         if !crontab.contains(LINUX_CRON_MARKER) {
             return Ok(ScheduleState::Missing);
         }
-        if crontab.contains("sync schedule run") && crontab.contains("0 */6 * * *") {
-            Ok(ScheduleState::Installed(expected_definition(
-                ScheduleBackendKind::LinuxCron,
-            )?))
-        } else {
-            Ok(ScheduleState::Installed(ScheduleDefinition {
-                backend: ScheduleBackendKind::LinuxCron,
-                exe: PathBuf::from("stale"),
-                args: Vec::new(),
-                interval_seconds: 0,
-            }))
-        }
+        Ok(ScheduleState::Installed(parse_cron_definition(&crontab)))
     }
 
     fn install(&mut self, expected: &ScheduleDefinition) -> Result<()> {
@@ -474,18 +479,9 @@ impl ScheduleBackend for WindowsTaskBackend {
         if !xml.contains("PACEFLOW_MANAGED_SYNC_SCHEDULE") {
             return Ok(ScheduleState::NonPaceflowArtifact);
         }
-        if xml.contains("sync schedule run") {
-            Ok(ScheduleState::Installed(expected_definition(
-                ScheduleBackendKind::WindowsTaskScheduler,
-            )?))
-        } else {
-            Ok(ScheduleState::Installed(ScheduleDefinition {
-                backend: ScheduleBackendKind::WindowsTaskScheduler,
-                exe: PathBuf::from("stale"),
-                args: Vec::new(),
-                interval_seconds: 0,
-            }))
-        }
+        Ok(ScheduleState::Installed(parse_windows_task_definition(
+            &xml,
+        )))
     }
 
     fn install(&mut self, expected: &ScheduleDefinition) -> Result<()> {
@@ -522,7 +518,10 @@ impl ScheduleBackend for WindowsTaskBackend {
 }
 
 #[cfg(any(target_os = "macos", all(unix, not(target_os = "macos"))))]
-fn state_from_file(path: &Path, backend: ScheduleBackendKind) -> Result<ScheduleState> {
+fn read_managed_file_state(
+    path: &Path,
+    parse: fn(&str) -> ScheduleDefinition,
+) -> Result<ScheduleState> {
     let contents = match fs::read_to_string(path) {
         Ok(contents) => contents,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
@@ -533,16 +532,192 @@ fn state_from_file(path: &Path, backend: ScheduleBackendKind) -> Result<Schedule
     if !contents.contains("PACEFLOW_MANAGED_SYNC_SCHEDULE") {
         return Ok(ScheduleState::NonPaceflowArtifact);
     }
-    if contents.contains("sync schedule run") && contents.contains("21600") {
-        Ok(ScheduleState::Installed(expected_definition(backend)?))
-    } else {
-        Ok(ScheduleState::Installed(ScheduleDefinition {
-            backend,
-            exe: PathBuf::from("stale"),
-            args: Vec::new(),
-            interval_seconds: 0,
-        }))
+    Ok(ScheduleState::Installed(parse(&contents)))
+}
+
+#[cfg(target_os = "macos")]
+fn parse_launchd_definition(contents: &str) -> ScheduleDefinition {
+    let (exe, args) =
+        split_exe_and_args(parse_launchd_program_arguments(contents).unwrap_or_default());
+    ScheduleDefinition {
+        backend: ScheduleBackendKind::MacOsLaunchd,
+        exe,
+        args,
+        interval_seconds: parse_launchd_start_interval(contents).unwrap_or(0),
     }
+}
+
+#[cfg(target_os = "macos")]
+fn parse_launchd_program_arguments(contents: &str) -> Option<Vec<String>> {
+    use regex::Regex;
+    let array_re = Regex::new(r"(?s)<array>(.*?)</array>").ok()?;
+    let array_content = array_re.captures(contents)?.get(1)?.as_str();
+    let string_re = Regex::new(r"<string>([^<]*)</string>").ok()?;
+    Some(
+        string_re
+            .captures_iter(array_content)
+            .map(|c| unescape_xml(&c[1]))
+            .collect(),
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn parse_launchd_start_interval(contents: &str) -> Option<u64> {
+    use regex::Regex;
+    let re = Regex::new(r"<key>StartInterval</key>\s*<integer>(\d+)</integer>").ok()?;
+    re.captures(contents)?.get(1)?.as_str().parse().ok()
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn parse_systemd_definition(contents: &str) -> ScheduleDefinition {
+    let exec_start = contents
+        .lines()
+        .find_map(|line| line.strip_prefix("ExecStart="))
+        .unwrap_or_default();
+    let (exe, args) = split_exe_and_args(shell_tokenize(exec_start));
+    let interval_seconds = contents
+        .lines()
+        .find_map(|line| line.strip_prefix("# IntervalSeconds="))
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .unwrap_or(0);
+    ScheduleDefinition {
+        backend: ScheduleBackendKind::LinuxSystemd,
+        exe,
+        args,
+        interval_seconds,
+    }
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn parse_cron_definition(crontab: &str) -> ScheduleDefinition {
+    let mut inside_managed_block = false;
+    let mut command_line: Option<&str> = None;
+    let mut six_hour_marker_found = false;
+    for line in crontab.lines() {
+        if line.trim() == LINUX_CRON_MARKER {
+            inside_managed_block = !inside_managed_block;
+            continue;
+        }
+        if !inside_managed_block {
+            continue;
+        }
+        let trimmed = line.trim_start();
+        if let Some(rest) = trimmed.strip_prefix("0 */6 * * *") {
+            six_hour_marker_found = true;
+            command_line = Some(rest.trim_start());
+            break;
+        }
+    }
+    let (exe, args) = split_exe_and_args(shell_tokenize(command_line.unwrap_or_default()));
+    ScheduleDefinition {
+        backend: ScheduleBackendKind::LinuxCron,
+        exe,
+        args,
+        interval_seconds: if six_hour_marker_found {
+            SCHEDULE_INTERVAL_SECONDS
+        } else {
+            0
+        },
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn parse_windows_task_definition(xml: &str) -> ScheduleDefinition {
+    use regex::Regex;
+    let command = Regex::new(r"(?s)<Command>(.*?)</Command>")
+        .ok()
+        .and_then(|re| re.captures(xml))
+        .and_then(|caps| caps.get(1))
+        .map(|m| unescape_xml(m.as_str()))
+        .unwrap_or_default();
+    let arguments = Regex::new(r"(?s)<Arguments>(.*?)</Arguments>")
+        .ok()
+        .and_then(|re| re.captures(xml))
+        .and_then(|caps| caps.get(1))
+        .map(|m| unescape_xml(m.as_str()))
+        .unwrap_or_default();
+    let interval_seconds = if xml.contains("<Interval>PT6H</Interval>") {
+        SCHEDULE_INTERVAL_SECONDS
+    } else {
+        0
+    };
+    let args: Vec<String> = if arguments.trim().is_empty() {
+        Vec::new()
+    } else {
+        arguments
+            .split_whitespace()
+            .map(|s| s.to_string())
+            .collect()
+    };
+    ScheduleDefinition {
+        backend: ScheduleBackendKind::WindowsTaskScheduler,
+        exe: if command.is_empty() {
+            PathBuf::from("stale")
+        } else {
+            PathBuf::from(command)
+        },
+        args,
+        interval_seconds,
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn unescape_xml(value: &str) -> String {
+    value
+        .replace("&apos;", "'")
+        .replace("&quot;", "\"")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
+}
+
+#[cfg(any(target_os = "macos", all(unix, not(target_os = "macos"))))]
+fn split_exe_and_args(mut tokens: Vec<String>) -> (PathBuf, Vec<String>) {
+    if tokens.is_empty() {
+        return (PathBuf::from("stale"), Vec::new());
+    }
+    let exe = PathBuf::from(tokens.remove(0));
+    (exe, tokens)
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn shell_tokenize(input: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut in_single = false;
+    let mut chars = input.chars().peekable();
+    while let Some(c) = chars.next() {
+        if in_single {
+            if c == '\'' {
+                let mut lookahead = chars.clone();
+                if lookahead.next() == Some('\\')
+                    && lookahead.next() == Some('\'')
+                    && lookahead.next() == Some('\'')
+                {
+                    chars.next();
+                    chars.next();
+                    chars.next();
+                    current.push('\'');
+                } else {
+                    in_single = false;
+                }
+            } else {
+                current.push(c);
+            }
+        } else if c.is_whitespace() {
+            if !current.is_empty() {
+                tokens.push(std::mem::take(&mut current));
+            }
+        } else if c == '\'' {
+            in_single = true;
+        } else {
+            current.push(c);
+        }
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    tokens
 }
 
 #[cfg(target_os = "macos")]
@@ -908,6 +1083,113 @@ mod tests {
 
         assert!(xml.contains(r"<Command>C:\Program Files\Paceflow\paceflow.exe</Command>"));
         assert!(xml.contains("<Arguments>sync schedule run</Arguments>"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn parse_launchd_definition_round_trips_through_rendered_plist() {
+        let original = expected_definition_with_exe(ScheduleBackendKind::MacOsLaunchd, fake_exe());
+
+        let plist = launchd_plist(&original);
+        let parsed = parse_launchd_definition(&plist);
+
+        assert_eq!(parsed, original);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn parse_launchd_definition_detects_stale_exe_so_install_can_update() {
+        let stale = expected_definition_with_exe(
+            ScheduleBackendKind::MacOsLaunchd,
+            PathBuf::from("/old/paceflow/target/debug/paceflow"),
+        );
+        let plist = launchd_plist(&stale);
+
+        let parsed = parse_launchd_definition(&plist);
+
+        assert_eq!(
+            parsed.exe,
+            PathBuf::from("/old/paceflow/target/debug/paceflow")
+        );
+        let fresh = expected_definition_with_exe(
+            ScheduleBackendKind::MacOsLaunchd,
+            PathBuf::from("/Users/me/.cargo/bin/paceflow"),
+        );
+        assert_ne!(parsed, fresh);
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn parse_systemd_definition_round_trips_through_rendered_service() {
+        let original = expected_definition_with_exe(ScheduleBackendKind::LinuxSystemd, fake_exe());
+
+        let service = systemd_service(&original);
+        let parsed = parse_systemd_definition(&service);
+
+        assert_eq!(parsed, original);
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn parse_systemd_definition_detects_stale_exe_so_install_can_update() {
+        let stale = expected_definition_with_exe(
+            ScheduleBackendKind::LinuxSystemd,
+            PathBuf::from("/old/paceflow/target/debug/paceflow"),
+        );
+        let service = systemd_service(&stale);
+
+        let parsed = parse_systemd_definition(&service);
+
+        assert_eq!(
+            parsed.exe,
+            PathBuf::from("/old/paceflow/target/debug/paceflow")
+        );
+        let fresh = expected_definition_with_exe(
+            ScheduleBackendKind::LinuxSystemd,
+            PathBuf::from("/home/me/.cargo/bin/paceflow"),
+        );
+        assert_ne!(parsed, fresh);
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn shell_tokenize_handles_quoted_paths_and_bare_args() {
+        let tokens = shell_tokenize("'/tmp/paceflow test/bin/paceflow' sync schedule run");
+        assert_eq!(
+            tokens,
+            vec![
+                "/tmp/paceflow test/bin/paceflow".to_string(),
+                "sync".to_string(),
+                "schedule".to_string(),
+                "run".to_string(),
+            ]
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn parse_windows_task_definition_detects_stale_command_so_install_can_update() {
+        let stale = expected_definition_with_exe(
+            ScheduleBackendKind::WindowsTaskScheduler,
+            PathBuf::from(r"C:\old\paceflow\target\debug\paceflow.exe"),
+        );
+        let xml = windows_task_xml(&stale);
+
+        let parsed = parse_windows_task_definition(&xml);
+
+        assert_eq!(
+            parsed.exe,
+            PathBuf::from(r"C:\old\paceflow\target\debug\paceflow.exe")
+        );
+        assert_eq!(
+            parsed.args,
+            vec![
+                "sync".to_string(),
+                "schedule".to_string(),
+                "run".to_string()
+            ]
+        );
+        assert_eq!(parsed.interval_seconds, SCHEDULE_INTERVAL_SECONDS);
     }
 
     #[derive(Default)]
