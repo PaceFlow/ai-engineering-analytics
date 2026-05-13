@@ -62,9 +62,32 @@ For macOS Apple Silicon, replace `paceflow-x86_64-unknown-linux-gnu` with `pacef
 macOS/Linux, for a local development build:
 
 ```bash
-cargo build
-export PATH="$(pwd)/target/debug:$PATH"
+cargo install --path .
 paceflow --help
+```
+
+This builds in release mode and copies the binary to `~/.cargo/bin/paceflow`, which is on `PATH` by default for rustup installs. Re-run the command (add `--force` after the first time) to pick up changes. If `~/.cargo/bin` is not on `PATH`, add it:
+
+```bash
+echo 'export PATH="$HOME/.cargo/bin:$PATH"' >> ~/.zshrc
+exec zsh
+```
+
+Windows PowerShell, for a local development build:
+
+```powershell
+cargo install --path .
+paceflow --help
+```
+
+This installs `paceflow.exe` to `%USERPROFILE%\.cargo\bin\`, which rustup adds to the user `Path`. Re-run with `--force` after the first install to pick up changes. If `cargo install` reports the binary is not on `PATH`, add `%USERPROFILE%\.cargo\bin` for the current user and open a new PowerShell window:
+
+```powershell
+[Environment]::SetEnvironmentVariable(
+  "Path",
+  [Environment]::GetEnvironmentVariable("Path", "User") + ";$env:USERPROFILE\.cargo\bin",
+  "User"
+)
 ```
 
 Windows PowerShell, for a downloaded release:
