@@ -7,6 +7,30 @@ paceflow --help
 paceflow ingest
 ```
 
+## Install with Cargo
+
+If you have the Rust toolchain (or `cargo-binstall`) on your machine, this is the fastest path.
+
+### `cargo binstall` (prebuilt binary, no compilation)
+
+```bash
+cargo binstall paceflow
+paceflow --help
+```
+
+`cargo binstall` downloads the matching prebuilt release artifact for your target triple and drops `paceflow` in `~/.cargo/bin`. No Rust compilation required. Install `cargo-binstall` itself with `cargo install cargo-binstall` or grab its prebuilt binary from [cargo-bins/cargo-binstall](https://github.com/cargo-bins/cargo-binstall#installation).
+
+### `cargo install` (compiles from source)
+
+```bash
+cargo install --locked paceflow
+paceflow --help
+```
+
+Builds from crates.io with your local toolchain. Slower than `binstall` (rusqlite-bundled + reqwest + tokio take a few minutes), but works on any target where Rust compiles. If install fails, try `rustup update` first.
+
+Both commands install to `~/.cargo/bin/paceflow`, which rustup adds to `PATH` by default. See [Add `paceflow` To `PATH`](#add-paceflow-to-path) if it isn't.
+
 ## Prebuilt Releases
 
 Download a release from [GitHub Releases](https://github.com/PaceFlow/ai-engineering-analytics/releases).
@@ -64,9 +88,20 @@ macOS/Linux, for a local development build:
 ```bash
 cargo install --path .
 paceflow --help
+paceflow --version           # paceflow 0.2.0 (<git-sha> clean, <commit-time>)
 ```
 
-This builds in release mode and copies the binary to `~/.cargo/bin/paceflow`, which is on `PATH` by default for rustup installs. Re-run the command (add `--force` after the first time) to pick up changes. If `~/.cargo/bin` is not on `PATH`, add it:
+This builds in release mode and copies the binary to `~/.cargo/bin/paceflow`, which is on `PATH` by default for rustup installs. Re-run the command (add `--force` after the first time) to pick up changes. `paceflow --version` embeds the git commit SHA and a `clean`/`dirty` flag from `build.rs`, so you can confirm which checkout you're running:
+
+```bash
+paceflow --version                          # what's on PATH
+git rev-parse --short=12 origin/main        # what main currently points at
+git fetch origin main && git diff --stat HEAD origin/main   # check if you're behind main
+```
+
+If the SHA in `paceflow --version` matches `git rev-parse --short=12 origin/main` and shows `clean`, you're running an exact build of `origin/main`.
+
+If `~/.cargo/bin` is not on `PATH`, add it:
 
 ```bash
 echo 'export PATH="$HOME/.cargo/bin:$PATH"' >> ~/.zshrc
@@ -78,9 +113,21 @@ Windows PowerShell, for a local development build:
 ```powershell
 cargo install --path .
 paceflow --help
+paceflow --version           # paceflow 0.2.0 (<git-sha> clean, <commit-time>)
 ```
 
-This installs `paceflow.exe` to `%USERPROFILE%\.cargo\bin\`, which rustup adds to the user `Path`. Re-run with `--force` after the first install to pick up changes. If `cargo install` reports the binary is not on `PATH`, add `%USERPROFILE%\.cargo\bin` for the current user and open a new PowerShell window:
+This installs `paceflow.exe` to `%USERPROFILE%\.cargo\bin\`, which rustup adds to the user `Path`. Re-run with `--force` after the first install to pick up changes. `paceflow --version` embeds the git commit SHA and a `clean`/`dirty` flag from `build.rs`, so you can confirm which checkout you're running:
+
+```powershell
+paceflow --version                          # what's on PATH
+git rev-parse --short=12 origin/main        # what main currently points at
+git fetch origin main; git diff --stat HEAD origin/main   # check if you're behind main
+(Get-Command paceflow).Source               # which paceflow.exe resolves on PATH
+```
+
+If the SHA in `paceflow --version` matches `git rev-parse --short=12 origin/main` and shows `clean`, you're running an exact build of `origin/main`.
+
+If `cargo install` reports the binary is not on `PATH`, add `%USERPROFILE%\.cargo\bin` for the current user and open a new PowerShell window:
 
 ```powershell
 [Environment]::SetEnvironmentVariable(

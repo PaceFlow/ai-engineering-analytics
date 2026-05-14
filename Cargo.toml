@@ -1,8 +1,15 @@
 [package]
-name = "ai-engineering-analytics"
+name = "paceflow"
 version = "0.2.0"
 edition = "2024"
 default-run = "paceflow"
+description = "Local-first CLI that turns AI coding session history and git metadata into engineering analytics."
+license = "MIT"
+repository = "https://github.com/PaceFlow/ai-engineering-analytics"
+homepage = "https://github.com/PaceFlow/ai-engineering-analytics"
+readme = "README.md"
+keywords = ["analytics", "ai", "cli", "git", "developer-tools"]
+categories = ["command-line-utilities", "development-tools"]
 
 [[bin]]
 name = "paceflow"
@@ -33,3 +40,11 @@ tempfile = "3.23.0"
 
 [profile.release]
 debug = "line-tables-only"
+
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/paceflow-{ target }{ archive-suffix }"
+bin-dir = "paceflow-{ target }/{ bin }{ binary-ext }"
+pkg-fmt = "tgz"
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-fmt = "zip"

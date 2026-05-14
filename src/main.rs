@@ -1,5 +1,5 @@
-use ai_engineering_analytics::cli::{Cli, Commands};
-use ai_engineering_analytics::commands;
+use paceflow::cli::{Cli, Commands};
+use paceflow::commands;
 use clap::Parser;
 
 fn main() -> anyhow::Result<()> {

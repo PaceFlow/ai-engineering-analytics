@@ -58,7 +58,19 @@ paceflow ingest
 
 ## Installation
 
-Build and install from source:
+Install a prebuilt binary with `cargo-binstall` (recommended if you have cargo):
+
+```bash
+cargo binstall paceflow
+```
+
+Or compile from crates.io:
+
+```bash
+cargo install --locked paceflow
+```
+
+Build and install from a local checkout:
 
 ```bash
 git clone https://github.com/PaceFlow/ai-engineering-analytics.git

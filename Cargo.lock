@@ -12,31 +12,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ai-engineering-analytics"
-version = "0.2.0"
-dependencies = [
- "anyhow",
- "assert_cmd",
- "chrono",
- "clap",
- "dirs",
- "insta",
- "md5",
- "percent-encoding",
- "rayon",
- "regex",
- "reqwest",
- "rusqlite",
- "serde",
- "serde_json",
- "similar",
- "tempfile",
- "terminal_size",
- "thiserror",
- "tokio",
-]
-
-[[package]]
 name = "android_system_properties"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -906,6 +881,31 @@ name = "option-ext"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
+
+[[package]]
+name = "paceflow"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "assert_cmd",
+ "chrono",
+ "clap",
+ "dirs",
+ "insta",
+ "md5",
+ "percent-encoding",
+ "rayon",
+ "regex",
+ "reqwest",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "similar",
+ "tempfile",
+ "terminal_size",
+ "thiserror",
+ "tokio",
+]
 
 [[package]]
 name = "percent-encoding"

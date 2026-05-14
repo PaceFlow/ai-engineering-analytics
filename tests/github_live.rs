@@ -1,7 +1,7 @@
-use ai_engineering_analytics::analytics;
-use ai_engineering_analytics::cli::ReportArgs;
-use ai_engineering_analytics::db;
-use ai_engineering_analytics::github;
+use paceflow::analytics;
+use paceflow::cli::ReportArgs;
+use paceflow::db;
+use paceflow::github;
 use anyhow::Result;
 use rusqlite::{Connection, params};
 use std::ffi::{OsStr, OsString};

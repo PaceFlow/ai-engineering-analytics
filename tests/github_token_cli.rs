@@ -1,4 +1,4 @@
-use ai_engineering_analytics::github::auth::github_token;
+use paceflow::github::auth::github_token;
 use assert_cmd::Command;
 use std::ffi::{OsStr, OsString};
 use std::fs;
