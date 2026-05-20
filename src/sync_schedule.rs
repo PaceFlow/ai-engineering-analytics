@@ -475,7 +475,9 @@ impl ScheduleBackend for WindowsTaskBackend {
         if !output.status.success() {
             return Ok(ScheduleState::Missing);
         }
-        let xml = String::from_utf8_lossy(&output.stdout);
+        // schtasks /Query /XML emits UTF-16 LE with a BOM; fall back to a lossy UTF-8
+        // decode for robustness against other output paths.
+        let xml = decode_schtasks_xml(&output.stdout);
         if !xml.contains("PACEFLOW_MANAGED_SYNC_SCHEDULE") {
             return Ok(ScheduleState::NonPaceflowArtifact);
         }
@@ -486,7 +488,10 @@ impl ScheduleBackend for WindowsTaskBackend {
 
     fn install(&mut self, expected: &ScheduleDefinition) -> Result<()> {
         let xml_path = env::temp_dir().join("paceflow-sync-task.xml");
-        fs::write(&xml_path, windows_task_xml(expected))?;
+        // schtasks /Create /XML rejects UTF-8 bytes whose prolog declares any encoding
+        // (it expects UTF-16 LE with a BOM and bails with
+        // "(1,40)::ERROR: unable to switch the encoding" otherwise).
+        fs::write(&xml_path, windows_task_xml_bytes(expected))?;
         let status = Command::new("schtasks")
             .args([
                 "/Create",
@@ -822,7 +827,7 @@ fn remove_managed_cron_block(crontab: &str) -> String {
 #[cfg(target_os = "windows")]
 fn windows_task_xml(expected: &ScheduleDefinition) -> String {
     format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?>
+        r#"<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo>
     <Description>PACEFLOW_MANAGED_SYNC_SCHEDULE</Description>
@@ -861,6 +866,37 @@ fn windows_task_xml(expected: &ScheduleDefinition) -> String {
         shell_quote_command(expected),
         expected.interval_seconds
     )
+}
+
+#[cfg(target_os = "windows")]
+fn windows_task_xml_bytes(expected: &ScheduleDefinition) -> Vec<u8> {
+    encode_utf16_le_with_bom(&windows_task_xml(expected))
+}
+
+#[cfg(target_os = "windows")]
+fn encode_utf16_le_with_bom(s: &str) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(2 + s.len() * 2);
+    bytes.extend_from_slice(&[0xFF, 0xFE]);
+    for unit in s.encode_utf16() {
+        bytes.extend_from_slice(&unit.to_le_bytes());
+    }
+    bytes
+}
+
+#[cfg(target_os = "windows")]
+fn decode_schtasks_xml(bytes: &[u8]) -> String {
+    if bytes.len() >= 2 && bytes[0] == 0xFF && bytes[1] == 0xFE {
+        let payload = &bytes[2..];
+        // Drop a trailing odd byte rather than failing — schtasks output is always
+        // an even number of bytes after the BOM in practice, but be defensive.
+        let unit_count = payload.len() / 2;
+        let units: Vec<u16> = (0..unit_count)
+            .map(|i| u16::from_le_bytes([payload[i * 2], payload[i * 2 + 1]]))
+            .collect();
+        String::from_utf16_lossy(&units)
+    } else {
+        String::from_utf8_lossy(bytes).into_owned()
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -1164,6 +1200,79 @@ mod tests {
                 "run".to_string(),
             ]
         );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_task_xml_bytes_are_utf16_le_with_bom() {
+        let definition = expected_definition_with_exe(
+            ScheduleBackendKind::WindowsTaskScheduler,
+            PathBuf::from(r"C:\Program Files\Paceflow\paceflow.exe"),
+        );
+
+        let bytes = windows_task_xml_bytes(&definition);
+
+        assert!(
+            bytes.starts_with(&[0xFF, 0xFE]),
+            "expected UTF-16 LE BOM, got {:?}",
+            bytes.get(..2)
+        );
+        assert!(
+            (bytes.len() - 2) % 2 == 0,
+            "UTF-16 payload must be an even number of bytes"
+        );
+
+        let payload = &bytes[2..];
+        let units: Vec<u16> = payload
+            .chunks_exact(2)
+            .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+            .collect();
+        let decoded = String::from_utf16(&units).expect("payload should be valid UTF-16");
+
+        assert!(
+            decoded.starts_with(r#"<?xml version="1.0" encoding="UTF-16"?>"#),
+            "prolog must declare encoding=\"UTF-16\" to match the file bytes: {decoded}"
+        );
+        assert!(
+            decoded.contains(r"<Command>C:\Program Files\Paceflow\paceflow.exe</Command>"),
+            "decoded XML missing command: {decoded}"
+        );
+        assert!(
+            decoded.contains("<Arguments>sync schedule run</Arguments>"),
+            "decoded XML missing arguments: {decoded}"
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn decode_schtasks_xml_handles_utf16_le_bom_and_falls_back_to_utf8() {
+        let original = "<Task>PACEFLOW_MANAGED_SYNC_SCHEDULE</Task>";
+        let utf16_bytes = encode_utf16_le_with_bom(original);
+
+        let decoded = decode_schtasks_xml(&utf16_bytes);
+
+        assert_eq!(decoded, original);
+        assert!(decoded.contains("PACEFLOW_MANAGED_SYNC_SCHEDULE"));
+
+        let utf8_bytes = original.as_bytes();
+        let decoded_utf8 = decode_schtasks_xml(utf8_bytes);
+        assert_eq!(decoded_utf8, original);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn parse_windows_task_definition_round_trips_through_utf16_query_output() {
+        let original = expected_definition_with_exe(
+            ScheduleBackendKind::WindowsTaskScheduler,
+            PathBuf::from(r"C:\Program Files\Paceflow\paceflow.exe"),
+        );
+        let utf16_bytes = windows_task_xml_bytes(&original);
+
+        let xml = decode_schtasks_xml(&utf16_bytes);
+
+        assert!(xml.contains("PACEFLOW_MANAGED_SYNC_SCHEDULE"));
+        let parsed = parse_windows_task_definition(&xml);
+        assert_eq!(parsed, original);
     }
 
     #[cfg(target_os = "windows")]
