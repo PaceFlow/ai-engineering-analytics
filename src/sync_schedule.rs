@@ -487,11 +487,19 @@ impl ScheduleBackend for WindowsTaskBackend {
     }
 
     fn install(&mut self, expected: &ScheduleDefinition) -> Result<()> {
+        let vbs_path = windows_vbs_path()?;
+        if let Some(parent) = vbs_path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create directory {}", parent.display()))?;
+        }
+        fs::write(&vbs_path, render_paceflow_sync_vbs(expected))
+            .with_context(|| format!("failed to write {}", vbs_path.display()))?;
+
         let xml_path = env::temp_dir().join("paceflow-sync-task.xml");
         // schtasks /Create /XML rejects UTF-8 bytes whose prolog declares any encoding
         // (it expects UTF-16 LE with a BOM and bails with
         // "(1,40)::ERROR: unable to switch the encoding" otherwise).
-        fs::write(&xml_path, windows_task_xml_bytes(expected))?;
+        fs::write(&xml_path, windows_task_xml_bytes(expected, &vbs_path))?;
         let status = Command::new("schtasks")
             .args([
                 "/Create",
@@ -517,6 +525,9 @@ impl ScheduleBackend for WindowsTaskBackend {
             .context("failed to run schtasks /Delete")?;
         if !status.success() {
             bail!("schtasks /Delete failed");
+        }
+        if let Ok(vbs_path) = windows_vbs_path() {
+            let _ = fs::remove_file(vbs_path);
         }
         Ok(())
     }
@@ -641,8 +652,8 @@ fn parse_windows_task_definition(xml: &str) -> ScheduleDefinition {
         .and_then(|caps| caps.get(1))
         .map(|m| unescape_xml(m.as_str()))
         .unwrap_or_default();
-    let (exe, args) = if command.eq_ignore_ascii_case("powershell.exe") {
-        parse_windows_hidden_powershell_arguments(&arguments)
+    let (exe, args) = if command.eq_ignore_ascii_case("wscript.exe") {
+        parse_windows_wscript_action(&arguments, xml)
             .unwrap_or_else(|| (PathBuf::from("stale"), Vec::new()))
     } else {
         let args = if arguments.trim().is_empty() {
@@ -676,34 +687,161 @@ fn parse_windows_task_definition(xml: &str) -> ScheduleDefinition {
 }
 
 #[cfg(any(target_os = "windows", test))]
-fn parse_windows_hidden_powershell_arguments(arguments: &str) -> Option<(PathBuf, Vec<String>)> {
-    use regex::Regex;
-    let file_re = Regex::new(r"-FilePath\s+'((?:''|[^'])*)'").ok()?;
-    let args_re = Regex::new(r"-ArgumentList\s+@\((?P<args>[^)]*)\)").ok()?;
-    let quoted_arg_re = Regex::new(r"'((?:''|[^'])*)'").ok()?;
-
-    let exe = file_re
-        .captures(arguments)?
-        .get(1)
-        .map(|m| powershell_unquote_single_quoted(m.as_str()))?;
-    let args = args_re
-        .captures(arguments)
-        .and_then(|captures| captures.name("args"))
-        .map(|m| {
-            quoted_arg_re
-                .captures_iter(m.as_str())
-                .filter_map(|capture| capture.get(1))
-                .map(|m| powershell_unquote_single_quoted(m.as_str()))
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-
-    Some((PathBuf::from(exe), args))
+fn parse_windows_wscript_action(arguments: &str, xml: &str) -> Option<(PathBuf, Vec<String>)> {
+    if let Some(vbs_path) = parse_double_quoted_path(arguments)
+        && let Ok(vbs) = fs::read_to_string(&vbs_path)
+        && vbs.contains("PACEFLOW_MANAGED_SYNC_SCHEDULE")
+        && let Some(parsed) = parse_paceflow_sync_vbs(&vbs)
+    {
+        return Some(parsed);
+    }
+    parse_managed_xml_comment(xml)
 }
 
 #[cfg(any(target_os = "windows", test))]
-fn powershell_unquote_single_quoted(value: &str) -> String {
-    value.replace("''", "'")
+fn parse_double_quoted_path(arguments: &str) -> Option<PathBuf> {
+    let trimmed = arguments.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let inner = if let Some(stripped) = trimmed.strip_prefix('"').and_then(|s| s.strip_suffix('"'))
+    {
+        stripped.to_string()
+    } else {
+        trimmed.to_string()
+    };
+    Some(PathBuf::from(inner))
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn parse_paceflow_sync_vbs(vbs: &str) -> Option<(PathBuf, Vec<String>)> {
+    let run_line = vbs
+        .lines()
+        .find(|line| line.trim_start().starts_with("sh.Run"))?;
+    let body = run_line.trim_start().strip_prefix("sh.Run")?.trim_start();
+    let literal = extract_first_vbs_string_literal(body)?;
+    let tokens = tokenize_windows_command_line(&literal);
+    let mut iter = tokens.into_iter();
+    let exe = PathBuf::from(iter.next()?);
+    Some((exe, iter.collect()))
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn extract_first_vbs_string_literal(input: &str) -> Option<String> {
+    let mut chars = input.chars().peekable();
+    if chars.next()? != '"' {
+        return None;
+    }
+    let mut out = String::new();
+    while let Some(c) = chars.next() {
+        if c == '"' {
+            if chars.peek() == Some(&'"') {
+                chars.next();
+                out.push('"');
+            } else {
+                return Some(out);
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    None
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn parse_managed_xml_comment(xml: &str) -> Option<(PathBuf, Vec<String>)> {
+    use regex::Regex;
+    let re = Regex::new(r"<!--\s*(.+?)\s+every\s+\d+\s+seconds\s*-->").ok()?;
+    let captured = re.captures(xml)?.get(1)?.as_str().trim().to_string();
+    let tokens = tokenize_quoted_command_line(&captured);
+    let mut iter = tokens.into_iter();
+    let exe = PathBuf::from(iter.next()?);
+    Some((exe, iter.collect()))
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn tokenize_windows_command_line(input: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut in_double = false;
+    let mut started = false;
+    let mut chars = input.chars().peekable();
+    while let Some(c) = chars.next() {
+        if in_double {
+            if c == '\\' && chars.peek() == Some(&'"') {
+                chars.next();
+                current.push('"');
+            } else if c == '"' {
+                in_double = false;
+            } else {
+                current.push(c);
+            }
+        } else if c == '"' {
+            in_double = true;
+            started = true;
+        } else if c.is_whitespace() {
+            if started {
+                tokens.push(std::mem::take(&mut current));
+                started = false;
+            }
+        } else {
+            current.push(c);
+            started = true;
+        }
+    }
+    if started {
+        tokens.push(current);
+    }
+    tokens
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn tokenize_quoted_command_line(input: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut quote: Option<char> = None;
+    let mut started = false;
+    let mut chars = input.chars().peekable();
+    while let Some(c) = chars.next() {
+        if let Some(q) = quote {
+            if q == '\'' && c == '\'' {
+                let mut lookahead = chars.clone();
+                if lookahead.next() == Some('\\')
+                    && lookahead.next() == Some('\'')
+                    && lookahead.next() == Some('\'')
+                {
+                    chars.next();
+                    chars.next();
+                    chars.next();
+                    current.push('\'');
+                    continue;
+                }
+                quote = None;
+            } else if q == '"' && c == '\\' && chars.peek() == Some(&'"') {
+                chars.next();
+                current.push('"');
+            } else if q == '"' && c == '"' {
+                quote = None;
+            } else {
+                current.push(c);
+            }
+        } else if c == '\'' || c == '"' {
+            quote = Some(c);
+            started = true;
+        } else if c.is_whitespace() {
+            if started {
+                tokens.push(std::mem::take(&mut current));
+                started = false;
+            }
+        } else {
+            current.push(c);
+            started = true;
+        }
+    }
+    if started {
+        tokens.push(current);
+    }
+    tokens
 }
 
 #[cfg(any(target_os = "macos", target_os = "windows", test))]
@@ -865,7 +1003,53 @@ fn remove_managed_cron_block(crontab: &str) -> String {
 }
 
 #[cfg(any(target_os = "windows", test))]
-fn windows_task_xml(expected: &ScheduleDefinition) -> String {
+fn windows_vbs_path() -> Result<PathBuf> {
+    Ok(paceflow_home_dir()?
+        .join(".paceflow")
+        .join("paceflow-sync.vbs"))
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn render_paceflow_sync_vbs(expected: &ScheduleDefinition) -> String {
+    let runtime_command_line = build_windows_run_command_line(expected);
+    let vbs_literal = vbs_string_literal(&runtime_command_line);
+    format!(
+        "' PACEFLOW_MANAGED_SYNC_SCHEDULE\r\nSet sh = CreateObject(\"WScript.Shell\")\r\nsh.Run {vbs_literal}, 0, True\r\n"
+    )
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn build_windows_run_command_line(expected: &ScheduleDefinition) -> String {
+    let exe = expected.exe.to_string_lossy().to_string();
+    let mut parts = Vec::with_capacity(1 + expected.args.len());
+    parts.push(double_quote_for_run(&exe));
+    for arg in &expected.args {
+        if arg.is_empty()
+            || arg
+                .chars()
+                .any(|c| c.is_whitespace() || c == '"' || c == '\\')
+        {
+            parts.push(double_quote_for_run(arg));
+        } else {
+            parts.push(arg.clone());
+        }
+    }
+    parts.join(" ")
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn double_quote_for_run(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', "\\\""))
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn vbs_string_literal(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', "\"\""))
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn windows_task_xml(expected: &ScheduleDefinition, vbs_path: &Path) -> String {
+    let arguments = format!("\"{}\"", vbs_path.to_string_lossy());
     format!(
         r#"<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
@@ -901,35 +1085,16 @@ fn windows_task_xml(expected: &ScheduleDefinition) -> String {
   <!-- {} every {} seconds -->
 </Task>
 "#,
-        escape_xml("powershell.exe"),
-        escape_xml(&windows_hidden_powershell_arguments(expected)),
+        escape_xml("wscript.exe"),
+        escape_xml(&arguments),
         shell_quote_command(expected),
         expected.interval_seconds
     )
 }
 
 #[cfg(any(target_os = "windows", test))]
-fn windows_hidden_powershell_arguments(expected: &ScheduleDefinition) -> String {
-    let exe = powershell_single_quote(&expected.exe.to_string_lossy());
-    let args = expected
-        .args
-        .iter()
-        .map(|arg| powershell_single_quote(arg))
-        .collect::<Vec<_>>()
-        .join(",");
-    format!(
-        "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command \"Start-Process -FilePath {exe} -ArgumentList @({args}) -WindowStyle Hidden -Wait\""
-    )
-}
-
-#[cfg(any(target_os = "windows", test))]
-fn powershell_single_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "''"))
-}
-
-#[cfg(any(target_os = "windows", test))]
-fn windows_task_xml_bytes(expected: &ScheduleDefinition) -> Vec<u8> {
-    encode_utf16_le_with_bom(&windows_task_xml(expected))
+fn windows_task_xml_bytes(expected: &ScheduleDefinition, vbs_path: &Path) -> Vec<u8> {
+    encode_utf16_le_with_bom(&windows_task_xml(expected, vbs_path))
 }
 
 #[cfg(any(target_os = "windows", test))]
@@ -1168,22 +1333,56 @@ mod tests {
 
     #[cfg(any(target_os = "windows", test))]
     #[test]
-    fn windows_task_xml_runs_paceflow_through_hidden_powershell() {
+    fn windows_task_xml_runs_paceflow_through_wscript_vbs_wrapper() {
+        let definition = expected_definition_with_exe(
+            ScheduleBackendKind::WindowsTaskScheduler,
+            PathBuf::from(r"C:\Program Files\Paceflow\paceflow.exe"),
+        );
+        let vbs_path = PathBuf::from(r"C:\Users\test\.paceflow\paceflow-sync.vbs");
+
+        let xml = windows_task_xml(&definition, &vbs_path);
+
+        assert!(xml.contains("<Command>wscript.exe</Command>"));
+        assert!(xml.contains("paceflow-sync.vbs"));
+        assert!(
+            xml.contains("&quot;C:\\Users\\test\\.paceflow\\paceflow-sync.vbs&quot;"),
+            "expected double-quoted .vbs path in escaped arguments: {xml}"
+        );
+        assert!(!xml.contains("powershell.exe"));
+        assert!(!xml.contains("Start-Process"));
+    }
+
+    #[cfg(any(target_os = "windows", test))]
+    #[test]
+    fn windows_vbs_payload_runs_paceflow_hidden_and_waits() {
         let definition = expected_definition_with_exe(
             ScheduleBackendKind::WindowsTaskScheduler,
             PathBuf::from(r"C:\Program Files\Paceflow\paceflow.exe"),
         );
 
-        let xml = windows_task_xml(&definition);
+        let vbs = render_paceflow_sync_vbs(&definition);
 
-        assert!(xml.contains("<Command>powershell.exe</Command>"));
-        assert!(xml.contains("-NoProfile"));
-        assert!(xml.contains("-WindowStyle Hidden"));
-        assert!(xml.contains("Start-Process"));
-        assert!(xml.contains(r"C:\Program Files\Paceflow\paceflow.exe"));
-        assert!(xml.contains("sync"));
-        assert!(xml.contains("schedule"));
-        assert!(xml.contains("run"));
+        assert!(vbs.contains("PACEFLOW_MANAGED_SYNC_SCHEDULE"));
+        assert!(vbs.contains("CreateObject(\"WScript.Shell\")"));
+        assert!(vbs.contains("sh.Run "));
+        assert!(
+            vbs.contains(", 0, True"),
+            "expected hidden + waited Run call: {vbs}"
+        );
+        assert!(
+            vbs.contains("\"\"C:\\Program Files\\Paceflow\\paceflow.exe\"\""),
+            "expected double-doubled exe path in VBS literal: {vbs}"
+        );
+        assert!(vbs.contains("sync"));
+        assert!(vbs.contains("schedule"));
+        assert!(vbs.contains("run"));
+
+        let parsed = parse_paceflow_sync_vbs(&vbs).expect("vbs should round-trip");
+        assert_eq!(
+            parsed.0,
+            PathBuf::from(r"C:\Program Files\Paceflow\paceflow.exe")
+        );
+        assert_eq!(parsed.1, vec!["sync", "schedule", "run"]);
     }
 
     #[cfg(target_os = "macos")]
@@ -1274,8 +1473,9 @@ mod tests {
             ScheduleBackendKind::WindowsTaskScheduler,
             PathBuf::from(r"C:\Program Files\Paceflow\paceflow.exe"),
         );
+        let vbs_path = PathBuf::from(r"C:\Users\test\.paceflow\paceflow-sync.vbs");
 
-        let bytes = windows_task_xml_bytes(&definition);
+        let bytes = windows_task_xml_bytes(&definition, &vbs_path);
 
         assert!(
             bytes.starts_with(&[0xFF, 0xFE]),
@@ -1298,10 +1498,10 @@ mod tests {
             decoded.starts_with(r#"<?xml version="1.0" encoding="UTF-16"?>"#),
             "prolog must declare encoding=\"UTF-16\" to match the file bytes: {decoded}"
         );
-        assert!(decoded.contains("<Command>powershell.exe</Command>"));
+        assert!(decoded.contains("<Command>wscript.exe</Command>"));
         assert!(
-            decoded.contains("-WindowStyle Hidden"),
-            "decoded XML missing hidden window arguments: {decoded}"
+            decoded.contains("paceflow-sync.vbs"),
+            "decoded XML missing .vbs path: {decoded}"
         );
     }
 
@@ -1323,35 +1523,69 @@ mod tests {
 
     #[cfg(any(target_os = "windows", test))]
     #[test]
-    fn parse_windows_task_definition_round_trips_through_utf16_query_output() {
+    fn parse_windows_task_definition_round_trips_via_real_vbs_file() -> Result<()> {
+        let _guard = lock_env();
+        let tempdir = tempdir()?;
+        let _home = ScopedEnvVar::set("PACEFLOW_HOME", tempdir.path());
+
         let original = expected_definition_with_exe(
             ScheduleBackendKind::WindowsTaskScheduler,
             PathBuf::from(r"C:\Program Files\Paceflow\paceflow.exe"),
         );
-        let utf16_bytes = windows_task_xml_bytes(&original);
+        let vbs_path = windows_vbs_path()?;
+        if let Some(parent) = vbs_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&vbs_path, render_paceflow_sync_vbs(&original))?;
 
+        let utf16_bytes = windows_task_xml_bytes(&original, &vbs_path);
         let xml = decode_schtasks_xml(&utf16_bytes);
 
         assert!(xml.contains("PACEFLOW_MANAGED_SYNC_SCHEDULE"));
         let parsed = parse_windows_task_definition(&xml);
         assert_eq!(parsed, original);
+        Ok(())
     }
 
     #[cfg(any(target_os = "windows", test))]
     #[test]
-    fn parse_windows_task_definition_detects_stale_command_so_install_can_update() {
-        let stale = expected_definition_with_exe(
-            ScheduleBackendKind::WindowsTaskScheduler,
-            PathBuf::from(r"C:\old\paceflow\target\debug\paceflow.exe"),
-        );
-        let xml = windows_task_xml(&stale);
+    fn parse_windows_task_definition_falls_back_to_xml_comment_when_vbs_is_missing() -> Result<()> {
+        let _guard = lock_env();
+        let tempdir = tempdir()?;
+        let _home = ScopedEnvVar::set("PACEFLOW_HOME", tempdir.path());
 
+        let original =
+            expected_definition_with_exe(ScheduleBackendKind::WindowsTaskScheduler, fallback_exe());
+        let vbs_path = windows_vbs_path()?;
+        // Intentionally do NOT write the .vbs file: parser must fall back to
+        // the trailing XML comment.
+
+        let xml = windows_task_xml(&original, &vbs_path);
         let parsed = parse_windows_task_definition(&xml);
 
-        assert_eq!(
-            parsed.exe,
-            PathBuf::from(r"C:\old\paceflow\target\debug\paceflow.exe")
-        );
+        assert_eq!(parsed, original);
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "windows", test))]
+    #[test]
+    fn parse_windows_task_definition_detects_stale_command_so_install_can_update() -> Result<()> {
+        let _guard = lock_env();
+        let tempdir = tempdir()?;
+        let _home = ScopedEnvVar::set("PACEFLOW_HOME", tempdir.path());
+
+        let stale =
+            expected_definition_with_exe(ScheduleBackendKind::WindowsTaskScheduler, stale_exe());
+        let vbs_path = windows_vbs_path()?;
+        if let Some(parent) = vbs_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&vbs_path, render_paceflow_sync_vbs(&stale))?;
+
+        let xml = windows_task_xml(&stale, &vbs_path);
+        let parsed = parse_windows_task_definition(&xml);
+
+        assert_eq!(parsed.exe, stale_exe());
         assert_eq!(
             parsed.args,
             vec![
@@ -1361,6 +1595,25 @@ mod tests {
             ]
         );
         assert_eq!(parsed.interval_seconds, SCHEDULE_INTERVAL_SECONDS);
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "windows", test))]
+    fn fallback_exe() -> PathBuf {
+        if cfg!(windows) {
+            PathBuf::from(r"C:\Program Files\Paceflow\paceflow.exe")
+        } else {
+            PathBuf::from("/opt/paceflow/bin/paceflow")
+        }
+    }
+
+    #[cfg(any(target_os = "windows", test))]
+    fn stale_exe() -> PathBuf {
+        if cfg!(windows) {
+            PathBuf::from(r"C:\old\paceflow\target\debug\paceflow.exe")
+        } else {
+            PathBuf::from("/old/paceflow/target/debug/paceflow")
+        }
     }
 
     #[derive(Default)]
