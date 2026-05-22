@@ -626,7 +626,7 @@ fn parse_cron_definition(crontab: &str) -> ScheduleDefinition {
     }
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", test))]
 fn parse_windows_task_definition(xml: &str) -> ScheduleDefinition {
     use regex::Regex;
     let command = Regex::new(r"(?s)<Command>(.*?)</Command>")
@@ -641,32 +641,72 @@ fn parse_windows_task_definition(xml: &str) -> ScheduleDefinition {
         .and_then(|caps| caps.get(1))
         .map(|m| unescape_xml(m.as_str()))
         .unwrap_or_default();
+    let (exe, args) = if command.eq_ignore_ascii_case("powershell.exe") {
+        parse_windows_hidden_powershell_arguments(&arguments)
+            .unwrap_or_else(|| (PathBuf::from("stale"), Vec::new()))
+    } else {
+        let args = if arguments.trim().is_empty() {
+            Vec::new()
+        } else {
+            arguments
+                .split_whitespace()
+                .map(|s| s.to_string())
+                .collect()
+        };
+        (
+            if command.is_empty() {
+                PathBuf::from("stale")
+            } else {
+                PathBuf::from(command)
+            },
+            args,
+        )
+    };
     let interval_seconds = if xml.contains("<Interval>PT6H</Interval>") {
         SCHEDULE_INTERVAL_SECONDS
     } else {
         0
     };
-    let args: Vec<String> = if arguments.trim().is_empty() {
-        Vec::new()
-    } else {
-        arguments
-            .split_whitespace()
-            .map(|s| s.to_string())
-            .collect()
-    };
     ScheduleDefinition {
         backend: ScheduleBackendKind::WindowsTaskScheduler,
-        exe: if command.is_empty() {
-            PathBuf::from("stale")
-        } else {
-            PathBuf::from(command)
-        },
+        exe,
         args,
         interval_seconds,
     }
 }
 
-#[cfg(any(target_os = "macos", target_os = "windows"))]
+#[cfg(any(target_os = "windows", test))]
+fn parse_windows_hidden_powershell_arguments(arguments: &str) -> Option<(PathBuf, Vec<String>)> {
+    use regex::Regex;
+    let file_re = Regex::new(r"-FilePath\s+'((?:''|[^'])*)'").ok()?;
+    let args_re = Regex::new(r"-ArgumentList\s+@\((?P<args>[^)]*)\)").ok()?;
+    let quoted_arg_re = Regex::new(r"'((?:''|[^'])*)'").ok()?;
+
+    let exe = file_re
+        .captures(arguments)?
+        .get(1)
+        .map(|m| powershell_unquote_single_quoted(m.as_str()))?;
+    let args = args_re
+        .captures(arguments)
+        .and_then(|captures| captures.name("args"))
+        .map(|m| {
+            quoted_arg_re
+                .captures_iter(m.as_str())
+                .filter_map(|capture| capture.get(1))
+                .map(|m| powershell_unquote_single_quoted(m.as_str()))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    Some((PathBuf::from(exe), args))
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn powershell_unquote_single_quoted(value: &str) -> String {
+    value.replace("''", "'")
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows", test))]
 fn unescape_xml(value: &str) -> String {
     value
         .replace("&apos;", "'")
@@ -824,7 +864,7 @@ fn remove_managed_cron_block(crontab: &str) -> String {
     output.join("\n")
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", test))]
 fn windows_task_xml(expected: &ScheduleDefinition) -> String {
     format!(
         r#"<?xml version="1.0" encoding="UTF-16"?>
@@ -861,19 +901,38 @@ fn windows_task_xml(expected: &ScheduleDefinition) -> String {
   <!-- {} every {} seconds -->
 </Task>
 "#,
-        escape_xml(&expected.exe.to_string_lossy()),
-        escape_xml(&expected.args.join(" ")),
+        escape_xml("powershell.exe"),
+        escape_xml(&windows_hidden_powershell_arguments(expected)),
         shell_quote_command(expected),
         expected.interval_seconds
     )
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", test))]
+fn windows_hidden_powershell_arguments(expected: &ScheduleDefinition) -> String {
+    let exe = powershell_single_quote(&expected.exe.to_string_lossy());
+    let args = expected
+        .args
+        .iter()
+        .map(|arg| powershell_single_quote(arg))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command \"Start-Process -FilePath {exe} -ArgumentList @({args}) -WindowStyle Hidden -Wait\""
+    )
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn powershell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+#[cfg(any(target_os = "windows", test))]
 fn windows_task_xml_bytes(expected: &ScheduleDefinition) -> Vec<u8> {
     encode_utf16_le_with_bom(&windows_task_xml(expected))
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", test))]
 fn encode_utf16_le_with_bom(s: &str) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(2 + s.len() * 2);
     bytes.extend_from_slice(&[0xFF, 0xFE]);
@@ -883,7 +942,7 @@ fn encode_utf16_le_with_bom(s: &str) -> Vec<u8> {
     bytes
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", test))]
 fn decode_schtasks_xml(bytes: &[u8]) -> String {
     if bytes.len() >= 2 && bytes[0] == 0xFF && bytes[1] == 0xFE {
         let payload = &bytes[2..];
@@ -949,7 +1008,7 @@ fn shell_quote(value: &str) -> String {
     format!("\"{}\"", value.replace('"', "\\\""))
 }
 
-#[cfg(any(target_os = "macos", target_os = "windows"))]
+#[cfg(any(target_os = "macos", target_os = "windows", test))]
 fn escape_xml(value: &str) -> String {
     value
         .replace('&', "&amp;")
@@ -1107,9 +1166,9 @@ mod tests {
         assert!(service.contains("ExecStart='/tmp/paceflow test/bin/paceflow' sync schedule run"));
     }
 
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", test))]
     #[test]
-    fn windows_task_xml_uses_absolute_executable_command() {
+    fn windows_task_xml_runs_paceflow_through_hidden_powershell() {
         let definition = expected_definition_with_exe(
             ScheduleBackendKind::WindowsTaskScheduler,
             PathBuf::from(r"C:\Program Files\Paceflow\paceflow.exe"),
@@ -1117,8 +1176,14 @@ mod tests {
 
         let xml = windows_task_xml(&definition);
 
-        assert!(xml.contains(r"<Command>C:\Program Files\Paceflow\paceflow.exe</Command>"));
-        assert!(xml.contains("<Arguments>sync schedule run</Arguments>"));
+        assert!(xml.contains("<Command>powershell.exe</Command>"));
+        assert!(xml.contains("-NoProfile"));
+        assert!(xml.contains("-WindowStyle Hidden"));
+        assert!(xml.contains("Start-Process"));
+        assert!(xml.contains(r"C:\Program Files\Paceflow\paceflow.exe"));
+        assert!(xml.contains("sync"));
+        assert!(xml.contains("schedule"));
+        assert!(xml.contains("run"));
     }
 
     #[cfg(target_os = "macos")]
@@ -1202,7 +1267,7 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", test))]
     #[test]
     fn windows_task_xml_bytes_are_utf16_le_with_bom() {
         let definition = expected_definition_with_exe(
@@ -1218,7 +1283,7 @@ mod tests {
             bytes.get(..2)
         );
         assert!(
-            (bytes.len() - 2) % 2 == 0,
+            (bytes.len() - 2).is_multiple_of(2),
             "UTF-16 payload must be an even number of bytes"
         );
 
@@ -1233,17 +1298,14 @@ mod tests {
             decoded.starts_with(r#"<?xml version="1.0" encoding="UTF-16"?>"#),
             "prolog must declare encoding=\"UTF-16\" to match the file bytes: {decoded}"
         );
+        assert!(decoded.contains("<Command>powershell.exe</Command>"));
         assert!(
-            decoded.contains(r"<Command>C:\Program Files\Paceflow\paceflow.exe</Command>"),
-            "decoded XML missing command: {decoded}"
-        );
-        assert!(
-            decoded.contains("<Arguments>sync schedule run</Arguments>"),
-            "decoded XML missing arguments: {decoded}"
+            decoded.contains("-WindowStyle Hidden"),
+            "decoded XML missing hidden window arguments: {decoded}"
         );
     }
 
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", test))]
     #[test]
     fn decode_schtasks_xml_handles_utf16_le_bom_and_falls_back_to_utf8() {
         let original = "<Task>PACEFLOW_MANAGED_SYNC_SCHEDULE</Task>";
@@ -1259,7 +1321,7 @@ mod tests {
         assert_eq!(decoded_utf8, original);
     }
 
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", test))]
     #[test]
     fn parse_windows_task_definition_round_trips_through_utf16_query_output() {
         let original = expected_definition_with_exe(
@@ -1275,7 +1337,7 @@ mod tests {
         assert_eq!(parsed, original);
     }
 
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", test))]
     #[test]
     fn parse_windows_task_definition_detects_stale_command_so_install_can_update() {
         let stale = expected_definition_with_exe(
