@@ -1,0 +1,64 @@
+name: Publish to crates.io
+
+on:
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: publish-crates
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: publish
+    runs-on: ubuntu-24.04
+    if: github.repository == 'PaceFlow/ai-engineering-analytics'
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Read package version from Cargo.toml
+        id: pkg
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "paceflow") | .version')
+          if [ -z "${version}" ] || [ "${version}" = "null" ]; then
+            echo "Failed to read paceflow version from Cargo.toml" >&2
+            exit 1
+          fi
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "Cargo.toml declares paceflow ${version}"
+
+      - name: Check if version is already on crates.io
+        id: check
+        run: |
+          version="${{ steps.pkg.outputs.version }}"
+          curl -sS -o /tmp/resp.json \
+            -H "User-Agent: paceflow-cd (github.com/PaceFlow/ai-engineering-analytics)" \
+            "https://crates.io/api/v1/crates/paceflow/${version}"
+          if jq -e 'has("version")' /tmp/resp.json >/dev/null; then
+            echo "paceflow ${version} is already published; skipping."
+            echo "should_publish=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "paceflow ${version} is new; will publish."
+            echo "should_publish=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish to crates.io
+        if: steps.check.outputs.should_publish == 'true'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_PACEFLOW_TOKEN }}
+        run: cargo publish --locked
+
+      - name: Summary
+        run: |
+          version="${{ steps.pkg.outputs.version }}"
+          if [ "${{ steps.check.outputs.should_publish }}" = "true" ]; then
+            echo "Published paceflow ${version} to crates.io" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "paceflow ${version} was already on crates.io; nothing to do" >> "$GITHUB_STEP_SUMMARY"
+          fi

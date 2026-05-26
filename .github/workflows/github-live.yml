@@ -1,0 +1,43 @@
+name: GitHub Live
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  github-live:
+    name: github-live
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    env:
+      PACEFLOW_GITHUB_TOKEN: ${{ secrets.PACEFLOW_GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Check live test configuration
+        id: config
+        shell: bash
+        run: |
+          missing=0
+          for key in PACEFLOW_GITHUB_TOKEN
+          do
+            if [ -z "${!key}" ]; then
+              echo "missing $key"
+              missing=1
+            fi
+          done
+          if [ "$missing" -eq 1 ]; then
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Skip live GitHub test
+        if: steps.config.outputs.enabled != 'true'
+        run: |
+          echo "Skipping live GitHub test: missing PACEFLOW_GITHUB_TOKEN secret"
+      - name: Run live GitHub test
+        if: steps.config.outputs.enabled == 'true'
+        run: cargo test --test github_live -- --ignored --nocapture

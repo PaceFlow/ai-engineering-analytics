@@ -1,0 +1,18 @@
+pub mod analytics;
+pub mod change_intel;
+pub mod cli;
+pub mod commands;
+pub mod cost;
+pub mod cursor_paths;
+pub mod db;
+pub mod error;
+pub mod github;
+pub mod ingest_progress;
+pub mod path_utils;
+pub mod providers;
+pub mod sync;
+pub mod sync_identity;
+pub mod sync_schedule;
+
+#[cfg(test)]
+pub mod test_support;

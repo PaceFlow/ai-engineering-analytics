@@ -1,0 +1,1056 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AI Engineering Analytics · Paceflow</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+:root{
+  color-scheme:dark;
+  --bg:#060608;--term:#111113;--chrome:#18181b;
+  --div:#1e1e22;--bdr:#27272a;--d3:#333338;--d4:#46464f;--d5:#5c5c66;
+  --mu:#71717a;--su:#a1a1aa;--bd:#d4d4d8;--br:#f4f4f5;
+  --cy:#22d3ee;--cy2:rgba(34,211,238,.07);--cy3:rgba(34,211,238,.14);
+  --gn:#4ade80;--rd:#f87171;--am:#fbbf24;
+  --fn:'Cascadia Code','JetBrains Mono','Fira Code',Consolas,'Courier New',monospace;
+}
+html{font-size:14px}
+body{background:var(--bg);color:var(--bd);font-family:var(--fn);line-height:1.5;
+  min-height:100vh;padding:0;margin:0;overflow-x:hidden}
+
+/* ── PAGE WRAPPER ── */
+.page{max-width:1100px;margin:0 auto;padding:28px 20px 60px}
+
+/* ── TOP BRAND BAR ── */
+.brand{display:flex;align-items:center;justify-content:space-between;
+  margin-bottom:22px;padding-bottom:18px;border-bottom:1px solid var(--div)}
+.brand-left{display:flex;align-items:center;gap:14px}
+.brand-logo{display:flex;align-items:center;gap:9px}
+.brand-icon{width:28px;height:28px;border-radius:6px;background:var(--cy3);
+  border:1px solid rgba(34,211,238,.3);display:flex;align-items:center;justify-content:center}
+.brand-icon svg{width:14px;height:14px}
+.brand-name{font-size:14px;font-weight:700;color:var(--br);letter-spacing:.02em}
+.brand-tag{font-size:10px;letter-spacing:.14em;color:var(--cy);text-transform:uppercase;
+  border:1px solid rgba(34,211,238,.25);padding:2px 8px;border-radius:3px;
+  background:rgba(34,211,238,.05)}
+.brand-right{font-size:11px;color:var(--d5)}
+.brand-right span{color:var(--mu)}
+
+/* ── TERMINAL SHELL ── */
+.terminal{background:var(--term);border:1px solid var(--bdr);border-radius:10px;
+  overflow:hidden;box-shadow:0 24px 80px rgba(0,0,0,.8),0 0 0 1px rgba(255,255,255,.03);
+  position:relative}
+.chrome{background:var(--chrome);padding:10px 16px;display:flex;align-items:center;
+  justify-content:space-between;border-bottom:1px solid var(--bdr)}
+.chrome-left{display:flex;align-items:center;gap:12px}
+.dots{display:flex;gap:6px}
+.dot{width:11px;height:11px;border-radius:50%;cursor:default}
+.dot-r{background:#ff5f57}.dot-y{background:#febc2e}.dot-g{background:#28c840}
+.chrome-title{color:var(--mu);font-size:11.5px}
+.chrome-title span{color:var(--su)}
+.chrome-right{font-size:11px;color:var(--d4)}
+
+/* ── SCREEN ── */
+#screen{position:relative;outline:none}
+
+/* ── HEADER ROW ── */
+.t-hdr{padding:12px 18px 0;display:flex;justify-content:space-between;align-items:center;
+  flex-wrap:wrap;gap:8px}
+.t-hdr-l{display:flex;align-items:baseline;gap:12px;flex-wrap:wrap}
+.t-prod{font-size:13px;font-weight:700;color:var(--br);letter-spacing:.02em}
+.t-ctx{font-size:11.5px;color:var(--d5)}.t-ctx span{color:var(--su)}
+.t-time{font-size:11px;color:var(--d4)}
+
+/* ── TABS ── */
+.t-tabs{padding:8px 18px 0;display:flex;border-bottom:1px solid var(--div);
+  gap:2px;flex-wrap:wrap}
+.tab{font-size:12.5px;color:var(--mu);padding:5px 12px 6px;
+  position:relative;cursor:pointer;white-space:nowrap;transition:color .1s;
+  border-radius:4px 4px 0 0;border:1px solid transparent;border-bottom:none;
+  user-select:none;-webkit-tap-highlight-color:transparent}
+.tab:hover{color:var(--su);background:rgba(255,255,255,.03)}
+.tab.on{color:var(--cy);background:rgba(34,211,238,.06);
+  border-color:var(--bdr);border-bottom:1px solid var(--term)}
+.tab-n{color:var(--d4);font-size:11px}.tab.on .tab-n{color:rgba(34,211,238,.45)}
+
+/* ── CONTROL BAR ── */
+.t-ctrl{padding:8px 18px;border-bottom:1px solid var(--div);
+  display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.ctrl-group{display:flex;align-items:center;gap:6px}
+.ctrl-label{font-size:11px;color:var(--d5)}
+.pill-group{display:flex;gap:3px}
+.pill{font-size:11.5px;color:var(--mu);padding:3px 10px;border-radius:20px;
+  border:1px solid var(--d3);cursor:pointer;transition:all .12s;
+  user-select:none;-webkit-tap-highlight-color:transparent;background:transparent}
+.pill:hover{color:var(--su);border-color:var(--d4)}
+.pill.on{color:var(--cy);border-color:rgba(34,211,238,.4);background:rgba(34,211,238,.07)}
+.ctrl-sep{color:var(--d3);margin:0 4px;font-size:11px}
+.legend-btn{font-size:11px;color:var(--d5);padding:3px 10px;border-radius:20px;
+  border:1px solid var(--d3);cursor:pointer;transition:all .12s;margin-left:auto;
+  user-select:none;-webkit-tap-highlight-color:transparent;background:transparent}
+.legend-btn:hover{color:var(--su);border-color:var(--d4)}
+
+/* ── BODY ── */
+.t-body{padding:14px 18px 12px;overflow:hidden}
+
+/* ── VERDICT ── */
+.v-stmt{font-size:13.5px;color:var(--br);margin-bottom:5px;line-height:1.5}
+.v-sub{font-size:12px;color:var(--mu);line-height:1.65;margin-bottom:14px;max-width:700px}
+.stats{display:flex;gap:0;border-top:1px solid var(--div);
+  border-bottom:1px solid var(--div);padding:10px 0;margin-bottom:16px;flex-wrap:wrap}
+.stat-item{padding:0 28px 0 0;flex-shrink:0}
+.stat-item:first-child{padding-left:0}
+.stat-v{font-size:19px;font-weight:700;color:var(--br);line-height:1.1}
+.stat-d{font-size:11px;margin-top:1px}
+.stat-l{font-size:10px;color:var(--d5);margin-top:1px;text-transform:uppercase;letter-spacing:.06em}
+
+/* ── TABLE ── */
+.tbl-wrap{overflow-x:auto;-webkit-overflow-scrolling:touch;margin:0 -2px}
+.tbl{width:100%;border-collapse:collapse;font-size:12px;min-width:400px}
+.tbl th{text-align:right;font-weight:500;font-size:11px;color:var(--mu);
+  padding:3px 10px 8px;border-bottom:1px solid var(--div);white-space:nowrap}
+.tbl th:first-child{text-align:left;padding-left:0}
+.tbl td{padding:6px 10px;text-align:right;color:var(--su);white-space:nowrap}
+.tbl td:first-child{text-align:left;color:var(--bd);padding-left:0}
+.tbl tbody tr{cursor:pointer;transition:background .08s}
+.tbl tbody tr:hover{background:rgba(255,255,255,.022)}
+.tbl tr.sel{background:var(--cy2)}
+.tbl tr.sel td:first-child{color:var(--br);padding-left:10px;border-left:2px solid var(--cy)}
+.tbl tr.baseline td{color:var(--d4);border-top:1px dashed var(--d3)}
+.tbl tr.baseline td:first-child{color:var(--d5)}
+.tbl th.sort-col{color:var(--cy)}
+
+/* ── INSIGHT ── */
+.insight{margin-top:11px;padding-top:9px;border-top:1px solid var(--div);
+  font-size:11.5px;color:var(--mu);line-height:1.6}
+.idot{color:var(--cy);margin-right:5px;font-size:9px;vertical-align:middle}
+
+/* ── LEGEND OVERLAY ── */
+.legend-overlay{position:absolute;top:0;left:0;right:0;bottom:0;
+  background:rgba(6,6,8,.94);z-index:10;padding:22px 24px;overflow-y:auto;
+  backdrop-filter:blur(4px)}
+.leg-hdr{display:flex;justify-content:space-between;align-items:center;
+  border-bottom:1px solid var(--div);padding-bottom:12px;margin-bottom:16px}
+.leg-title{font-size:13px;font-weight:600;color:var(--br)}
+.leg-close-btn{font-size:11.5px;color:var(--mu);padding:4px 12px;
+  border:1px solid var(--d3);border-radius:20px;cursor:pointer;transition:all .12s;
+  user-select:none}
+.leg-close-btn:hover{color:var(--su);border-color:var(--d4)}
+.leg-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:0 28px}
+.leg-row{display:grid;grid-template-columns:130px 1fr;gap:10px;
+  padding:7px 0;border-bottom:1px solid var(--div)}
+.leg-k{font-size:11.5px;color:var(--cy)}
+.leg-v{font-size:11.5px;color:var(--mu);line-height:1.55}
+
+/* ── FOOTER ── */
+.t-foot{border-top:1px solid var(--div);padding:7px 18px;
+  display:flex;justify-content:space-between;align-items:center;
+  font-size:11px;color:var(--d4);flex-wrap:wrap;gap:6px}
+.kbd-hints{display:flex;flex-wrap:wrap;gap:2px 8px}
+.fk{display:inline-block;color:var(--cy);padding:0 4px;
+  background:rgba(34,211,238,.08);border:1px solid rgba(34,211,238,.2);
+  border-radius:3px;font-size:10px;line-height:1.6;margin-right:2px}
+.fsep{color:var(--d3);margin:0 3px}
+.t-foot-r{font-size:10.5px;color:var(--d3)}
+
+/* ── COLOR CLASSES ── */
+.gn{color:var(--gn)}.rd{color:var(--rd)}.am{color:var(--am)}
+.cy{color:var(--cy)}.br{color:var(--br)}.mu{color:var(--mu)}.su{color:var(--su)}
+.d4{color:var(--d4)}.d5{color:var(--d5)}.bold{font-weight:700}
+
+/* ── BELOW-THE-FOLD EXPLANATION ── */
+.explainer{margin-top:24px;border:1px solid var(--div);border-radius:8px;
+  padding:18px 22px;background:rgba(255,255,255,.015)}
+.exp-title{font-size:11px;letter-spacing:.12em;text-transform:uppercase;
+  color:var(--d5);margin-bottom:12px}
+.exp-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:12px 24px}
+.exp-item{}
+.exp-k{font-size:11px;color:var(--cy);margin-bottom:2px}
+.exp-v{font-size:11.5px;color:var(--mu);line-height:1.5}
+
+/* ── RESPONSIVE ── */
+@media(max-width:640px){
+  .page{padding:16px 12px 40px}
+  .brand{flex-direction:column;align-items:flex-start;gap:10px}
+  .stats{gap:16px}
+  .stat-item{padding-right:0}
+  .t-ctrl{gap:6px}
+  .pill{padding:4px 10px;font-size:11px}
+  .t-hdr{padding:10px 12px 0}
+  .t-tabs{padding:8px 12px 0}
+  .t-ctrl,.t-body,.t-foot{padding-left:12px;padding-right:12px}
+  .tbl th,.tbl td{padding:5px 7px}
+  .tbl td:first-child,.tbl th:first-child{padding-left:0}
+  .legend-overlay{padding:16px}
+  .leg-grid{grid-template-columns:1fr}
+}
+</style>
+</head>
+<body>
+<div class="page">
+
+  <!-- BRAND BAR -->
+  <div class="brand">
+    <div class="brand-left">
+      <div class="brand-logo">
+        <div class="brand-icon">
+          <svg viewBox="0 0 14 14" fill="none" xmlns="http://www.w3.org/2000/svg">
+            <rect x="1" y="4" width="3" height="9" rx="1" fill="#22d3ee" opacity=".9"/>
+            <rect x="5.5" y="1" width="3" height="12" rx="1" fill="#22d3ee"/>
+            <rect x="10" y="6" width="3" height="7" rx="1" fill="#22d3ee" opacity=".6"/>
+          </svg>
+        </div>
+        <span class="brand-name">paceflow</span>
+      </div>
+      <span class="brand-tag">Prototype · v3</span>
+    </div>
+    <div class="brand-right">AI Engineering Analytics &nbsp;·&nbsp; <span>Interactive Design Review</span></div>
+  </div>
+
+  <!-- TERMINAL -->
+  <div class="terminal">
+    <div class="chrome">
+      <div class="chrome-left">
+        <div class="dots">
+          <div class="dot dot-r"></div>
+          <div class="dot dot-y"></div>
+          <div class="dot dot-g"></div>
+        </div>
+        <div class="chrome-title">paceflow &nbsp;·&nbsp; <span>AI Engineering Analytics</span></div>
+      </div>
+      <div class="chrome-right">prototype</div>
+    </div>
+    <div id="screen"></div>
+  </div>
+
+  <!-- EXPLAINER -->
+  <div class="explainer">
+    <div class="exp-title">What this shows</div>
+    <div class="exp-grid">
+      <div class="exp-item">
+        <div class="exp-k">Verdict</div>
+        <div class="exp-v">Cross-model comparison — which tools actually ship to main and which add bugs. Sorted by Mainline Reach.</div>
+      </div>
+      <div class="exp-item">
+        <div class="exp-k">Sessions</div>
+        <div class="exp-v">Session-level efficiency — prompts per session, first accepted change time, error and no-output rates.</div>
+      </div>
+      <div class="exp-item">
+        <div class="exp-k">Delivery</div>
+        <div class="exp-v">Commit pipeline — how many heavy AI commits opened PRs, reached main, and merged.</div>
+      </div>
+      <div class="exp-item">
+        <div class="exp-k">Quality</div>
+        <div class="exp-v">Post-merge signals — code churn rate, bug-after-merge rate, and revert rate by group.</div>
+      </div>
+      <div class="exp-item">
+        <div class="exp-k">Group by</div>
+        <div class="exp-v">Slice by model, provider, task type, or branch prefix. Each tab respects the active group.</div>
+      </div>
+      <div class="exp-item">
+        <div class="exp-k">no-AI anchor</div>
+        <div class="exp-v">Dashed row shows your baseline commits made without AI. Every AI metric is compared against this.</div>
+      </div>
+    </div>
+  </div>
+
+</div><!-- .page -->
+
+<script>
+const S={tab:1,gi:0,wi:0,row:0,leg:false};
+const GROUPS=['model','provider','task','branch'];
+const WINDOWS=['7d','30d','90d'];
+
+const COL={
+  firstChg: v=>v==='—'||v==='N/A'?'d4':parseFloat(v)<=3?'gn':parseFloat(v)<=6?'am':'rd',
+  loopRate: v=>v<=2?'gn':v<=6?'am':'rd',
+  mainline:  v=>v>=70?'gn':v>=55?'am':'rd',
+  bugRate:   v=>v===0?'gn':v<=8?'am':'rd',
+  errorRate: v=>v<=10?'gn':v<=20?'am':'rd',
+  toCommit:  v=>v>=70?'gn':v>=50?'am':'rd',
+  noOutput:  v=>v<=8?'gn':v<=18?'am':'rd',
+  prReach:   v=>v>=80?'gn':v>=60?'am':'rd',
+  prMerge:   v=>v>=70?'gn':v>=50?'am':'rd',
+  churn:     v=>v<=5?'gn':v<=15?'am':'rd',
+  revert:    v=>v<=3?'gn':v<=10?'am':'rd',
+};
+
+// ── VERDICT ──────────────────────────────────────────────────────────────────
+const VERD={
+  model:{
+    '7d':{
+      stmt:"claude-sonnet-4 leads mainline reach — <span class='gn bold'>79%</span> of AI-heavy commits shipping to main.",
+      sub:"Lowest debug loop rate and zero bug rate this week. cursor/default is net negative: 17% mainline reach, 22% bug rate.",
+      stats:[
+        {l:'sessions',   v:'80',   d:'▲ +12 vs last 7d',dc:'gn'},
+        {l:'first chg',  v:'2m51', d:'▼ −0m44s',        dc:'gn'},
+        {l:'mainline %', v:'56%',  d:'▲ +4pp',           dc:'gn'},
+        {l:'bug rate',   v:'9%',   d:'▼ −2pp',           dc:'gn'},
+      ],
+      rows:[
+        {n:'claude-sonnet-4',fc:'2m51',lp:2, ml:79,br:0},
+        {n:'claude-opus-4',  fc:'4m23',lp:4, ml:64,br:7},
+        {n:'codex/gpt-5.4',  fc:'5m12',lp:6, ml:61,br:13},
+        {n:'cursor/default', fc:'—',   lp:14,ml:17,br:22},
+      ],
+      baseline:{n:'you · no-AI',fc:'—',lp:null,ml:71,br:6},
+      ins:"sonnet is the only model above your no-AI mainline baseline of 71%. cursor/default is 54pp below it."
+    },
+    '30d':{
+      stmt:"anthropic models are <span class='gn bold'>the only ones above no-AI mainline baseline</span> at 30 days.",
+      sub:"codex mainline reach at 58% and flat. cursor/default declining on both mainline reach and bug rate.",
+      stats:[
+        {l:'sessions',   v:'322',  d:'▲ +48 vs last 30d',dc:'gn'},
+        {l:'first chg',  v:'2m58', d:'▼ −0m36s',         dc:'gn'},
+        {l:'mainline %', v:'55%',  d:'▲ +3pp',            dc:'gn'},
+        {l:'bug rate',   v:'10%',  d:'▼ −2pp',            dc:'gn'},
+      ],
+      rows:[
+        {n:'claude-sonnet-4',fc:'2m58',lp:2, ml:77,br:2},
+        {n:'claude-opus-4',  fc:'4m31',lp:4, ml:62,br:8},
+        {n:'codex/gpt-5.4',  fc:'5m20',lp:7, ml:58,br:14},
+        {n:'cursor/default', fc:'—',   lp:15,ml:15,br:24},
+      ],
+      baseline:{n:'you · no-AI',fc:'—',lp:null,ml:69,br:6},
+      ins:"30d: codex and cursor both below no-AI baseline on mainline reach. sonnet and opus above."
+    },
+    '90d':{
+      stmt:"sonnet mainline reach is <span class='gn bold'>stable above 75%</span> across the full quarter.",
+      sub:"cursor/default declining every window. codex flat at 57–61%. sonnet is your most consistent delivery model.",
+      stats:[
+        {l:'sessions',   v:'948',  d:'▲ +112 vs last 90d',dc:'gn'},
+        {l:'first chg',  v:'3m02', d:'▼ −0m58s',          dc:'gn'},
+        {l:'mainline %', v:'54%',  d:'▲ +5pp',             dc:'gn'},
+        {l:'bug rate',   v:'11%',  d:'▼ −3pp',             dc:'gn'},
+      ],
+      rows:[
+        {n:'claude-sonnet-4',fc:'3m02',lp:2, ml:76,br:3},
+        {n:'claude-opus-4',  fc:'4m44',lp:5, ml:61,br:9},
+        {n:'codex/gpt-5.4',  fc:'5m35',lp:7, ml:57,br:15},
+        {n:'cursor/default', fc:'—',   lp:16,ml:14,br:26},
+      ],
+      baseline:{n:'you · no-AI',fc:'—',lp:null,ml:68,br:6},
+      ins:"Quarter: sonnet 8pp above no-AI baseline. cursor/default 54pp below. Consider removing it from rotation."
+    },
+  },
+  provider:{
+    '7d':{
+      stmt:"anthropic is the <span class='gn bold'>only provider above no-AI mainline baseline</span> this week.",
+      sub:"73% mainline reach, 2% bug rate. cursor is 54pp below the no-AI baseline on mainline reach.",
+      stats:[
+        {l:'sessions',   v:'80',   d:'▲ +12',   dc:'gn'},
+        {l:'first chg',  v:'3m14', d:'▼ −0m44s',dc:'gn'},
+        {l:'mainline %', v:'51%',  d:'▲ +3pp',  dc:'gn'},
+        {l:'bug rate',   v:'11%',  d:'▼ −2pp',  dc:'gn'},
+      ],
+      rows:[
+        {n:'anthropic',fc:'3m14',lp:3, ml:73,br:2},
+        {n:'openai',   fc:'5m12',lp:6, ml:61,br:13},
+        {n:'cursor',   fc:'—',   lp:14,ml:17,br:22},
+      ],
+      baseline:{n:'you · no-AI',fc:'—',lp:null,ml:71,br:6},
+      ins:"anthropic above no-AI mainline baseline. openai at parity. cursor well below."
+    },
+    '30d':{
+      stmt:"anthropic sessions are <span class='gn bold'>the only provider above mainline baseline</span> at 30 days.",
+      sub:"openai mainline reach at 58% — flat across windows. cursor declining on all four metrics.",
+      stats:[
+        {l:'sessions',   v:'322',  d:'▲ +48',   dc:'gn'},
+        {l:'first chg',  v:'3m22', d:'▼ −0m36s',dc:'gn'},
+        {l:'mainline %', v:'50%',  d:'▲ +3pp',  dc:'gn'},
+        {l:'bug rate',   v:'12%',  d:'▼ −2pp',  dc:'gn'},
+      ],
+      rows:[
+        {n:'anthropic',fc:'3m22',lp:3, ml:71,br:3},
+        {n:'openai',   fc:'5m20',lp:7, ml:58,br:14},
+        {n:'cursor',   fc:'—',   lp:15,ml:15,br:24},
+      ],
+      baseline:{n:'you · no-AI',fc:'—',lp:null,ml:69,br:6},
+      ins:"30d: openai at parity with no-AI baseline on mainline, but above on bug rate. cursor below both."
+    },
+    '90d':{
+      stmt:"anthropic has the <span class='gn bold'>strongest and most consistent delivery record</span> this quarter.",
+      sub:"70% mainline reach, 4% bug rate across 700 sessions. cursor trending negative on all four metrics.",
+      stats:[
+        {l:'sessions',   v:'948',  d:'▲ +112',  dc:'gn'},
+        {l:'first chg',  v:'3m30', d:'▼ −0m58s',dc:'gn'},
+        {l:'mainline %', v:'49%',  d:'▲ +5pp',  dc:'gn'},
+        {l:'bug rate',   v:'13%',  d:'▼ −3pp',  dc:'gn'},
+      ],
+      rows:[
+        {n:'anthropic',fc:'3m30',lp:3, ml:70,br:4},
+        {n:'openai',   fc:'5m35',lp:7, ml:57,br:15},
+        {n:'cursor',   fc:'—',   lp:16,ml:14,br:26},
+      ],
+      baseline:{n:'you · no-AI',fc:'—',lp:null,ml:68,br:6},
+      ins:"Quarter: anthropic above no-AI baseline on both mainline and bug rate. openai and cursor both below."
+    },
+  },
+  task:{
+    '7d':{
+      stmt:"<span class='cy bold'>pr-followups</span> and <span class='cy bold'>ci-pipeline-cleanup</span> lead mainline reach this week.",
+      sub:"88% and 84% mainline reach respectively. auth-token-refresh at 56% — below your no-AI baseline.",
+      stats:[
+        {l:'sessions',   v:'47',   d:'▲ +8',    dc:'gn'},
+        {l:'first chg',  v:'1m45', d:'▼ −0m52s',dc:'gn'},
+        {l:'mainline %', v:'74%',  d:'▲ +4pp',  dc:'gn'},
+        {l:'bug rate',   v:'4%',   d:'▼ −2pp',  dc:'gn'},
+      ],
+      rows:[
+        {n:'pr-followups',         fc:'1m45',lp:1,ml:88,br:1},
+        {n:'ci-pipeline-cleanup',  fc:'2m10',lp:2,ml:84,br:0},
+        {n:'analytics-cleanup',    fc:'2m30',lp:3,ml:80,br:2},
+        {n:'onboarding-validation',fc:'3m50',lp:5,ml:62,br:8},
+        {n:'auth-token-refresh',   fc:'4m15',lp:8,ml:56,br:9},
+      ],
+      baseline:{n:'you · no-AI',fc:'—',lp:null,ml:71,br:6},
+      ins:"Top 3 tasks above no-AI mainline baseline. auth-token-refresh 15pp below it — consider smaller prompt scope."
+    },
+    '30d':{
+      stmt:"Refactor and follow-up tasks <span class='gn bold'>consistently above mainline baseline</span> at 30 days.",
+      sub:"auth-token-refresh at 54% mainline reach and slightly worsening. onboarding-validation holding near baseline.",
+      stats:[
+        {l:'sessions',   v:'190',  d:'▲ +32',   dc:'gn'},
+        {l:'first chg',  v:'1m52', d:'▼ −0m44s',dc:'gn'},
+        {l:'mainline %', v:'72%',  d:'▲ +3pp',  dc:'gn'},
+        {l:'bug rate',   v:'5%',   d:'▼ −1pp',  dc:'gn'},
+      ],
+      rows:[
+        {n:'pr-followups',         fc:'1m52',lp:1,ml:87,br:2},
+        {n:'ci-pipeline-cleanup',  fc:'2m18',lp:2,ml:82,br:1},
+        {n:'analytics-cleanup',    fc:'2m38',lp:3,ml:78,br:3},
+        {n:'onboarding-validation',fc:'3m58',lp:5,ml:60,br:9},
+        {n:'auth-token-refresh',   fc:'4m22',lp:9,ml:54,br:10},
+      ],
+      baseline:{n:'you · no-AI',fc:'—',lp:null,ml:69,br:6},
+      ins:"auth-token-refresh mainline reach at 54% — below no-AI baseline. Bug rate at 10% — 4pp above baseline."
+    },
+    '90d':{
+      stmt:"pr-followups have the <span class='gn bold'>highest mainline reach of any task type</span> this quarter.",
+      sub:"86% mainline reach, 2% bug rate across 124 sessions. auth-token-refresh now below no-AI baseline on both metrics.",
+      stats:[
+        {l:'sessions',   v:'556',  d:'▲ +88',   dc:'gn'},
+        {l:'first chg',  v:'1m58', d:'▼ −1m08s',dc:'gn'},
+        {l:'mainline %', v:'71%',  d:'▲ +5pp',  dc:'gn'},
+        {l:'bug rate',   v:'5%',   d:'▼ −3pp',  dc:'gn'},
+      ],
+      rows:[
+        {n:'pr-followups',         fc:'1m58',lp:1,ml:86,br:2},
+        {n:'ci-pipeline-cleanup',  fc:'2m24',lp:2,ml:81,br:1},
+        {n:'analytics-cleanup',    fc:'2m44',lp:3,ml:77,br:4},
+        {n:'onboarding-validation',fc:'4m04',lp:6,ml:58,br:10},
+        {n:'auth-token-refresh',   fc:'4m30',lp:9,ml:52,br:11},
+      ],
+      baseline:{n:'you · no-AI',fc:'—',lp:null,ml:68,br:6},
+      ins:"Quarter: auth-token-refresh below no-AI baseline on mainline reach and bug rate. Scope discipline is the fix."
+    },
+  },
+  branch:{
+    '7d':{
+      stmt:"fix/* branches have the <span class='gn bold'>highest mainline reach</span> this week.",
+      sub:"88% mainline, 1% bug rate. feat/auth-token-refresh at 56% — below the no-AI baseline of 71%.",
+      stats:[
+        {l:'sessions',   v:'47',   d:'▲ +8',    dc:'gn'},
+        {l:'first chg',  v:'1m45', d:'▼ −0m58s',dc:'gn'},
+        {l:'mainline %', v:'74%',  d:'▲ +4pp',  dc:'gn'},
+        {l:'bug rate',   v:'4%',   d:'▼ −2pp',  dc:'gn'},
+      ],
+      rows:[
+        {n:'fix/pr-followups',           fc:'1m45',lp:1,ml:88,br:1},
+        {n:'chore/ci-pipeline-cleanup',  fc:'2m10',lp:2,ml:84,br:0},
+        {n:'refactor/analytics-explorer',fc:'2m30',lp:3,ml:80,br:2},
+        {n:'fix/onboarding-validation',  fc:'3m50',lp:5,ml:62,br:8},
+        {n:'feat/auth-token-refresh',    fc:'4m15',lp:8,ml:56,br:9},
+      ],
+      baseline:{n:'you · no-AI',fc:'—',lp:null,ml:71,br:6},
+      ins:"fix/* and chore/* above no-AI baseline. feat/auth-token-refresh 15pp below it."
+    },
+    '30d':{
+      stmt:"fix/* and chore/* branches are <span class='gn bold'>consistently your best mainline delivery patterns</span>.",
+      sub:"feat/* branches below no-AI baseline on both mainline reach and bug rate at 30 days.",
+      stats:[
+        {l:'sessions',   v:'190',  d:'▲ +32',   dc:'gn'},
+        {l:'first chg',  v:'1m52', d:'▼ −0m46s',dc:'gn'},
+        {l:'mainline %', v:'72%',  d:'▲ +3pp',  dc:'gn'},
+        {l:'bug rate',   v:'5%',   d:'▼ −1pp',  dc:'gn'},
+      ],
+      rows:[
+        {n:'fix/pr-followups',           fc:'1m52',lp:1,ml:87,br:2},
+        {n:'chore/ci-pipeline-cleanup',  fc:'2m18',lp:2,ml:82,br:1},
+        {n:'refactor/analytics-explorer',fc:'2m38',lp:3,ml:78,br:3},
+        {n:'fix/onboarding-validation',  fc:'3m58',lp:5,ml:60,br:9},
+        {n:'feat/auth-token-refresh',    fc:'4m22',lp:9,ml:54,br:10},
+      ],
+      baseline:{n:'you · no-AI',fc:'—',lp:null,ml:69,br:6},
+      ins:"30d: fix/* branches above baseline on both metrics. feat/* below on both."
+    },
+    '90d':{
+      stmt:"fix/* branches have the <span class='gn bold'>most reliable shipping record</span> in the quarter.",
+      sub:"86% mainline reach, 2% bug rate. feat/* branches below no-AI baseline for the full 90 days.",
+      stats:[
+        {l:'sessions',   v:'556',  d:'▲ +88',   dc:'gn'},
+        {l:'first chg',  v:'1m58', d:'▼ −1m06s',dc:'gn'},
+        {l:'mainline %', v:'71%',  d:'▲ +5pp',  dc:'gn'},
+        {l:'bug rate',   v:'5%',   d:'▼ −3pp',  dc:'gn'},
+      ],
+      rows:[
+        {n:'fix/pr-followups',           fc:'1m58',lp:1,ml:86,br:2},
+        {n:'chore/ci-pipeline-cleanup',  fc:'2m24',lp:2,ml:81,br:1},
+        {n:'refactor/analytics-explorer',fc:'2m44',lp:3,ml:77,br:4},
+        {n:'fix/onboarding-validation',  fc:'4m04',lp:6,ml:58,br:10},
+        {n:'feat/auth-token-refresh',    fc:'4m30',lp:9,ml:52,br:11},
+      ],
+      baseline:{n:'you · no-AI',fc:'—',lp:null,ml:68,br:6},
+      ins:"Quarter: feat/* below no-AI baseline on mainline reach and bug rate. Apply fix-branch scope to feat work."
+    },
+  },
+};
+
+// ── SESSIONS ─────────────────────────────────────────────────────────────────
+const SESS={
+  model:{
+    '7d':{rows:[
+      {n:'claude-sonnet-4',s:38, pr:'6.2', fc:'2.9', lp:2, er:8,  tc:72,no:6},
+      {n:'claude-opus-4',  s:22, pr:'7.8', fc:'4.4', lp:4, er:14, tc:64,no:9},
+      {n:'codex/gpt-5.4',  s:11, pr:'9.4', fc:'5.2', lp:6, er:22, tc:52,no:18},
+      {n:'cursor/default', s:9,  pr:'12.1',fc:'N/A', lp:14,er:42, tc:28,no:44},
+    ],ins:"cursor/default: 44% no-output sessions, 42% error paste rate — highest friction of any model."},
+    '30d':{rows:[
+      {n:'claude-sonnet-4',s:162,pr:'6.4', fc:'3.0', lp:2, er:9,  tc:71,no:7},
+      {n:'claude-opus-4',  s:88, pr:'8.0', fc:'4.5', lp:4, er:15, tc:63,no:10},
+      {n:'codex/gpt-5.4',  s:44, pr:'9.6', fc:'5.3', lp:7, er:23, tc:50,no:19},
+      {n:'cursor/default', s:28, pr:'13.2',fc:'N/A', lp:15,er:45, tc:25,no:46},
+    ],ins:"30d: cursor/default no-output rate up to 46%. codex error paste rate at 23% and rising."},
+    '90d':{rows:[
+      {n:'claude-sonnet-4',s:448,pr:'6.5', fc:'3.0', lp:2, er:9,  tc:70,no:7},
+      {n:'claude-opus-4',  s:252,pr:'8.1', fc:'4.7', lp:5, er:15, tc:62,no:10},
+      {n:'codex/gpt-5.4',  s:124,pr:'9.8', fc:'5.6', lp:7, er:24, tc:49,no:20},
+      {n:'cursor/default', s:60, pr:'13.8',fc:'N/A', lp:16,er:46, tc:23,no:48},
+    ],ins:"Quarter: cursor/default to-commit rate declining each window — 28% → 25% → 23%."},
+  },
+  provider:{
+    '7d':{rows:[
+      {n:'anthropic',s:60, pr:'6.8', fc:'3.2', lp:3, er:10,tc:69,no:7},
+      {n:'openai',   s:11, pr:'9.4', fc:'5.2', lp:6, er:22,tc:52,no:18},
+      {n:'cursor',   s:9,  pr:'12.1',fc:'N/A', lp:14,er:42,tc:28,no:44},
+    ],ins:"anthropic: 3% loop rate, 69% to-commit. cursor is your lowest-value provider on every session metric."},
+    '30d':{rows:[
+      {n:'anthropic',s:250,pr:'7.0', fc:'3.4', lp:3, er:11,tc:68,no:8},
+      {n:'openai',   s:44, pr:'9.6', fc:'5.3', lp:7, er:23,tc:50,no:19},
+      {n:'cursor',   s:28, pr:'13.2',fc:'N/A', lp:15,er:45,tc:25,no:46},
+    ],ins:"30d: cursor to-commit rate at 25% — lowest of any provider across all windows."},
+    '90d':{rows:[
+      {n:'anthropic',s:700,pr:'7.1', fc:'3.5', lp:3, er:11,tc:67,no:8},
+      {n:'openai',   s:124,pr:'9.8', fc:'5.6', lp:7, er:24,tc:49,no:20},
+      {n:'cursor',   s:60, pr:'13.8',fc:'N/A', lp:16,er:46,tc:23,no:48},
+    ],ins:"Quarter: anthropic improving on all session metrics. cursor worsening on all."},
+  },
+  task:{
+    '7d':{rows:[
+      {n:'pr-followups',         s:11,pr:'4.8', fc:'1.8',lp:1,er:5, tc:85,no:4},
+      {n:'analytics-cleanup',    s:14,pr:'6.4', fc:'2.5',lp:3,er:9, tc:78,no:6},
+      {n:'ci-pipeline-cleanup',  s:5, pr:'5.8', fc:'2.2',lp:2,er:6, tc:80,no:4},
+      {n:'onboarding-validation',s:9, pr:'9.2', fc:'3.8',lp:5,er:18,tc:58,no:14},
+      {n:'auth-token-refresh',   s:8, pr:'11.4',fc:'4.3',lp:8,er:28,tc:50,no:22},
+    ],ins:"pr-followups: 85% to-commit, 4% no-output. auth-token-refresh: 22% no-output, 28% error paste."},
+    '30d':{rows:[
+      {n:'pr-followups',         s:44, pr:'4.9', fc:'1.9',lp:1,er:6, tc:84,no:5},
+      {n:'analytics-cleanup',    s:56, pr:'6.6', fc:'2.6',lp:3,er:10,tc:77,no:7},
+      {n:'ci-pipeline-cleanup',  s:22, pr:'5.9', fc:'2.3',lp:2,er:7, tc:79,no:5},
+      {n:'onboarding-validation',s:36, pr:'9.4', fc:'4.0',lp:5,er:19,tc:56,no:15},
+      {n:'auth-token-refresh',   s:32, pr:'11.6',fc:'4.4',lp:9,er:26,tc:52,no:20},
+    ],ins:"Task patterns stable at 30d. auth-token-refresh error paste rate at 26% — highest of any task."},
+    '90d':{rows:[
+      {n:'pr-followups',         s:124,pr:'5.0', fc:'2.0',lp:1,er:6, tc:84,no:5},
+      {n:'analytics-cleanup',    s:158,pr:'6.8', fc:'2.7',lp:3,er:10,tc:76,no:7},
+      {n:'ci-pipeline-cleanup',  s:62, pr:'6.0', fc:'2.4',lp:2,er:7, tc:78,no:5},
+      {n:'onboarding-validation',s:102,pr:'9.6', fc:'4.1',lp:6,er:20,tc:55,no:16},
+      {n:'auth-token-refresh',   s:94, pr:'11.8',fc:'4.5',lp:9,er:27,tc:51,no:21},
+    ],ins:"Quarter: auth-token-refresh to-commit rate declining to 51%. Prompt discipline is the lever."},
+  },
+  branch:{
+    '7d':{rows:[
+      {n:'fix/pr-followups',           s:11,pr:'4.8', fc:'1.8',lp:1,er:5, tc:85,no:4},
+      {n:'refactor/analytics-explorer',s:14,pr:'6.4', fc:'2.5',lp:3,er:9, tc:78,no:6},
+      {n:'chore/ci-pipeline-cleanup',  s:5, pr:'5.8', fc:'2.2',lp:2,er:6, tc:80,no:4},
+      {n:'fix/onboarding-validation',  s:9, pr:'9.2', fc:'3.8',lp:5,er:18,tc:58,no:14},
+      {n:'feat/auth-token-refresh',    s:8, pr:'11.4',fc:'4.3',lp:8,er:28,tc:50,no:22},
+    ],ins:"fix/* branches: 85% to-commit, 4% no-output. feat/* highest loop and error rates."},
+    '30d':{rows:[
+      {n:'fix/pr-followups',           s:44, pr:'4.9', fc:'1.9',lp:1,er:6, tc:84,no:5},
+      {n:'refactor/analytics-explorer',s:56, pr:'6.6', fc:'2.6',lp:3,er:10,tc:77,no:7},
+      {n:'chore/ci-pipeline-cleanup',  s:22, pr:'5.9', fc:'2.3',lp:2,er:7, tc:79,no:5},
+      {n:'fix/onboarding-validation',  s:36, pr:'9.4', fc:'4.0',lp:5,er:19,tc:56,no:15},
+      {n:'feat/auth-token-refresh',    s:32, pr:'11.6',fc:'4.4',lp:9,er:26,tc:52,no:20},
+    ],ins:"Branch patterns stable at 30d. fix/* consistently best on to-commit and no-output."},
+    '90d':{rows:[
+      {n:'fix/pr-followups',           s:124,pr:'5.0', fc:'2.0',lp:1,er:6, tc:84,no:5},
+      {n:'refactor/analytics-explorer',s:158,pr:'6.8', fc:'2.7',lp:3,er:10,tc:76,no:7},
+      {n:'chore/ci-pipeline-cleanup',  s:62, pr:'6.0', fc:'2.4',lp:2,er:7, tc:78,no:5},
+      {n:'fix/onboarding-validation',  s:102,pr:'9.6', fc:'4.1',lp:6,er:20,tc:55,no:16},
+      {n:'feat/auth-token-refresh',    s:94, pr:'11.8',fc:'4.5',lp:9,er:27,tc:51,no:21},
+    ],ins:"Quarter: feat/* declining on to-commit. Apply fix-branch scope discipline to feature work."},
+  },
+};
+
+// ── DELIVERY ─────────────────────────────────────────────────────────────────
+const DEL={
+  model:{
+    '7d':{rows:[
+      {n:'claude-sonnet-4',c:27,hc:19,prS:'19/19',prR:89,ml:79,prM:81},
+      {n:'claude-opus-4',  c:14,hc:9, prS:'9/9',  prR:82,ml:64,prM:74},
+      {n:'codex/gpt-5.4',  c:6, hc:4, prS:'—',    prR:61,ml:61,prM:null},
+      {n:'cursor/default', c:3, hc:1, prS:'—',    prR:22,ml:17,prM:null},
+    ],baseline:{n:'you · no-AI',c:28,prR:78,ml:71},
+     ins:"sonnet: 79% mainline vs 71% no-AI baseline. cursor/default: 17% — 54pp below no-AI."},
+    '30d':{rows:[
+      {n:'claude-sonnet-4',c:116,hc:81, prS:'81/81', prR:87,ml:77,prM:79},
+      {n:'claude-opus-4',  c:56, hc:40, prS:'40/40', prR:80,ml:62,prM:72},
+      {n:'codex/gpt-5.4',  c:23, hc:14, prS:'—',     prR:59,ml:58,prM:null},
+      {n:'cursor/default', c:7,  hc:3,  prS:'—',     prR:20,ml:15,prM:null},
+    ],baseline:{n:'you · no-AI',c:118,prR:76,ml:69},
+     ins:"30d: codex PR reach at 59% and dropping. cursor mainline at 15% — well below no-AI."},
+    '90d':{rows:[
+      {n:'claude-sonnet-4',c:314,hc:218,prS:'218/218',prR:86,ml:76,prM:78},
+      {n:'claude-opus-4',  c:157,hc:108,prS:'108/108',prR:79,ml:61,prM:71},
+      {n:'codex/gpt-5.4',  c:61, hc:38, prS:'—',      prR:58,ml:57,prM:null},
+      {n:'cursor/default', c:14, hc:5,  prS:'—',      prR:18,ml:14,prM:null},
+    ],baseline:{n:'you · no-AI',c:348,prR:75,ml:68},
+     ins:"Quarter: sonnet and opus above baseline. codex and cursor both below on every delivery metric."},
+  },
+  provider:{
+    '7d':{rows:[
+      {n:'anthropic',c:41,hc:28,prS:'28/28',prR:86,ml:73,prM:78},
+      {n:'openai',   c:6, hc:4, prS:'—',    prR:61,ml:61,prM:null},
+      {n:'cursor',   c:3, hc:1, prS:'—',    prR:22,ml:17,prM:null},
+    ],baseline:{n:'you · no-AI',c:28,prR:78,ml:71},ins:"anthropic above no-AI baseline on mainline. cursor well below."},
+    '30d':{rows:[
+      {n:'anthropic',c:172,hc:121,prS:'121/121',prR:84,ml:71,prM:76},
+      {n:'openai',   c:23, hc:14, prS:'—',      prR:59,ml:58,prM:null},
+      {n:'cursor',   c:7,  hc:3,  prS:'—',      prR:20,ml:15,prM:null},
+    ],baseline:{n:'you · no-AI',c:118,prR:76,ml:69},ins:"anthropic above baseline on both PR reach and mainline. openai and cursor below."},
+    '90d':{rows:[
+      {n:'anthropic',c:471,hc:326,prS:'326/326',prR:83,ml:70,prM:75},
+      {n:'openai',   c:61, hc:38, prS:'—',      prR:58,ml:57,prM:null},
+      {n:'cursor',   c:14, hc:5,  prS:'—',      prR:18,ml:14,prM:null},
+    ],baseline:{n:'you · no-AI',c:348,prR:75,ml:68},ins:"Quarter: anthropic above no-AI baseline. openai at parity. cursor well below."},
+  },
+  task:{
+    '7d':{rows:[
+      {n:'pr-followups',         c:10,hc:7,prS:'7/7',prR:95,ml:88,prM:91},
+      {n:'analytics-cleanup',    c:11,hc:8,prS:'8/8',prR:88,ml:80,prM:82},
+      {n:'ci-pipeline-cleanup',  c:4, hc:3,prS:'3/3',prR:90,ml:84,prM:85},
+      {n:'onboarding-validation',c:5, hc:3,prS:'—',  prR:72,ml:62,prM:null},
+      {n:'auth-token-refresh',   c:4, hc:2,prS:'—',  prR:64,ml:56,prM:null},
+    ],baseline:{n:'you · no-AI',c:28,prR:78,ml:71},ins:"Top 3 tasks above no-AI mainline baseline. auth-token-refresh 15pp below."},
+    '30d':{rows:[
+      {n:'pr-followups',         c:37, hc:28,prS:'28/28',prR:94,ml:87,prM:90},
+      {n:'analytics-cleanup',    c:43, hc:32,prS:'32/32',prR:86,ml:78,prM:80},
+      {n:'ci-pipeline-cleanup',  c:17, hc:13,prS:'13/13',prR:88,ml:82,prM:83},
+      {n:'onboarding-validation',c:21, hc:12,prS:'—',    prR:70,ml:60,prM:null},
+      {n:'auth-token-refresh',   c:17, hc:8, prS:'—',    prR:62,ml:54,prM:null},
+    ],baseline:{n:'you · no-AI',c:118,prR:76,ml:69},ins:"auth-token-refresh mainline at 54% — below no-AI baseline and declining."},
+    '90d':{rows:[
+      {n:'pr-followups',         c:104,hc:78, prS:'78/78', prR:93,ml:86,prM:89},
+      {n:'analytics-cleanup',    c:120,hc:90, prS:'90/90', prR:85,ml:77,prM:79},
+      {n:'ci-pipeline-cleanup',  c:48, hc:36, prS:'36/36', prR:87,ml:81,prM:82},
+      {n:'onboarding-validation',c:56, hc:32, prS:'—',     prR:68,ml:58,prM:null},
+      {n:'auth-token-refresh',   c:48, hc:24, prS:'—',     prR:60,ml:52,prM:null},
+    ],baseline:{n:'you · no-AI',c:348,prR:75,ml:68},ins:"Quarter: auth-token-refresh mainline reach now below no-AI baseline."},
+  },
+  branch:{
+    '7d':{rows:[
+      {n:'fix/pr-followups',           c:10,hc:7,prS:'7/7',prR:95,ml:88,prM:91},
+      {n:'refactor/analytics-explorer',c:11,hc:8,prS:'8/8',prR:88,ml:80,prM:82},
+      {n:'chore/ci-pipeline-cleanup',  c:4, hc:3,prS:'3/3',prR:90,ml:84,prM:85},
+      {n:'fix/onboarding-validation',  c:5, hc:3,prS:'—',  prR:72,ml:62,prM:null},
+      {n:'feat/auth-token-refresh',    c:4, hc:2,prS:'—',  prR:64,ml:56,prM:null},
+    ],baseline:{n:'you · no-AI',c:28,prR:78,ml:71},ins:"fix/* and chore/* above no-AI mainline baseline. feat/* below."},
+    '30d':{rows:[
+      {n:'fix/pr-followups',           c:37, hc:28,prS:'28/28',prR:94,ml:87,prM:90},
+      {n:'refactor/analytics-explorer',c:43, hc:32,prS:'32/32',prR:86,ml:78,prM:80},
+      {n:'chore/ci-pipeline-cleanup',  c:17, hc:13,prS:'13/13',prR:88,ml:82,prM:83},
+      {n:'fix/onboarding-validation',  c:21, hc:12,prS:'—',    prR:70,ml:60,prM:null},
+      {n:'feat/auth-token-refresh',    c:17, hc:8, prS:'—',    prR:62,ml:54,prM:null},
+    ],baseline:{n:'you · no-AI',c:118,prR:76,ml:69},ins:"fix/* consistently above baseline. feat/* below on mainline reach."},
+    '90d':{rows:[
+      {n:'fix/pr-followups',           c:104,hc:78, prS:'78/78', prR:93,ml:86,prM:89},
+      {n:'refactor/analytics-explorer',c:120,hc:90, prS:'90/90', prR:85,ml:77,prM:79},
+      {n:'chore/ci-pipeline-cleanup',  c:48, hc:36, prS:'36/36', prR:87,ml:81,prM:82},
+      {n:'fix/onboarding-validation',  c:56, hc:32, prS:'—',     prR:68,ml:58,prM:null},
+      {n:'feat/auth-token-refresh',    c:48, hc:24, prS:'—',     prR:60,ml:52,prM:null},
+    ],baseline:{n:'you · no-AI',c:348,prR:75,ml:68},ins:"Quarter: feat/* below no-AI baseline on mainline reach."},
+  },
+};
+
+// ── QUALITY ──────────────────────────────────────────────────────────────────
+const QUA={
+  model:{
+    '7d':{rows:[
+      {n:'claude-sonnet-4',hc:19,ch:4, br:0, rv:2},
+      {n:'claude-opus-4',  hc:9, ch:6, br:7, rv:5},
+      {n:'codex/gpt-5.4',  hc:4, ch:14,br:13,rv:9},
+      {n:'cursor/default', hc:1, ch:31,br:22,rv:18},
+    ],baseline:{n:'you · no-AI',ch:8,br:6,rv:7},
+     ins:"codex and cursor both exceed no-AI bug rate. cursor churn at 31%."},
+    '30d':{rows:[
+      {n:'claude-sonnet-4',hc:81, ch:5, br:2, rv:3},
+      {n:'claude-opus-4',  hc:40, ch:7, br:8, rv:6},
+      {n:'codex/gpt-5.4',  hc:14, ch:15,br:14,rv:10},
+      {n:'cursor/default', hc:3,  ch:33,br:24,rv:19},
+    ],baseline:{n:'you · no-AI',ch:9,br:6,rv:7},
+     ins:"30d: codex bug rate at 14% and rising. cursor 4× above no-AI bug rate."},
+    '90d':{rows:[
+      {n:'claude-sonnet-4',hc:218,ch:5, br:3, rv:3},
+      {n:'claude-opus-4',  hc:108,ch:7, br:9, rv:7},
+      {n:'codex/gpt-5.4',  hc:38, ch:16,br:15,rv:11},
+      {n:'cursor/default', hc:5,  ch:35,br:26,rv:20},
+    ],baseline:{n:'you · no-AI',ch:9,br:6,rv:7},
+     ins:"Quarter: sonnet is the only model with quality above no-AI baseline."},
+  },
+  provider:{
+    '7d':{rows:[{n:'anthropic',hc:28,ch:4,br:2,rv:3},{n:'openai',hc:4,ch:14,br:13,rv:9},{n:'cursor',hc:1,ch:31,br:22,rv:18}],
+      baseline:{n:'you · no-AI',ch:8,br:6,rv:7},ins:"anthropic below no-AI on both churn and bug rate. cursor well above."},
+    '30d':{rows:[{n:'anthropic',hc:121,ch:5,br:3,rv:4},{n:'openai',hc:14,ch:15,br:14,rv:10},{n:'cursor',hc:3,ch:33,br:24,rv:19}],
+      baseline:{n:'you · no-AI',ch:9,br:6,rv:7},ins:"30d: anthropic holding quality above baseline. openai above. cursor worsening."},
+    '90d':{rows:[{n:'anthropic',hc:326,ch:5,br:4,rv:4},{n:'openai',hc:38,ch:16,br:15,rv:11},{n:'cursor',hc:5,ch:35,br:26,rv:20}],
+      baseline:{n:'you · no-AI',ch:9,br:6,rv:7},ins:"Quarter: anthropic only provider at or below no-AI bug rate."},
+  },
+  task:{
+    '7d':{rows:[{n:'pr-followups',hc:7,ch:2,br:1,rv:1},{n:'ci-pipeline-cleanup',hc:3,ch:3,br:0,rv:0},{n:'analytics-cleanup',hc:8,ch:4,br:2,rv:3},{n:'onboarding-validation',hc:3,ch:8,br:8,rv:6},{n:'auth-token-refresh',hc:2,ch:11,br:9,rv:7}],
+      baseline:{n:'you · no-AI',ch:8,br:6,rv:7},ins:"CI and PR follow-ups below no-AI bug rate. auth and onboarding above."},
+    '30d':{rows:[{n:'pr-followups',hc:28,ch:2,br:2,rv:1},{n:'ci-pipeline-cleanup',hc:13,ch:3,br:1,rv:0},{n:'analytics-cleanup',hc:32,ch:4,br:3,rv:3},{n:'onboarding-validation',hc:12,ch:9,br:9,rv:7},{n:'auth-token-refresh',hc:8,ch:12,br:10,rv:8}],
+      baseline:{n:'you · no-AI',ch:9,br:6,rv:7},ins:"Task quality stable. auth bug rate slightly worsening at 30d."},
+    '90d':{rows:[{n:'pr-followups',hc:78,ch:2,br:2,rv:1},{n:'ci-pipeline-cleanup',hc:36,ch:3,br:1,rv:0},{n:'analytics-cleanup',hc:90,ch:5,br:4,rv:4},{n:'onboarding-validation',hc:32,ch:10,br:10,rv:8},{n:'auth-token-refresh',hc:24,ch:13,br:11,rv:9}],
+      baseline:{n:'you · no-AI',ch:9,br:6,rv:7},ins:"Quarter: auth and onboarding both above no-AI bug rate."},
+  },
+  branch:{
+    '7d':{rows:[{n:'fix/pr-followups',hc:7,ch:2,br:1,rv:1},{n:'chore/ci-pipeline-cleanup',hc:3,ch:3,br:0,rv:0},{n:'refactor/analytics-explorer',hc:8,ch:4,br:2,rv:3},{n:'fix/onboarding-validation',hc:3,ch:8,br:8,rv:6},{n:'feat/auth-token-refresh',hc:2,ch:11,br:9,rv:7}],
+      baseline:{n:'you · no-AI',ch:8,br:6,rv:7},ins:"fix/* and chore/* below no-AI bug rate. feat/* above it."},
+    '30d':{rows:[{n:'fix/pr-followups',hc:28,ch:2,br:2,rv:1},{n:'chore/ci-pipeline-cleanup',hc:13,ch:3,br:1,rv:0},{n:'refactor/analytics-explorer',hc:32,ch:4,br:3,rv:3},{n:'fix/onboarding-validation',hc:12,ch:9,br:9,rv:7},{n:'feat/auth-token-refresh',hc:8,ch:12,br:10,rv:8}],
+      baseline:{n:'you · no-AI',ch:9,br:6,rv:7},ins:"Branch quality patterns stable at 30d. fix/* consistent wins."},
+    '90d':{rows:[{n:'fix/pr-followups',hc:78,ch:2,br:2,rv:1},{n:'chore/ci-pipeline-cleanup',hc:36,ch:3,br:1,rv:0},{n:'refactor/analytics-explorer',hc:90,ch:5,br:4,rv:4},{n:'fix/onboarding-validation',hc:32,ch:10,br:10,rv:8},{n:'feat/auth-token-refresh',hc:24,ch:13,br:11,rv:9}],
+      baseline:{n:'you · no-AI',ch:9,br:6,rv:7},ins:"Quarter: feat/* above no-AI bug rate. Branch name is a quality proxy."},
+  },
+};
+
+// ── LEGENDS ──────────────────────────────────────────────────────────────────
+const LEGENDS={
+  1:[
+    ['First Chg',    'avg_minutes_to_first_accepted_change — time to first accepted diff in this group'],
+    ['Debug Loop',   'debug_loop_rate — share of sessions with at least one debug retry cycle'],
+    ['Mainline %',   'merge_rate — share of heavy AI commits that merged to the main branch'],
+    ['Bug Rate %',   'bug_after_merge_rate — share of heavy AI commits that drew a fix within 60 days'],
+    ['Sort order',   'Rows sorted by Mainline % descending — highest shipping rate at the top'],
+    ['no-AI anchor', 'Commits made without AI heavy involvement in the same period — your baseline'],
+  ],
+  2:[
+    ['Sessions',    'session_count — total AI coding sessions in this group and window'],
+    ['Avg Prompts', 's2_avg — average number of prompts sent per session'],
+    ['First Chg',   'avg_minutes_to_first_accepted_change — avg minutes to first accepted diff'],
+    ['Loop %',      'debug_loop_rate — share of sessions with a debug retry cycle'],
+    ['Error %',     's6_rate — share of sessions where an error was pasted back into context'],
+    ['To Commit %', 's9_rate — share of sessions that produced at least one git commit'],
+    ['No Output %', 'no_output_session_rate — share of sessions that returned no usable diff'],
+  ],
+  3:[
+    ['Commits',     'commit_count — total git commits in the period'],
+    ['Heavy',       'heavy_commit_count — commits where AI-attributed lines ≥ 50% of changed lines'],
+    ['PR sync',     'github_pr_heavy_eligible / ready — requires GitHub sync to be enabled'],
+    ['PR Reach %',  'pr_reach_rate — share of heavy commits that opened a pull request'],
+    ['Mainline %',  'merge_rate — share of heavy commits that merged to main'],
+    ['PR Merge %',  'pr_merge_rate — share of PRs that merged (— if GitHub sync unavailable)'],
+    ['no-AI anchor','Commits without AI heavy involvement in the same period'],
+  ],
+  4:[
+    ['Heavy',       'heavy_commit_count — heavy AI commits tracked for quality signals'],
+    ['Churn %',     'code_churn_rate — share of AI-added lines removed within the churn window'],
+    ['Bug Rate %',  'bug_after_merge_rate — share of heavy AI commits that drew a fix within 60 days'],
+    ['Revert %',    'revert_rate — share of heavy AI commits that were subsequently reverted'],
+    ['no-AI anchor','Quality signals for non-AI-heavy commits in the same period — your baseline'],
+  ],
+};
+
+// ── HELPERS ───────────────────────────────────────────────────────────────────
+const g=()=>GROUPS[S.gi];
+const wi=()=>WINDOWS[S.wi];
+
+function render(){
+  document.getElementById('screen').innerHTML=buildScreen();
+  bindClicks();
+}
+
+function buildScreen(){
+  const hdr=buildHeader();
+  const tabs=buildTabs();
+  const ctrl=buildCtrl();
+  let body='';
+  if(S.tab===1)body=buildVerdict();
+  if(S.tab===2)body=buildSessions();
+  if(S.tab===3)body=buildDelivery();
+  if(S.tab===4)body=buildQuality();
+  return`${hdr}${tabs}${ctrl}<div class="t-body">${body}</div>${buildFooter()}${S.leg?buildLegend():''}`;
+}
+
+function buildHeader(){
+  const now=new Date();
+  const t=now.getHours().toString().padStart(2,'0')+':'+now.getMinutes().toString().padStart(2,'0');
+  return`<div class="t-hdr">
+    <div class="t-hdr-l">
+      <span class="t-prod">AI Engineering Analytics</span>
+      <span class="t-ctx"><span>${g()}</span> &nbsp;·&nbsp; <span>${wi()}</span></span>
+    </div>
+    <span class="t-time">${t}</span>
+  </div>`;
+}
+
+function buildTabs(){
+  const labels=['Verdict','Sessions','Delivery','Quality'];
+  return`<div class="t-tabs">${labels.map((l,i)=>
+    `<div class="tab${S.tab===i+1?' on':''}" data-tab="${i+1}">
+      <span class="tab-n">[${i+1}]</span> ${l}
+    </div>`).join('')}</div>`;
+}
+
+function buildCtrl(){
+  const gPills=GROUPS.map((gr,i)=>
+    `<span class="pill${S.gi===i?' on':''}" data-gi="${i}">${gr}</span>`).join('');
+  const wPills=WINDOWS.map((w,i)=>
+    `<span class="pill${S.wi===i?' on':''}" data-wi="${i}">${w}</span>`).join('');
+  return`<div class="t-ctrl">
+    <div class="ctrl-group">
+      <span class="ctrl-label">group</span>
+      <div class="pill-group">${gPills}</div>
+    </div>
+    <span class="ctrl-sep">·</span>
+    <div class="ctrl-group">
+      <span class="ctrl-label">window</span>
+      <div class="pill-group">${wPills}</div>
+    </div>
+    <span class="legend-btn" id="leg-btn">L legend</span>
+  </div>`;
+}
+
+function buildFooter(){
+  return`<div class="t-foot">
+    <div class="kbd-hints">
+      <span><span class="fk">1–4</span> tab</span>
+      <span class="fsep">·</span>
+      <span><span class="fk">↑↓</span> row</span>
+      <span class="fsep">·</span>
+      <span><span class="fk">g</span> group</span>
+      <span class="fsep">·</span>
+      <span><span class="fk">w</span> window</span>
+      <span class="fsep">·</span>
+      <span><span class="fk">L</span> legend</span>
+    </div>
+    <span class="t-foot-r">prototype · v3</span>
+  </div>`;
+}
+
+function buildLegend(){
+  const entries=LEGENDS[S.tab]||[];
+  const rows=entries.map(([k,v])=>
+    `<div class="leg-row"><span class="leg-k">${k}</span><span class="leg-v">${v}</span></div>`
+  ).join('');
+  return`<div class="legend-overlay" id="leg-overlay">
+    <div class="leg-hdr">
+      <span class="leg-title">Legend &nbsp;·&nbsp; ${['Verdict','Sessions','Delivery','Quality'][S.tab-1]}</span>
+      <span class="leg-close-btn" id="leg-close">Close</span>
+    </div>
+    <div class="leg-grid">${rows}</div>
+  </div>`;
+}
+
+// ── TAB BUILDERS ──────────────────────────────────────────────────────────────
+function buildVerdict(){
+  const d=VERD[g()][wi()];
+  const rows=d.rows.map((r,i)=>{
+    const sel=S.row===i;
+    const fcC=r.fc==='—'?'d4':parseFloat(r.fc)<=3?'gn':parseFloat(r.fc)<=6?'am':'rd';
+    return`<tr class="${sel?'sel':''}" data-row="${i}">
+      <td>${r.n}</td>
+      <td><span class="${fcC}">${r.fc}</span></td>
+      <td><span class="${COL.loopRate(r.lp)}">${r.lp}%</span></td>
+      <td><span class="${COL.mainline(r.ml)}">${r.ml}%</span></td>
+      <td><span class="${COL.bugRate(r.br)}">${r.br}%</span></td>
+    </tr>`;
+  }).join('');
+  const b=d.baseline;
+  const baseRow=`<tr class="baseline">
+    <td>${b.n}</td>
+    <td class="d4">${b.fc}</td>
+    <td class="d4">—</td>
+    <td><span class="${COL.mainline(b.ml)}">${b.ml}%</span></td>
+    <td><span class="${COL.bugRate(b.br)}">${b.br}%</span></td>
+  </tr>`;
+  const stats=d.stats.map(s=>`<div class="stat-item">
+    <div class="stat-v">${s.v}</div>
+    <div class="stat-d ${s.dc}">${s.d}</div>
+    <div class="stat-l">${s.l}</div>
+  </div>`).join('');
+  return`
+    <div class="v-stmt">${d.stmt}</div>
+    <div class="v-sub">${d.sub}</div>
+    <div class="stats">${stats}</div>
+    <div class="tbl-wrap"><table class="tbl">
+      <thead><tr>
+        <th></th>
+        <th>First Chg</th>
+        <th>Debug Loop</th>
+        <th class="sort-col">Mainline ↓</th>
+        <th>Bug Rate</th>
+      </tr></thead>
+      <tbody>${rows}${baseRow}</tbody>
+    </table></div>
+    <div class="insight"><span class="idot">●</span>${d.ins}</div>`;
+}
+
+function buildSessions(){
+  const d=SESS[g()][wi()];
+  const rows=d.rows.map((r,i)=>{
+    const sel=S.row===i;
+    const fcC=r.fc==='N/A'?'d4':parseFloat(r.fc)<=3?'gn':parseFloat(r.fc)<=6?'am':'rd';
+    return`<tr class="${sel?'sel':''}" data-row="${i}">
+      <td>${r.n}</td>
+      <td>${r.s}</td>
+      <td class="su">${r.pr}</td>
+      <td><span class="${fcC}">${r.fc}</span></td>
+      <td><span class="${COL.loopRate(r.lp)}">${r.lp}%</span></td>
+      <td><span class="${COL.errorRate(r.er)}">${r.er}%</span></td>
+      <td><span class="${COL.toCommit(r.tc)}">${r.tc}%</span></td>
+      <td><span class="${COL.noOutput(r.no)}">${r.no}%</span></td>
+    </tr>`;
+  }).join('');
+  return`<div class="tbl-wrap"><table class="tbl">
+    <thead><tr>
+      <th></th>
+      <th>Sessions</th>
+      <th>Avg Prompts</th>
+      <th>First Chg</th>
+      <th>Loop %</th>
+      <th>Error %</th>
+      <th>To Commit %</th>
+      <th>No Output %</th>
+    </tr></thead>
+    <tbody>${rows}</tbody>
+  </table></div>
+  <div class="insight"><span class="idot">●</span>${d.ins}</div>`;
+}
+
+function buildDelivery(){
+  const d=DEL[g()][wi()];
+  const dataRows=d.rows.map((r,i)=>{
+    const sel=S.row===i;
+    const prMVal=r.prM===null?`<span class="d4">—</span>`:`<span class="${COL.prMerge(r.prM)}">${r.prM}%</span>`;
+    const prSVal=r.prS==='—'?`<span class="d4">—</span>`:`<span class="d5">${r.prS}</span>`;
+    return`<tr class="${sel?'sel':''}" data-row="${i}">
+      <td>${r.n}</td>
+      <td>${r.c}</td>
+      <td class="su">${r.hc}</td>
+      <td>${prSVal}</td>
+      <td><span class="${COL.prReach(r.prR)}">${r.prR}%</span></td>
+      <td><span class="${COL.mainline(r.ml)}">${r.ml}%</span></td>
+      <td>${prMVal}</td>
+    </tr>`;
+  }).join('');
+  const b=d.baseline;
+  return`<div class="tbl-wrap"><table class="tbl">
+    <thead><tr>
+      <th></th>
+      <th>Commits</th>
+      <th>Heavy</th>
+      <th>PR sync</th>
+      <th>PR Reach %</th>
+      <th>Mainline %</th>
+      <th>PR Merge %</th>
+    </tr></thead>
+    <tbody>${dataRows}
+    <tr class="baseline">
+      <td>${b.n}</td>
+      <td>${b.c}</td>
+      <td class="d4">—</td>
+      <td class="d4">—</td>
+      <td><span class="${COL.prReach(b.prR)}">${b.prR}%</span></td>
+      <td><span class="${COL.mainline(b.ml)}">${b.ml}%</span></td>
+      <td class="d4">—</td>
+    </tr></tbody>
+  </table></div>
+  <div class="insight"><span class="idot">●</span>${d.ins}</div>`;
+}
+
+function buildQuality(){
+  const d=QUA[g()][wi()];
+  const dataRows=d.rows.map((r,i)=>{
+    const sel=S.row===i;
+    return`<tr class="${sel?'sel':''}" data-row="${i}">
+      <td>${r.n}</td>
+      <td class="su">${r.hc}</td>
+      <td><span class="${COL.churn(r.ch)}">${r.ch}%</span></td>
+      <td><span class="${COL.bugRate(r.br)}">${r.br}%</span></td>
+      <td><span class="${COL.revert(r.rv)}">${r.rv}%</span></td>
+    </tr>`;
+  }).join('');
+  const b=d.baseline;
+  return`<div class="tbl-wrap"><table class="tbl">
+    <thead><tr>
+      <th></th>
+      <th>Heavy</th>
+      <th>Churn %</th>
+      <th>Bug Rate %</th>
+      <th>Revert %</th>
+    </tr></thead>
+    <tbody>${dataRows}
+    <tr class="baseline">
+      <td>${b.n}</td>
+      <td class="d4">—</td>
+      <td><span class="${COL.churn(b.ch)}">${b.ch}%</span></td>
+      <td><span class="${COL.bugRate(b.br)}">${b.br}%</span></td>
+      <td><span class="${COL.revert(b.rv)}">${b.rv}%</span></td>
+    </tr></tbody>
+  </table></div>
+  <div class="insight"><span class="idot">●</span>${d.ins}</div>`;
+}
+
+// ── BINDINGS ──────────────────────────────────────────────────────────────────
+function bindClicks(){
+  document.querySelectorAll('[data-tab]').forEach(el=>
+    el.addEventListener('click',()=>{S.tab=parseInt(el.dataset.tab);S.row=0;S.leg=false;render();}));
+  document.querySelectorAll('[data-row]').forEach(el=>
+    el.addEventListener('click',()=>{S.row=parseInt(el.dataset.row);render();}));
+  document.querySelectorAll('[data-gi]').forEach(el=>
+    el.addEventListener('click',()=>{S.gi=parseInt(el.dataset.gi);S.row=0;render();}));
+  document.querySelectorAll('[data-wi]').forEach(el=>
+    el.addEventListener('click',()=>{S.wi=parseInt(el.dataset.wi);S.row=0;render();}));
+  const lb=document.getElementById('leg-btn');
+  if(lb)lb.addEventListener('click',()=>{S.leg=!S.leg;render();});
+  const lc=document.getElementById('leg-close');
+  if(lc)lc.addEventListener('click',()=>{S.leg=false;render();});
+  const lo=document.getElementById('leg-overlay');
+  if(lo)lo.addEventListener('click',e=>{if(e.target===lo){S.leg=false;render();}});
+}
+
+function rowCount(){
+  if(S.tab===1)return(VERD[g()][wi()].rows||[]).length;
+  if(S.tab===2)return(SESS[g()][wi()].rows||[]).length;
+  if(S.tab===3)return(DEL[g()][wi()].rows||[]).length;
+  if(S.tab===4)return(QUA[g()][wi()].rows||[]).length;
+  return 0;
+}
+
+document.addEventListener('keydown',e=>{
+  if(e.target.tagName==='INPUT'||e.target.tagName==='TEXTAREA')return;
+  if(e.key>='1'&&e.key<='4'&&!e.ctrlKey&&!e.metaKey){S.tab=parseInt(e.key);S.row=0;S.leg=false;render();return;}
+  if(e.key==='g'){S.gi=(S.gi+1)%GROUPS.length;S.row=0;render();return;}
+  if(e.key==='w'){S.wi=(S.wi+1)%WINDOWS.length;S.row=0;render();return;}
+  if(e.key==='l'||e.key==='L'){S.leg=!S.leg;render();return;}
+  if(e.key==='Escape'||e.key==='q'){if(S.leg){S.leg=false;render();}return;}
+  if(e.key==='ArrowDown'||e.key==='j'){e.preventDefault();S.row=Math.min(S.row+1,rowCount()-1);render();return;}
+  if(e.key==='ArrowUp'||e.key==='k'){e.preventDefault();S.row=Math.max(S.row-1,0);render();return;}
+});
+
+render();
+</script>
+</body>
+</html>
