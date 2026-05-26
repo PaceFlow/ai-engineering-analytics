@@ -1,36 +1,24 @@
-# `paceflow` v0.2.2
+# `paceflow` v0.2.3
 
-This release focuses on the new analytics sync flow, periodic background scheduling, and reliability fixes on Windows and macOS.
+This is a small UX release that makes empty reports more discoverable when data was ingested while working in a different repo.
 
 Download the archive for your platform from the Assets section below, extract it, and run `paceflow --help`.
 
 ## Highlights
 
-- Added `paceflow sync` commands for manually pushing local analytics events to PaceFlow.
-- Added a periodic sync schedule that runs in the background via `launchd` on macOS, the Task Scheduler on Windows, and `systemd` user units on Linux.
-- Added a `paceflow hook setup` gate so analytics sync is opt-in and tied to a configured person.
-- Added a person sync setup flow for first-time configuration.
-- Filtered sync cost metrics to committed work so unmerged sessions no longer skew totals.
-- Published `paceflow` to crates.io via a new CI workflow, with package publishing metadata in `Cargo.toml`.
-
-## Fixes
-
-- Wrote Windows scheduled-task XML as UTF-16 LE with a BOM so Task Scheduler accepts it.
-- Avoided showing a console window for the background sync task on Windows by launching it through `wscript`.
-- Updated the macOS `launchd` config so the periodic sync agent installs and reloads cleanly.
-- Tightened `paceflow hook` and sync tests after the new gate and schedule logic landed.
+- When a report (`paceflow session`, `delivery`, `quality`, or `cost`) is run inside a git repo and returns no rows, the empty-state message now points users at `--all-projects`, instead of only suggesting `paceflow ingest`. The hint only appears when the current-repo scope was auto-injected, so explicit `--repo` and `--all-projects` runs are unaffected.
 
 ## Upgrade Notes
 
 - No database migration is required.
-- Re-run `paceflow ingest` after upgrading to keep analytics events current.
-- To enable background sync, run `paceflow hook setup` and follow the person sync setup prompts.
+- No new commands or flags; behavior only changes when reports return zero rows under the default current-repo scope.
 - Existing commands continue to work:
   - `paceflow ingest`
   - `paceflow session`
   - `paceflow delivery`
   - `paceflow quality`
-  - `paceflow sync` (new)
+  - `paceflow cost`
+  - `paceflow sync`
 
 ## Requirements
 
