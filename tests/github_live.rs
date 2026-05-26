@@ -1,8 +1,8 @@
+use anyhow::Result;
 use paceflow::analytics;
 use paceflow::cli::ReportArgs;
 use paceflow::db;
 use paceflow::github;
-use anyhow::Result;
 use rusqlite::{Connection, params};
 use std::ffi::{OsStr, OsString};
 use std::sync::{Mutex, MutexGuard, OnceLock};

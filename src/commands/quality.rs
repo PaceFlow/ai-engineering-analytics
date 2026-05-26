@@ -22,7 +22,12 @@ pub fn run(args: QualityReportArgs) -> Result<()> {
         rows.is_empty() && task_report_hidden_branch_rows_exist(&db, &resolved.report, options)?;
     print!(
         "{}",
-        render_quality_report(&rows, &resolved.report, show_branch_hint)
+        render_quality_report(
+            &rows,
+            &resolved.report,
+            show_branch_hint,
+            resolved.repo_auto_injected,
+        )
     );
     Ok(())
 }
@@ -31,6 +36,7 @@ fn render_quality_report(
     rows: &[analytics::LifecycleReportRow],
     report: &ReportArgs,
     show_branch_hint: bool,
+    repo_auto_injected: bool,
 ) -> String {
     let mut out = String::new();
     out.push_str("Quality Metrics\n");
@@ -39,6 +45,10 @@ fn render_quality_report(
         if show_branch_hint {
             out.push_str(
                 "No ticket-style task rows matched. Try `paceflow quality --group-by branch` or `--overall`.\n",
+            );
+        } else if repo_auto_injected {
+            out.push_str(
+                "No quality rows found for the current repo. Run `paceflow ingest` first, or pass `--all-projects` to include data from other ingested repos.\n",
             );
         } else {
             out.push_str("No quality rows found. Run `paceflow ingest` first.\n");
@@ -197,7 +207,7 @@ mod tests {
             limit: 50,
         };
 
-        let rendered = render_quality_report(&rows, &report, false);
+        let rendered = render_quality_report(&rows, &report, false, false);
         assert!(rendered.contains("Heavy commits analyzed: 3"));
         assert!(rendered.contains("│ Signal"));
         assert!(rendered.contains("│ Code churn"));
@@ -243,7 +253,7 @@ mod tests {
             limit: 50,
         };
 
-        let rendered = render_quality_report(&rows, &report, false);
+        let rendered = render_quality_report(&rows, &report, false, false);
         assert!(rendered.contains("Churn Rate"));
         assert!(rendered.contains("Bug Rate"));
         assert!(rendered.contains("Revert Rate"));
@@ -267,9 +277,30 @@ mod tests {
             limit: 50,
         };
 
-        let rendered = render_quality_report(&[], &report, true);
+        let rendered = render_quality_report(&[], &report, true, false);
         assert!(rendered.contains("No ticket-style task rows matched."));
         assert!(rendered.contains("`paceflow quality --group-by branch`"));
         assert!(!rendered.contains("Run `paceflow ingest` first."));
+    }
+
+    #[test]
+    fn render_quality_report_suggests_all_projects_when_repo_auto_injected() {
+        let report = ReportArgs {
+            weekly: false,
+            group_by: None,
+            from: None,
+            to: None,
+            repo: Some("/tmp/sample-repo".to_string()),
+            all_projects: false,
+            provider: None,
+            task: None,
+            branch: None,
+            model: None,
+            limit: 50,
+        };
+
+        let rendered = render_quality_report(&[], &report, false, true);
+        assert!(rendered.contains("No quality rows found for the current repo."));
+        assert!(rendered.contains("`--all-projects`"));
     }
 }

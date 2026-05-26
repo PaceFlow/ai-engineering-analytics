@@ -1,5 +1,5 @@
-use paceflow::github::auth::github_token;
 use assert_cmd::Command;
+use paceflow::github::auth::github_token;
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::path::PathBuf;

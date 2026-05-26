@@ -1,6 +1,6 @@
+use clap::Parser;
 use paceflow::cli::{Cli, Commands};
 use paceflow::commands;
-use clap::Parser;
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();

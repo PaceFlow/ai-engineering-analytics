@@ -23,12 +23,17 @@ pub fn run(args: SessionReportArgs) -> Result<()> {
 
     let output = if args.list_sessions {
         let rows = analytics::query_session_list_rows(&db, &resolved.report)?;
-        render_session_list(&rows)
+        render_session_list(&rows, resolved.repo_auto_injected)
     } else {
         let rows = analytics::query_session_report_with_options(&db, &resolved.report, options)?;
         let show_branch_hint = rows.is_empty()
             && task_report_hidden_branch_rows_exist(&db, &resolved.report, options)?;
-        render_session_report(&rows, &resolved.report, show_branch_hint)
+        render_session_report(
+            &rows,
+            &resolved.report,
+            show_branch_hint,
+            resolved.repo_auto_injected,
+        )
     };
 
     if std::io::stdout().is_terminal() && output.lines().count() > terminal_height() {
@@ -43,6 +48,7 @@ fn render_session_report(
     rows: &[analytics::SessionReportRow],
     report: &ReportArgs,
     show_branch_hint: bool,
+    repo_auto_injected: bool,
 ) -> String {
     let mut out = String::new();
     out.push_str("Session Metrics\n");
@@ -51,6 +57,10 @@ fn render_session_report(
         if show_branch_hint {
             out.push_str(
                 "No ticket-style task rows matched. Try `paceflow session --group-by branch` or `--overall`.\n",
+            );
+        } else if repo_auto_injected {
+            out.push_str(
+                "No session rows found for the current repo. Run `paceflow ingest` first, or pass `--all-projects` to include data from other ingested repos.\n",
             );
         } else {
             out.push_str("No session rows found. Run `paceflow ingest` first.\n");
@@ -183,11 +193,17 @@ fn render_session_report(
     out
 }
 
-fn render_session_list(rows: &[analytics::SessionListRow]) -> String {
+fn render_session_list(rows: &[analytics::SessionListRow], repo_auto_injected: bool) -> String {
     let mut out = String::new();
     out.push_str("Session List\n\n");
     if rows.is_empty() {
-        out.push_str("No session rows found. Run `paceflow ingest` first.\n");
+        if repo_auto_injected {
+            out.push_str(
+                "No session rows found for the current repo. Run `paceflow ingest` first, or pass `--all-projects` to include data from other ingested repos.\n",
+            );
+        } else {
+            out.push_str("No session rows found. Run `paceflow ingest` first.\n");
+        }
         return out;
     }
 
@@ -427,14 +443,24 @@ mod tests {
 
     #[test]
     fn render_session_list_shows_distinct_project_tails() {
-        let output = render_session_list(&[
-            row("/Users/daniel/work/company/apps/mobile/customer-portal"),
-            row("/Users/daniel/work/company/apps/mobile/admin-portal"),
-        ]);
+        let output = render_session_list(
+            &[
+                row("/Users/daniel/work/company/apps/mobile/customer-portal"),
+                row("/Users/daniel/work/company/apps/mobile/admin-portal"),
+            ],
+            false,
+        );
 
         assert!(output.contains("customer-portal"));
         assert!(output.contains("admin-portal"));
         assert!(!output.contains("/Users/daniel/work/company/apps/mobile/customer-portal"));
+    }
+
+    #[test]
+    fn render_session_list_suggests_all_projects_when_repo_auto_injected() {
+        let output = render_session_list(&[], true);
+        assert!(output.contains("No session rows found for the current repo."));
+        assert!(output.contains("`--all-projects`"));
     }
 
     #[test]
@@ -477,7 +503,7 @@ mod tests {
             limit: 50,
         };
 
-        let rendered = render_session_report(&rows, &report, false);
+        let rendered = render_session_report(&rows, &report, false, false);
         assert!(rendered.contains("Sessions analyzed: 411"));
         assert!(rendered.contains("│ Signal"));
         assert!(rendered.contains("│ Time to first change"));
@@ -505,9 +531,30 @@ mod tests {
             limit: 50,
         };
 
-        let rendered = render_session_report(&[], &report, true);
+        let rendered = render_session_report(&[], &report, true, false);
         assert!(rendered.contains("No ticket-style task rows matched."));
         assert!(rendered.contains("`paceflow session --group-by branch`"));
         assert!(!rendered.contains("Run `paceflow ingest` first."));
+    }
+
+    #[test]
+    fn render_session_report_suggests_all_projects_when_repo_auto_injected() {
+        let report = ReportArgs {
+            weekly: false,
+            group_by: None,
+            from: None,
+            to: None,
+            repo: Some("/tmp/sample-repo".to_string()),
+            all_projects: false,
+            provider: None,
+            task: None,
+            branch: None,
+            model: None,
+            limit: 50,
+        };
+
+        let rendered = render_session_report(&[], &report, false, true);
+        assert!(rendered.contains("No session rows found for the current repo."));
+        assert!(rendered.contains("`--all-projects`"));
     }
 }

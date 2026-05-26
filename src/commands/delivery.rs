@@ -22,7 +22,12 @@ pub fn run(args: DeliveryReportArgs) -> Result<()> {
         rows.is_empty() && task_report_hidden_branch_rows_exist(&db, &resolved.report, options)?;
     print!(
         "{}",
-        render_delivery_report(&rows, &resolved.report, show_branch_hint)
+        render_delivery_report(
+            &rows,
+            &resolved.report,
+            show_branch_hint,
+            resolved.repo_auto_injected,
+        )
     );
     Ok(())
 }
@@ -31,6 +36,7 @@ fn render_delivery_report(
     rows: &[analytics::ChangeReportRow],
     report: &ReportArgs,
     show_branch_hint: bool,
+    repo_auto_injected: bool,
 ) -> String {
     let mut out = String::new();
     out.push_str("Delivery Metrics\n");
@@ -39,6 +45,10 @@ fn render_delivery_report(
         if show_branch_hint {
             out.push_str(
                 "No ticket-style task rows matched. Try `paceflow delivery --group-by branch` or `--overall`.\n",
+            );
+        } else if repo_auto_injected {
+            out.push_str(
+                "No delivery rows found for the current repo. Run `paceflow ingest` first, or pass `--all-projects` to include data from other ingested repos.\n",
             );
         } else {
             out.push_str("No delivery rows found. Run `paceflow ingest` first.\n");
@@ -338,7 +348,7 @@ mod tests {
             limit: 50,
         };
 
-        let rendered = render_delivery_report(&rows, &report, false);
+        let rendered = render_delivery_report(&rows, &report, false, false);
         assert!(rendered.contains("Commits analyzed: 4"));
         assert!(rendered.contains("Heavy commits: 2 (50.00% of commits)"));
         assert!(rendered.contains("GitHub PR lookup coverage: 2 / 2 heavy GitHub commits"));
@@ -394,7 +404,7 @@ mod tests {
             limit: 50,
         };
 
-        let rendered = render_delivery_report(&rows, &report, false);
+        let rendered = render_delivery_report(&rows, &report, false, false);
         assert!(rendered.contains("PR Reach"));
         assert!(rendered.contains("Mainline Reach"));
         assert!(rendered.contains("PR Merge"));
@@ -445,7 +455,7 @@ mod tests {
             limit: 50,
         };
 
-        let rendered = render_delivery_report(&rows, &report, false);
+        let rendered = render_delivery_report(&rows, &report, false, false);
         assert!(rendered.contains("unavailable"));
         assert!(rendered.contains("GitHub PR lookup coverage: 0 / 2 heavy GitHub commits"));
         assert!(rendered.contains(
@@ -469,9 +479,51 @@ mod tests {
             limit: 50,
         };
 
-        let rendered = render_delivery_report(&[], &report, true);
+        let rendered = render_delivery_report(&[], &report, true, false);
         assert!(rendered.contains("No ticket-style task rows matched."));
         assert!(rendered.contains("`paceflow delivery --group-by branch`"));
         assert!(!rendered.contains("Run `paceflow ingest` first."));
+    }
+
+    #[test]
+    fn render_delivery_report_suggests_all_projects_when_repo_auto_injected() {
+        let report = ReportArgs {
+            weekly: false,
+            group_by: None,
+            from: None,
+            to: None,
+            repo: Some("/tmp/sample-repo".to_string()),
+            all_projects: false,
+            provider: None,
+            task: None,
+            branch: None,
+            model: None,
+            limit: 50,
+        };
+
+        let rendered = render_delivery_report(&[], &report, false, true);
+        assert!(rendered.contains("No delivery rows found for the current repo."));
+        assert!(rendered.contains("`--all-projects`"));
+    }
+
+    #[test]
+    fn render_delivery_report_omits_all_projects_hint_when_scope_explicit() {
+        let report = ReportArgs {
+            weekly: false,
+            group_by: None,
+            from: None,
+            to: None,
+            repo: Some("/tmp/sample-repo".to_string()),
+            all_projects: false,
+            provider: None,
+            task: None,
+            branch: None,
+            model: None,
+            limit: 50,
+        };
+
+        let rendered = render_delivery_report(&[], &report, false, false);
+        assert!(rendered.contains("No delivery rows found. Run `paceflow ingest` first."));
+        assert!(!rendered.contains("--all-projects"));
     }
 }
