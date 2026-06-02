@@ -1895,12 +1895,12 @@ pub fn query_lifecycle_report_with_options(
             "COUNT(DISTINCT CASE WHEN heavy_ai_flag = 1 THEN commit_sha END) AS heavy_commit_count"
                 .to_string(),
         );
-        select.push("CAST(ROUND(SUM(CASE WHEN heavy_ai_flag = 1 THEN share_of_ai * ai_added_lines_removed_within_window ELSE 0 END), 0) AS INTEGER) AS l1_n".to_string());
-        select.push("CAST(ROUND(SUM(CASE WHEN heavy_ai_flag = 1 THEN share_of_ai * ai_added_lines_reaching_mainline ELSE 0 END), 0) AS INTEGER) AS l1_d".to_string());
-        select.push("CAST(ROUND(SUM(CASE WHEN heavy_ai_flag = 1 AND merged_to_mainline_flag = 1 AND bug_after_merge_flag = 1 THEN share_of_ai ELSE 0 END), 0) AS INTEGER) AS l3_n".to_string());
-        select.push("CAST(ROUND(SUM(CASE WHEN heavy_ai_flag = 1 AND merged_to_mainline_flag = 1 THEN share_of_ai ELSE 0 END), 0) AS INTEGER) AS l3_d".to_string());
-        select.push("CAST(ROUND(SUM(CASE WHEN heavy_ai_flag = 1 AND reverted_later_flag = 1 THEN share_of_ai ELSE 0 END), 0) AS INTEGER) AS l4_n".to_string());
-        select.push("CAST(ROUND(SUM(CASE WHEN heavy_ai_flag = 1 THEN share_of_ai ELSE 0 END), 0) AS INTEGER) AS l4_d".to_string());
+        select.push("COALESCE(CAST(ROUND(SUM(CASE WHEN heavy_ai_flag = 1 THEN share_of_ai * ai_added_lines_removed_within_window ELSE 0 END), 0) AS INTEGER), 0) AS l1_n".to_string());
+        select.push("COALESCE(CAST(ROUND(SUM(CASE WHEN heavy_ai_flag = 1 THEN share_of_ai * ai_added_lines_reaching_mainline ELSE 0 END), 0) AS INTEGER), 0) AS l1_d".to_string());
+        select.push("COALESCE(CAST(ROUND(SUM(CASE WHEN heavy_ai_flag = 1 AND merged_to_mainline_flag = 1 AND bug_after_merge_flag = 1 THEN share_of_ai ELSE 0 END), 0) AS INTEGER), 0) AS l3_n".to_string());
+        select.push("COALESCE(CAST(ROUND(SUM(CASE WHEN heavy_ai_flag = 1 AND merged_to_mainline_flag = 1 THEN share_of_ai ELSE 0 END), 0) AS INTEGER), 0) AS l3_d".to_string());
+        select.push("COALESCE(CAST(ROUND(SUM(CASE WHEN heavy_ai_flag = 1 AND reverted_later_flag = 1 THEN share_of_ai ELSE 0 END), 0) AS INTEGER), 0) AS l4_n".to_string());
+        select.push("COALESCE(CAST(ROUND(SUM(CASE WHEN heavy_ai_flag = 1 THEN share_of_ai ELSE 0 END), 0) AS INTEGER), 0) AS l4_d".to_string());
     } else {
         select.push(
             "COALESCE(SUM(CASE WHEN heavy_ai_flag = 1 THEN 1 ELSE 0 END), 0) AS heavy_commit_count"

@@ -63,6 +63,19 @@ pub enum Commands {
     #[command(name = "hooks")]
     /// Install and manage Paceflow git hooks
     Hooks(HooksArgs),
+    #[command(name = "tui")]
+    /// Launch the interactive terminal dashboard
+    Tui(TuiArgs),
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct TuiArgs {
+    /// Show results across all tracked projects instead of defaulting to the current repo
+    #[arg(long)]
+    pub all_projects: bool,
+    /// Max number of grouped rows to display
+    #[arg(long, default_value_t = 50)]
+    pub limit: usize,
 }
 
 #[derive(Args, Debug, Clone)]

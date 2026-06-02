@@ -14,6 +14,7 @@ fn main() -> anyhow::Result<()> {
         Commands::GitHub(args) => commands::github::run(args)?,
         Commands::Sync(args) => commands::sync::run(args)?,
         Commands::Hooks(args) => commands::hooks::run(args)?,
+        Commands::Tui(args) => commands::tui::run(args)?,
     }
     Ok(())
 }
