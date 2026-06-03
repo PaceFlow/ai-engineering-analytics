@@ -442,24 +442,28 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &App) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1), // header
+            Constraint::Length(1), // spacer
             Constraint::Length(1), // tabs
+            Constraint::Length(1), // spacer
             Constraint::Length(1), // control bar
+            Constraint::Length(1), // spacer
             Constraint::Min(6),    // body
             Constraint::Length(1), // footer
         ])
         .split(area);
     render_header(frame, app, chunks[0]);
-    render_tabs(frame, app, chunks[1]);
-    render_control(frame, app, chunks[2]);
+    render_tabs(frame, app, chunks[2]);
+    render_control(frame, app, chunks[4]);
+    let body = chunks[6];
     match app.tab {
-        Tab::Verdict => render_verdict(frame, app, chunks[3]),
-        Tab::Sessions => render_sessions(frame, app, chunks[3]),
-        Tab::Delivery => render_delivery(frame, app, chunks[3]),
-        Tab::Quality => render_quality(frame, app, chunks[3]),
+        Tab::Verdict => render_verdict(frame, app, body),
+        Tab::Sessions => render_sessions(frame, app, body),
+        Tab::Delivery => render_delivery(frame, app, body),
+        Tab::Quality => render_quality(frame, app, body),
     }
-    render_footer(frame, app.message.as_deref(), chunks[4]);
+    render_footer(frame, app.message.as_deref(), chunks[7]);
     if app.legend {
-        render_legend(frame, app, centered_rect(78, 80, area));
+        render_legend(frame, app, centered_rect(86, 92, area));
     }
 }
 
@@ -583,8 +587,11 @@ fn render_verdict(frame: &mut ratatui::Frame<'_>, app: &App, area: Rect) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1), // statement
+            Constraint::Length(1), // spacer
             Constraint::Length(2), // sub statement
+            Constraint::Length(1), // spacer
             Constraint::Length(2), // stat strip
+            Constraint::Length(1), // spacer
             Constraint::Min(4),    // table
             Constraint::Length(2), // insight
         ])
@@ -598,9 +605,9 @@ fn render_verdict(frame: &mut ratatui::Frame<'_>, app: &App, area: Rect) {
     frame.render_widget(
         Paragraph::new(Span::styled(sub, Style::default().fg(MU)))
             .wrap(ratatui::widgets::Wrap { trim: true }),
-        chunks[1],
+        chunks[2],
     );
-    render_stat_strip(frame, app, chunks[2]);
+    render_stat_strip(frame, app, chunks[4]);
 
     let header = Row::new(vec![
         header_cell(""),
@@ -625,6 +632,7 @@ fn render_verdict(frame: &mut ratatui::Frame<'_>, app: &App, area: Rect) {
                 cell_value(fmt_pct(row.bug_rate), color_bug(row.bug_rate)),
             ])
             .style(style)
+            .bottom_margin(1)
         })
         .collect();
     if let Some(base) = app.reports.delivery_baseline.as_ref() {
@@ -652,11 +660,14 @@ fn render_verdict(frame: &mut ratatui::Frame<'_>, app: &App, area: Rect) {
         Constraint::Length(10),
     ];
     if rows.is_empty() && app.reports.delivery_baseline.is_none() {
-        frame.render_widget(empty_paragraph(), chunks[3]);
+        frame.render_widget(empty_paragraph(), chunks[6]);
     } else {
-        frame.render_widget(Table::new(table_rows, widths).header(header), chunks[3]);
+        frame.render_widget(
+            Table::new(table_rows, widths).header(spaced_header(header)),
+            chunks[6],
+        );
     }
-    frame.render_widget(insight(verdict_insight(&rows, app)), chunks[4]);
+    frame.render_widget(insight(verdict_insight(&rows, app)), chunks[7]);
 }
 
 fn render_stat_strip(frame: &mut ratatui::Frame<'_>, app: &App, area: Rect) {
@@ -739,6 +750,7 @@ fn render_sessions(frame: &mut ratatui::Frame<'_>, app: &App, area: Rect) {
                 ),
             ])
             .style(style)
+            .bottom_margin(1)
         })
         .collect();
     let widths = [
@@ -754,7 +766,10 @@ fn render_sessions(frame: &mut ratatui::Frame<'_>, app: &App, area: Rect) {
     if table_rows.is_empty() {
         frame.render_widget(empty_paragraph(), chunks[0]);
     } else {
-        frame.render_widget(Table::new(table_rows, widths).header(header), chunks[0]);
+        frame.render_widget(
+            Table::new(table_rows, widths).header(spaced_header(header)),
+            chunks[0],
+        );
     }
     frame.render_widget(insight(sessions_insight(app)), chunks[1]);
 }
@@ -817,6 +832,7 @@ fn render_delivery(frame: &mut ratatui::Frame<'_>, app: &App, area: Rect) {
                 pr_merge,
             ])
             .style(selection_style(idx == app.selected))
+            .bottom_margin(1)
         })
         .collect();
     if let Some(base) = app.reports.delivery_baseline.as_ref() {
@@ -848,7 +864,10 @@ fn render_delivery(frame: &mut ratatui::Frame<'_>, app: &App, area: Rect) {
     if app.reports.delivery.is_empty() && app.reports.delivery_baseline.is_none() {
         frame.render_widget(empty_paragraph(), chunks[0]);
     } else {
-        frame.render_widget(Table::new(table_rows, widths).header(header), chunks[0]);
+        frame.render_widget(
+            Table::new(table_rows, widths).header(spaced_header(header)),
+            chunks[0],
+        );
     }
     frame.render_widget(insight(delivery_insight(app)), chunks[1]);
 }
@@ -891,6 +910,7 @@ fn render_quality(frame: &mut ratatui::Frame<'_>, app: &App, area: Rect) {
                 ),
             ])
             .style(selection_style(idx == app.selected))
+            .bottom_margin(1)
         })
         .collect();
     if let Some(base) = app.reports.quality_baseline.as_ref() {
@@ -921,21 +941,28 @@ fn render_quality(frame: &mut ratatui::Frame<'_>, app: &App, area: Rect) {
     if app.reports.quality.is_empty() && app.reports.quality_baseline.is_none() {
         frame.render_widget(empty_paragraph(), chunks[0]);
     } else {
-        frame.render_widget(Table::new(table_rows, widths).header(header), chunks[0]);
+        frame.render_widget(
+            Table::new(table_rows, widths).header(spaced_header(header)),
+            chunks[0],
+        );
     }
     frame.render_widget(insight(quality_insight(app)), chunks[1]);
 }
 
 fn render_legend(frame: &mut ratatui::Frame<'_>, app: &App, area: Rect) {
     frame.render_widget(Clear, area);
+    let entries = legend_entries(app.tab);
     let mut lines = Vec::new();
-    for (key, value) in legend_entries(app.tab) {
+    for (idx, (key, value)) in entries.iter().enumerate() {
         lines.push(Line::from(vec![
             Span::styled(format!("{key:<14}"), Style::default().fg(CY)),
             Span::styled(*value, Style::default().fg(MU)),
         ]));
+        if idx + 1 < entries.len() {
+            lines.push(Line::from(""));
+        }
     }
-    let title = format!("Legend · {}", app.tab.title());
+    let title = format!("Legend · {} · how each metric is calculated", app.tab.title());
     frame.render_widget(
         Paragraph::new(lines)
             .block(
@@ -1326,7 +1353,14 @@ fn selection_style(selected: bool) -> Style {
 }
 
 fn baseline_row(cells: Vec<Cell<'static>>) -> Row<'static> {
-    Row::new(cells).style(Style::default().fg(D4))
+    Row::new(cells)
+        .style(Style::default().fg(D4))
+        .bottom_margin(1)
+}
+
+/// Adds a blank line under the header row so it isn't flush against the data.
+fn spaced_header(header: Row<'static>) -> Row<'static> {
+    header.bottom_margin(1)
 }
 
 fn insight(text: String) -> Paragraph<'static> {
@@ -1429,88 +1463,93 @@ fn legend_entries(tab: Tab) -> &'static [(&'static str, &'static str)] {
         Tab::Verdict => &[
             (
                 "First Chg",
-                "avg minutes to the first accepted change in this group",
+                "avg minutes from session start to the first accepted code change. Sessions that never produced an accepted change are excluded, so this measures speed-to-traction, not engagement.",
             ),
             (
                 "Debug Loop",
-                "share of sessions with at least one debug retry cycle",
+                "share of sessions that fell into an error-fix loop. A session is flagged when the same normalized error signature recurs across 5+ user turns with assistant replies between them.",
             ),
             (
                 "Mainline %",
-                "share of heavy AI commits that merged to the main branch",
+                "of heavy AI commits, the share that reached the main branch. Uses squash-aware content matching, so a commit still counts when its content lands via a squash or rebase merge.",
             ),
             (
                 "Bug Rate %",
-                "share of heavy AI commits that drew a fix within 60 days",
-            ),
-            ("Sort order", "rows sorted by Mainline % descending"),
-            (
-                "no-AI anchor",
-                "commits made without heavy AI involvement — your baseline",
+                "of merged heavy AI commits, the share that later drew a fix-like commit touching the same files within 60 days. A proxy for defects that escaped to main.",
             ),
         ],
         Tab::Sessions => &[
             (
                 "Sessions",
-                "total AI coding sessions in this group and window",
+                "count of AI coding sessions in this group and window. One session is one continuous assistant conversation tied to an editor.",
             ),
-            ("Avg Prompts", "average number of prompts sent per session"),
-            ("First Chg", "avg minutes to the first accepted diff"),
-            ("Loop %", "share of sessions with a debug retry cycle"),
+            (
+                "Avg Prompts",
+                "average user prompts per session, counting only non-empty user turns. High values can signal back-and-forth or under-specified asks.",
+            ),
+            (
+                "First Chg",
+                "avg minutes from session start to the first accepted diff. Sessions with no accepted change are excluded from the average.",
+            ),
+            (
+                "Loop %",
+                "share of sessions flagged as a debug loop — the same normalized error signature recurring across 5+ user turns.",
+            ),
             (
                 "Error %",
-                "share of sessions where an error was pasted back into context",
+                "share of sessions where an error-like message was pasted back into the chat after the first user message.",
             ),
             (
                 "To Commit %",
-                "share of sessions that produced at least one git commit",
+                "share of sessions with at least one matched git commit between session start and session end + 4 hours.",
             ),
             (
                 "No Output %",
-                "share of sessions that returned no usable diff",
+                "share of sessions that had user turns but produced no accepted code change — effort that did not turn into a diff.",
             ),
         ],
         Tab::Delivery => &[
-            ("Commits", "total git commits in the period"),
+            (
+                "Commits",
+                "count of all git commits in the window for this group, AI-heavy or not.",
+            ),
             (
                 "Heavy",
-                "commits where AI-attributed lines are >= 50% of changed lines",
+                "commits where AI-attributed lines are >= 50% of changed lines. The reach/merge rates below are computed over heavy commits only.",
             ),
             (
                 "PR sync",
-                "ready / eligible heavy commits (requires GitHub sync)",
+                "ready / eligible heavy commits for PR metrics. Requires a GitHub sync; shows — until commits are linked to pull requests.",
             ),
             (
                 "PR Reach %",
-                "share of heavy commits that opened a pull request",
+                "of heavy commits (GitHub-linked), the share that opened a pull request. Measures whether AI work even entered review.",
             ),
-            ("Mainline %", "share of heavy commits that merged to main"),
+            (
+                "Mainline %",
+                "of heavy commits, the share that reached main, including squash-aware content matching across squash/rebase merges.",
+            ),
             (
                 "PR Merge %",
-                "share of PRs that merged (— if GitHub sync unavailable)",
-            ),
-            (
-                "no-AI anchor",
-                "commits without heavy AI involvement in the same period",
+                "of PR-linked heavy commits, the share whose PR merged. Shows — when GitHub sync is unavailable for the group.",
             ),
         ],
         Tab::Quality => &[
-            ("Heavy", "heavy AI commits tracked for quality signals"),
+            (
+                "Heavy",
+                "heavy AI commits (>= 50% AI-attributed changed lines) tracked for quality signals. Light assists are excluded.",
+            ),
             (
                 "Churn %",
-                "share of AI-added lines removed within the churn window",
+                "of AI-added lines that reached main, the share removed again from main within 14 days. High churn means code landed but did not stick.",
             ),
             (
                 "Bug Rate %",
-                "share of heavy AI commits that drew a fix within 60 days",
+                "of merged heavy commits, the share that drew a later fix-like commit on the same files within 60 days.",
             ),
             (
                 "Revert %",
-                "share of heavy AI commits that were subsequently reverted",
-            ),
-            (
-                "no-AI anchor",
-                "quality signals for non-AI-heavy commits — your baseline",
+                "share of heavy commits later reverted — detected when a commit body contains `This reverts commit <sha>`.",
             ),
         ],
     }
@@ -1738,7 +1777,7 @@ mod tests {
         app.legend = true;
         let verdict_text = render_text(&app);
         assert!(verdict_text.contains("Legend · Verdict"));
-        assert!(verdict_text.contains("no-AI anchor"));
+        assert!(verdict_text.contains("Debug Loop"));
 
         app.tab = Tab::Sessions;
         let session_text = render_text(&app);
