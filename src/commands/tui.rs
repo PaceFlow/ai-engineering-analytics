@@ -962,7 +962,10 @@ fn render_legend(frame: &mut ratatui::Frame<'_>, app: &App, area: Rect) {
             lines.push(Line::from(""));
         }
     }
-    let title = format!("Legend · {} · how each metric is calculated", app.tab.title());
+    let title = format!(
+        "Legend · {} · how each metric is calculated",
+        app.tab.title()
+    );
     frame.render_widget(
         Paragraph::new(lines)
             .block(

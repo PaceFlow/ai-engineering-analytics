@@ -8,8 +8,8 @@ use crate::change_intel::types::LineSide;
 use super::types::{CommitAttribution, GitCommitDiff, SessionAttributionRow};
 
 const FALLBACK_STRICT_WEAK_RATIO: f64 = 0.20;
-const FALLBACK_MIN_RATIO: f64 = 0.80;
-const FALLBACK_MIN_MATCHED_LINES: i64 = 30;
+const FALLBACK_MIN_RATIO: f64 = 0.60;
+const FALLBACK_MIN_MATCHED_LINES: i64 = 10;
 const FALLBACK_WINNER_MARGIN: f64 = 0.20;
 const HUMAN_PROVIDER: &str = "human";
 const HUMAN_SESSION_ID: &str = "__human__";
