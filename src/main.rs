@@ -5,7 +5,7 @@ use paceflow::commands;
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Commands::Ingest => commands::ingest::run(cli.verbose)?,
+        Commands::Ingest(args) => commands::ingest::run(cli.verbose, args)?,
         Commands::Session(args) => commands::session::run(args)?,
         Commands::Delivery(args) => commands::delivery::run(args)?,
         Commands::Quality(args) => commands::quality::run(args)?,

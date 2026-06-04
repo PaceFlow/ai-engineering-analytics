@@ -597,6 +597,13 @@ impl MainlineIndex {
     }
 }
 
+/// Quiet stretches longer than this many minutes (no messages and no code
+/// changes) are treated as the person/agent stepping away and are excluded from
+/// `minutes_to_first_accepted_change`. This keeps "time to first change" focused
+/// on active getting-started time instead of wall-clock that can span a session
+/// left open across a break or overnight. Tune here to change sensitivity.
+const FIRST_CHANGE_IDLE_GAP_MINUTES: f64 = 30.0;
+
 pub fn refresh_session_events(conn: &Connection) -> Result<()> {
     conn.execute("DELETE FROM event_session_quality", [])?;
     conn.execute("DELETE FROM event_session_productivity", [])?;
@@ -625,7 +632,7 @@ pub fn refresh_session_events(conn: &Connection) -> Result<()> {
         );
     }
 
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare(&format!(
         "SELECT
              s.provider,
              s.session_id,
@@ -651,7 +658,40 @@ pub fn refresh_session_events(conn: &Connection) -> Result<()> {
              CASE
                  WHEN COALESCE(s.started_at, sig.min_signal_ts) IS NOT NULL
                   AND out.first_accepted_change_at IS NOT NULL
-                 THEN (julianday(out.first_accepted_change_at) - julianday(COALESCE(s.started_at, sig.min_signal_ts))) * 24.0 * 60.0
+                 THEN MAX(
+                     0.0,
+                     (julianday(out.first_accepted_change_at) - julianday(COALESCE(s.started_at, sig.min_signal_ts))) * 24.0 * 60.0
+                     -- Subtract quiet stretches (nobody/nothing active) so the metric
+                     -- reflects active 'time to get started' rather than wall-clock that
+                     -- includes the user stepping away (e.g. a session left open overnight).
+                     - COALESCE((
+                         SELECT SUM(gap_minutes)
+                         FROM (
+                             SELECT (julianday(ts) - julianday(LAG(ts) OVER (ORDER BY ts))) * 24.0 * 60.0 AS gap_minutes
+                             FROM (
+                                 SELECT COALESCE(s.started_at, sig.min_signal_ts) AS ts
+                                 UNION
+                                 SELECT m.message_ts AS ts
+                                 FROM fact_session_message m
+                                 WHERE m.provider = s.provider
+                                   AND m.session_id = s.session_id
+                                   AND m.message_ts IS NOT NULL
+                                   AND m.message_ts >= COALESCE(s.started_at, sig.min_signal_ts)
+                                   AND m.message_ts <= out.first_accepted_change_at
+                                 UNION
+                                 SELECT c.change_ts AS ts
+                                 FROM fact_session_code_change c
+                                 WHERE c.provider = s.provider
+                                   AND c.session_id = s.session_id
+                                   AND c.change_ts IS NOT NULL
+                                   AND c.source_kind IN ('accepted_change', 'tool_write')
+                                   AND c.change_ts >= COALESCE(s.started_at, sig.min_signal_ts)
+                                   AND c.change_ts <= out.first_accepted_change_at
+                             ) ordered_signals
+                         ) gaps
+                         WHERE gap_minutes > {idle_gap_minutes}
+                     ), 0.0)
+                 )
              END AS minutes_to_first_accepted_change,
              CASE
                  WHEN EXISTS (
@@ -744,7 +784,8 @@ pub fn refresh_session_events(conn: &Connection) -> Result<()> {
             OR ch.removed_lines IS NOT NULL
             OR out.accepted_output_flag IS NOT NULL
          ORDER BY productivity_ended_at DESC NULLS LAST",
-    )?;
+        idle_gap_minutes = FIRST_CHANGE_IDLE_GAP_MINUTES,
+    ))?;
 
     let rows = stmt.query_map([], |row| {
         Ok((
@@ -4400,6 +4441,97 @@ mod tests {
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )?;
         assert_eq!(row, (6, 1, 1));
+        Ok(())
+    }
+
+    #[test]
+    fn first_change_excludes_idle_gaps_but_keeps_active_ramp() -> Result<()> {
+        let conn = open_test_db()?;
+        // Session opened in the morning; one prompt, then left idle ~24h, resumed
+        // the next morning and made the first edit shortly after re-engaging.
+        upsert_metadata_session(
+            &conn,
+            "codex",
+            "idle",
+            Some("/tmp/repo"),
+            Some("2026-03-22T06:50:00Z"),
+            Some("2026-03-23T10:00:00Z"),
+            None,
+        )?;
+        let idle_messages = [
+            (0, "2026-03-22T06:50:00Z", "kick off the task"),
+            (1, "2026-03-23T07:14:00Z", "ok lets continue"),
+            (2, "2026-03-23T07:20:00Z", "make the change"),
+        ];
+        for (index, ts, text) in idle_messages {
+            conn.execute(
+                "INSERT INTO fact_session_message (provider, session_id, message_index, message_ts, role, content, content_words)
+                 VALUES ('codex', 'idle', ?1, ?2, 'user', ?3, 3)",
+                params![index, ts, text],
+            )?;
+        }
+        conn.execute(
+            "INSERT INTO fact_session_code_change (provider, session_id, change_index, change_ts, lines_added, lines_removed, source_kind)
+             VALUES ('codex', 'idle', 0, '2026-03-23T07:25:00Z', 5, 0, 'tool_write')",
+            [],
+        )?;
+
+        // Control: continuous session that genuinely ramps for 35 minutes before
+        // the first edit, with no quiet stretch over the threshold.
+        upsert_metadata_session(
+            &conn,
+            "codex",
+            "active",
+            Some("/tmp/repo"),
+            Some("2026-03-24T09:00:00Z"),
+            Some("2026-03-24T10:00:00Z"),
+            None,
+        )?;
+        let active_messages = [
+            (0, "2026-03-24T09:00:00Z"),
+            (1, "2026-03-24T09:20:00Z"),
+            (2, "2026-03-24T09:30:00Z"),
+        ];
+        for (index, ts) in active_messages {
+            conn.execute(
+                "INSERT INTO fact_session_message (provider, session_id, message_index, message_ts, role, content, content_words)
+                 VALUES ('codex', 'active', ?1, ?2, 'user', 'explore the code', 3)",
+                params![index, ts],
+            )?;
+        }
+        conn.execute(
+            "INSERT INTO fact_session_code_change (provider, session_id, change_index, change_ts, lines_added, lines_removed, source_kind)
+             VALUES ('codex', 'active', 0, '2026-03-24T09:35:00Z', 5, 0, 'tool_write')",
+            [],
+        )?;
+
+        refresh_session_events(&conn)?;
+
+        let idle_minutes: f64 = conn.query_row(
+            "SELECT minutes_to_first_accepted_change FROM event_session_quality
+             WHERE provider = 'codex' AND session_id = 'idle'",
+            [],
+            |row| row.get(0),
+        )?;
+        // Raw wall-clock would be ~1475 min; the ~24h overnight gap is removed,
+        // leaving only the active minutes on each side of it (06:50 segment + the
+        // 07:14 -> 07:25 ramp = ~11 min).
+        assert!(
+            (idle_minutes - 11.0).abs() < 0.001,
+            "idle gap should be excluded, got {idle_minutes}"
+        );
+
+        let active_minutes: f64 = conn.query_row(
+            "SELECT minutes_to_first_accepted_change FROM event_session_quality
+             WHERE provider = 'codex' AND session_id = 'active'",
+            [],
+            |row| row.get(0),
+        )?;
+        // No gap exceeds the threshold, so the full 35-minute ramp is preserved.
+        assert!(
+            (active_minutes - 35.0).abs() < 0.001,
+            "continuous ramp should be preserved, got {active_minutes}"
+        );
         Ok(())
     }
 

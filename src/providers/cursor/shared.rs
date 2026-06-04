@@ -97,6 +97,9 @@ pub(crate) struct CursorBubbleEvent {
     pub role: Option<CursorBubbleRole>,
     pub text: Option<String>,
     pub order_key: i64,
+    /// Per-message wall-clock timestamp (ISO-8601) sourced from the bubble's own
+    /// `createdAt`. `None` for legacy inline `conversation` rows that don't carry one.
+    pub timestamp: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -203,6 +206,9 @@ pub(crate) struct AggregatedFileEdit {
     pub abs_path: String,
     pub added_lines: i64,
     pub removed_lines: i64,
+    /// Earliest known edit timestamp for this path, so the accepted-change
+    /// event reflects when the first edit actually happened.
+    pub timestamp: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -251,6 +257,13 @@ struct BubbleSlim<'a> {
     text: Option<String>,
     #[serde(rename = "modelInfo")]
     model_info: Option<ModelInfoSlim>,
+    // Cursor stamps every bubble row with its own `createdAt`. Production data
+    // stores it as an ISO-8601 string (e.g. "2026-06-01T07:19:41.178Z"); some
+    // builds/fixtures use epoch-millis instead. Capture the raw value and
+    // normalize later so we record real per-message timestamps instead of
+    // collapsing the whole session onto the composer-level `createdAt`.
+    #[serde(rename = "createdAt", default)]
+    created_at: Option<JsonValue>,
     #[serde(rename = "toolFormerData", borrow, default)]
     tool_former_data: Option<&'a RawValue>,
 }
@@ -414,14 +427,27 @@ pub(crate) fn aggregate_file_edits(edits: &[ResolvedFileEdit]) -> Vec<Aggregated
                 abs_path: edit.abs_path.clone(),
                 added_lines: 0,
                 removed_lines: 0,
+                timestamp: None,
             });
         entry.added_lines += edit.added_lines;
         entry.removed_lines += edit.removed_lines;
+        // Keep the earliest timestamp across edits to the same path.
+        entry.timestamp = min_timestamp(entry.timestamp.take(), edit.timestamp.clone());
     }
 
     let mut out: Vec<_> = by_path.into_values().collect();
     out.sort_by_key(|edit| edit.abs_path.clone());
     out
+}
+
+/// Return the earlier of two optional ISO-8601 timestamps. Lexicographic
+/// comparison is correct for the zero-padded UTC strings Cursor emits.
+fn min_timestamp(a: Option<String>, b: Option<String>) -> Option<String> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(if a <= b { a } else { b }),
+        (Some(a), None) => Some(a),
+        (None, b) => b,
+    }
 }
 
 pub(crate) fn build_seed_graph(
@@ -453,6 +479,7 @@ pub(crate) fn build_seed_graph(
             role,
             text: bubble.text.clone(),
             order_key: idx as i64,
+            timestamp: None,
         });
     }
 
@@ -628,6 +655,7 @@ fn populate_bubbles(
 
             let role = slim.bubble_type.and_then(map_bubble_role);
             let text = slim.text.clone();
+            let bubble_ts = normalize_bubble_timestamp(slim.created_at.as_ref());
             let order_key = header_orders
                 .get(session_id)
                 .and_then(|headers| headers.get(bubble_id))
@@ -639,6 +667,7 @@ fn populate_bubbles(
                 role,
                 text,
                 order_key,
+                timestamp: bubble_ts.clone(),
             });
 
             if graphs[graph_idx].model_name.is_none() {
@@ -654,11 +683,14 @@ fn populate_bubbles(
                 Err(_) => continue,
             };
 
+            // Prefer the originating bubble's own `createdAt` for the tool call so
+            // accepted edits are stamped when they actually happened, rather than
+            // falling back to the session-level `last_seen_at` (= composer end).
             if let Some(tool_call) = parse_tool_call(
                 bubble_id,
                 &tool_former_value,
                 graphs[graph_idx].project_path.as_deref(),
-                graphs[graph_idx].last_seen_at(),
+                bubble_ts.or_else(|| graphs[graph_idx].last_seen_at()),
                 &graphs[graph_idx].first_edit_path_by_bubble(),
             ) {
                 for path in &tool_call.path_hints {
@@ -1679,6 +1711,20 @@ pub(crate) fn ms_to_iso(ms: i64) -> Option<String> {
         .map(|dt| dt.to_rfc3339())
 }
 
+/// Normalize a bubble's raw `createdAt` value into an ISO-8601 string. Cursor
+/// production data stores it as an ISO string; some builds/fixtures store epoch
+/// millis. Anything else (missing/empty/unexpected shape) yields `None`.
+fn normalize_bubble_timestamp(value: Option<&JsonValue>) -> Option<String> {
+    match value {
+        Some(JsonValue::String(s)) => {
+            let trimmed = s.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        }
+        Some(JsonValue::Number(n)) => n.as_i64().and_then(ms_to_iso),
+        _ => None,
+    }
+}
+
 fn dedupe_vec(values: &mut Vec<String>) {
     let mut seen = HashSet::new();
     values.retain(|value| seen.insert(value.clone()));
@@ -1769,6 +1815,92 @@ mod tests {
         assert_eq!(edits[0].abs_path, "/tmp/repo/src/app.ts");
         assert_eq!(edits[0].added_lines, 1);
         assert_eq!(edits[0].removed_lines, 1);
+    }
+
+    #[test]
+    fn normalize_bubble_timestamp_handles_string_and_millis() {
+        assert_eq!(
+            normalize_bubble_timestamp(Some(&json!("2026-06-01T07:19:41.178Z"))).as_deref(),
+            Some("2026-06-01T07:19:41.178Z")
+        );
+        // Epoch millis (1780298369463 == 2026-06-01T07:19:29.463Z) get converted.
+        assert_eq!(
+            normalize_bubble_timestamp(Some(&json!(1780298369463i64))).as_deref(),
+            Some("2026-06-01T07:19:29.463+00:00")
+        );
+        assert_eq!(normalize_bubble_timestamp(Some(&json!("  "))), None);
+        assert_eq!(normalize_bubble_timestamp(Some(&json!(null))), None);
+        assert_eq!(normalize_bubble_timestamp(None), None);
+    }
+
+    #[test]
+    fn populate_bubbles_captures_per_message_timestamps() {
+        let file = NamedTempFile::new().expect("temp db should be created");
+        let conn = Connection::open(file.path()).expect("temp db should open");
+        conn.execute_batch(
+            "CREATE TABLE cursorDiskKV (
+                key   TEXT PRIMARY KEY,
+                value TEXT
+            );",
+        )
+        .expect("schema should be created");
+
+        // Composer-level created/updated span a full day; without per-bubble
+        // timestamps every message would collapse onto `createdAt`.
+        conn.execute(
+            "INSERT INTO cursorDiskKV (key, value) VALUES (?1, ?2)",
+            params![
+                "composerData:s1",
+                json!({
+                    "composerId": "s1",
+                    "createdAt": 1_780_298_369_463i64,
+                    "lastUpdatedAt": 1_780_382_474_682i64,
+                })
+                .to_string()
+            ],
+        )
+        .expect("composer row should insert");
+        conn.execute(
+            "INSERT INTO cursorDiskKV (key, value) VALUES (?1, ?2)",
+            params![
+                "bubbleId:s1:b1",
+                json!({
+                    "type": 1,
+                    "text": "first user turn",
+                    "createdAt": "2026-06-01T07:19:41.178Z",
+                })
+                .to_string()
+            ],
+        )
+        .expect("user bubble should insert");
+        conn.execute(
+            "INSERT INTO cursorDiskKV (key, value) VALUES (?1, ?2)",
+            params![
+                "bubbleId:s1:b2",
+                json!({
+                    "type": 2,
+                    "text": "assistant reply",
+                    "createdAt": "2026-06-02T06:40:58.614Z",
+                })
+                .to_string()
+            ],
+        )
+        .expect("assistant bubble should insert");
+
+        let graphs =
+            load_cursor_session_graphs(&conn, "/tmp/state.vscdb").expect("graph load should work");
+        assert_eq!(graphs.len(), 1);
+        let messages = graphs[0].messages();
+        let timestamps: Vec<Option<&str>> =
+            messages.iter().map(|m| m.timestamp.as_deref()).collect();
+        assert!(
+            timestamps.contains(&Some("2026-06-01T07:19:41.178Z")),
+            "expected first bubble's own createdAt, got {timestamps:?}"
+        );
+        assert!(
+            timestamps.contains(&Some("2026-06-02T06:40:58.614Z")),
+            "expected second bubble's own createdAt, got {timestamps:?}"
+        );
     }
 
     #[test]

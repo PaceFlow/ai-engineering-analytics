@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::env;
 use std::path::Path;
@@ -7,11 +7,44 @@ use crate::change_intel::schema::init_change_intel_schema;
 use crate::path_utils::{detect_repo_root, path_to_string, to_rel_path};
 
 pub fn open() -> Result<Connection> {
-    let home = env::var_os("PACEFLOW_HOME")
+    open_at_home(&resolve_home()?)
+}
+
+fn resolve_home() -> Result<std::path::PathBuf> {
+    env::var_os("PACEFLOW_HOME")
         .map(std::path::PathBuf::from)
         .or_else(dirs::home_dir)
-        .ok_or_else(|| anyhow::anyhow!("Home directory not found"))?;
-    open_at_home(&home)
+        .ok_or_else(|| anyhow::anyhow!("Home directory not found"))
+}
+
+/// Absolute path to the main paceflow sqlite database file.
+pub fn database_path() -> Result<std::path::PathBuf> {
+    Ok(resolve_home()?.join(".paceflow").join("paceflow.db"))
+}
+
+/// Delete the database and its WAL sidecar files so the next `open()` rebuilds a
+/// clean schema. Missing files are ignored. Local config files in `.paceflow`
+/// (GitHub token, sync config, caches) are intentionally left untouched.
+pub fn reset_database() -> Result<()> {
+    let db_path = database_path()?;
+    let mut targets = vec![db_path.clone()];
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let mut sidecar = db_path.clone().into_os_string();
+        sidecar.push(suffix);
+        targets.push(std::path::PathBuf::from(sidecar));
+    }
+
+    for path in targets {
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(err).with_context(|| format!("failed to delete {}", path.display()));
+            }
+        }
+    }
+
+    Ok(())
 }
 
 fn open_at_home(home: &Path) -> Result<Connection> {

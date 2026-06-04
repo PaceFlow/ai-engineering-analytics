@@ -43,7 +43,7 @@ pub struct Cli {
 #[derive(Subcommand)]
 pub enum Commands {
     /// Build the analytics data model from local sessions, code changes, and git history
-    Ingest,
+    Ingest(IngestArgs),
     /// Show session efficiency and delivery metrics
     Session(SessionReportArgs),
     /// Show commit attribution and merge outcome metrics
@@ -66,6 +66,20 @@ pub enum Commands {
     #[command(name = "tui")]
     /// Launch the interactive terminal dashboard
     Tui(TuiArgs),
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct IngestArgs {
+    /// Delete the local analytics database and rebuild it from scratch.
+    ///
+    /// Normal ingest is incremental: already-ingested sessions and unchanged
+    /// code-change sources are skipped, so changes to parsing/derivation logic
+    /// do not propagate to existing rows. A fresh ingest fixes that by wiping
+    /// the database first, then rebuilding from local sources and git history.
+    /// GitHub data is re-fetched and sync-push state is reset. Local files
+    /// (GitHub token, sync config) are not touched.
+    #[arg(long)]
+    pub fresh: bool,
 }
 
 #[derive(Args, Debug, Clone)]
