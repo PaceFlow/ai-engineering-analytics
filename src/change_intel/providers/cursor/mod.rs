@@ -51,6 +51,10 @@ type InlineHintScore = (usize, usize, usize, usize, usize);
 #[derive(Debug, Clone)]
 struct CandidateSession {
     info: SessionInfo,
+    /// Session START (composer `createdAt`). Used as the timestamp anchor for
+    /// edits whose own per-edit time can't be recovered, instead of the
+    /// session END (`info.last_seen_at`), which fabricated huge latencies.
+    started_at: Option<String>,
     checkpoint_paths: HashSet<String>,
     strong_path_hints: HashSet<String>,
     weak_path_hints: HashSet<String>,
@@ -59,6 +63,17 @@ struct CandidateSession {
     total_lines_removed: Option<i64>,
     partial_targets: Vec<PartialTarget>,
     legacy_targets: Vec<LegacyTarget>,
+}
+
+impl CandidateSession {
+    /// Fallback timestamp for edits without a recoverable per-edit time. Prefer
+    /// the session START so unknown-time edits don't get pinned to the session
+    /// END (which produced multi-hour "time to first change" artifacts).
+    fn edit_timestamp_anchor(&self) -> Option<String> {
+        self.started_at
+            .clone()
+            .or_else(|| self.info.last_seen_at.clone())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -439,6 +454,7 @@ fn collect_candidate_sessions_from_graphs(
                     session_cwd: None,
                     last_seen_at: graph.last_seen_at(),
                 },
+                started_at: graph.started_at.clone(),
                 checkpoint_paths: graph.checkpoint_paths.clone(),
                 strong_path_hints: graph.strong_path_hints.clone(),
                 weak_path_hints: graph.weak_path_hints.clone(),
@@ -1431,7 +1447,10 @@ fn resolve_partial_with_path(
     ResolvedNewSchemaPartial {
         abs_path: abs_path.to_string(),
         call_id: partial_id.to_string(),
-        timestamp: session.info.last_seen_at.clone(),
+        // No inline hint matched this path, so there's no real per-edit time.
+        // Anchor to the session START rather than END to avoid fabricating a
+        // large "time to first change" for long-lived composers.
+        timestamp: session.edit_timestamp_anchor(),
     }
 }
 
@@ -1771,7 +1790,7 @@ fn build_change_op_candidate(
         source_file: session.info.source_file.clone(),
         call_id,
         op_index,
-        timestamp: timestamp.or_else(|| session.info.last_seen_at.clone()),
+        timestamp: timestamp.or_else(|| session.edit_timestamp_anchor()),
         repo_root: repo_root.as_deref().map(path_to_string),
         abs_path: abs_path.to_string(),
         rel_path,
@@ -1870,7 +1889,7 @@ fn build_inline_change_op(
             .get("createdAt")
             .and_then(|v| v.as_i64())
             .and_then(ms_to_iso)
-            .or_else(|| session.info.last_seen_at.clone()),
+            .or_else(|| session.edit_timestamp_anchor()),
         repo_root: repo_root.as_deref().map(path_to_string),
         abs_path: abs_path.to_string(),
         rel_path,
@@ -1908,7 +1927,7 @@ fn build_partial_fates_op(
         source_file: session.info.source_file.clone(),
         call_id: call_id.to_string(),
         op_index: 0,
-        timestamp: session.info.last_seen_at.clone(),
+        timestamp: session.edit_timestamp_anchor(),
         repo_root: repo_root.as_deref().map(path_to_string),
         abs_path: abs_path.to_string(),
         rel_path,
@@ -1954,7 +1973,7 @@ fn build_new_schema_partial_fates_op(
         source_file: session.info.source_file.clone(),
         call_id: call_id.to_string(),
         op_index: 0,
-        timestamp: timestamp.or_else(|| session.info.last_seen_at.clone()),
+        timestamp: timestamp.or_else(|| session.edit_timestamp_anchor()),
         repo_root: repo_root.as_deref().map(path_to_string),
         abs_path: abs_path.to_string(),
         rel_path,
@@ -3670,6 +3689,7 @@ mod tests {
                 session_cwd: None,
                 last_seen_at: None,
             },
+            started_at: None,
             checkpoint_paths: HashSet::new(),
             strong_path_hints: HashSet::new(),
             weak_path_hints: [path_to_string(&alpha), path_to_string(&beta)]

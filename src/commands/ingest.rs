@@ -4,6 +4,7 @@ use rusqlite::Connection;
 use crate::analytics;
 use crate::change_intel::commit_assoc;
 use crate::change_intel::pipeline;
+use crate::cli::IngestArgs;
 use crate::db;
 use crate::github;
 use crate::ingest_progress::{
@@ -11,7 +12,16 @@ use crate::ingest_progress::{
 };
 use crate::providers;
 
-pub fn run(verbose: bool) -> Result<()> {
+pub fn run(verbose: bool, args: IngestArgs) -> Result<()> {
+    if args.fresh {
+        let db_path = db::database_path()?;
+        db::reset_database()?;
+        println!(
+            "Fresh ingest: deleted {} — rebuilding from scratch.",
+            db_path.display()
+        );
+    }
+
     let mut db = db::open()?;
     let providers = providers::all_providers();
     println!("Planning ingest...");

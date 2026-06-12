@@ -7,7 +7,7 @@ use serde_json::value::RawValue;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use crate::change_intel::line_hash::hash_line;
+use crate::change_intel::line_hash::{diff_with_hashes, hash_line};
 use crate::change_intel::types::{LineHashCount, LineSide, WriteMode};
 use crate::ingest_progress::IngestProgressObserver;
 use crate::path_utils::{
@@ -41,6 +41,10 @@ pub(crate) struct CursorSessionGraph {
     pub inline_undo_rows: Vec<CursorInlineUndoRow>,
     pub partial_fates: HashMap<String, JsonValue>,
     pub legacy_diff_payloads: HashMap<String, JsonValue>,
+    /// Content-addressed edit blobs referenced by tool calls via
+    /// `beforeContentId`/`afterContentId`, keyed by their full content-store key
+    /// (e.g. `composer.content.<hash>`). Populated after tool calls are parsed.
+    pub content_blobs: HashMap<String, String>,
 }
 
 impl CursorSessionGraph {
@@ -97,6 +101,9 @@ pub(crate) struct CursorBubbleEvent {
     pub role: Option<CursorBubbleRole>,
     pub text: Option<String>,
     pub order_key: i64,
+    /// Per-message wall-clock timestamp (ISO-8601) sourced from the bubble's own
+    /// `createdAt`. `None` for legacy inline `conversation` rows that don't carry one.
+    pub timestamp: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -114,6 +121,14 @@ pub(crate) struct CursorToolCall {
     pub timestamp: Option<String>,
     pub path_hints: Vec<String>,
     pub patch_texts: Vec<String>,
+    /// Newer Cursor agent edits store the diff by reference: the tool `result`
+    /// carries `beforeContentId`/`afterContentId` that point at content-addressed
+    /// blobs (the value is the full `cursorDiskKV` key, e.g.
+    /// `composer.content.<hash>`) instead of an inline `streamingContent` patch.
+    /// The referenced blobs are loaded into [`CursorSessionGraph::content_blobs`]
+    /// during graph population.
+    pub before_content_id: Option<String>,
+    pub after_content_id: Option<String>,
 }
 
 impl CursorToolCall {
@@ -203,6 +218,9 @@ pub(crate) struct AggregatedFileEdit {
     pub abs_path: String,
     pub added_lines: i64,
     pub removed_lines: i64,
+    /// Earliest known edit timestamp for this path, so the accepted-change
+    /// event reflects when the first edit actually happened.
+    pub timestamp: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -251,6 +269,13 @@ struct BubbleSlim<'a> {
     text: Option<String>,
     #[serde(rename = "modelInfo")]
     model_info: Option<ModelInfoSlim>,
+    // Cursor stamps every bubble row with its own `createdAt`. Production data
+    // stores it as an ISO-8601 string (e.g. "2026-06-01T07:19:41.178Z"); some
+    // builds/fixtures use epoch-millis instead. Capture the raw value and
+    // normalize later so we record real per-message timestamps instead of
+    // collapsing the whole session onto the composer-level `createdAt`.
+    #[serde(rename = "createdAt", default)]
+    created_at: Option<JsonValue>,
     #[serde(rename = "toolFormerData", borrow, default)]
     tool_former_data: Option<&'a RawValue>,
 }
@@ -365,7 +390,7 @@ pub(crate) fn resolve_tool_call_edits(graph: &CursorSessionGraph) -> Vec<Resolve
         {
             path_hints.push(path.clone());
         }
-        if !tool.can_emit_edit() {
+        if !tool.looks_like_write() {
             continue;
         }
         if path_hints.len() != 1 {
@@ -373,6 +398,19 @@ pub(crate) fn resolve_tool_call_edits(graph: &CursorSessionGraph) -> Vec<Resolve
         }
 
         let abs_path = path_hints[0].clone();
+
+        // Newer agent edits reference before/after file content by id. Prefer
+        // diffing those full snapshots when present; they are the source of truth
+        // and also cover edits that carry no inline `streamingContent` patch.
+        if let Some(edit) = resolve_content_edit(tool, graph, &abs_path) {
+            edits.push(edit);
+            continue;
+        }
+
+        if !tool.can_emit_edit() {
+            continue;
+        }
+
         let mut added_lines = Vec::new();
         let mut removed_lines = Vec::new();
         for patch in &tool.patch_texts {
@@ -405,6 +443,58 @@ pub(crate) fn resolve_tool_call_edits(graph: &CursorSessionGraph) -> Vec<Resolve
     edits
 }
 
+/// Build a [`ResolvedFileEdit`] by diffing the before/after content blobs a tool
+/// call references by id. Returns `None` when the edit uses the older inline
+/// patch schema, the blobs are unavailable, or the diff is empty.
+fn resolve_content_edit(
+    tool: &CursorToolCall,
+    graph: &CursorSessionGraph,
+    abs_path: &str,
+) -> Option<ResolvedFileEdit> {
+    // Only completed edits carry a final, committed after-content snapshot.
+    if tool.status.as_deref() != Some("completed") {
+        return None;
+    }
+
+    let after_id = tool.after_content_id.as_ref()?;
+    let after = graph.content_blobs.get(after_id)?;
+
+    // A missing `beforeContentId` means a freshly created file: treat before as
+    // empty so every line counts as added.
+    let before_known = tool.before_content_id.is_some();
+    let before = tool
+        .before_content_id
+        .as_ref()
+        .and_then(|id| graph.content_blobs.get(id))
+        .map(String::as_str)
+        .unwrap_or("");
+
+    // Cursor frequently stores the before snapshot with CRLF and the after with
+    // LF (or vice versa) on Windows. `diff_with_hashes` diffs raw lines before
+    // hashing, so a bare line-ending flip would mark every line as changed.
+    // Normalize EOLs first so only real content edits are counted.
+    let summary = diff_with_hashes(
+        &normalize_line_endings(before),
+        &normalize_line_endings(after),
+    );
+    if summary.added_lines == 0 && summary.removed_lines == 0 {
+        return None;
+    }
+
+    Some(ResolvedFileEdit {
+        abs_path: abs_path.to_string(),
+        call_id: tool.call_id.clone(),
+        op_index: 0,
+        timestamp: tool.timestamp.clone().or_else(|| graph.last_seen_at()),
+        write_mode: WriteMode::Patch,
+        before_known,
+        added_lines: summary.added_lines,
+        removed_lines: summary.removed_lines,
+        parser_name: format!("cursor_tool_{}_content_v1", tool.name),
+        line_hashes: summary.line_hashes,
+    })
+}
+
 pub(crate) fn aggregate_file_edits(edits: &[ResolvedFileEdit]) -> Vec<AggregatedFileEdit> {
     let mut by_path: HashMap<String, AggregatedFileEdit> = HashMap::new();
     for edit in edits {
@@ -414,14 +504,27 @@ pub(crate) fn aggregate_file_edits(edits: &[ResolvedFileEdit]) -> Vec<Aggregated
                 abs_path: edit.abs_path.clone(),
                 added_lines: 0,
                 removed_lines: 0,
+                timestamp: None,
             });
         entry.added_lines += edit.added_lines;
         entry.removed_lines += edit.removed_lines;
+        // Keep the earliest timestamp across edits to the same path.
+        entry.timestamp = min_timestamp(entry.timestamp.take(), edit.timestamp.clone());
     }
 
     let mut out: Vec<_> = by_path.into_values().collect();
     out.sort_by_key(|edit| edit.abs_path.clone());
     out
+}
+
+/// Return the earlier of two optional ISO-8601 timestamps. Lexicographic
+/// comparison is correct for the zero-padded UTC strings Cursor emits.
+fn min_timestamp(a: Option<String>, b: Option<String>) -> Option<String> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(if a <= b { a } else { b }),
+        (Some(a), None) => Some(a),
+        (None, b) => b,
+    }
 }
 
 pub(crate) fn build_seed_graph(
@@ -453,6 +556,7 @@ pub(crate) fn build_seed_graph(
             role,
             text: bubble.text.clone(),
             order_key: idx as i64,
+            timestamp: None,
         });
     }
 
@@ -505,6 +609,7 @@ pub(crate) fn build_seed_graph(
         inline_undo_rows: Vec::new(),
         partial_fates: HashMap::new(),
         legacy_diff_payloads: HashMap::new(),
+        content_blobs: HashMap::new(),
     })
 }
 
@@ -527,6 +632,11 @@ fn populate_graph_details(
         obs.set_phase("bubbles");
     }
     populate_bubbles(vscdb, graphs, &by_session)?;
+
+    if let Some(obs) = observer.as_mut() {
+        obs.set_phase("tool content");
+    }
+    populate_tool_content(vscdb, graphs)?;
 
     if let Some(obs) = observer.as_mut() {
         obs.set_phase("checkpoints");
@@ -628,6 +738,7 @@ fn populate_bubbles(
 
             let role = slim.bubble_type.and_then(map_bubble_role);
             let text = slim.text.clone();
+            let bubble_ts = normalize_bubble_timestamp(slim.created_at.as_ref());
             let order_key = header_orders
                 .get(session_id)
                 .and_then(|headers| headers.get(bubble_id))
@@ -639,6 +750,7 @@ fn populate_bubbles(
                 role,
                 text,
                 order_key,
+                timestamp: bubble_ts.clone(),
             });
 
             if graphs[graph_idx].model_name.is_none() {
@@ -654,11 +766,14 @@ fn populate_bubbles(
                 Err(_) => continue,
             };
 
+            // Prefer the originating bubble's own `createdAt` for the tool call so
+            // accepted edits are stamped when they actually happened, rather than
+            // falling back to the session-level `last_seen_at` (= composer end).
             if let Some(tool_call) = parse_tool_call(
                 bubble_id,
                 &tool_former_value,
                 graphs[graph_idx].project_path.as_deref(),
-                graphs[graph_idx].last_seen_at(),
+                bubble_ts.or_else(|| graphs[graph_idx].last_seen_at()),
                 &graphs[graph_idx].first_edit_path_by_bubble(),
             ) {
                 for path in &tool_call.path_hints {
@@ -690,6 +805,67 @@ pub(crate) fn hydrate_session_bubbles(
     if let Some(updated) = graphs.pop() {
         *graph = updated;
     }
+    Ok(())
+}
+
+/// Loads the content-addressed before/after edit blobs referenced by tool calls
+/// (newer agent edits store the diff by id rather than inline). Fetches each
+/// referenced key once and stashes it on every graph whose tool calls use it so
+/// [`resolve_tool_call_edits`] can diff before→after without DB access.
+fn populate_tool_content(vscdb: &Connection, graphs: &mut [CursorSessionGraph]) -> Result<()> {
+    let mut needed: HashSet<String> = HashSet::new();
+    for graph in graphs.iter() {
+        for tool in &graph.tool_calls {
+            if let Some(id) = &tool.before_content_id {
+                needed.insert(id.clone());
+            }
+            if let Some(id) = &tool.after_content_id {
+                needed.insert(id.clone());
+            }
+        }
+    }
+    if needed.is_empty() {
+        return Ok(());
+    }
+
+    // Keys are the full content-store keys (e.g. `composer.content.<hash>`), which
+    // are the primary key of `cursorDiskKV`, so each lookup is a point query.
+    let mut stmt = vscdb.prepare("SELECT value FROM cursorDiskKV WHERE key = ?1")?;
+    let mut blobs: HashMap<String, String> = HashMap::with_capacity(needed.len());
+    for id in &needed {
+        let raw: Option<String> = stmt
+            .query_row(params![id], |row| row.get(0))
+            .optional()
+            .ok()
+            .flatten();
+        if let Some(raw) = raw {
+            blobs.insert(id.clone(), raw);
+        }
+    }
+
+    for graph in graphs.iter_mut() {
+        let referenced: Vec<String> = graph
+            .tool_calls
+            .iter()
+            .flat_map(|tool| {
+                [
+                    tool.before_content_id.clone(),
+                    tool.after_content_id.clone(),
+                ]
+                .into_iter()
+            })
+            .flatten()
+            .collect();
+        for id in referenced {
+            if let Some(content) = blobs.get(&id) {
+                graph
+                    .content_blobs
+                    .entry(id)
+                    .or_insert_with(|| content.clone());
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -1006,6 +1182,16 @@ fn parse_tool_call(
     }
     dedupe_vec(&mut patch_texts);
 
+    // Newer agent edits reference the before/after file content by id instead of
+    // embedding a patch. Capture the content-store keys so the blobs can be
+    // resolved and diffed once they are loaded into the session graph.
+    let before_content_id = result_json
+        .as_ref()
+        .and_then(content_id_from_result("beforeContentId"));
+    let after_content_id = result_json
+        .as_ref()
+        .and_then(content_id_from_result("afterContentId"));
+
     Some(CursorToolCall {
         bubble_id: bubble_id.to_string(),
         name,
@@ -1014,7 +1200,21 @@ fn parse_tool_call(
         timestamp: default_timestamp,
         path_hints,
         patch_texts,
+        before_content_id,
+        after_content_id,
     })
+}
+
+/// Build a closure that extracts a non-empty content-store key (e.g.
+/// `beforeContentId`) from a tool `result` object.
+fn content_id_from_result(field: &'static str) -> impl Fn(&JsonValue) -> Option<String> {
+    move |result_json: &JsonValue| {
+        result_json
+            .get(field)
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+    }
 }
 
 fn collect_tool_paths(value: &JsonValue, project_path: Option<&str>, out: &mut Vec<String>) {
@@ -1679,9 +1879,29 @@ pub(crate) fn ms_to_iso(ms: i64) -> Option<String> {
         .map(|dt| dt.to_rfc3339())
 }
 
+/// Normalize a bubble's raw `createdAt` value into an ISO-8601 string. Cursor
+/// production data stores it as an ISO string; some builds/fixtures store epoch
+/// millis. Anything else (missing/empty/unexpected shape) yields `None`.
+fn normalize_bubble_timestamp(value: Option<&JsonValue>) -> Option<String> {
+    match value {
+        Some(JsonValue::String(s)) => {
+            let trimmed = s.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        }
+        Some(JsonValue::Number(n)) => n.as_i64().and_then(ms_to_iso),
+        _ => None,
+    }
+}
+
 fn dedupe_vec(values: &mut Vec<String>) {
     let mut seen = HashSet::new();
     values.retain(|value| seen.insert(value.clone()));
+}
+
+/// Collapse `\r\n` and lone `\r` line endings to `\n` so line-based diffing is
+/// not confused by cosmetic EOL differences between content snapshots.
+fn normalize_line_endings(text: &str) -> String {
+    text.replace("\r\n", "\n").replace('\r', "\n")
 }
 
 #[cfg(test)]
@@ -1745,6 +1965,8 @@ mod tests {
                 timestamp: None,
                 path_hints: Vec::new(),
                 patch_texts: vec!["@@\n-old\n+new\n".to_string()],
+                before_content_id: None,
+                after_content_id: None,
             }],
             checkpoint_paths: HashSet::new(),
             strong_path_hints: HashSet::new(),
@@ -1762,6 +1984,7 @@ mod tests {
             inline_undo_rows: Vec::new(),
             partial_fates: HashMap::new(),
             legacy_diff_payloads: HashMap::new(),
+            content_blobs: HashMap::new(),
         };
 
         let edits = resolve_tool_call_edits(&graph);
@@ -1769,6 +1992,203 @@ mod tests {
         assert_eq!(edits[0].abs_path, "/tmp/repo/src/app.ts");
         assert_eq!(edits[0].added_lines, 1);
         assert_eq!(edits[0].removed_lines, 1);
+    }
+
+    #[test]
+    fn resolve_tool_call_edits_diffs_referenced_content_blobs() {
+        let before_id = "composer.content.before".to_string();
+        let after_id = "composer.content.after".to_string();
+        let graph = CursorSessionGraph {
+            composer_id: "c1".to_string(),
+            source_file: "/tmp/state.vscdb".to_string(),
+            created_at_ms: None,
+            last_updated_at_ms: None,
+            started_at: None,
+            ended_at: Some("2026-04-18T11:07:54Z".to_string()),
+            project_path: Some("/tmp/repo".to_string()),
+            model_name: None,
+            subtitle: None,
+            files_changed_count: Some(1),
+            total_lines_added: Some(1),
+            total_lines_removed: Some(1),
+            conversation_messages: Vec::new(),
+            bubble_events: Vec::new(),
+            tool_calls: vec![CursorToolCall {
+                bubble_id: "bubble-1".to_string(),
+                name: "edit_file_v2".to_string(),
+                call_id: "call-1".to_string(),
+                status: Some("completed".to_string()),
+                timestamp: None,
+                // No inline patch: this edit is referenced purely by content id,
+                // mirroring the newer Cursor agent-edit schema (CRLF before, LF
+                // after, to exercise line-ending normalization).
+                path_hints: vec!["/tmp/repo/lib/home.dart".to_string()],
+                patch_texts: Vec::new(),
+                before_content_id: Some(before_id.clone()),
+                after_content_id: Some(after_id.clone()),
+            }],
+            checkpoint_paths: HashSet::new(),
+            strong_path_hints: HashSet::new(),
+            weak_path_hints: HashSet::new(),
+            original_file_states: HashMap::new(),
+            partial_targets: Vec::new(),
+            legacy_targets: Vec::new(),
+            inline_hints: Vec::new(),
+            inline_undo_rows: Vec::new(),
+            partial_fates: HashMap::new(),
+            legacy_diff_payloads: HashMap::new(),
+            content_blobs: HashMap::from([
+                (before_id, "import 'a';\r\nclass Home {}\r\n".to_string()),
+                (
+                    after_id,
+                    "import 'a';\nimport 'b';\nclass Home {}\n".to_string(),
+                ),
+            ]),
+        };
+
+        let edits = resolve_tool_call_edits(&graph);
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].abs_path, "/tmp/repo/lib/home.dart");
+        // The only real change between before/after is the added `import 'b';`.
+        assert_eq!(edits[0].added_lines, 1);
+        assert_eq!(edits[0].removed_lines, 0);
+        assert_eq!(edits[0].parser_name, "cursor_tool_edit_file_v2_content_v1");
+        assert!(edits[0].before_known);
+    }
+
+    #[test]
+    fn resolve_tool_call_edits_treats_missing_before_content_as_new_file() {
+        let after_id = "composer.content.after".to_string();
+        let graph = CursorSessionGraph {
+            composer_id: "c1".to_string(),
+            source_file: "/tmp/state.vscdb".to_string(),
+            created_at_ms: None,
+            last_updated_at_ms: None,
+            started_at: None,
+            ended_at: Some("2026-04-18T11:07:54Z".to_string()),
+            project_path: Some("/tmp/repo".to_string()),
+            model_name: None,
+            subtitle: None,
+            files_changed_count: Some(1),
+            total_lines_added: Some(2),
+            total_lines_removed: Some(0),
+            conversation_messages: Vec::new(),
+            bubble_events: Vec::new(),
+            tool_calls: vec![CursorToolCall {
+                bubble_id: "bubble-1".to_string(),
+                name: "edit_file_v2".to_string(),
+                call_id: "call-1".to_string(),
+                status: Some("completed".to_string()),
+                timestamp: None,
+                path_hints: vec!["/tmp/repo/lib/new.dart".to_string()],
+                patch_texts: Vec::new(),
+                before_content_id: None,
+                after_content_id: Some(after_id.clone()),
+            }],
+            checkpoint_paths: HashSet::new(),
+            strong_path_hints: HashSet::new(),
+            weak_path_hints: HashSet::new(),
+            original_file_states: HashMap::new(),
+            partial_targets: Vec::new(),
+            legacy_targets: Vec::new(),
+            inline_hints: Vec::new(),
+            inline_undo_rows: Vec::new(),
+            partial_fates: HashMap::new(),
+            legacy_diff_payloads: HashMap::new(),
+            content_blobs: HashMap::from([(after_id, "line one\nline two\n".to_string())]),
+        };
+
+        let edits = resolve_tool_call_edits(&graph);
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].added_lines, 2);
+        assert_eq!(edits[0].removed_lines, 0);
+        assert!(!edits[0].before_known);
+    }
+
+    #[test]
+    fn normalize_bubble_timestamp_handles_string_and_millis() {
+        assert_eq!(
+            normalize_bubble_timestamp(Some(&json!("2026-06-01T07:19:41.178Z"))).as_deref(),
+            Some("2026-06-01T07:19:41.178Z")
+        );
+        // Epoch millis (1780298369463 == 2026-06-01T07:19:29.463Z) get converted.
+        assert_eq!(
+            normalize_bubble_timestamp(Some(&json!(1780298369463i64))).as_deref(),
+            Some("2026-06-01T07:19:29.463+00:00")
+        );
+        assert_eq!(normalize_bubble_timestamp(Some(&json!("  "))), None);
+        assert_eq!(normalize_bubble_timestamp(Some(&json!(null))), None);
+        assert_eq!(normalize_bubble_timestamp(None), None);
+    }
+
+    #[test]
+    fn populate_bubbles_captures_per_message_timestamps() {
+        let file = NamedTempFile::new().expect("temp db should be created");
+        let conn = Connection::open(file.path()).expect("temp db should open");
+        conn.execute_batch(
+            "CREATE TABLE cursorDiskKV (
+                key   TEXT PRIMARY KEY,
+                value TEXT
+            );",
+        )
+        .expect("schema should be created");
+
+        // Composer-level created/updated span a full day; without per-bubble
+        // timestamps every message would collapse onto `createdAt`.
+        conn.execute(
+            "INSERT INTO cursorDiskKV (key, value) VALUES (?1, ?2)",
+            params![
+                "composerData:s1",
+                json!({
+                    "composerId": "s1",
+                    "createdAt": 1_780_298_369_463i64,
+                    "lastUpdatedAt": 1_780_382_474_682i64,
+                })
+                .to_string()
+            ],
+        )
+        .expect("composer row should insert");
+        conn.execute(
+            "INSERT INTO cursorDiskKV (key, value) VALUES (?1, ?2)",
+            params![
+                "bubbleId:s1:b1",
+                json!({
+                    "type": 1,
+                    "text": "first user turn",
+                    "createdAt": "2026-06-01T07:19:41.178Z",
+                })
+                .to_string()
+            ],
+        )
+        .expect("user bubble should insert");
+        conn.execute(
+            "INSERT INTO cursorDiskKV (key, value) VALUES (?1, ?2)",
+            params![
+                "bubbleId:s1:b2",
+                json!({
+                    "type": 2,
+                    "text": "assistant reply",
+                    "createdAt": "2026-06-02T06:40:58.614Z",
+                })
+                .to_string()
+            ],
+        )
+        .expect("assistant bubble should insert");
+
+        let graphs =
+            load_cursor_session_graphs(&conn, "/tmp/state.vscdb").expect("graph load should work");
+        assert_eq!(graphs.len(), 1);
+        let messages = graphs[0].messages();
+        let timestamps: Vec<Option<&str>> =
+            messages.iter().map(|m| m.timestamp.as_deref()).collect();
+        assert!(
+            timestamps.contains(&Some("2026-06-01T07:19:41.178Z")),
+            "expected first bubble's own createdAt, got {timestamps:?}"
+        );
+        assert!(
+            timestamps.contains(&Some("2026-06-02T06:40:58.614Z")),
+            "expected second bubble's own createdAt, got {timestamps:?}"
+        );
     }
 
     #[test]

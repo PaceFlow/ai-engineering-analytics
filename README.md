@@ -207,6 +207,8 @@ paceflow ingest
 
 This only removes Paceflow's derived analytics database. It does not delete Claude Code, Codex, Cursor, OpenCode, git, or GitHub source data.
 
+> Note: After upgrading to a build that changes how lines are matched (for example, the whitespace-insensitive line normalization that makes matching tolerant of reformatting), start over with a clean database so stored session line hashes are recomputed. Otherwise old hashes will not match newly scanned commits and metrics like Mainline Reach can read low.
+
 ### Cursor Data Is Missing
 
 Paceflow looks for Cursor state/history in the OS config directory under `Cursor/User`. If your Cursor data lives somewhere else, point Paceflow at it before ingesting:

@@ -603,6 +603,10 @@ fn ingest_session_graph(
             _ => continue,
         };
         let words = text.split_whitespace().count();
+        // Prefer the bubble's own per-message timestamp; fall back to the
+        // session-level composer `createdAt` only when a bubble lacks one
+        // (e.g. legacy inline `conversation` rows).
+        let message_ts = bubble.timestamp.as_deref().or(timestamp.as_deref());
         db::ingest_session_message(
             db,
             "cursor",
@@ -610,7 +614,7 @@ fn ingest_session_graph(
             role,
             text,
             words as i64,
-            timestamp.as_deref(),
+            message_ts,
         )?;
         written += 1;
     }
@@ -618,6 +622,9 @@ fn ingest_session_graph(
     let mut loc_events_pushed = 0usize;
     let resolved_file_edits = aggregate_file_edits(&resolve_tool_call_edits(graph));
     for edit in &resolved_file_edits {
+        // Use the earliest real edit timestamp for this file; only fall back to
+        // the session-level timestamp when the edit carried none.
+        let change_ts = edit.timestamp.as_deref().or(timestamp.as_deref());
         db::ingest_accepted_code_change(
             db,
             "cursor",
@@ -625,7 +632,7 @@ fn ingest_session_graph(
             &edit.abs_path,
             edit.added_lines,
             edit.removed_lines,
-            timestamp.as_deref(),
+            change_ts,
         )?;
         loc_events_pushed += 1;
         written += 1;

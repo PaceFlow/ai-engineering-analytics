@@ -11,8 +11,17 @@ pub struct DiffSummary {
     pub line_hashes: Vec<LineHashCount>,
 }
 
+/// Normalizes a source line before hashing so cosmetic reformatting does not break matching.
+///
+/// We trim both leading and trailing whitespace: format-on-save, linters, and pre-commit hooks
+/// frequently re-indent lines between the moment a change is accepted and the moment it is
+/// committed, which would otherwise change the line hash and silently drop the match.
+///
+/// NOTE: changing this normalization invalidates previously stored session line hashes in
+/// `fact_session_code_change_line_hashes`. A full re-ingest/rebuild is required for the change to
+/// take effect consistently (commit diff hashes are recomputed on every scan).
 pub fn normalize_line(line: &str) -> String {
-    line.trim_end_matches([' ', '\t', '\r']).to_string()
+    line.trim().to_string()
 }
 
 pub fn hash_line(line: &str) -> String {
