@@ -1,17 +1,21 @@
-# `paceflow` v0.2.3
+# `paceflow` v0.2.4
 
-This is a small UX release that makes empty reports more discoverable when data was ingested while working in a different repo.
+This release adds an interactive terminal dashboard, improves Cursor edit ingestion for newer agent formats, and tightens first-change and mainline attribution.
 
 Download the archive for your platform from the Assets section below, extract it, and run `paceflow --help`.
 
 ## Highlights
 
-- When a report (`paceflow session`, `delivery`, `quality`, or `cost`) is run inside a git repo and returns no rows, the empty-state message now points users at `--all-projects`, instead of only suggesting `paceflow ingest`. The hint only appears when the current-repo scope was auto-injected, so explicit `--repo` and `--all-projects` runs are unaffected.
+- **`paceflow tui`**: new interactive terminal dashboard for exploring session, delivery, quality, and cost analytics with keyboard navigation.
+- **Cursor `edit_file_v2` support**: ingest edits that reference before/after content blobs by id, not just inline streaming patches.
+- **First-change timing**: more accurate first-change attribution and a `--fresh` ingest option to rebuild from scratch.
+- **Mainline matching**: improved line matching and mainline update detection for commit association.
 
 ## Upgrade Notes
 
 - No database migration is required.
-- No new commands or flags; behavior only changes when reports return zero rows under the default current-repo scope.
+- New command: `paceflow tui`
+- New ingest flag: `paceflow ingest --fresh` (rebuilds analytics from scratch)
 - Existing commands continue to work:
   - `paceflow ingest`
   - `paceflow session`
