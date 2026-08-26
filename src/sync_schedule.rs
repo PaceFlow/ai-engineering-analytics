@@ -1488,9 +1488,8 @@ mod tests {
         );
 
         let payload = &bytes[2..];
-        let units: Vec<u16> = payload
-            .chunks_exact(2)
-            .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+        let units: Vec<u16> = (0..payload.len() / 2)
+            .map(|i| u16::from_le_bytes([payload[2 * i], payload[2 * i + 1]]))
             .collect();
         let decoded = String::from_utf16(&units).expect("payload should be valid UTF-16");
 
