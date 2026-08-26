@@ -7,7 +7,7 @@ const COST_AFTER_HELP: &str = "Examples:\n  paceflow cost                    # d
 const GITHUB_AFTER_HELP: &str = "Examples:\n  paceflow github token\n\nGitHub token setup:\n  Use this command to save, replace, or delete the local GitHub token used for PR sync during ingest.";
 const SYNC_AFTER_HELP: &str = "Examples:\n  paceflow sync config\n  paceflow sync status\n  paceflow sync push --all-projects\n  paceflow sync schedule install\n\nSync setup:\n  Use `paceflow sync config` to authenticate with the PaceFlow backend and choose a default organization.\n  Sync uploads normalized local analytics events so shared org views stay consistent across devices.";
 const SYNC_SCHEDULE_AFTER_HELP: &str = "Examples:\n  paceflow sync schedule install\n  paceflow sync schedule status\n  paceflow sync schedule uninstall\n  paceflow sync schedule run\n\nSchedule setup:\n  Installs a user-level Paceflow schedule that runs ingest and sync push --all-projects every 6 hours.";
-const HOOKS_AFTER_HELP: &str = "Examples:\n  paceflow hooks install                         # install the pre-commit setup gate in the current repo\n  paceflow hooks install --repo /path/to/repo    # install in a specific repo\n  paceflow hooks status\n  paceflow hooks pre-commit --repo .             # dry-run the gate against the current repo\n  paceflow hooks uninstall\n\nHook setup:\n  Paceflow-managed hooks verify that sync is configured locally and that the periodic sync schedule can be installed.\n  The pre-commit gate fails the commit if `paceflow sync config` has not been run (or the PACEFLOW_SYNC_* env vars are not set), and installs the periodic sync schedule on first use.";
+const HOOKS_AFTER_HELP: &str = "Examples:\n  paceflow hooks install                         # install the composite pre-commit hook in the current repo\n  paceflow hooks install --repo /path/to/repo    # install in a specific repo\n  paceflow hooks install --force                 # overwrite an existing foreign hook instead of chaining it\n  paceflow hooks status\n  paceflow hooks pre-commit --repo .             # dry-run the gate against the current repo\n  paceflow hooks uninstall\n\nHook setup:\n  Paceflow installs a composite pre-commit hook that (1) verifies sync is configured locally and that the periodic sync schedule can be installed, then (2) runs the repository's own pre-commit checks so they are not skipped.\n  The gate fails the commit if `paceflow sync config` has not been run (or the PACEFLOW_SYNC_* env vars are not set), and installs the periodic sync schedule on first use.\n\nCoexistence:\n  If a foreign pre-commit hook already exists, Paceflow backs it up to `pre-commit.paceflow-chained` and runs it after the gate (use --force to overwrite instead). `paceflow hooks uninstall` restores the backup.\n  If a `.pre-commit-config.yaml` is present and `pre-commit` is on PATH, the composite hook invokes `pre-commit run --hook-stage pre-commit` — so you do not need to run `pre-commit install`. `paceflow hooks status` warns when configured checks would not run.";
 
 /// Version string baked at build time, e.g.
 /// `0.2.0 (abc123def456 clean, 2026-05-13T15:00:00+03:00)`.
@@ -154,8 +154,8 @@ pub struct HooksArgs {
 
 #[derive(Subcommand, Debug, Clone)]
 pub enum HooksCommands {
-    /// Install the Paceflow-managed pre-commit setup gate
-    Install(HooksRepoArgs),
+    /// Install the Paceflow-managed pre-commit hook (composes with existing hooks)
+    Install(HooksInstallArgs),
     /// Remove the Paceflow-managed pre-commit setup gate
     Uninstall(HooksRepoArgs),
     /// Show whether the Paceflow-managed pre-commit hook is installed
@@ -170,6 +170,16 @@ pub struct HooksRepoArgs {
     /// Restrict hook management to a specific repository root or path inside a repository
     #[arg(long)]
     pub repo: Option<String>,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct HooksInstallArgs {
+    /// Restrict hook management to a specific repository root or path inside a repository
+    #[arg(long)]
+    pub repo: Option<String>,
+    /// Overwrite an existing foreign pre-commit hook instead of chaining to it
+    #[arg(long)]
+    pub force: bool,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -546,7 +556,23 @@ mod tests {
         match cli.command {
             Commands::Hooks(args) => match args.command {
                 HooksCommands::Install(hooks) => {
-                    assert_eq!(hooks.repo.as_deref(), Some("/tmp/repo"))
+                    assert_eq!(hooks.repo.as_deref(), Some("/tmp/repo"));
+                    assert!(!hooks.force);
+                }
+                _ => panic!("expected hooks install command"),
+            },
+            _ => panic!("expected hooks command"),
+        }
+    }
+
+    #[test]
+    fn parses_hooks_install_force() {
+        let cli = Cli::parse_from(["paceflow", "hooks", "install", "--force"]);
+        match cli.command {
+            Commands::Hooks(args) => match args.command {
+                HooksCommands::Install(hooks) => {
+                    assert!(hooks.force);
+                    assert_eq!(hooks.repo, None);
                 }
                 _ => panic!("expected hooks install command"),
             },
