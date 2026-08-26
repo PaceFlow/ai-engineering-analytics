@@ -1,6 +1,6 @@
 [package]
 name = "paceflow"
-version = "0.2.4"
+version = "0.2.5"
 edition = "2024"
 default-run = "paceflow"
 description = "Local-first CLI that turns AI coding session history and git metadata into engineering analytics."
