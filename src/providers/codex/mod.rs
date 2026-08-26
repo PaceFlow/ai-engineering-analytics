@@ -499,10 +499,8 @@ fn parse_exec_cmd_write(
     // Extract file path from `> /path` or `>> /path`
     let file_path = if let Some(path) = redirect_and_path.strip_prefix(">>") {
         path.trim()
-    } else if let Some(path) = redirect_and_path.strip_prefix('>') {
-        path.trim()
     } else {
-        return None;
+        redirect_and_path.strip_prefix('>')?.trim()
     };
     if file_path.is_empty() {
         return None;
