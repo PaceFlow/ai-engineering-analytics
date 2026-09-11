@@ -8,7 +8,7 @@
 
 PaceFlow is a local-first CLI with an interactive terminal dashboard for engineers using **Claude Code, Codex, Cursor, and OpenCode**. It connects local assistant history with git commits to help you understand where agents save effort, where work gets stuck, and what happens to the code after it lands.
 
-The command is **`vba`**. The install package is `paceflow`; the `paceflow` command is also available as a compatibility alias.
+The command is **`vca`**. The install package is `paceflow`; the `paceflow` command is also available as a compatibility alias.
 
 [Get started](#get-started) · [Explore reports](#explore-reports) · [User guide](docs/USER_GUIDE.md) · [Troubleshooting](docs/TROUBLESHOOTING.md)
 
@@ -20,10 +20,10 @@ The command is **`vba`**. The install package is `paceflow`; the `paceflow` comm
 
 | Your question | Report | What it measures |
 | --- | --- | --- |
-| How much steering does agent work need? | `vba session` | Prompts, time to first accepted change, retry loops, and sessions followed by commits |
-| Does the work reach review and mainline? | `vba delivery` | AI-heavy commits, PR reach, merge rate, and mainline lead time |
-| Does the code hold up after landing? | `vba quality` | Code churn, follow-up fixes, and reverts |
-| What does useful output cost? | `vba cost` | Token usage, API-equivalent cost, and cost per accepted or mainline output |
+| How much steering does agent work need? | `vca session` | Prompts, time to first accepted change, retry loops, and sessions followed by commits |
+| Does the work reach review and mainline? | `vca delivery` | AI-heavy commits, PR reach, merge rate, and mainline lead time |
+| Does the code hold up after landing? | `vca quality` | Code churn, follow-up fixes, and reverts |
+| What does useful output cost? | `vca cost` | Token usage, API-equivalent cost, and cost per accepted or mainline output |
 
 Use these signals to investigate your workflow: compare providers, inspect a branch or task, and see whether smaller tasks or earlier validation improve the results.
 
@@ -53,50 +53,50 @@ Run from the git repository you want to analyze:
 
 ```bash
 cd /path/to/your/repo
-vba ingest
+vca ingest
 ```
 
-Ingestion reads local assistant history, associates code changes with git commits, and builds a SQLite analytics database at `~/.paceflow/paceflow.db`. Re-run `vba ingest` when you have new sessions or commits.
+Ingestion reads local assistant history, associates code changes with git commits, and builds a SQLite analytics database at `~/.paceflow/paceflow.db`. Re-run `vca ingest` when you have new sessions or commits.
 
 ### 3. Explore the dashboard
 
 ```bash
-vba tui
+vca tui
 ```
 
 The interactive dashboard combines **Verdict, Sessions, Delivery, and Quality** views. Switch tabs with `1`–`4`, cycle model/provider/task/branch grouping with `g`, and switch between 7-, 30-, and 90-day windows with `w`. Use `↑`/`↓` to select rows, `L` to open metric definitions, and `q` to quit.
 
-Use `vba tui --all-projects` to explore all tracked repositories. The Verdict view summarizes outcomes and changes from the preceding time window; the other tabs show the underlying comparisons.
+Use `vca tui --all-projects` to explore all tracked repositories. The Verdict view summarizes outcomes and changes from the preceding time window; the other tabs show the underlying comparisons.
 
 ### 4. Run individual reports
 
 For printable output and additional filters, use the report commands. Cost is available as a separate CLI report:
 
 ```bash
-vba session                 # Compare sessions by model
-vba delivery                # See what reached review and mainline
-vba quality                 # Inspect churn, fixes, and reverts
-vba cost                    # Compare estimated cost and useful output
+vca session                 # Compare sessions by model
+vca delivery                # See what reached review and mainline
+vca quality                 # Inspect churn, fixes, and reverts
+vca cost                    # Compare estimated cost and useful output
 ```
 
-The dashboard and report commands default to the current repository and group by model. For a single printable summary, run `vba session --overall`.
+The dashboard and report commands default to the current repository and group by model. For a single printable summary, run `vca session --overall`.
 
-**No rows?** Try `vba session --all-projects` to check whether sessions were associated with another repository. See [troubleshooting](docs/TROUBLESHOOTING.md) for missing provider data and rebuild instructions.
+**No rows?** Try `vca session --all-projects` to check whether sessions were associated with another repository. See [troubleshooting](docs/TROUBLESHOOTING.md) for missing provider data and rebuild instructions.
 
 ## Explore reports
 
 Compare by provider, branch, task, repository, or model. All four reports share the same filters.
 
 ```bash
-vba session --group-by provider
-vba delivery --group-by branch
-vba quality --task ABC-123
-vba cost --provider codex --all-projects
-vba session --from 2026-03-01 --to 2026-03-31
-vba delivery --repo /path/to/another/repo
+vca session --group-by provider
+vca delivery --group-by branch
+vca quality --task ABC-123
+vca cost --provider codex --all-projects
+vca session --from 2026-03-01 --to 2026-03-31
+vca delivery --repo /path/to/another/repo
 ```
 
-Use `--model <provider/name>` to focus on a model shown in your report, `--overall` for a summary, or `--limit 10` to shorten grouped output. `vba session --list-sessions` drills down to individual sessions. Run `vba <command> --help` for all options.
+Use `--model <provider/name>` to focus on a model shown in your report, `--overall` for a summary, or `--limit 10` to shorten grouped output. `vca session --list-sessions` drills down to individual sessions. Run `vca <command> --help` for all options.
 
 ### Compare workflows and outcomes
 
@@ -132,9 +132,9 @@ The Quality view follows AI-heavy commits after landing. Compare churn and follo
 To include GitHub PR reach and merge metrics, save a token and refresh:
 
 ```bash
-vba github token
-vba ingest
-vba delivery
+vca github token
+vca ingest
+vca delivery
 ```
 
 `PACEFLOW_GITHUB_TOKEN` provides an environment override for CI or one-off runs. Without GitHub credentials, you can still use local session and git analytics.
@@ -155,7 +155,7 @@ See the [user guide](docs/USER_GUIDE.md) for metric definitions, denominators, s
 
 Local ingestion and reports store analytics on your machine under `~/.paceflow`. `PACEFLOW_HOME` changes the base directory; the database then lives at `$PACEFLOW_HOME/.paceflow/paceflow.db`. GitHub integration fetches remote PR metadata when a token is configured.
 
-Team sync is a separate, optional workflow. `vba sync config` sets up authentication and an organization; `vba sync push` uploads normalized analytics events to the PaceFlow backend. `vba sync schedule install` enables recurring ingestion and uploads every six hours. Check `vba sync --help` before configuring shared analytics.
+Team sync is a separate, optional workflow. `vca sync config` sets up authentication and an organization; `vca sync push` uploads normalized analytics events to the PaceFlow backend. `vca sync schedule install` enables recurring ingestion and uploads every six hours. Check `vca sync --help` before configuring shared analytics.
 
 ## Documentation and contributing
 

@@ -1,9 +1,9 @@
 # Paceflow User Guide
 
-This guide explains how to read `vba` reports after you have run:
+This guide explains how to read `vca` reports after you have run:
 
 ```bash
-vba ingest
+vca ingest
 ```
 
 For the shortest setup path, start with the [README](../README.md).
@@ -13,10 +13,10 @@ For the shortest setup path, start with the [README](../README.md).
 Use the reports to answer four practical questions:
 
 ```bash
-vba session
-vba delivery
-vba quality
-vba cost
+vca session
+vca delivery
+vca quality
+vca cost
 ```
 
 By default, `session`, `delivery`, `quality`, and `cost` compare outcomes by model. Use `--overall` for a rolled-up summary, or `--model <provider/name>` to keep the same report but inspect one model only.
@@ -24,18 +24,18 @@ By default, `session`, `delivery`, `quality`, and `cost` compare outcomes by mod
 Examples:
 
 ```bash
-vba session --model codex/gpt-5.4
-vba session --overall
-vba delivery --group-by branch
-vba quality --group-by provider
-vba cost --group-by task
+vca session --model codex/gpt-5.4
+vca session --overall
+vca delivery --group-by branch
+vca quality --group-by provider
+vca cost --group-by task
 ```
 
 ## How To Read The Reports
 
 ### Session
 
-`vba session` shows whether your sessions were actually useful.
+`vca session` shows whether your sessions were actually useful.
 
 Key signals:
 
@@ -50,7 +50,7 @@ High prompt counts and slow first changes usually mean you are spending too much
 
 ### Delivery
 
-`vba delivery` shows whether AI-heavy work turned into shipped change.
+`vca delivery` shows whether AI-heavy work turned into shipped change.
 
 Key signals:
 
@@ -64,7 +64,7 @@ Heavy commits tell you where AI materially influenced the diff instead of just a
 
 ### Quality
 
-`vba quality` shows whether the code held up after landing.
+`vca quality` shows whether the code held up after landing.
 
 Key signals:
 
@@ -76,7 +76,7 @@ Churn means accepted code landed but was removed soon after. Bug-after-merge cat
 
 ### Cost
 
-`vba cost` shows token usage and estimated spend per useful output.
+`vca cost` shows token usage and estimated spend per useful output.
 
 Key signals:
 

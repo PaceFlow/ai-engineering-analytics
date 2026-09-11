@@ -1,5 +1,5 @@
 //! Build script that bakes the current git commit into the binary so
-//! `vba --version` can identify exactly which source revision was built.
+//! `vca --version` can identify exactly which source revision was built.
 //!
 //! Emits three `rustc-env` variables that `src/cli.rs` consumes via `env!()`:
 //!

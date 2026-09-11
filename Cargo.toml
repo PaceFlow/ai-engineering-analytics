@@ -2,7 +2,7 @@
 name = "paceflow"
 version = "0.2.5"
 edition = "2024"
-default-run = "vba"
+default-run = "vca"
 description = "Local-first CLI that turns AI coding session history and git metadata into engineering analytics."
 license = "MIT"
 repository = "https://github.com/PaceFlow/ai-engineering-analytics"
@@ -12,7 +12,7 @@ keywords = ["analytics", "ai", "cli", "git", "developer-tools"]
 categories = ["command-line-utilities", "development-tools"]
 
 [[bin]]
-name = "vba"
+name = "vca"
 path = "src/main.rs"
 
 [[bin]]

@@ -61,7 +61,7 @@ impl Fixture {
     }
 
     fn run(&self, args: &[&str]) -> Result<Output> {
-        Ok(Command::cargo_bin("vba")?
+        Ok(Command::cargo_bin("vca")?
             .args(args)
             .current_dir(self.dir.path())
             .env("PACEFLOW_HOME", self.dir.path())
@@ -145,7 +145,7 @@ impl Fixture {
 
     fn cost(&self, provider: &str) -> Result<analytics::CostReportRow> {
         let cli = Cli::parse_from([
-            "vba",
+            "vca",
             "cost",
             "--all-projects",
             "--overall",
@@ -220,7 +220,7 @@ fn ingest_opencode_db_then_changes_tokens_cost_and_coverage_have_known_values() 
         assert!(output.status.success());
         assert!(String::from_utf8_lossy(&output.stdout).contains("50.0%"));
         let cli = Cli::parse_from([
-            "vba",
+            "vca",
             "session",
             "--provider",
             "opencode",
@@ -272,7 +272,7 @@ fn ingest_copied_local_databases_then_known_metrics_match() -> Result<()> {
     ] {
         let mut first_metrics = None;
         for _ in 0..2 {
-            let output = Command::cargo_bin("vba")?
+            let output = Command::cargo_bin("vca")?
                 .args(["ingest", "--provider", provider])
                 .current_dir(fixture.dir.path())
                 .env("PACEFLOW_HOME", fixture.dir.path())

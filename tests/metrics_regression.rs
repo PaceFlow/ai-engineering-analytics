@@ -113,7 +113,7 @@ impl TestEnv {
     }
 
     fn run_paceflow(&self, args: &[&str]) -> anyhow::Result<String> {
-        let output = Command::cargo_bin("vba")?
+        let output = Command::cargo_bin("vca")?
             .args(args)
             .current_dir(&self.home)
             .env("PACEFLOW_HOME", &self.home)
@@ -777,11 +777,11 @@ fn claude_task_grouped_reports_suggest_branch_view_when_only_non_ticket_rows_exi
     ])?);
 
     assert!(session.contains("No ticket-style task rows matched."));
-    assert!(session.contains("`vba session --group-by branch`"));
+    assert!(session.contains("`vca session --group-by branch`"));
     assert!(delivery.contains("No ticket-style task rows matched."));
-    assert!(delivery.contains("`vba delivery --group-by branch`"));
+    assert!(delivery.contains("`vca delivery --group-by branch`"));
     assert!(quality.contains("No ticket-style task rows matched."));
-    assert!(quality.contains("`vba quality --group-by branch`"));
+    assert!(quality.contains("`vca quality --group-by branch`"));
 
     Ok(())
 }

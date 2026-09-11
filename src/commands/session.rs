@@ -56,14 +56,14 @@ fn render_session_report(
     if rows.is_empty() {
         if show_branch_hint {
             out.push_str(
-                "No ticket-style task rows matched. Try `vba session --group-by branch` or `--overall`.\n",
+                "No ticket-style task rows matched. Try `vca session --group-by branch` or `--overall`.\n",
             );
         } else if repo_auto_injected {
             out.push_str(
-                "No session rows found for the current repo. Run `vba ingest` first, or pass `--all-projects` to include data from other ingested repos.\n",
+                "No session rows found for the current repo. Run `vca ingest` first, or pass `--all-projects` to include data from other ingested repos.\n",
             );
         } else {
-            out.push_str("No session rows found. Run `vba ingest` first.\n");
+            out.push_str("No session rows found. Run `vca ingest` first.\n");
         }
         return out;
     }
@@ -199,10 +199,10 @@ fn render_session_list(rows: &[analytics::SessionListRow], repo_auto_injected: b
     if rows.is_empty() {
         if repo_auto_injected {
             out.push_str(
-                "No session rows found for the current repo. Run `vba ingest` first, or pass `--all-projects` to include data from other ingested repos.\n",
+                "No session rows found for the current repo. Run `vca ingest` first, or pass `--all-projects` to include data from other ingested repos.\n",
             );
         } else {
-            out.push_str("No session rows found. Run `vba ingest` first.\n");
+            out.push_str("No session rows found. Run `vca ingest` first.\n");
         }
         return out;
     }
@@ -533,8 +533,8 @@ mod tests {
 
         let rendered = render_session_report(&[], &report, true, false);
         assert!(rendered.contains("No ticket-style task rows matched."));
-        assert!(rendered.contains("`vba session --group-by branch`"));
-        assert!(!rendered.contains("Run `vba ingest` first."));
+        assert!(rendered.contains("`vca session --group-by branch`"));
+        assert!(!rendered.contains("Run `vca ingest` first."));
     }
 
     #[test]

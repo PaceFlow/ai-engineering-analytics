@@ -44,14 +44,14 @@ fn render_delivery_report(
     if rows.is_empty() {
         if show_branch_hint {
             out.push_str(
-                "No ticket-style task rows matched. Try `vba delivery --group-by branch` or `--overall`.\n",
+                "No ticket-style task rows matched. Try `vca delivery --group-by branch` or `--overall`.\n",
             );
         } else if repo_auto_injected {
             out.push_str(
-                "No delivery rows found for the current repo. Run `vba ingest` first, or pass `--all-projects` to include data from other ingested repos.\n",
+                "No delivery rows found for the current repo. Run `vca ingest` first, or pass `--all-projects` to include data from other ingested repos.\n",
             );
         } else {
-            out.push_str("No delivery rows found. Run `vba ingest` first.\n");
+            out.push_str("No delivery rows found. Run `vca ingest` first.\n");
         }
         return out;
     }
@@ -481,8 +481,8 @@ mod tests {
 
         let rendered = render_delivery_report(&[], &report, true, false);
         assert!(rendered.contains("No ticket-style task rows matched."));
-        assert!(rendered.contains("`vba delivery --group-by branch`"));
-        assert!(!rendered.contains("Run `vba ingest` first."));
+        assert!(rendered.contains("`vca delivery --group-by branch`"));
+        assert!(!rendered.contains("Run `vca ingest` first."));
     }
 
     #[test]
@@ -523,7 +523,7 @@ mod tests {
         };
 
         let rendered = render_delivery_report(&[], &report, false, false);
-        assert!(rendered.contains("No delivery rows found. Run `vba ingest` first."));
+        assert!(rendered.contains("No delivery rows found. Run `vca ingest` first."));
         assert!(!rendered.contains("--all-projects"));
     }
 }

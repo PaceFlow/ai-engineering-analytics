@@ -1,15 +1,15 @@
-# `vba` Install Notes
+# `vca` Install Notes
 
-`vba` is a single-file CLI binary. Download the archive for your platform, extract it, and run:
+`vca` is a single-file CLI binary. Download the archive for your platform, extract it, and run:
 
 ```bash
-vba --help
-vba ingest
+vca --help
+vca ingest
 ```
 
 ## Install with Cargo
 
-The package is still named `paceflow`. Installs and release archives include both `vba` and the `paceflow` compatibility executable. Keep both on `PATH` so existing hooks and scripts continue to work. Both use the same `~/.paceflow` data and `PACEFLOW_*` environment variables.
+The package is still named `paceflow`. Installs and release archives include both `vca` and the `paceflow` compatibility executable. Keep both on `PATH` so existing hooks and scripts continue to work. Both use the same `~/.paceflow` data and `PACEFLOW_*` environment variables.
 
 If you have the Rust toolchain (or `cargo-binstall`) on your machine, this is the fastest path.
 
@@ -17,21 +17,21 @@ If you have the Rust toolchain (or `cargo-binstall`) on your machine, this is th
 
 ```bash
 cargo binstall paceflow
-vba --help
+vca --help
 ```
 
-`cargo binstall` downloads the matching prebuilt release artifact for your target triple and drops `vba` in `~/.cargo/bin`. No Rust compilation required. Install `cargo-binstall` itself with `cargo install cargo-binstall` or grab its prebuilt binary from [cargo-bins/cargo-binstall](https://github.com/cargo-bins/cargo-binstall#installation).
+`cargo binstall` downloads the matching prebuilt release artifact for your target triple and drops `vca` in `~/.cargo/bin`. No Rust compilation required. Install `cargo-binstall` itself with `cargo install cargo-binstall` or grab its prebuilt binary from [cargo-bins/cargo-binstall](https://github.com/cargo-bins/cargo-binstall#installation).
 
 ### `cargo install` (compiles from source)
 
 ```bash
 cargo install --locked paceflow
-vba --help
+vca --help
 ```
 
 Builds from crates.io with your local toolchain. Slower than `binstall` (rusqlite-bundled + reqwest + tokio take a few minutes), but works on any target where Rust compiles. If install fails, try `rustup update` first.
 
-Both commands install `vba` and `paceflow` to `~/.cargo/bin`, which rustup adds to `PATH` by default. See [Add `vba` To `PATH`](#add-vba-to-path) if it isn't.
+Both commands install `vca` and `paceflow` to `~/.cargo/bin`, which rustup adds to `PATH` by default. See [Add `vca` To `PATH`](#add-vca-to-path) if it isn't.
 
 ## Prebuilt Releases
 
@@ -54,7 +54,7 @@ Invoke-WebRequest `
   -Uri "https://github.com/PaceFlow/ai-engineering-analytics/releases/download/$version/$asset" `
   -OutFile $asset
 Expand-Archive .\$asset -DestinationPath .\paceflow
-.\paceflow\vba.exe --help
+.\paceflow\vca.exe --help
 ```
 
 macOS/Linux example:
@@ -64,24 +64,24 @@ version="v0.2.0"
 asset="paceflow-x86_64-unknown-linux-gnu.tar.gz"
 curl -L "https://github.com/PaceFlow/ai-engineering-analytics/releases/download/${version}/${asset}" -o "${asset}"
 tar -xzf "${asset}"
-./paceflow-x86_64-unknown-linux-gnu/vba --help
+./paceflow-x86_64-unknown-linux-gnu/vca --help
 ```
 
 For macOS Apple Silicon, use `paceflow-aarch64-apple-darwin.tar.gz` as the asset name.
 
-## Add `vba` To `PATH`
+## Add `vca` To `PATH`
 
-Keep both `vba` and `paceflow` on `PATH`; installed Git hooks and older team setup scripts may still call `paceflow` by name.
+Keep both `vca` and `paceflow` on `PATH`; installed Git hooks and older team setup scripts may still call `paceflow` by name.
 
 macOS/Linux, for a downloaded release:
 
 ```bash
 mkdir -p ~/.local/bin
-cp ./paceflow-x86_64-unknown-linux-gnu/vba ~/.local/bin/vba
+cp ./paceflow-x86_64-unknown-linux-gnu/vca ~/.local/bin/vca
 cp ./paceflow-x86_64-unknown-linux-gnu/paceflow ~/.local/bin/paceflow
 echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc
 exec zsh
-vba --help
+vca --help
 ```
 
 For macOS Apple Silicon, replace `paceflow-x86_64-unknown-linux-gnu` with `paceflow-aarch64-apple-darwin`. If you use Bash, append the `PATH` line to `~/.bashrc` instead of `~/.zshrc`.
@@ -90,19 +90,19 @@ macOS/Linux, for a local development build:
 
 ```bash
 cargo install --path .
-vba --help
-vba --version           # vba 0.2.0 (<git-sha> clean, <commit-time>)
+vca --help
+vca --version           # vca 0.2.0 (<git-sha> clean, <commit-time>)
 ```
 
-This builds in release mode and copies `vba` and `paceflow` to `~/.cargo/bin`, which is on `PATH` by default for rustup installs. Re-run the command (add `--force` after the first time) to pick up changes. `vba --version` embeds the git commit SHA and a `clean`/`dirty` flag from `build.rs`, so you can confirm which checkout you're running:
+This builds in release mode and copies `vca` and `paceflow` to `~/.cargo/bin`, which is on `PATH` by default for rustup installs. Re-run the command (add `--force` after the first time) to pick up changes. `vca --version` embeds the git commit SHA and a `clean`/`dirty` flag from `build.rs`, so you can confirm which checkout you're running:
 
 ```bash
-vba --version                          # what's on PATH
+vca --version                          # what's on PATH
 git rev-parse --short=12 origin/main        # what main currently points at
 git fetch origin main && git diff --stat HEAD origin/main   # check if you're behind main
 ```
 
-If the SHA in `vba --version` matches `git rev-parse --short=12 origin/main` and shows `clean`, you're running an exact build of `origin/main`.
+If the SHA in `vca --version` matches `git rev-parse --short=12 origin/main` and shows `clean`, you're running an exact build of `origin/main`.
 
 If `~/.cargo/bin` is not on `PATH`, add it:
 
@@ -115,20 +115,20 @@ Windows PowerShell, for a local development build:
 
 ```powershell
 cargo install --path .
-vba --help
-vba --version           # vba 0.2.0 (<git-sha> clean, <commit-time>)
+vca --help
+vca --version           # vca 0.2.0 (<git-sha> clean, <commit-time>)
 ```
 
-This installs `vba.exe` and `paceflow.exe` to `%USERPROFILE%\.cargo\bin\`, which rustup adds to the user `Path`. Re-run with `--force` after the first install to pick up changes. `vba --version` embeds the git commit SHA and a `clean`/`dirty` flag from `build.rs`, so you can confirm which checkout you're running:
+This installs `vca.exe` and `paceflow.exe` to `%USERPROFILE%\.cargo\bin\`, which rustup adds to the user `Path`. Re-run with `--force` after the first install to pick up changes. `vca --version` embeds the git commit SHA and a `clean`/`dirty` flag from `build.rs`, so you can confirm which checkout you're running:
 
 ```powershell
-vba --version                          # what's on PATH
+vca --version                          # what's on PATH
 git rev-parse --short=12 origin/main        # what main currently points at
 git fetch origin main; git diff --stat HEAD origin/main   # check if you're behind main
-(Get-Command vba).Source               # which vba.exe resolves on PATH
+(Get-Command vca).Source               # which vca.exe resolves on PATH
 ```
 
-If the SHA in `vba --version` matches `git rev-parse --short=12 origin/main` and shows `clean`, you're running an exact build of `origin/main`.
+If the SHA in `vca --version` matches `git rev-parse --short=12 origin/main` and shows `clean`, you're running an exact build of `origin/main`.
 
 If `cargo install` reports the binary is not on `PATH`, add `%USERPROFILE%\.cargo\bin` for the current user and open a new PowerShell window:
 
@@ -146,7 +146,7 @@ Windows PowerShell, for a downloaded release:
 $installDir = "$env:USERPROFILE\bin\paceflow"
 New-Item -ItemType Directory -Force -Path $installDir | Out-Null
 Copy-Item .\paceflow\paceflow.exe $installDir
-Copy-Item .\paceflow\vba.exe $installDir
+Copy-Item .\paceflow\vca.exe $installDir
 [Environment]::SetEnvironmentVariable(
   "Path",
   [Environment]::GetEnvironmentVariable("Path", "User") + ";$installDir",
@@ -157,7 +157,7 @@ Copy-Item .\paceflow\vba.exe $installDir
 Open a new PowerShell window, then verify:
 
 ```powershell
-vba --help
+vca --help
 ```
 
 ## Build From Source
@@ -170,23 +170,23 @@ cargo install --path . --force
 
 ## macOS Gatekeeper
 
-If Gatekeeper blocks `vba`, go to `System Settings > Privacy & Security` and click `Open Anyway`, then rerun the binary.
+If Gatekeeper blocks `vca`, go to `System Settings > Privacy & Security` and click `Open Anyway`, then rerun the binary.
 
 Fresh extractions can inherit quarantine from the downloaded archive. If needed, clear quarantine on the extracted folder:
 
 ```bash
 xattr -dr com.apple.quarantine paceflow-aarch64-apple-darwin
-./paceflow-aarch64-apple-darwin/vba --help
+./paceflow-aarch64-apple-darwin/vca --help
 ```
 
 ## Requirements
 
 - Git must be installed and available on `PATH`
-- `vba` reads local Claude Code sessions from `~/.claude/projects/*/*.jsonl`
-- `vba` reads local Codex sessions from `~/.codex/sessions`
-- `vba` reads local Cursor state/history from the OS config directory under `Cursor/User`
-- `vba` reads local OpenCode history from `~/.local/share/opencode/opencode.db` and `~/.local/share/opencode/storage/session_diff`
-- GitHub PR sync requires `vba github token` or `PACEFLOW_GITHUB_TOKEN`
+- `vca` reads local Claude Code sessions from `~/.claude/projects/*/*.jsonl`
+- `vca` reads local Codex sessions from `~/.codex/sessions`
+- `vca` reads local Cursor state/history from the OS config directory under `Cursor/User`
+- `vca` reads local OpenCode history from `~/.local/share/opencode/opencode.db` and `~/.local/share/opencode/storage/session_diff`
+- GitHub PR sync requires `vca github token` or `PACEFLOW_GITHUB_TOKEN`
 
 ## Optional Overrides
 

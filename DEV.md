@@ -4,7 +4,7 @@ Development-oriented workflows, profiling notes, and source-level commands live 
 
 ## Provider Metric Regression Tests
 
-`cargo test --test provider_metrics_e2e` creates small provider-shaped SQLite databases and Codex JSONL files, runs the actual `vba ingest` command, and asserts derived metrics. It never seeds analytics tables. Cases cover both OpenCode diff formats, exact changed-line/token/cost totals, 50% cost coverage with a zero-token priced session, first-change latency, atomic failure/retry, changed-source refresh, Cursor edits, Codex cumulative usage, and idempotency. A real Git fixture verifies one AI-heavy mainline commit and churn changing from 0/2 to 1/2 lines after a later fix, including after cache warmup.
+`cargo test --test provider_metrics_e2e` creates small provider-shaped SQLite databases and Codex JSONL files, runs the actual `vca ingest` command, and asserts derived metrics. It never seeds analytics tables. Cases cover both OpenCode diff formats, exact changed-line/token/cost totals, 50% cost coverage with a zero-token priced session, first-change latency, atomic failure/retry, changed-source refresh, Cursor edits, Codex cumulative usage, and idempotency. A real Git fixture verifies one AI-heavy mainline commit and churn changing from 0/2 to 1/2 lines after a later fix, including after cache warmup.
 
 Private source copies are kept outside version control under `.local-fixtures/2026-09-10`. Layout:
 
@@ -88,7 +88,7 @@ task install-profiler
 task profile -- ingest
 task profile -- session
 task install-live-profiler
-task profile-live PID=$(pgrep -n vba)
+task profile-live PID=$(pgrep -n vca)
 ```
 
 ### Browser-Based Profiling With Samply
@@ -115,10 +115,10 @@ This uses call stacks based on frame pointers:
 perf top -p <pid> -g --call-graph fp
 ```
 
-If you need to find the newest `vba` process first:
+If you need to find the newest `vca` process first:
 
 ```bash
-pgrep -n vba
+pgrep -n vca
 ```
 
 ### Environment Notes

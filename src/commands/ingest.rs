@@ -283,7 +283,7 @@ pub fn run(verbose: bool, args: IngestArgs) -> Result<()> {
                 println!("GitHub PR sync: no pending GitHub updates for eligible repos");
             } else {
                 println!(
-                    "GitHub PR sync: skipped remote fetch (run `vba github token` or set PACEFLOW_GITHUB_TOKEN to enable refresh)"
+                    "GitHub PR sync: skipped remote fetch (run `vca github token` or set PACEFLOW_GITHUB_TOKEN to enable refresh)"
                 );
             }
         }
