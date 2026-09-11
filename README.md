@@ -1,192 +1,135 @@
-# AI Engineering Analytics
+# PaceFlow — AI Engineering Analytics
 
-`vba` is a local-first CLI for understanding whether coding-agent work is actually helping.
+[![CI](https://github.com/PaceFlow/ai-engineering-analytics/actions/workflows/ci.yml/badge.svg)](https://github.com/PaceFlow/ai-engineering-analytics/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/PaceFlow/ai-engineering-analytics)](https://github.com/PaceFlow/ai-engineering-analytics/releases)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-It reads local Claude Code, Codex, Cursor, and OpenCode history plus git metadata, then turns that evidence into four practical report views:
+**See which coding-agent sessions turn into shipped, lasting code—and what they cost.**
 
-- `session`: were you getting leverage, or just steering and retrying?
-- `delivery`: did AI-heavy work turn into commits that reached review or mainline?
-- `quality`: did accepted AI-generated code hold up, or did it churn out later?
-- `cost`: what did useful work cost in tokens, compute estimates, and accepted output?
+PaceFlow is a local-first CLI with an interactive terminal dashboard for engineers using **Claude Code, Codex, Cursor, and OpenCode**. It connects local assistant history with git commits to help you understand where agents save effort, where work gets stuck, and what happens to the code after it lands.
 
-The point is not to count prompts or accepted lines for their own sake. The point is to help individual engineers improve how they work with coding agents.
+The command is **`vba`**. The install package is `paceflow`; the `paceflow` command is also available as a compatibility alias.
 
-## What It Does
+[Get started](#get-started) · [Explore reports](#explore-reports) · [User guide](docs/USER_GUIDE.md) · [Troubleshooting](docs/TROUBLESHOOTING.md)
 
-Most AI coding workflows feel productive in the moment. That does not mean they were useful.
+![Full Verdict dashboard with navigation tabs, grouping and time-window controls, period-over-period trends, model comparisons, and keyboard shortcuts.](docs/images/tui-verdict.png)
 
-`vba` helps spot patterns that are easy to miss:
+*The interactive dashboard: a 90-day view of real Cursor history, with model comparisons and changes from the preceding period. All screenshots show the full running app, captured from a local data snapshot on September 11, 2026.*
 
-- sessions that felt busy but produced little accepted output
-- AI-heavy work that never made it to mainline
-- accepted code that landed quickly and was removed soon after
-- costly sessions that produced little accepted or mainline output
+## What can you learn?
 
-If those patterns show up repeatedly, you usually need tighter task slicing, better upfront constraints, earlier validation, or stricter review before accepting generated code.
+| Your question | Report | What it measures |
+| --- | --- | --- |
+| How much steering does agent work need? | `vba session` | Prompts, time to first accepted change, retry loops, and sessions followed by commits |
+| Does the work reach review and mainline? | `vba delivery` | AI-heavy commits, PR reach, merge rate, and mainline lead time |
+| Does the code hold up after landing? | `vba quality` | Code churn, follow-up fixes, and reverts |
+| What does useful output cost? | `vba cost` | Token usage, API-equivalent cost, and cost per accepted or mainline output |
 
-## Quick Start
+Use these signals to investigate your workflow: compare providers, inspect a branch or task, and see whether smaller tasks or earlier validation improve the results.
 
-Run `vba` from a git repository you want to analyze:
+## Get started
 
-```bash
-vba ingest
-vba session
-vba delivery
-vba quality
-vba cost
-```
+You need **git** on your `PATH` and local history from at least one supported coding assistant. Local reports require no PaceFlow account. GitHub PR metrics are optional.
 
-The first ingest reads local assistant history, scans git metadata, and creates the local analytics database at `~/.paceflow/paceflow.db`.
+### 1. Install
 
-To refresh just one source, use `vba ingest --provider cursor` (also `codex`, `opencode`, or `claude`). Provider ingestion failures return a nonzero exit status. `--fresh` rebuilds all providers and cannot be combined with `--provider`.
-
-`PACEFLOW_CURSOR_STATE_PATH` and `PACEFLOW_CURSOR_HISTORY_PATH` override Cursor discovery and can point at local test copies. Database copying is an external preparation step, not an application feature. When testing Windows Cursor data from WSL, use a consistent local SQLite copy (including committed WAL data) rather than opening the live Windows database. `PACEFLOW_CODEX_SESSIONS_PATH` can point both Codex ingestion paths at a copied session directory.
-
-OpenCode accepts both unified `patch` diffs and `before`/`after` snapshots. Changed OpenCode sessions refresh atomically on the next ingest, including repair of previously partial imports. After upgrading Cursor parser behavior, run `vba ingest --fresh` to rebuild existing session facts. Historical Cursor edits with no unique file mapping remain in the parse diagnostics and are excluded from file attribution; resolved edits still contribute to metrics.
-
-Use this loop when you are trying the tool for the first time:
-
-1. Run `vba ingest` after you have local Claude Code, Codex, Cursor, or OpenCode history on the machine.
-2. Run `vba session` to see whether sessions are producing accepted code and commits.
-3. Run `vba delivery` to see whether AI-heavy commits reached PRs or mainline.
-4. Run `vba quality` to see whether AI-heavy code churned, drew follow-up fixes, or was reverted.
-5. Run `vba cost` to compare API-equivalent cost against accepted and mainline output.
-6. Re-run `vba ingest` whenever you have new sessions, commits, or GitHub PR metadata to refresh.
-
-For GitHub PR reach and PR merge metrics, save a token and ingest again:
-
-```bash
-vba github token
-vba ingest
-```
-
-`PACEFLOW_GITHUB_TOKEN` can be used for CI or one-off overrides.
-
-## Installation
-
-The primary executable is `vba`; `paceflow` remains available as a compatibility alias with the same commands. The Cargo package and release archive names remain `paceflow`. Both executables share the existing `~/.paceflow` data and `PACEFLOW_*` configuration.
-
-Install a prebuilt binary with `cargo-binstall` (recommended if you have cargo):
-
-```bash
-cargo binstall paceflow
-```
-
-Or compile from crates.io:
+With the Rust toolchain installed, compile from crates.io:
 
 ```bash
 cargo install --locked paceflow
 ```
 
-Build and install from a local checkout:
+If you already have **cargo-binstall**, install a prebuilt binary:
 
 ```bash
-git clone https://github.com/PaceFlow/ai-engineering-analytics.git
-cd ai-engineering-analytics
-cargo install --path . --force
+cargo binstall paceflow
 ```
 
-Prefer not to build from source? Download a prebuilt release from [GitHub Releases](https://github.com/PaceFlow/ai-engineering-analytics/releases).
+You can also download a binary from [GitHub Releases](https://github.com/PaceFlow/ai-engineering-analytics/releases). Release targets are Linux x86_64 (glibc), macOS Apple Silicon, and Windows x86_64. See the [install notes](packaging/INSTALL.md) for platform commands, Gatekeeper, and PATH setup.
 
-Supported release targets:
+### 2. Ingest your history
 
-| Platform | Asset |
-| --- | --- |
-| Windows x86_64 | `paceflow-x86_64-pc-windows-msvc.zip` |
-| Linux x86_64 (glibc) | `paceflow-x86_64-unknown-linux-gnu.tar.gz` |
-| macOS Apple Silicon | `paceflow-aarch64-apple-darwin.tar.gz` |
-
-See [packaging/INSTALL.md](packaging/INSTALL.md) for platform-specific install commands, macOS Gatekeeper notes, and optional path overrides.
-
-If team hooks or setup scripts will call `vba`, make sure the binary is available on `PATH`; see [Add `vba` To `PATH`](packaging/INSTALL.md#add-vba-to-path).
-
-Requirements:
-
-- `git` must be installed and available on `PATH`
-- local Claude Code, Codex, Cursor, or OpenCode history must exist on the machine you run `vba` on
-- GitHub PR sync requires `vba github token` or `PACEFLOW_GITHUB_TOKEN`
-
-## Reports
-
-By default, the four report commands compare outcomes by model.
+Run from the git repository you want to analyze:
 
 ```bash
-vba session
-vba delivery
-vba quality
-vba cost
-```
-
-Use `--overall` when you want one rolled-up summary row:
-
-```bash
-vba session --overall
-vba delivery --overall
-vba quality --overall
-vba cost --overall
-```
-
-Use `--model <provider/name>` to keep the same report but narrow it to one model:
-
-```bash
-vba session --model codex/gpt-5.4
-vba delivery --model codex/gpt-5.4
-vba quality --model codex/gpt-5.4
-vba cost --model codex/gpt-5.4
-```
-
-The reports answer four questions:
-
-- `session`: which models or providers are efficient, noisy, or stuck in loops?
-- `delivery`: which AI-heavy changes actually turn into shipped work?
-- `quality`: which AI-heavy changes remain durable versus needing cleanup?
-- `cost`: which sessions or groups produce useful output for the spend?
-
-For metric definitions, status bands, grouped report behavior, and interpretation guidance, see [docs/USER_GUIDE.md](docs/USER_GUIDE.md).
-
-## Common Options
-
-`session`, `delivery`, `quality`, and `cost` share the same filter interface:
-
-- `--from YYYY-MM-DD --to YYYY-MM-DD` focuses a time window.
-- `--repo /path/to/repo` analyzes a specific repository.
-- `--all-projects` shows results across all tracked projects instead of defaulting to the current repo.
-- `--provider codex`, `--provider cursor`, `--provider claude`, or `--provider opencode` filters by provider.
-- `--group-by provider`, `--group-by model`, `--group-by branch`, or `--group-by task` changes the comparison dimension.
-- `--branch <name>` or `--task ABC-123` narrows reports to a branch or ticket-like task key.
-- `--limit <n>` controls the number of grouped rows shown.
-
-Useful examples:
-
-```bash
-vba session --list-sessions
-vba session --group-by provider
-vba delivery --group-by task
-vba delivery --group-by branch
-vba quality --group-by provider
-vba quality --group-by branch
-vba cost --group-by provider
-vba cost --group-by task
-```
-
-Use `vba <command> --help` to see command-specific options and metric notes.
-
-## Troubleshooting
-
-### Reports Say There Are No Rows
-
-Run a fresh ingest from a repository that has local assistant history and git commits:
-
-```bash
+cd /path/to/your/repo
 vba ingest
-vba session --all-projects
 ```
 
-If `session --all-projects` has rows but the plain report does not, you are probably running `vba` from a repo that has no matched sessions yet. Use `--all-projects`, run from the target repo, or pass `--repo /path/to/repo`.
+Ingestion reads local assistant history, associates code changes with git commits, and builds a SQLite analytics database at `~/.paceflow/paceflow.db`. Re-run `vba ingest` when you have new sessions or commits.
 
-### GitHub PR Metrics Are Empty Or Stale
+### 3. Explore the dashboard
 
-GitHub PR reach and PR merge metrics need a token and a fresh ingest:
+```bash
+vba tui
+```
+
+The interactive dashboard combines **Verdict, Sessions, Delivery, and Quality** views. Switch tabs with `1`–`4`, cycle model/provider/task/branch grouping with `g`, and switch between 7-, 30-, and 90-day windows with `w`. Use `↑`/`↓` to select rows, `L` to open metric definitions, and `q` to quit.
+
+Use `vba tui --all-projects` to explore all tracked repositories. The Verdict view summarizes outcomes and changes from the preceding time window; the other tabs show the underlying comparisons.
+
+### 4. Run individual reports
+
+For printable output and additional filters, use the report commands. Cost is available as a separate CLI report:
+
+```bash
+vba session                 # Compare sessions by model
+vba delivery                # See what reached review and mainline
+vba quality                 # Inspect churn, fixes, and reverts
+vba cost                    # Compare estimated cost and useful output
+```
+
+The dashboard and report commands default to the current repository and group by model. For a single printable summary, run `vba session --overall`.
+
+**No rows?** Try `vba session --all-projects` to check whether sessions were associated with another repository. See [troubleshooting](docs/TROUBLESHOOTING.md) for missing provider data and rebuild instructions.
+
+## Explore reports
+
+Compare by provider, branch, task, repository, or model. All four reports share the same filters.
+
+```bash
+vba session --group-by provider
+vba delivery --group-by branch
+vba quality --task ABC-123
+vba cost --provider codex --all-projects
+vba session --from 2026-03-01 --to 2026-03-31
+vba delivery --repo /path/to/another/repo
+```
+
+Use `--model <provider/name>` to focus on a model shown in your report, `--overall` for a summary, or `--limit 10` to shorten grouped output. `vba session --list-sessions` drills down to individual sessions. Run `vba <command> --help` for all options.
+
+### Compare workflows and outcomes
+
+The Sessions view makes differences in steering effort visible. Here, grouping by branch compares prompts, time to first change, and how often sessions are followed by a commit.
+
+![Full Sessions dashboard grouped by branch, showing prompt counts, time to first change, error rates, and session-to-commit rates with all navigation visible.](docs/images/tui-sessions-branches.png)
+
+The Quality view follows AI-heavy commits after landing. Compare churn and follow-up fixes alongside the number of commits behind each rate.
+
+![Full Quality dashboard comparing AI-heavy commit counts, churn, follow-up fixes, and reverts by model, with grouping controls and keyboard shortcuts visible.](docs/images/tui-quality.png)
+
+<details>
+<summary>More views: sessions by model, delivery, and metric definitions</summary>
+
+**Sessions by model** shows where sessions need more prompts, take longer to produce an accepted change, or produce no accepted output.
+
+![Full Sessions dashboard grouped by model, comparing prompts, time to first change, error rates, and accepted-output signals.](docs/images/tui-sessions.png)
+
+**Delivery** connects AI-heavy commits to mainline outcomes. This local snapshot has no completed GitHub PR lookups, so PR metrics remain unavailable.
+
+![Full Delivery dashboard with commit counts, AI-heavy commits, PR lookup coverage, and mainline reach by model.](docs/images/tui-delivery.png)
+
+**Metric definitions** are available inside the dashboard. Press `L` to open the legend for the current tab.
+
+![Quality metric legend open in the running dashboard, explaining heavy commits, churn, bug rate, and reverts.](docs/images/tui-legend.png)
+
+</details>
+
+*These examples reflect one engineer's Cursor history, not a cross-provider benchmark. Model labels, including default and unknown values, appear as recorded by the provider.*
+
+### Add GitHub PR context
+
+To include GitHub PR reach and merge metrics, save a token and refresh:
 
 ```bash
 vba github token
@@ -194,42 +137,44 @@ vba ingest
 vba delivery
 ```
 
-The saved token lives locally under the `PACEFLOW_HOME` base directory. `PACEFLOW_GITHUB_TOKEN` can be used for CI or one-off overrides.
+`PACEFLOW_GITHUB_TOKEN` provides an environment override for CI or one-off runs. Without GitHub credentials, you can still use local session and git analytics.
 
-### Start Over With A Clean Database
+## How it works—and how to interpret it
 
-If reports look stale, an ingest was interrupted, or you want to rebuild everything from local source data, delete the local analytics database and ingest again.
+1. **Read history:** parse locally stored assistant sessions and code changes.
+2. **Connect changes:** match AI-attributed lines to git commits and track mainline outcomes.
+3. **Report outcomes:** aggregate session, delivery, quality, and cost signals across your chosen scope.
+
+Attribution depends on the history each provider records and the changes that can be matched. An **AI-heavy commit** has matched AI-attributed lines making up at least half of its changed lines. Missing or ambiguous history can reduce coverage.
+
+Quality metrics are signals to investigate: churn and later fix-like commits do not establish that AI caused a defect. Status bands are opinionated thresholds. Cost uses provider-reported cost when available and otherwise an **API-equivalent estimate**; it does not represent your subscription bill. Unknown models can remain unpriced. Compare coverage and task context alongside the numbers.
+
+See the [user guide](docs/USER_GUIDE.md) for metric definitions, denominators, status bands, and interpretation.
+
+## Local data and optional team sync
+
+Local ingestion and reports store analytics on your machine under `~/.paceflow`. `PACEFLOW_HOME` changes the base directory; the database then lives at `$PACEFLOW_HOME/.paceflow/paceflow.db`. GitHub integration fetches remote PR metadata when a token is configured.
+
+Team sync is a separate, optional workflow. `vba sync config` sets up authentication and an organization; `vba sync push` uploads normalized analytics events to the PaceFlow backend. `vba sync schedule install` enables recurring ingestion and uploads every six hours. Check `vba sync --help` before configuring shared analytics.
+
+## Documentation and contributing
+
+- [User guide](docs/USER_GUIDE.md): metrics, grouping, and interpretation
+- [Install notes](packaging/INSTALL.md): binaries, platform setup, and configuration
+- [Troubleshooting](docs/TROUBLESHOOTING.md): missing data, provider overrides, and rebuilding
+- [Development notes](DEV.md): local workflows, profiling, and validation
+- [Architecture](docs/ARCHITECTURE.md): ingestion, storage, and the analytics pipeline
+
+Bug reports and contributions are welcome through [issues](https://github.com/PaceFlow/ai-engineering-analytics/issues) and pull requests. Include the command, platform, provider, and expected behavior; use anonymized examples when sharing session data.
+
+To build from a checkout:
 
 ```bash
-rm -f ~/.paceflow/paceflow.db ~/.paceflow/paceflow.db-wal ~/.paceflow/paceflow.db-shm
-vba ingest
-vba session
+git clone https://github.com/PaceFlow/ai-engineering-analytics.git
+cd ai-engineering-analytics
+cargo build
+cargo test
+cargo clippy --all-targets --all-features
 ```
 
-If you use a custom `PACEFLOW_HOME`, remove the database under that directory instead:
-
-```bash
-rm -f "$PACEFLOW_HOME/.paceflow/paceflow.db" "$PACEFLOW_HOME/.paceflow/paceflow.db-wal" "$PACEFLOW_HOME/.paceflow/paceflow.db-shm"
-vba ingest
-```
-
-This only removes Paceflow's derived analytics database. It does not delete Claude Code, Codex, Cursor, OpenCode, git, or GitHub source data.
-
-> Note: After upgrading to a build that changes how lines are matched (for example, the whitespace-insensitive line normalization that makes matching tolerant of reformatting), start over with a clean database so stored session line hashes are recomputed. Otherwise old hashes will not match newly scanned commits and metrics like Mainline Reach can read low.
-
-### Cursor Data Is Missing
-
-Paceflow looks for Cursor state/history in the OS config directory under `Cursor/User`. If your Cursor data lives somewhere else, point Paceflow at it before ingesting:
-
-```bash
-export PACEFLOW_CURSOR_STATE_PATH=/path/to/state.vscdb
-export PACEFLOW_CURSOR_HISTORY_PATH=/path/to/History
-vba ingest
-```
-
-## More Documentation
-
-- [User Guide](docs/USER_GUIDE.md): report interpretation, metric definitions, status bands, and grouping behavior
-- [Install Notes](packaging/INSTALL.md): release assets, platform commands, and local data requirements
-- [Development Notes](DEV.md): source workflows, tests, profiling, and validation commands
-- [Architecture](docs/ARCHITECTURE.md): ingestion, storage, and analytics pipeline internals
+Licensed under the [MIT License](LICENSE).
