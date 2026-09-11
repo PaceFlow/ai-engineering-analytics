@@ -4,7 +4,6 @@ pub mod cli;
 pub mod commands;
 pub mod cost;
 pub mod cursor_paths;
-mod cursor_snapshot;
 pub mod db;
 pub mod error;
 pub mod github;

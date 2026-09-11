@@ -122,7 +122,6 @@ impl TestEnv {
             .env_remove("HOMEDRIVE")
             .env_remove("HOMEPATH")
             .env_remove("XDG_CONFIG_HOME")
-            .env_remove("WSL_DISTRO_NAME")
             .env_remove("PACEFLOW_CURSOR_STATE_PATH")
             .env_remove("PACEFLOW_CURSOR_HISTORY_PATH")
             .env_remove("PACEFLOW_OPENCODE_DB_PATH")

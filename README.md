@@ -40,7 +40,7 @@ The first ingest reads local assistant history, scans git metadata, and creates 
 
 To refresh just one source, use `vba ingest --provider cursor` (also `codex`, `opencode`, or `claude`). Provider ingestion failures return a nonzero exit status. `--fresh` rebuilds all providers and cannot be combined with `--provider`.
 
-On WSL, Cursor discovery also checks the current Windows user's `%APPDATA%`. Windows-mounted SQLite databases are copied with their WAL into a checked Linux snapshot, cached under `~/.paceflow/cursor-snapshots`; the original database is read only. `PACEFLOW_CURSOR_STATE_PATH` and `PACEFLOW_CURSOR_HISTORY_PATH` override discovery. `PACEFLOW_CODEX_SESSIONS_PATH` can point both Codex ingestion paths at a copied session directory.
+`PACEFLOW_CURSOR_STATE_PATH` and `PACEFLOW_CURSOR_HISTORY_PATH` override Cursor discovery and can point at local test copies. Database copying is an external preparation step, not an application feature. When testing Windows Cursor data from WSL, use a consistent local SQLite copy (including committed WAL data) rather than opening the live Windows database. `PACEFLOW_CODEX_SESSIONS_PATH` can point both Codex ingestion paths at a copied session directory.
 
 OpenCode accepts both unified `patch` diffs and `before`/`after` snapshots. Changed OpenCode sessions refresh atomically on the next ingest, including repair of previously partial imports. After upgrading Cursor parser behavior, run `vba ingest --fresh` to rebuild existing session facts. Historical Cursor edits with no unique file mapping remain in the parse diagnostics and are excluded from file attribution; resolved edits still contribute to metrics.
 

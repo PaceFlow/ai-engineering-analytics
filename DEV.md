@@ -22,6 +22,17 @@ To run the optional E2E checks against those exact copies (including a second in
 VBA_LOCAL_FIXTURES="$PWD/.local-fixtures/2026-09-10" cargo test --release --test provider_metrics_e2e ingest_copied_local_databases_then_known_metrics_match -- --ignored --nocapture
 ```
 
+Copy preparation is local test setup, not application functionality. To analyze an already prepared Cursor copy directly, configure its source paths and use a separate analytics home:
+
+```bash
+PACEFLOW_HOME="$PWD/.local-fixtures/cursor-analysis" \
+PACEFLOW_CURSOR_STATE_PATH="$PWD/.local-fixtures/2026-09-10/sources/cursor/state.vscdb" \
+PACEFLOW_CURSOR_HISTORY_PATH="$PWD/.local-fixtures/2026-09-10/sources/cursor/History" \
+cargo run --release -- ingest --provider cursor
+```
+
+The application reads the configured source directly; it does not copy databases, maintain snapshot caches, or discover Windows profiles from WSL.
+
 The local case expects 9 OpenCode sessions, 232 changed lines and 51,866,246 tokens; 141 Codex sessions and 1,758,526,143 tokens; and 482 Cursor sessions. These expectations describe the dated copies, not future live history. Git-dependent attribution can vary as the original repositories change, so those metrics use the small deterministic fixtures instead. Original databases/history are never modified. Copy active SQLite databases with their WAL (or use SQLite backup); copying only the main file may omit recent data.
 
 ## Run From Source
