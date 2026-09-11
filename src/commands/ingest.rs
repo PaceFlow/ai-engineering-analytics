@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use rusqlite::Connection;
 
 use crate::analytics;
@@ -23,7 +23,10 @@ pub fn run(verbose: bool, args: IngestArgs) -> Result<()> {
     }
 
     let mut db = db::open()?;
-    let providers = providers::all_providers();
+    let providers = args
+        .provider
+        .map(|provider| vec![provider])
+        .unwrap_or_else(providers::all_providers);
     println!("Planning ingest...");
 
     let mut provider_plans = Vec::with_capacity(providers.len());
@@ -76,7 +79,7 @@ pub fn run(verbose: bool, args: IngestArgs) -> Result<()> {
                 }
                 grand_total += n;
             }
-            Err(e) => println!("  error: {}", e),
+            Err(e) => return Err(e).with_context(|| format!("ingesting {provider_name} sessions")),
         }
 
         let change_result = {
@@ -97,6 +100,12 @@ pub fn run(verbose: bool, args: IngestArgs) -> Result<()> {
         };
         match change_result {
             Ok(summary) => {
+                if summary.parse_errors > 0 {
+                    eprintln!(
+                        "Warning: {}: {} code-change records could not be attributed; available records were ingested.",
+                        summary.provider, summary.parse_errors
+                    );
+                }
                 let mut line = format!(
                     "  code changes [{}]: sources={} skipped={} calls={} ops={} parse_errors={}",
                     summary.provider,
@@ -126,7 +135,7 @@ pub fn run(verbose: bool, args: IngestArgs) -> Result<()> {
                 }
             }
             Err(e) => {
-                println!("  code changes error: {}", e);
+                return Err(e).with_context(|| format!("ingesting {provider_name} code changes"));
             }
         }
     }
@@ -274,7 +283,7 @@ pub fn run(verbose: bool, args: IngestArgs) -> Result<()> {
                 println!("GitHub PR sync: no pending GitHub updates for eligible repos");
             } else {
                 println!(
-                    "GitHub PR sync: skipped remote fetch (run `paceflow github token` or set PACEFLOW_GITHUB_TOKEN to enable refresh)"
+                    "GitHub PR sync: skipped remote fetch (run `vca github token` or set PACEFLOW_GITHUB_TOKEN to enable refresh)"
                 );
             }
         }

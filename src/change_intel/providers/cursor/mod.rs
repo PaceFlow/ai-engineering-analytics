@@ -21,7 +21,7 @@ use crate::providers::cursor::shared::{
     CursorSessionGraph, load_cursor_session_graphs_with_observer, resolve_tool_call_edits,
 };
 
-const CURSOR_CURSOR_NAMESPACE: &str = "cursor_core_v1";
+const CURSOR_CURSOR_NAMESPACE: &str = "cursor_core_v2";
 const INLINE_PARSER_NAME: &str = "cursor_inline_undo_v1";
 const PARTIAL_PARSER_NAME: &str = "cursor_partial_fates_v1";
 const NEW_SCHEMA_PARSER_NAME: &str = "cursor_new_schema_partial_fates_v1";
@@ -99,7 +99,49 @@ struct ResolvedNewSchemaPartial {
 
 #[derive(Debug, Clone, Default)]
 struct RepoContentIndex {
-    line_hash_hits: HashMap<String, Vec<(String, i64)>>,
+    line_hash_hits: HashMap<String, HashMap<String, i64>>,
+}
+
+#[derive(Default)]
+struct SessionContentIndex {
+    repo_root: Option<String>,
+    inline_hashes: HashMap<String, Vec<HashMap<String, i64>>>,
+    original_hashes: HashMap<String, HashMap<String, i64>>,
+    checkpoints: HashSet<String>,
+    strong_hints: HashSet<String>,
+    weak_hints: HashSet<String>,
+}
+
+impl SessionContentIndex {
+    fn new(
+        session: &CandidateSession,
+        hints: &[NewInlineHint],
+        candidates: &HashSet<String>,
+    ) -> Self {
+        let Some(root) = plausible_repo_root(session, hints, candidates) else {
+            return Self::default();
+        };
+        let normalize = |path: &String| normalize_repo_candidate_path(&root, path);
+        let mut inline_hashes: HashMap<String, Vec<HashMap<String, i64>>> = HashMap::new();
+        for hint in hints {
+            inline_hashes
+                .entry(normalize(&hint.abs_path))
+                .or_default()
+                .push(hash_count_map_for_lines(&hint.original_text_lines));
+        }
+        Self {
+            inline_hashes,
+            original_hashes: session
+                .original_state_contents
+                .iter()
+                .map(|(path, text)| (normalize(path), hash_count_map_for_text(text)))
+                .collect(),
+            checkpoints: session.checkpoint_paths.iter().map(normalize).collect(),
+            strong_hints: session.strong_path_hints.iter().map(normalize).collect(),
+            weak_hints: session.weak_path_hints.iter().map(normalize).collect(),
+            repo_root: Some(root),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -720,6 +762,9 @@ fn ingest_new_schema_partial_fates(
         let Some(partials) = partials_by_session.get(composer_id) else {
             continue;
         };
+        if partials.is_empty() {
+            continue;
+        }
 
         let explicit_partial_ids: HashSet<&str> = session
             .partial_targets
@@ -737,6 +782,15 @@ fn ingest_new_schema_partial_fates(
 
         let mut grouped_by_path: HashMap<String, NewPartialGroup> = HashMap::new();
         let mut deferred_errors: HashMap<String, (String, Option<String>)> = HashMap::new();
+        let mut content_cache = None;
+        let started = std::time::Instant::now();
+        if verbose {
+            eprintln!(
+                "[cursor] resolving {} partial edits for {}",
+                partials.len(),
+                composer_id
+            );
+        }
 
         for (partial_id, payload) in partials {
             if explicit_partial_ids.contains(partial_id.as_str()) {
@@ -752,6 +806,7 @@ fn ingest_new_schema_partial_fates(
                 inline_hints,
                 &prior_seen_paths,
                 &mut repo_content_indexes,
+                &mut content_cache,
             ) {
                 Ok(Some(resolved)) => {
                     let entry = grouped_by_path.entry(resolved.abs_path).or_insert_with(|| {
@@ -776,6 +831,14 @@ fn ingest_new_schema_partial_fates(
                         .or_insert_with(|| (partial_id.clone(), session.info.last_seen_at.clone()));
                 }
             }
+        }
+
+        if verbose {
+            eprintln!(
+                "[cursor] resolved partial edits for {} in {:.3}s",
+                composer_id,
+                started.elapsed().as_secs_f64()
+            );
         }
 
         for (abs_path, (call_id, timestamp, grouped_partials)) in grouped_by_path {
@@ -887,6 +950,7 @@ fn resolve_new_schema_partial_path(
     inline_hints: &[NewInlineHint],
     prior_seen_paths: &HashSet<String>,
     repo_content_indexes: &mut HashMap<String, RepoContentIndex>,
+    content_cache: &mut Option<SessionContentIndex>,
 ) -> std::result::Result<Option<ResolvedNewSchemaPartial>, String> {
     let (added_lines, removed_lines) = accepted_partial_fate_lines(payload)?;
     if added_lines.is_empty() && removed_lines.is_empty() {
@@ -1023,6 +1087,7 @@ fn resolve_new_schema_partial_path(
         inline_hints,
         &candidate_paths,
         repo_content_indexes,
+        content_cache,
     )? {
         ContentResolverDecision::Resolved(resolved) => return Ok(Some(resolved)),
         ContentResolverDecision::NoSignal => {}
@@ -1040,6 +1105,7 @@ fn resolve_new_schema_partial_path(
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn resolve_new_schema_partial_with_content(
     session: &CandidateSession,
     partial_id: &str,
@@ -1048,15 +1114,19 @@ fn resolve_new_schema_partial_with_content(
     inline_hints: &[NewInlineHint],
     export_candidate_paths: &HashSet<String>,
     repo_content_indexes: &mut HashMap<String, RepoContentIndex>,
+    content_cache: &mut Option<SessionContentIndex>,
 ) -> std::result::Result<ContentResolverDecision, String> {
-    let Some(repo_root) = plausible_repo_root(session, inline_hints, export_candidate_paths) else {
+    let prepared = content_cache.get_or_insert_with(|| {
+        SessionContentIndex::new(session, inline_hints, export_candidate_paths)
+    });
+    let Some(repo_root) = prepared.repo_root.as_deref() else {
         return Ok(ContentResolverDecision::NoSignal);
     };
 
-    let repo_content_index = load_repo_content_index(&repo_root, repo_content_indexes)?;
+    let repo_content_index = load_repo_content_index(repo_root, repo_content_indexes)?;
     let normalized_export_candidate_paths: HashSet<String> = export_candidate_paths
         .iter()
-        .map(|path| normalize_repo_candidate_path(&repo_root, path))
+        .map(|path| normalize_repo_candidate_path(repo_root, path))
         .collect();
     let added_hashes = hash_count_map_for_lines(added_lines);
     let removed_hashes = hash_count_map_for_lines(removed_lines);
@@ -1067,7 +1137,7 @@ fn resolve_new_schema_partial_with_content(
 
     let mut candidate_paths = normalized_export_candidate_paths.clone();
     for path in repo_candidate_paths_from_added_lines(repo_content_index, &added_hashes) {
-        candidate_paths.insert(normalize_repo_candidate_path(&repo_root, &path));
+        candidate_paths.insert(normalize_repo_candidate_path(repo_root, &path));
     }
 
     if candidate_paths.is_empty() {
@@ -1078,14 +1148,13 @@ fn resolve_new_schema_partial_with_content(
         .iter()
         .map(|abs_path| {
             score_new_schema_content_candidate(
-                session,
+                prepared,
                 abs_path,
-                inline_hints,
                 &removed_hashes,
                 &added_hashes,
                 repo_content_index,
                 &normalized_export_candidate_paths,
-                &repo_root,
+                repo_root,
             )
         })
         .collect();
@@ -1214,7 +1283,7 @@ fn index_repo_content_dir(
                 .line_hash_hits
                 .entry(line_hash)
                 .or_default()
-                .push((abs_path.clone(), count));
+                .insert(abs_path.clone(), count);
         }
     }
 
@@ -1241,33 +1310,26 @@ fn repo_candidate_paths_from_added_lines(
 
 #[allow(clippy::too_many_arguments)]
 fn score_new_schema_content_candidate(
-    session: &CandidateSession,
+    prepared: &SessionContentIndex,
     abs_path: &str,
-    inline_hints: &[NewInlineHint],
     removed_hashes: &HashMap<String, i64>,
     added_hashes: &HashMap<String, i64>,
     repo_content_index: &RepoContentIndex,
     export_candidate_paths: &HashSet<String>,
     repo_root: &str,
 ) -> ContentMatchScore {
-    let inline_removed_overlap = inline_hints
-        .iter()
-        .filter(|hint| normalize_repo_candidate_path(repo_root, &hint.abs_path) == abs_path)
-        .map(|hint| {
-            overlap_hash_counts(
-                removed_hashes,
-                &hash_count_map_for_lines(&hint.original_text_lines),
-            )
-        })
+    let inline_removed_overlap = prepared
+        .inline_hashes
+        .get(abs_path)
+        .into_iter()
+        .flatten()
+        .map(|hashes| overlap_hash_counts(removed_hashes, hashes))
         .max()
         .unwrap_or(0);
-    let original_state_removed_overlap = session
-        .original_state_contents
-        .iter()
-        .find_map(|(path, content)| {
-            (normalize_repo_candidate_path(repo_root, path) == abs_path)
-                .then(|| overlap_hash_counts(removed_hashes, &hash_count_map_for_text(content)))
-        })
+    let original_state_removed_overlap = prepared
+        .original_hashes
+        .get(abs_path)
+        .map(|hashes| overlap_hash_counts(removed_hashes, hashes))
         .unwrap_or(0);
     let historical_removed_overlap = inline_removed_overlap.max(original_state_removed_overlap);
 
@@ -1285,24 +1347,9 @@ fn score_new_schema_content_candidate(
         historical_removed_overlap,
         live_added_overlap,
         live_removed_overlap,
-        checkpoint_match: usize::from(
-            session
-                .checkpoint_paths
-                .iter()
-                .any(|path| normalize_repo_candidate_path(repo_root, path) == abs_path),
-        ),
-        strong_hint_match: usize::from(
-            session
-                .strong_path_hints
-                .iter()
-                .any(|path| normalize_repo_candidate_path(repo_root, path) == abs_path),
-        ),
-        weak_hint_match: usize::from(
-            session
-                .weak_path_hints
-                .iter()
-                .any(|path| normalize_repo_candidate_path(repo_root, path) == abs_path),
-        ),
+        checkpoint_match: usize::from(prepared.checkpoints.contains(abs_path)),
+        strong_hint_match: usize::from(prepared.strong_hints.contains(abs_path)),
+        weak_hint_match: usize::from(prepared.weak_hints.contains(abs_path)),
         basename_match,
         path_proximity,
     }
@@ -1350,7 +1397,7 @@ fn overlap_repo_index_hash_counts(
         let Some(hits) = repo_content_index.line_hash_hits.get(line_hash) else {
             continue;
         };
-        let Some((_path, file_count)) = hits.iter().find(|(path, _)| path == abs_path) else {
+        let Some(file_count) = hits.get(abs_path) else {
             continue;
         };
         matched += (*query_count).min(*file_count) as usize;
@@ -1460,13 +1507,14 @@ fn score_new_schema_inline_hint(
     removed_lines: &[String],
     partial_has_only_additions: bool,
 ) -> (usize, usize, usize, usize, usize) {
+    let originals: HashSet<&str> = hint
+        .original_text_lines
+        .iter()
+        .map(String::as_str)
+        .collect();
     let removed_overlap = removed_lines
         .iter()
-        .filter(|line| {
-            hint.original_text_lines
-                .iter()
-                .any(|candidate| candidate == *line)
-        })
+        .filter(|line| originals.contains(line.as_str()))
         .count();
     let new_file_match =
         usize::from(partial_has_only_additions && hint.original_text_lines.is_empty());
@@ -2181,12 +2229,25 @@ fn file_signature(path: &Path) -> Result<Option<(i64, i64)>> {
     }
 
     let md = std::fs::metadata(path)?;
-    let size = md.len() as i64;
+    let mut size = md.len() as i64;
     let mtime = md
         .modified()?
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
-        .as_secs() as i64;
+        .as_nanos() as i64;
+
+    let mut mtime = mtime;
+    let mut wal_path = path.as_os_str().to_owned();
+    wal_path.push("-wal");
+    if let Ok(wal) = std::fs::metadata(PathBuf::from(wal_path)) {
+        size += wal.len() as i64;
+        mtime = mtime.max(
+            wal.modified()?
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos() as i64,
+        );
+    }
 
     Ok(Some((mtime, size)))
 }
@@ -3733,6 +3794,7 @@ mod tests {
             &inline_hints,
             &prior_seen_paths,
             &mut repo_content_indexes,
+            &mut None,
         )
         .map_err(anyhow::Error::msg)?;
         assert_eq!(
@@ -3756,6 +3818,7 @@ mod tests {
             &inline_hints,
             &prior_seen_paths,
             &mut repo_content_indexes,
+            &mut None,
         )
         .map_err(anyhow::Error::msg)?;
         assert_eq!(

@@ -29,7 +29,7 @@ impl ProviderSessionPlan {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
 pub enum Provider {
     Claude,
     Codex,

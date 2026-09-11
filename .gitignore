@@ -1,4 +1,5 @@
 /target
+/.local-fixtures/
 profile*.json.gz
 .worktrees/
 *.code-workspace

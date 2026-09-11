@@ -216,34 +216,7 @@ fn ingest_codex_sources(
 }
 
 fn discover_codex_sources() -> Result<Vec<PathBuf>> {
-    let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Home directory not found"))?;
-    let root = home.join(".codex").join("sessions");
-
-    if !root.exists() {
-        return Ok(Vec::new());
-    }
-
-    let mut files = discover_jsonl_files(&root);
-    files.sort();
-    Ok(files)
-}
-
-fn discover_jsonl_files(root: &Path) -> Vec<PathBuf> {
-    let mut files = Vec::new();
-    let Ok(entries) = std::fs::read_dir(root) else {
-        return files;
-    };
-
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            files.extend(discover_jsonl_files(&path));
-        } else if path.extension().and_then(|x| x.to_str()) == Some("jsonl") {
-            files.push(path);
-        }
-    }
-
-    files
+    crate::providers::codex::plan_session_files()
 }
 
 fn parse_codex_source(path: &Path) -> Result<ParsedSource> {

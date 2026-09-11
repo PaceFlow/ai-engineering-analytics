@@ -1,6 +1,5 @@
 use anyhow::Result;
 use rusqlite::{Connection, TransactionBehavior};
-use serde::Deserialize;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
@@ -12,6 +11,7 @@ use crate::change_intel::types::{
     ChangeOpCandidate, LineHashCount, LineSide, ParseError, SessionInfo, WriteMode,
 };
 use crate::ingest_progress::IngestProgressObserver;
+use crate::providers::opencode::diff::SessionDiffEntry;
 use crate::providers::opencode::{ms_to_iso, open_readonly_db};
 
 const PROVIDER: &str = "opencode";
@@ -24,16 +24,6 @@ struct OpenCodeSessionRef {
     directory: Option<String>,
     source_file: String,
     last_seen_at: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct SessionDiffEntry {
-    file: String,
-    patch: String,
-    #[serde(default)]
-    additions: Option<i64>,
-    #[serde(default)]
-    deletions: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -202,18 +192,10 @@ fn build_change_op(
     entry: &SessionDiffEntry,
     index: usize,
 ) -> std::result::Result<Option<ChangeOpCandidate>, String> {
-    let patch = parse_unified_patch_lines(&entry.patch)?;
+    let patch = parse_unified_patch_lines(&entry.unified_patch().map_err(|e| e.to_string())?)?;
     if patch.added_lines == 0 && patch.removed_lines == 0 {
         return Ok(None);
     }
-
-    let _metadata_counts_match =
-        entry
-            .additions
-            .zip(entry.deletions)
-            .map(|(additions, deletions)| {
-                additions == patch.added_lines && deletions == patch.removed_lines
-            });
 
     let abs_path = resolve_diff_path(session.directory.as_deref(), &entry.file);
     let repo_root = detect_repo_root(&abs_path).or_else(|| {
@@ -327,7 +309,7 @@ fn file_signature(path: &Path) -> Result<Option<(i64, i64)>> {
     };
     let modified = metadata.modified()?;
     let duration = modified.duration_since(UNIX_EPOCH).unwrap_or_default();
-    Ok(Some((duration.as_secs() as i64, metadata.len() as i64)))
+    Ok(Some((duration.as_nanos() as i64, metadata.len() as i64)))
 }
 
 #[cfg(test)]

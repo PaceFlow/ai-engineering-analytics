@@ -1847,7 +1847,7 @@ pub fn query_cost_report(conn: &Connection, args: &ReportArgs) -> Result<Vec<Cos
             .to_string(),
     );
     select.push(
-        "COUNT(DISTINCT CASE WHEN COALESCE(actual_cost_usd, estimated_cost_usd) IS NOT NULL THEN session_id END) AS priced_session_count"
+        "COUNT(DISTINCT CASE WHEN total_tokens > 0 AND COALESCE(actual_cost_usd, estimated_cost_usd) IS NOT NULL THEN session_id END) AS priced_session_count"
             .to_string(),
     );
     select.push(
@@ -2934,6 +2934,7 @@ fn derive_repo_commit_events(
     let (mainline_added_events, mainline_removed_events) = if let Some(ref_name) = main_ref.as_ref()
     {
         load_mainline_hash_events(
+            conn,
             repo_root,
             ref_name,
             &earliest_commit_time,
@@ -3873,10 +3874,11 @@ fn load_issue_linked_bug_signal_candidates(
 }
 
 fn load_commit_added_hashes(conn: &Connection, repo_root: &str) -> Result<CommitPathHashCounts> {
+    // Keep the repository filter outside the global side/hash index scan.
     let mut stmt = conn.prepare(
         "SELECT f.commit_sha, f.rel_path, h.line_hash, h.count
          FROM fact_commit_file_change f
-         JOIN fact_commit_file_change_line_hashes h ON h.file_change_id = f.id
+         CROSS JOIN fact_commit_file_change_line_hashes h ON h.file_change_id = f.id
          WHERE f.repo_root = ?1
            AND h.side = '+'",
     )?;
@@ -3907,7 +3909,7 @@ fn load_commit_removed_hashes(conn: &Connection, repo_root: &str) -> Result<Comm
     let mut stmt = conn.prepare(
         "SELECT f.commit_sha, f.rel_path, h.line_hash, h.count
          FROM fact_commit_file_change f
-         JOIN fact_commit_file_change_line_hashes h ON h.file_change_id = f.id
+         CROSS JOIN fact_commit_file_change_line_hashes h ON h.file_change_id = f.id
          WHERE f.repo_root = ?1
            AND h.side = '-'",
     )?;
@@ -3935,12 +3937,15 @@ fn load_commit_removed_hashes(conn: &Connection, repo_root: &str) -> Result<Comm
 }
 
 fn load_session_added_availability(conn: &Connection, repo_root: &str) -> Result<PathHashCounts> {
+    // Start from this repo's changes. SQLite otherwise chooses the global
+    // side/hash index and scans every provider's added hashes for each repo.
+    // CROSS JOIN fixes the loop order while preserving the inner-join result.
     let mut stmt = conn.prepare(
         "SELECT rel_path, line_hash, SUM(provider_max) AS avail_total
          FROM (
             SELECT co.rel_path AS rel_path, hol.line_hash AS line_hash, co.provider AS provider, MAX(hol.count) AS provider_max
             FROM fact_session_code_change co
-            JOIN fact_session_code_change_line_hashes hol ON hol.code_change_id = co.id
+            CROSS JOIN fact_session_code_change_line_hashes hol ON hol.code_change_id = co.id
             WHERE co.repo_root = ?1
               AND co.rel_path IS NOT NULL
               AND hol.side = '+'
@@ -4035,6 +4040,7 @@ fn find_mainline_reached_at(
 }
 
 fn load_mainline_hash_events(
+    conn: &Connection,
     repo_root: &str,
     main_ref: &str,
     since: &DateTime<Utc>,
@@ -4046,7 +4052,15 @@ fn load_mainline_hash_events(
     let mut added = Vec::new();
     let mut removed = Vec::new();
     for sha in commits {
-        let diff = load_commit_diff(repo_root, &sha)?;
+        // Association already stores immutable commit diffs by repository/SHA.
+        // Reuse those hashes instead of spawning git again for every mainline
+        // commit on every ingest (especially costly across WSL mounts).
+        let diff = match crate::change_intel::commit_assoc::storage::load_cached_commit_diff(
+            conn, repo_root, &sha,
+        )? {
+            Some(diff) => diff,
+            None => load_commit_diff(repo_root, &sha)?,
+        };
         let commit_time = DateTime::parse_from_rfc3339(&diff.commit_time)
             .map_err(|e| anyhow!("invalid mainline commit time '{}': {}", diff.commit_time, e))?
             .with_timezone(&Utc);

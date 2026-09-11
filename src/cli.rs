@@ -1,13 +1,13 @@
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
-const SESSION_AFTER_HELP: &str = "Examples:\n  paceflow session                 # default: grouped by model\n  paceflow session --model codex/gpt-5.4\n  paceflow session --overall\n  paceflow session --group-by provider\n  paceflow session --group-by branch\n  paceflow session --branch fix/cursor-new-partial-fate-schema\n  paceflow session --list-sessions\n\nMetrics:\n  Average user prompts: average number of user prompts per session.\n  Avg time to first accepted change: minutes from session start to the first accepted code change.\n  Debug loop rate: share of sessions that look like repeated fix-retry cycles.\n  Error paste rate: share of sessions where an error message was pasted mid-session.\n  Session-to-commit rate: share of sessions followed by a commit within 4 hours.\n  No-output session rate: share of sessions with no accepted code changes.";
-const DELIVERY_AFTER_HELP: &str = "Examples:\n  paceflow delivery                # default: grouped by model\n  paceflow delivery --model codex/gpt-5.4\n  paceflow delivery --overall\n  paceflow delivery --group-by provider\n  paceflow delivery --group-by task --task ABC-123\n  paceflow delivery --group-by branch\n  paceflow delivery --branch fix/cursor-new-partial-fate-schema\n\nMetrics:\n  Heavy commits: commits where matched AI-attributed lines are at least half of changed lines.\n  PR sync: completed GitHub PR lookups per heavy commit on github.com (see table column).\n  PR reach rate: among completed lookups, share where a pull request existed.\n  Mainline reach rate: share of heavy AI commits that later reached mainline.\n  Mainline lead: average hours from commit time to mainline reach (prefer a later mainline reach timestamp; otherwise use later PR merged time).\n  PR merge rate: among completed PR-linked lookups, share whose PR merged.";
-const QUALITY_AFTER_HELP: &str = "Examples:\n  paceflow quality                 # default: grouped by model\n  paceflow quality --model codex/gpt-5.4\n  paceflow quality --overall\n  paceflow quality --group-by provider\n  paceflow quality --group-by task --task ABC-123\n  paceflow quality --group-by branch\n  paceflow quality --branch fix/cursor-new-partial-fate-schema\n\nMetrics:\n  Code churn rate: share of AI-added lines on heavy AI commits that were removed again within the churn window.\n  Bug-after-merge rate: share of merged heavy AI commits that drew a later fix-like commit within 60 days.\n  Revert rate: share of heavy AI commits that were later reverted.";
-const COST_AFTER_HELP: &str = "Examples:\n  paceflow cost                    # default: grouped by model\n  paceflow cost --overall\n  paceflow cost --group-by provider\n  paceflow cost --group-by task --task ABC-123\n  paceflow cost --provider=opencode --all-projects   # cross-repo provider totals\n\nScoped reports default to the current git repo (unless --all-projects). Filters such as --provider still apply after that scope.\n\nMetrics:\n  Cost: API-equivalent model cost when token usage can be priced.\n  Cost/accepted LOC: priced session cost divided by accepted changed lines.\n  Coverage: sessions with priced cost over sessions with token usage.";
-const GITHUB_AFTER_HELP: &str = "Examples:\n  paceflow github token\n\nGitHub token setup:\n  Use this command to save, replace, or delete the local GitHub token used for PR sync during ingest.";
-const SYNC_AFTER_HELP: &str = "Examples:\n  paceflow sync config\n  paceflow sync status\n  paceflow sync push --all-projects\n  paceflow sync schedule install\n\nSync setup:\n  Use `paceflow sync config` to authenticate with the PaceFlow backend and choose a default organization.\n  Sync uploads normalized local analytics events so shared org views stay consistent across devices.";
-const SYNC_SCHEDULE_AFTER_HELP: &str = "Examples:\n  paceflow sync schedule install\n  paceflow sync schedule status\n  paceflow sync schedule uninstall\n  paceflow sync schedule run\n\nSchedule setup:\n  Installs a user-level Paceflow schedule that runs ingest and sync push --all-projects every 6 hours.";
-const HOOKS_AFTER_HELP: &str = "Examples:\n  paceflow hooks install                         # install the composite pre-commit hook in the current repo\n  paceflow hooks install --repo /path/to/repo    # install in a specific repo\n  paceflow hooks install --force                 # overwrite an existing foreign hook instead of chaining it\n  paceflow hooks status\n  paceflow hooks pre-commit --repo .             # dry-run the gate against the current repo\n  paceflow hooks uninstall\n\nHook setup:\n  Paceflow installs a composite pre-commit hook that (1) verifies sync is configured locally and that the periodic sync schedule can be installed, then (2) runs the repository's own pre-commit checks so they are not skipped.\n  The gate fails the commit if `paceflow sync config` has not been run (or the PACEFLOW_SYNC_* env vars are not set), and installs the periodic sync schedule on first use.\n\nCoexistence:\n  If a foreign pre-commit hook already exists, Paceflow backs it up to `pre-commit.paceflow-chained` and runs it after the gate (use --force to overwrite instead). `paceflow hooks uninstall` restores the backup.\n  If a `.pre-commit-config.yaml` is present and `pre-commit` is on PATH, the composite hook invokes `pre-commit run --hook-stage pre-commit` — so you do not need to run `pre-commit install`. `paceflow hooks status` warns when configured checks would not run.";
+const SESSION_AFTER_HELP: &str = "Examples:\n  vca session                 # default: grouped by model\n  vca session --model codex/gpt-5.4\n  vca session --overall\n  vca session --group-by provider\n  vca session --group-by branch\n  vca session --branch fix/cursor-new-partial-fate-schema\n  vca session --list-sessions\n\nMetrics:\n  Average user prompts: average number of user prompts per session.\n  Avg time to first accepted change: minutes from session start to the first accepted code change.\n  Debug loop rate: share of sessions that look like repeated fix-retry cycles.\n  Error paste rate: share of sessions where an error message was pasted mid-session.\n  Session-to-commit rate: share of sessions followed by a commit within 4 hours.\n  No-output session rate: share of sessions with no accepted code changes.";
+const DELIVERY_AFTER_HELP: &str = "Examples:\n  vca delivery                # default: grouped by model\n  vca delivery --model codex/gpt-5.4\n  vca delivery --overall\n  vca delivery --group-by provider\n  vca delivery --group-by task --task ABC-123\n  vca delivery --group-by branch\n  vca delivery --branch fix/cursor-new-partial-fate-schema\n\nMetrics:\n  Heavy commits: commits where matched AI-attributed lines are at least half of changed lines.\n  PR sync: completed GitHub PR lookups per heavy commit on github.com (see table column).\n  PR reach rate: among completed lookups, share where a pull request existed.\n  Mainline reach rate: share of heavy AI commits that later reached mainline.\n  Mainline lead: average hours from commit time to mainline reach (prefer a later mainline reach timestamp; otherwise use later PR merged time).\n  PR merge rate: among completed PR-linked lookups, share whose PR merged.";
+const QUALITY_AFTER_HELP: &str = "Examples:\n  vca quality                 # default: grouped by model\n  vca quality --model codex/gpt-5.4\n  vca quality --overall\n  vca quality --group-by provider\n  vca quality --group-by task --task ABC-123\n  vca quality --group-by branch\n  vca quality --branch fix/cursor-new-partial-fate-schema\n\nMetrics:\n  Code churn rate: share of AI-added lines on heavy AI commits that were removed again within the churn window.\n  Bug-after-merge rate: share of merged heavy AI commits that drew a later fix-like commit within 60 days.\n  Revert rate: share of heavy AI commits that were later reverted.";
+const COST_AFTER_HELP: &str = "Examples:\n  vca cost                    # default: grouped by model\n  vca cost --overall\n  vca cost --group-by provider\n  vca cost --group-by task --task ABC-123\n  vca cost --provider=opencode --all-projects   # cross-repo provider totals\n\nScoped reports default to the current git repo (unless --all-projects). Filters such as --provider still apply after that scope.\n\nMetrics:\n  Cost: API-equivalent model cost when token usage can be priced.\n  Cost/accepted LOC: priced session cost divided by accepted changed lines.\n  Coverage: sessions with priced cost over sessions with token usage.";
+const GITHUB_AFTER_HELP: &str = "Examples:\n  vca github token\n\nGitHub token setup:\n  Use this command to save, replace, or delete the local GitHub token used for PR sync during ingest.";
+const SYNC_AFTER_HELP: &str = "Examples:\n  vca sync config\n  vca sync status\n  vca sync push --all-projects\n  vca sync schedule install\n\nSync setup:\n  Use `vca sync config` to authenticate with the PaceFlow backend and choose a default organization.\n  Sync uploads normalized local analytics events so shared org views stay consistent across devices.";
+const SYNC_SCHEDULE_AFTER_HELP: &str = "Examples:\n  vca sync schedule install\n  vca sync schedule status\n  vca sync schedule uninstall\n  vca sync schedule run\n\nSchedule setup:\n  Installs a user-level Paceflow schedule that runs ingest and sync push --all-projects every 6 hours.";
+const HOOKS_AFTER_HELP: &str = "Examples:\n  vca hooks install                         # install the composite pre-commit hook in the current repo\n  vca hooks install --repo /path/to/repo    # install in a specific repo\n  vca hooks install --force                 # overwrite an existing foreign hook instead of chaining it\n  vca hooks status\n  vca hooks pre-commit --repo .             # dry-run the gate against the current repo\n  vca hooks uninstall\n\nHook setup:\n  Paceflow installs a composite pre-commit hook that (1) verifies sync is configured locally and that the periodic sync schedule can be installed, then (2) runs the repository's own pre-commit checks so they are not skipped.\n  The gate fails the commit if `vca sync config` has not been run (or the PACEFLOW_SYNC_* env vars are not set), and installs the periodic sync schedule on first use.\n\nCoexistence:\n  If a foreign pre-commit hook already exists, Paceflow backs it up to `pre-commit.paceflow-chained` and runs it after the gate (use --force to overwrite instead). `vca hooks uninstall` restores the backup.\n  If a `.pre-commit-config.yaml` is present and `pre-commit` is on PATH, the composite hook invokes `pre-commit run --hook-stage pre-commit` — so you do not need to run `pre-commit install`. `vca hooks status` warns when configured checks would not run.";
 
 /// Version string baked at build time, e.g.
 /// `0.2.0 (abc123def456 clean, 2026-05-13T15:00:00+03:00)`.
@@ -24,11 +24,12 @@ const VERSION: &str = concat!(
     env!("PACEFLOW_GIT_COMMIT_TIME"),
     ")"
 );
-const TOP_LEVEL_AFTER_HELP: &str = "Quick start:\n  paceflow ingest\n  paceflow session\n  paceflow delivery\n  paceflow quality\n  paceflow cost\n\nStart here:\n  paceflow session       # default: compare workflow trust by model\n  paceflow delivery      # default: compare ship-rate by model\n  paceflow quality       # default: compare durability by model\n  paceflow cost          # default: compare spend by model\n\nTeam setup:\n  paceflow github token              # save the GitHub token used for PR sync\n  paceflow sync config               # authenticate and pick a default PaceFlow org\n  paceflow sync schedule install     # install the 6-hour ingest + push schedule\n  paceflow hooks install             # install the pre-commit setup gate in this repo\n\nManual validation:\n  paceflow event-stream --stream session-base\n\nDiscover options:\n  paceflow --help\n  paceflow <command> --help";
+const TOP_LEVEL_AFTER_HELP: &str = "Quick start:\n  vca ingest\n  vca session\n  vca delivery\n  vca quality\n  vca cost\n\nStart here:\n  vca session       # default: compare workflow trust by model\n  vca delivery      # default: compare ship-rate by model\n  vca quality       # default: compare durability by model\n  vca cost          # default: compare spend by model\n\nTeam setup:\n  vca github token              # save the GitHub token used for PR sync\n  vca sync config               # authenticate and pick a default PaceFlow org\n  vca sync schedule install     # install the 6-hour ingest + push schedule\n  vca hooks install             # install the pre-commit setup gate in this repo\n\nManual validation:\n  vca event-stream --stream session-base\n\nDiscover options:\n  vca --help\n  vca <command> --help";
 
 #[derive(Parser)]
 #[command(
-    name = "paceflow",
+    name = "vca",
+    bin_name = "vca",
     version = VERSION,
     about = "Local-first analytics for improving agent-assisted engineering outcomes",
     after_help = TOP_LEVEL_AFTER_HELP
@@ -70,6 +71,10 @@ pub enum Commands {
 
 #[derive(Args, Debug, Clone)]
 pub struct IngestArgs {
+    /// Ingest one provider (defaults to all providers).
+    #[arg(long, value_enum)]
+    pub provider: Option<crate::providers::Provider>,
+
     /// Delete the local analytics database and rebuild it from scratch.
     ///
     /// Normal ingest is incremental: already-ingested sessions and unchanged
@@ -78,7 +83,7 @@ pub struct IngestArgs {
     /// the database first, then rebuilding from local sources and git history.
     /// GitHub data is re-fetched and sync-push state is reset. Local files
     /// (GitHub token, sync config) are not touched.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "provider")]
     pub fresh: bool,
 }
 
@@ -353,7 +358,7 @@ mod tests {
 
     #[test]
     fn parses_session_group_by_repo() {
-        let cli = Cli::parse_from(["paceflow", "session", "--group-by", "repo"]);
+        let cli = Cli::parse_from(["vca", "session", "--group-by", "repo"]);
         match cli.command {
             Commands::Session(args) => assert_eq!(args.report.group_by, Some(GroupBy::Repo)),
             _ => panic!("expected session command"),
@@ -362,7 +367,7 @@ mod tests {
 
     #[test]
     fn parses_delivery_weekly_group_by_task() {
-        let cli = Cli::parse_from(["paceflow", "delivery", "--weekly", "--group-by", "task"]);
+        let cli = Cli::parse_from(["vca", "delivery", "--weekly", "--group-by", "task"]);
         match cli.command {
             Commands::Delivery(args) => {
                 assert!(args.report.weekly);
@@ -374,7 +379,7 @@ mod tests {
 
     #[test]
     fn parses_quality_group_by_branch() {
-        let cli = Cli::parse_from(["paceflow", "quality", "--group-by", "branch"]);
+        let cli = Cli::parse_from(["vca", "quality", "--group-by", "branch"]);
         match cli.command {
             Commands::Quality(args) => assert_eq!(args.report.group_by, Some(GroupBy::Branch)),
             _ => panic!("expected quality command"),
@@ -383,7 +388,7 @@ mod tests {
 
     #[test]
     fn parses_quality_model_filter() {
-        let cli = Cli::parse_from(["paceflow", "quality", "--model", "gpt-5"]);
+        let cli = Cli::parse_from(["vca", "quality", "--model", "gpt-5"]);
         match cli.command {
             Commands::Quality(args) => assert_eq!(args.report.model.as_deref(), Some("gpt-5")),
             _ => panic!("expected quality command"),
@@ -392,7 +397,7 @@ mod tests {
 
     #[test]
     fn parses_cost_group_by_task() {
-        let cli = Cli::parse_from(["paceflow", "cost", "--group-by", "task"]);
+        let cli = Cli::parse_from(["vca", "cost", "--group-by", "task"]);
         match cli.command {
             Commands::Cost(args) => assert_eq!(args.report.group_by, Some(GroupBy::Task)),
             _ => panic!("expected cost command"),
@@ -401,7 +406,7 @@ mod tests {
 
     #[test]
     fn parses_report_branch_filter() {
-        let cli = Cli::parse_from(["paceflow", "session", "--branch", "fix/test"]);
+        let cli = Cli::parse_from(["vca", "session", "--branch", "fix/test"]);
         match cli.command {
             Commands::Session(args) => assert_eq!(args.report.branch.as_deref(), Some("fix/test")),
             _ => panic!("expected session command"),
@@ -410,7 +415,7 @@ mod tests {
 
     #[test]
     fn parses_report_all_projects_flag() {
-        let cli = Cli::parse_from(["paceflow", "session", "--all-projects"]);
+        let cli = Cli::parse_from(["vca", "session", "--all-projects"]);
         match cli.command {
             Commands::Session(args) => assert!(args.report.all_projects),
             _ => panic!("expected session command"),
@@ -419,7 +424,7 @@ mod tests {
 
     #[test]
     fn parses_session_overall_flag() {
-        let cli = Cli::parse_from(["paceflow", "session", "--overall"]);
+        let cli = Cli::parse_from(["vca", "session", "--overall"]);
         match cli.command {
             Commands::Session(args) => assert!(args.overall),
             _ => panic!("expected session command"),
@@ -428,8 +433,7 @@ mod tests {
 
     #[test]
     fn overall_conflicts_with_group_by() {
-        let result =
-            Cli::try_parse_from(["paceflow", "delivery", "--overall", "--group-by", "model"]);
+        let result = Cli::try_parse_from(["vca", "delivery", "--overall", "--group-by", "model"]);
         assert!(result.is_err());
         let err = result.err().expect("expected clap conflict");
         assert_eq!(err.kind(), ErrorKind::ArgumentConflict);
@@ -437,7 +441,7 @@ mod tests {
 
     #[test]
     fn parses_event_stream_defaults() {
-        let cli = Cli::parse_from(["paceflow", "event-stream"]);
+        let cli = Cli::parse_from(["vca", "event-stream"]);
         match cli.command {
             Commands::EventStream(args) => {
                 assert_eq!(args.category, EventCategory::All);
@@ -450,7 +454,7 @@ mod tests {
 
     #[test]
     fn parses_event_stream_category_session() {
-        let cli = Cli::parse_from(["paceflow", "event-stream", "--category", "session"]);
+        let cli = Cli::parse_from(["vca", "event-stream", "--category", "session"]);
         match cli.command {
             Commands::EventStream(args) => assert_eq!(args.category, EventCategory::Session),
             _ => panic!("expected event-stream command"),
@@ -481,7 +485,7 @@ mod tests {
 
     #[test]
     fn parses_event_stream_pretty_flag() {
-        let cli = Cli::parse_from(["paceflow", "event-stream", "--pretty"]);
+        let cli = Cli::parse_from(["vca", "event-stream", "--pretty"]);
         match cli.command {
             Commands::EventStream(args) => assert!(args.pretty),
             _ => panic!("expected event-stream command"),
@@ -490,7 +494,7 @@ mod tests {
 
     #[test]
     fn parses_github_token_command() {
-        let cli = Cli::parse_from(["paceflow", "github", "token"]);
+        let cli = Cli::parse_from(["vca", "github", "token"]);
         match cli.command {
             Commands::GitHub(args) => match args.command {
                 GitHubCommands::Token => {}
@@ -501,7 +505,7 @@ mod tests {
 
     #[test]
     fn parses_sync_push_all_projects() {
-        let cli = Cli::parse_from(["paceflow", "sync", "push", "--all-projects"]);
+        let cli = Cli::parse_from(["vca", "sync", "push", "--all-projects"]);
         match cli.command {
             Commands::Sync(args) => match args.command {
                 SyncCommands::Push(push) => assert!(push.all_projects),
@@ -513,7 +517,7 @@ mod tests {
 
     #[test]
     fn parses_sync_status_repo_filter() {
-        let cli = Cli::parse_from(["paceflow", "sync", "status", "--repo", "/tmp/repo"]);
+        let cli = Cli::parse_from(["vca", "sync", "status", "--repo", "/tmp/repo"]);
         match cli.command {
             Commands::Sync(args) => match args.command {
                 SyncCommands::Status(status) => {
@@ -533,7 +537,7 @@ mod tests {
             ("uninstall", "uninstall"),
             ("run", "run"),
         ] {
-            let cli = Cli::parse_from(["paceflow", "sync", "schedule", command]);
+            let cli = Cli::parse_from(["vca", "sync", "schedule", command]);
             match cli.command {
                 Commands::Sync(args) => match args.command {
                     SyncCommands::Schedule(schedule) => match (schedule.command, expected) {
@@ -552,7 +556,7 @@ mod tests {
 
     #[test]
     fn parses_hooks_install_repo_filter() {
-        let cli = Cli::parse_from(["paceflow", "hooks", "install", "--repo", "/tmp/repo"]);
+        let cli = Cli::parse_from(["vca", "hooks", "install", "--repo", "/tmp/repo"]);
         match cli.command {
             Commands::Hooks(args) => match args.command {
                 HooksCommands::Install(hooks) => {
@@ -567,7 +571,7 @@ mod tests {
 
     #[test]
     fn parses_hooks_install_force() {
-        let cli = Cli::parse_from(["paceflow", "hooks", "install", "--force"]);
+        let cli = Cli::parse_from(["vca", "hooks", "install", "--force"]);
         match cli.command {
             Commands::Hooks(args) => match args.command {
                 HooksCommands::Install(hooks) => {
@@ -582,7 +586,7 @@ mod tests {
 
     #[test]
     fn parses_hooks_pre_commit_repo_filter() {
-        let cli = Cli::parse_from(["paceflow", "hooks", "pre-commit", "--repo", "/tmp/repo"]);
+        let cli = Cli::parse_from(["vca", "hooks", "pre-commit", "--repo", "/tmp/repo"]);
         match cli.command {
             Commands::Hooks(args) => match args.command {
                 HooksCommands::PreCommit(hooks) => {
@@ -596,7 +600,7 @@ mod tests {
 
     #[test]
     fn parses_hooks_status_repo_filter() {
-        let cli = Cli::parse_from(["paceflow", "hooks", "status", "--repo", "/tmp/repo"]);
+        let cli = Cli::parse_from(["vca", "hooks", "status", "--repo", "/tmp/repo"]);
         match cli.command {
             Commands::Hooks(args) => match args.command {
                 HooksCommands::Status(hooks) => {
@@ -610,7 +614,7 @@ mod tests {
 
     #[test]
     fn parses_hooks_uninstall_repo_filter() {
-        let cli = Cli::parse_from(["paceflow", "hooks", "uninstall", "--repo", "/tmp/repo"]);
+        let cli = Cli::parse_from(["vca", "hooks", "uninstall", "--repo", "/tmp/repo"]);
         match cli.command {
             Commands::Hooks(args) => match args.command {
                 HooksCommands::Uninstall(hooks) => {
@@ -624,8 +628,8 @@ mod tests {
 
     #[test]
     fn rejects_legacy_change_and_lifecycle_commands() {
-        assert!(Cli::try_parse_from(["paceflow", "change"]).is_err());
-        assert!(Cli::try_parse_from(["paceflow", "lifecycle"]).is_err());
+        assert!(Cli::try_parse_from(["vca", "change"]).is_err());
+        assert!(Cli::try_parse_from(["vca", "lifecycle"]).is_err());
     }
 
     #[test]
@@ -678,10 +682,10 @@ mod tests {
         let help = String::from_utf8(buffer).expect("utf8");
 
         assert!(help.contains("Team setup:"));
-        assert!(help.contains("paceflow github token"));
-        assert!(help.contains("paceflow sync config"));
-        assert!(help.contains("paceflow sync schedule install"));
-        assert!(help.contains("paceflow hooks install"));
+        assert!(help.contains("vca github token"));
+        assert!(help.contains("vca sync config"));
+        assert!(help.contains("vca sync schedule install"));
+        assert!(help.contains("vca hooks install"));
     }
 
     #[test]
@@ -695,9 +699,9 @@ mod tests {
             .expect("write hooks help");
         let help = String::from_utf8(buffer).expect("utf8");
 
-        assert!(help.contains("paceflow hooks install"));
-        assert!(help.contains("paceflow hooks pre-commit --repo ."));
-        assert!(help.contains("paceflow sync config"));
+        assert!(help.contains("vca hooks install"));
+        assert!(help.contains("vca hooks pre-commit --repo ."));
+        assert!(help.contains("vca sync config"));
     }
 
     #[test]

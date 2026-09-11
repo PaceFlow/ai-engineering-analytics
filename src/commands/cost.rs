@@ -28,10 +28,10 @@ fn render_cost_report(
     if rows.is_empty() {
         if repo_auto_injected {
             out.push_str(
-                "No cost rows found for the current repo. Run `paceflow ingest` first, or pass `--all-projects` to include data from other ingested repos.\n",
+                "No cost rows found for the current repo. Run `vca ingest` first, or pass `--all-projects` to include data from other ingested repos.\n",
             );
         } else {
-            out.push_str("No cost rows found. Run `paceflow ingest` first.\n");
+            out.push_str("No cost rows found. Run `vca ingest` first.\n");
         }
         return out;
     }

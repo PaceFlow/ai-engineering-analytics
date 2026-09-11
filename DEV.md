@@ -2,6 +2,39 @@
 
 Development-oriented workflows, profiling notes, and source-level commands live here so [README.md](README.md) can stay focused on end-user value and usage.
 
+## Provider Metric Regression Tests
+
+`cargo test --test provider_metrics_e2e` creates small provider-shaped SQLite databases and Codex JSONL files, runs the actual `vca ingest` command, and asserts derived metrics. It never seeds analytics tables. Cases cover both OpenCode diff formats, exact changed-line/token/cost totals, 50% cost coverage with a zero-token priced session, first-change latency, atomic failure/retry, changed-source refresh, Cursor edits, Codex cumulative usage, and idempotency. A real Git fixture verifies one AI-heavy mainline commit and churn changing from 0/2 to 1/2 lines after a later fix, including after cache warmup.
+
+Private source copies are kept outside version control under `.local-fixtures/2026-09-10`. Layout:
+
+```text
+sources/cursor/state.vscdb
+sources/cursor/History/
+sources/opencode/opencode.db
+sources/opencode/storage/session_diff/
+home/.codex/sessions/
+```
+
+To run the optional E2E checks against those exact copies (including a second ingestion):
+
+```bash
+VBA_LOCAL_FIXTURES="$PWD/.local-fixtures/2026-09-10" cargo test --release --test provider_metrics_e2e ingest_copied_local_databases_then_known_metrics_match -- --ignored --nocapture
+```
+
+Copy preparation is local test setup, not application functionality. To analyze an already prepared Cursor copy directly, configure its source paths and use a separate analytics home:
+
+```bash
+PACEFLOW_HOME="$PWD/.local-fixtures/cursor-analysis" \
+PACEFLOW_CURSOR_STATE_PATH="$PWD/.local-fixtures/2026-09-10/sources/cursor/state.vscdb" \
+PACEFLOW_CURSOR_HISTORY_PATH="$PWD/.local-fixtures/2026-09-10/sources/cursor/History" \
+cargo run --release -- ingest --provider cursor
+```
+
+The application reads the configured source directly; it does not copy databases, maintain snapshot caches, or discover Windows profiles from WSL.
+
+The local case expects 9 OpenCode sessions, 232 changed lines and 51,866,246 tokens; 141 Codex sessions and 1,758,526,143 tokens; and 482 Cursor sessions. These expectations describe the dated copies, not future live history. Git-dependent attribution can vary as the original repositories change, so those metrics use the small deterministic fixtures instead. Original databases/history are never modified. Copy active SQLite databases with their WAL (or use SQLite backup); copying only the main file may omit recent data.
+
 ## Run From Source
 
 Use Cargo for local development:
@@ -55,7 +88,7 @@ task install-profiler
 task profile -- ingest
 task profile -- session
 task install-live-profiler
-task profile-live PID=$(pgrep -n paceflow)
+task profile-live PID=$(pgrep -n vca)
 ```
 
 ### Browser-Based Profiling With Samply
@@ -82,10 +115,10 @@ This uses call stacks based on frame pointers:
 perf top -p <pid> -g --call-graph fp
 ```
 
-If you need to find the newest `paceflow` process first:
+If you need to find the newest `vca` process first:
 
 ```bash
-pgrep -n paceflow
+pgrep -n vca
 ```
 
 ### Environment Notes

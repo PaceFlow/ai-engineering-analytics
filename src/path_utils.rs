@@ -78,7 +78,14 @@ pub fn path_to_string(path: &Path) -> String {
 }
 
 pub fn strip_file_scheme(uri: &str) -> String {
-    if let Some(p) = uri.strip_prefix("file://localhost/") {
+    if let Some(remote) = uri.strip_prefix("vscode-remote://")
+        && let Some((authority, path)) = remote.split_once('/')
+        && percent_decode_str(authority)
+            .decode_utf8_lossy()
+            .starts_with("wsl+")
+    {
+        normalize_file_uri_path(path)
+    } else if let Some(p) = uri.strip_prefix("file://localhost/") {
         normalize_file_uri_path(p)
     } else if let Some(p) = uri.strip_prefix("file:///") {
         normalize_file_uri_path(p)

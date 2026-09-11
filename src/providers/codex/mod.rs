@@ -58,6 +58,15 @@ pub fn ingest_planned_sessions(
 }
 
 fn codex_sessions_dir() -> Result<PathBuf> {
+    if let Some(path) = std::env::var_os("PACEFLOW_CODEX_SESSIONS_PATH") {
+        let path = PathBuf::from(path);
+        anyhow::ensure!(
+            path.is_dir(),
+            "PACEFLOW_CODEX_SESSIONS_PATH is not a directory: {}",
+            path.display()
+        );
+        return Ok(path);
+    }
     let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Home directory not found"))?;
     Ok(home.join(".codex").join("sessions"))
 }

@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::TimeZone;
 use rusqlite::{Connection, OpenFlags, params};
 use serde_json::Value;
@@ -6,12 +6,16 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use crate::change_intel::storage;
 use crate::db;
 use crate::ingest_progress::IngestProgressObserver;
 
 const PROVIDER: &str = "opencode";
 
-#[derive(Debug, Clone)]
+pub(crate) mod diff;
+use diff::SessionDiffEntry;
+
+#[derive(Debug, Clone, serde::Serialize)]
 struct OpenCodeSession {
     id: String,
     directory: Option<String>,
@@ -22,14 +26,14 @@ struct OpenCodeSession {
     usage_events: Vec<OpenCodeUsageEvent>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 struct OpenCodeMessage {
     role: String,
     text: String,
     timestamp: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
 struct OpenCodeUsageEvent {
     input_tokens: i64,
     cached_input_tokens: i64,
@@ -40,17 +44,11 @@ struct OpenCodeUsageEvent {
     actual_cost_usd: Option<f64>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 struct OpenCodeAcceptedChange {
     file_path: String,
     added_lines: i64,
     removed_lines: i64,
-}
-
-#[derive(Debug, Clone, serde::Deserialize)]
-struct OpenCodeDiffEntry {
-    file: String,
-    patch: String,
 }
 
 #[derive(Debug, Clone)]
@@ -110,7 +108,8 @@ pub fn ingest_planned_sessions(
                 total_rows += written;
             }
             Err(error) => {
-                eprintln!("Warning: skipping {:?}: {}", db_path, error);
+                return Err(error)
+                    .with_context(|| format!("ingesting OpenCode database {}", db_path.display()));
             }
         }
 
@@ -123,6 +122,8 @@ pub fn ingest_planned_sessions(
 }
 
 fn ingest_db(path: &Path, analytics: &Connection) -> Result<usize> {
+    let tx = analytics.unchecked_transaction()?;
+    let analytics = &tx;
     let sessions = parse_sessions(path)?;
     let source_path = path.to_string_lossy().to_string();
     let diff_root = path
@@ -131,8 +132,28 @@ fn ingest_db(path: &Path, analytics: &Connection) -> Result<usize> {
     let mut written = 0usize;
 
     for session in sessions {
-        let already_exists = db::session_exists(analytics, &session.id)?;
-        let usage_already_exists = db::session_usage_exists(analytics, PROVIDER, &session.id)?;
+        let changes = match diff_root.as_deref() {
+            Some(root) => parse_accepted_changes(root, &session)?,
+            None => Vec::new(),
+        };
+        let digest = md5::compute(serde_json::to_vec(&(&session, &changes))?);
+        let fingerprint = i64::from_le_bytes(digest.0[..8].try_into().expect("eight bytes"));
+        let source_key = format!("{source_path}#{}", session.id);
+        const NAMESPACE: &str = "opencode_sessions_v2";
+        if storage::get_ingest_cursor(analytics, NAMESPACE, &source_key)?
+            .is_some_and(|cursor| cursor.file_size == fingerprint)
+        {
+            continue;
+        }
+        // Replace this provider's session facts atomically. This also repairs
+        // partially ingested sessions left behind by older parser failures.
+        for table in ["fact_session_message", "fact_session_usage"] {
+            analytics.execute(
+                &format!("DELETE FROM {table} WHERE provider = ?1 AND session_id = ?2"),
+                params![PROVIDER, session.id],
+            )?;
+        }
+        analytics.execute("DELETE FROM fact_session_code_change WHERE provider = ?1 AND session_id = ?2 AND source_kind = 'accepted_change'", params![PROVIDER, session.id])?;
         db::upsert_metadata_session_with_model(
             analytics,
             PROVIDER,
@@ -148,14 +169,8 @@ fn ingest_db(path: &Path, analytics: &Connection) -> Result<usize> {
             session.model_name.as_deref(),
         )?;
 
-        if already_exists && usage_already_exists {
-            continue;
-        }
-
-        if !already_exists {
-            written += 1;
-        }
-        if !usage_already_exists {
+        written += 1;
+        {
             for usage in &session.usage_events {
                 db::ingest_session_usage(
                     analytics,
@@ -182,10 +197,6 @@ fn ingest_db(path: &Path, analytics: &Connection) -> Result<usize> {
                 written += 1;
             }
         }
-        if already_exists {
-            continue;
-        }
-
         for message in &session.messages {
             let words = message.text.split_whitespace().count();
             if words == 0 {
@@ -203,8 +214,8 @@ fn ingest_db(path: &Path, analytics: &Connection) -> Result<usize> {
             written += 1;
         }
 
-        if let Some(diff_root) = diff_root.as_deref() {
-            for change in parse_accepted_changes(diff_root, &session)? {
+        {
+            for change in changes {
                 db::ingest_accepted_code_change(
                     analytics,
                     PROVIDER,
@@ -220,8 +231,10 @@ fn ingest_db(path: &Path, analytics: &Connection) -> Result<usize> {
                 written += 1;
             }
         }
+        storage::upsert_ingest_cursor(analytics, NAMESPACE, &source_key, 0, fingerprint)?;
     }
 
+    tx.commit()?;
     Ok(written)
 }
 
@@ -431,11 +444,12 @@ fn parse_accepted_changes(
         return Ok(Vec::new());
     }
 
-    let raw = std::fs::read_to_string(diff_file)?;
-    let entries: Vec<OpenCodeDiffEntry> = serde_json::from_str(&raw)?;
+    let raw = std::fs::read_to_string(&diff_file)?;
+    let entries: Vec<SessionDiffEntry> = serde_json::from_str(&raw)
+        .with_context(|| format!("reading OpenCode diff {}", diff_file.display()))?;
     let mut changes = Vec::new();
     for entry in entries {
-        let (added_lines, removed_lines) = count_unified_patch_lines(&entry.patch);
+        let (added_lines, removed_lines) = count_unified_patch_lines(&entry.unified_patch()?);
         if added_lines == 0 && removed_lines == 0 {
             continue;
         }

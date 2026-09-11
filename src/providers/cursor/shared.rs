@@ -1293,11 +1293,7 @@ fn jsonish_to_value(value: &JsonValue) -> Option<JsonValue> {
 }
 
 fn normalize_tool_path(raw: &str, project_path: Option<&str>) -> Option<String> {
-    let normalized = if raw.starts_with("file://") {
-        strip_file_scheme(raw)
-    } else {
-        normalize_filesystem_path(raw)
-    };
+    let normalized = extract_file_path_from_string(raw)?;
 
     let path = Path::new(&normalized);
     if path.is_absolute() {
@@ -1835,6 +1831,14 @@ pub(crate) fn extract_file_path_from_uri_value(uri: &JsonValue) -> Option<String
             if let Some(scheme) = map.get("scheme").and_then(|value| value.as_str())
                 && scheme != "file"
             {
+                if scheme == "vscode-remote"
+                    && let Some(authority) = map.get("authority").and_then(|v| v.as_str())
+                    && let Some(path) = map.get("path").and_then(|v| v.as_str())
+                {
+                    return extract_file_path_from_string(&format!(
+                        "vscode-remote://{authority}{path}"
+                    ));
+                }
                 return None;
             }
 
@@ -1855,6 +1859,10 @@ pub(crate) fn extract_file_path_from_uri_value(uri: &JsonValue) -> Option<String
 }
 
 pub(crate) fn extract_file_path_from_string(raw: &str) -> Option<String> {
+    if raw.starts_with("vscode-remote://") {
+        let local = strip_file_scheme(raw);
+        return (local != raw).then_some(local);
+    }
     if raw.starts_with("file://") {
         return Some(strip_file_scheme(raw));
     }
@@ -1907,6 +1915,27 @@ fn normalize_line_endings(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wsl_remote_file_uris_resolve_locally_but_ssh_uris_do_not() {
+        let expected = Some("/home/test/my repo/main.rs".to_string());
+        assert_eq!(
+            extract_file_path_from_string(
+                "vscode-remote://wsl%2BUbuntu/home/test/my%20repo/main.rs"
+            ),
+            expected
+        );
+        assert_eq!(
+            extract_file_path_from_uri_value(
+                &serde_json::json!({"scheme":"vscode-remote","authority":"wsl+Ubuntu","path":"/home/test/my%20repo/main.rs"})
+            ),
+            expected
+        );
+        assert_eq!(
+            extract_file_path_from_string("vscode-remote://ssh-remote+server/home/test/main.rs"),
+            None
+        );
+    }
     use rusqlite::{Connection, params};
     use serde_json::json;
     use tempfile::NamedTempFile;

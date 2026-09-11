@@ -985,7 +985,7 @@ fn verdict_narrative(rows: &[VerdictRow], baseline: Option<&ChangeReportRow>) ->
     if ranked.is_empty() {
         return (
             "No data yet for this window.".to_string(),
-            "Run `paceflow ingest` or widen the window to populate the verdict.".to_string(),
+            "Run `vca ingest` or widen the window to populate the verdict.".to_string(),
         );
     }
     let leader = ranked[0];
@@ -1376,7 +1376,7 @@ fn insight(text: String) -> Paragraph<'static> {
 
 fn empty_paragraph() -> Paragraph<'static> {
     Paragraph::new(Span::styled(
-        "No rows found. Run `paceflow ingest` first or widen the window.",
+        "No rows found. Run `vca ingest` first or widen the window.",
         Style::default().fg(MU),
     ))
 }
