@@ -22,7 +22,7 @@ impl TestEnv {
     }
 
     fn command(&self) -> anyhow::Result<Command> {
-        let mut command = Command::cargo_bin("paceflow")?;
+        let mut command = Command::cargo_bin("vba")?;
         command
             .current_dir(&self.home)
             .env("PACEFLOW_HOME", &self.home)

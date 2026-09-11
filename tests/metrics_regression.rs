@@ -113,7 +113,7 @@ impl TestEnv {
     }
 
     fn run_paceflow(&self, args: &[&str]) -> anyhow::Result<String> {
-        let output = Command::cargo_bin("paceflow")?
+        let output = Command::cargo_bin("vba")?
             .args(args)
             .current_dir(&self.home)
             .env("PACEFLOW_HOME", &self.home)
@@ -122,6 +122,11 @@ impl TestEnv {
             .env_remove("HOMEDRIVE")
             .env_remove("HOMEPATH")
             .env_remove("XDG_CONFIG_HOME")
+            .env_remove("WSL_DISTRO_NAME")
+            .env_remove("PACEFLOW_CURSOR_STATE_PATH")
+            .env_remove("PACEFLOW_CURSOR_HISTORY_PATH")
+            .env_remove("PACEFLOW_OPENCODE_DB_PATH")
+            .env_remove("PACEFLOW_CODEX_SESSIONS_PATH")
             .env_remove("PACEFLOW_GITHUB_TOKEN")
             .output()?;
 
@@ -773,11 +778,11 @@ fn claude_task_grouped_reports_suggest_branch_view_when_only_non_ticket_rows_exi
     ])?);
 
     assert!(session.contains("No ticket-style task rows matched."));
-    assert!(session.contains("`paceflow session --group-by branch`"));
+    assert!(session.contains("`vba session --group-by branch`"));
     assert!(delivery.contains("No ticket-style task rows matched."));
-    assert!(delivery.contains("`paceflow delivery --group-by branch`"));
+    assert!(delivery.contains("`vba delivery --group-by branch`"));
     assert!(quality.contains("No ticket-style task rows matched."));
-    assert!(quality.contains("`paceflow quality --group-by branch`"));
+    assert!(quality.contains("`vba quality --group-by branch`"));
 
     Ok(())
 }

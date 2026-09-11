@@ -1,6 +1,6 @@
 # AI Engineering Analytics
 
-`paceflow` is a local-first CLI for understanding whether coding-agent work is actually helping.
+`vba` is a local-first CLI for understanding whether coding-agent work is actually helping.
 
 It reads local Claude Code, Codex, Cursor, and OpenCode history plus git metadata, then turns that evidence into four practical report views:
 
@@ -15,7 +15,7 @@ The point is not to count prompts or accepted lines for their own sake. The poin
 
 Most AI coding workflows feel productive in the moment. That does not mean they were useful.
 
-`paceflow` helps spot patterns that are easy to miss:
+`vba` helps spot patterns that are easy to miss:
 
 - sessions that felt busy but produced little accepted output
 - AI-heavy work that never made it to mainline
@@ -26,37 +26,45 @@ If those patterns show up repeatedly, you usually need tighter task slicing, bet
 
 ## Quick Start
 
-Run `paceflow` from a git repository you want to analyze:
+Run `vba` from a git repository you want to analyze:
 
 ```bash
-paceflow ingest
-paceflow session
-paceflow delivery
-paceflow quality
-paceflow cost
+vba ingest
+vba session
+vba delivery
+vba quality
+vba cost
 ```
 
 The first ingest reads local assistant history, scans git metadata, and creates the local analytics database at `~/.paceflow/paceflow.db`.
 
+To refresh just one source, use `vba ingest --provider cursor` (also `codex`, `opencode`, or `claude`). Provider ingestion failures return a nonzero exit status. `--fresh` rebuilds all providers and cannot be combined with `--provider`.
+
+On WSL, Cursor discovery also checks the current Windows user's `%APPDATA%`. Windows-mounted SQLite databases are copied with their WAL into a checked Linux snapshot, cached under `~/.paceflow/cursor-snapshots`; the original database is read only. `PACEFLOW_CURSOR_STATE_PATH` and `PACEFLOW_CURSOR_HISTORY_PATH` override discovery. `PACEFLOW_CODEX_SESSIONS_PATH` can point both Codex ingestion paths at a copied session directory.
+
+OpenCode accepts both unified `patch` diffs and `before`/`after` snapshots. Changed OpenCode sessions refresh atomically on the next ingest, including repair of previously partial imports. After upgrading Cursor parser behavior, run `vba ingest --fresh` to rebuild existing session facts. Historical Cursor edits with no unique file mapping remain in the parse diagnostics and are excluded from file attribution; resolved edits still contribute to metrics.
+
 Use this loop when you are trying the tool for the first time:
 
-1. Run `paceflow ingest` after you have local Claude Code, Codex, Cursor, or OpenCode history on the machine.
-2. Run `paceflow session` to see whether sessions are producing accepted code and commits.
-3. Run `paceflow delivery` to see whether AI-heavy commits reached PRs or mainline.
-4. Run `paceflow quality` to see whether AI-heavy code churned, drew follow-up fixes, or was reverted.
-5. Run `paceflow cost` to compare API-equivalent cost against accepted and mainline output.
-6. Re-run `paceflow ingest` whenever you have new sessions, commits, or GitHub PR metadata to refresh.
+1. Run `vba ingest` after you have local Claude Code, Codex, Cursor, or OpenCode history on the machine.
+2. Run `vba session` to see whether sessions are producing accepted code and commits.
+3. Run `vba delivery` to see whether AI-heavy commits reached PRs or mainline.
+4. Run `vba quality` to see whether AI-heavy code churned, drew follow-up fixes, or was reverted.
+5. Run `vba cost` to compare API-equivalent cost against accepted and mainline output.
+6. Re-run `vba ingest` whenever you have new sessions, commits, or GitHub PR metadata to refresh.
 
 For GitHub PR reach and PR merge metrics, save a token and ingest again:
 
 ```bash
-paceflow github token
-paceflow ingest
+vba github token
+vba ingest
 ```
 
 `PACEFLOW_GITHUB_TOKEN` can be used for CI or one-off overrides.
 
 ## Installation
+
+The primary executable is `vba`; `paceflow` remains available as a compatibility alias with the same commands. The Cargo package and release archive names remain `paceflow`. Both executables share the existing `~/.paceflow` data and `PACEFLOW_*` configuration.
 
 Install a prebuilt binary with `cargo-binstall` (recommended if you have cargo):
 
@@ -90,41 +98,41 @@ Supported release targets:
 
 See [packaging/INSTALL.md](packaging/INSTALL.md) for platform-specific install commands, macOS Gatekeeper notes, and optional path overrides.
 
-If team hooks or setup scripts will call `paceflow`, make sure the binary is available on `PATH`; see [Add `paceflow` To `PATH`](packaging/INSTALL.md#add-paceflow-to-path).
+If team hooks or setup scripts will call `vba`, make sure the binary is available on `PATH`; see [Add `vba` To `PATH`](packaging/INSTALL.md#add-vba-to-path).
 
 Requirements:
 
 - `git` must be installed and available on `PATH`
-- local Claude Code, Codex, Cursor, or OpenCode history must exist on the machine you run `paceflow` on
-- GitHub PR sync requires `paceflow github token` or `PACEFLOW_GITHUB_TOKEN`
+- local Claude Code, Codex, Cursor, or OpenCode history must exist on the machine you run `vba` on
+- GitHub PR sync requires `vba github token` or `PACEFLOW_GITHUB_TOKEN`
 
 ## Reports
 
 By default, the four report commands compare outcomes by model.
 
 ```bash
-paceflow session
-paceflow delivery
-paceflow quality
-paceflow cost
+vba session
+vba delivery
+vba quality
+vba cost
 ```
 
 Use `--overall` when you want one rolled-up summary row:
 
 ```bash
-paceflow session --overall
-paceflow delivery --overall
-paceflow quality --overall
-paceflow cost --overall
+vba session --overall
+vba delivery --overall
+vba quality --overall
+vba cost --overall
 ```
 
 Use `--model <provider/name>` to keep the same report but narrow it to one model:
 
 ```bash
-paceflow session --model codex/gpt-5.4
-paceflow delivery --model codex/gpt-5.4
-paceflow quality --model codex/gpt-5.4
-paceflow cost --model codex/gpt-5.4
+vba session --model codex/gpt-5.4
+vba delivery --model codex/gpt-5.4
+vba quality --model codex/gpt-5.4
+vba cost --model codex/gpt-5.4
 ```
 
 The reports answer four questions:
@@ -151,17 +159,17 @@ For metric definitions, status bands, grouped report behavior, and interpretatio
 Useful examples:
 
 ```bash
-paceflow session --list-sessions
-paceflow session --group-by provider
-paceflow delivery --group-by task
-paceflow delivery --group-by branch
-paceflow quality --group-by provider
-paceflow quality --group-by branch
-paceflow cost --group-by provider
-paceflow cost --group-by task
+vba session --list-sessions
+vba session --group-by provider
+vba delivery --group-by task
+vba delivery --group-by branch
+vba quality --group-by provider
+vba quality --group-by branch
+vba cost --group-by provider
+vba cost --group-by task
 ```
 
-Use `paceflow <command> --help` to see command-specific options and metric notes.
+Use `vba <command> --help` to see command-specific options and metric notes.
 
 ## Troubleshooting
 
@@ -170,20 +178,20 @@ Use `paceflow <command> --help` to see command-specific options and metric notes
 Run a fresh ingest from a repository that has local assistant history and git commits:
 
 ```bash
-paceflow ingest
-paceflow session --all-projects
+vba ingest
+vba session --all-projects
 ```
 
-If `session --all-projects` has rows but the plain report does not, you are probably running `paceflow` from a repo that has no matched sessions yet. Use `--all-projects`, run from the target repo, or pass `--repo /path/to/repo`.
+If `session --all-projects` has rows but the plain report does not, you are probably running `vba` from a repo that has no matched sessions yet. Use `--all-projects`, run from the target repo, or pass `--repo /path/to/repo`.
 
 ### GitHub PR Metrics Are Empty Or Stale
 
 GitHub PR reach and PR merge metrics need a token and a fresh ingest:
 
 ```bash
-paceflow github token
-paceflow ingest
-paceflow delivery
+vba github token
+vba ingest
+vba delivery
 ```
 
 The saved token lives locally under the `PACEFLOW_HOME` base directory. `PACEFLOW_GITHUB_TOKEN` can be used for CI or one-off overrides.
@@ -194,15 +202,15 @@ If reports look stale, an ingest was interrupted, or you want to rebuild everyth
 
 ```bash
 rm -f ~/.paceflow/paceflow.db ~/.paceflow/paceflow.db-wal ~/.paceflow/paceflow.db-shm
-paceflow ingest
-paceflow session
+vba ingest
+vba session
 ```
 
 If you use a custom `PACEFLOW_HOME`, remove the database under that directory instead:
 
 ```bash
 rm -f "$PACEFLOW_HOME/.paceflow/paceflow.db" "$PACEFLOW_HOME/.paceflow/paceflow.db-wal" "$PACEFLOW_HOME/.paceflow/paceflow.db-shm"
-paceflow ingest
+vba ingest
 ```
 
 This only removes Paceflow's derived analytics database. It does not delete Claude Code, Codex, Cursor, OpenCode, git, or GitHub source data.
@@ -216,7 +224,7 @@ Paceflow looks for Cursor state/history in the OS config directory under `Cursor
 ```bash
 export PACEFLOW_CURSOR_STATE_PATH=/path/to/state.vscdb
 export PACEFLOW_CURSOR_HISTORY_PATH=/path/to/History
-paceflow ingest
+vba ingest
 ```
 
 ## More Documentation

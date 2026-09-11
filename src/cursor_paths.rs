@@ -5,7 +5,21 @@ pub const CURSOR_STATE_PATH_ENV: &str = "PACEFLOW_CURSOR_STATE_PATH";
 pub const CURSOR_HISTORY_PATH_ENV: &str = "PACEFLOW_CURSOR_HISTORY_PATH";
 
 pub fn cursor_state_path() -> Result<Option<PathBuf>> {
-    resolve_state_path_from(None, &default_cursor_user_roots())
+    let Some(path) = resolve_state_path_from(None, &default_cursor_user_roots())? else {
+        return Ok(None);
+    };
+    if cfg!(target_os = "linux") && path.starts_with("/mnt") {
+        let home = std::env::var_os("PACEFLOW_HOME")
+            .map(PathBuf::from)
+            .or_else(dirs::home_dir)
+            .ok_or_else(|| anyhow::anyhow!("Home directory not found"))?;
+        return crate::cursor_snapshot::snapshot_database(
+            &path,
+            &home.join(".paceflow/cursor-snapshots"),
+        )
+        .map(Some);
+    }
+    Ok(Some(path))
 }
 
 pub fn cursor_history_path() -> Result<Option<PathBuf>> {
@@ -99,7 +113,31 @@ fn env_override(env_var: &str) -> Option<PathBuf> {
 }
 
 fn default_cursor_user_roots() -> Vec<PathBuf> {
-    build_cursor_user_roots(dirs::config_dir(), dirs::home_dir())
+    let mut roots = build_cursor_user_roots(dirs::config_dir(), dirs::home_dir());
+    // Only use the current Windows profile, never another user's history.
+    if cfg!(target_os = "linux")
+        && std::env::var_os("WSL_DISTRO_NAME").is_some()
+        && let Ok(output) = std::process::Command::new("/mnt/c/Windows/System32/cmd.exe")
+            .args(["/C", "echo", "%APPDATA%"])
+            .output()
+        && output.status.success()
+    {
+        let windows_path = String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .replace('\\', "/");
+        let bytes = windows_path.as_bytes();
+        if bytes.len() > 3 && bytes[0].is_ascii_alphabetic() && &bytes[1..3] == b":/" {
+            roots.push(
+                PathBuf::from(format!(
+                    "/mnt/{}/{}",
+                    (bytes[0] as char).to_ascii_lowercase(),
+                    &windows_path[3..]
+                ))
+                .join("Cursor/User"),
+            );
+        }
+    }
+    roots
 }
 
 fn build_cursor_user_roots(config_dir: Option<PathBuf>, home_dir: Option<PathBuf>) -> Vec<PathBuf> {

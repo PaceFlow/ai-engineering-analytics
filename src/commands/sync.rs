@@ -37,7 +37,7 @@ fn run_config() -> Result<()> {
 
 fn run_push(args: SyncPushArgs) -> Result<()> {
     let config = resolved_sync_config()?
-        .ok_or_else(|| anyhow!("Sync is not configured. Run `paceflow sync config` first."))?;
+        .ok_or_else(|| anyhow!("Sync is not configured. Run `vba sync config` first."))?;
     let scope = resolve_sync_scope(args.repo.as_deref(), args.all_projects)?;
     let mut conn = db::open()?;
     let pending = pending_sync_events(&conn, &config.organization_id, &scope)?;
@@ -170,7 +170,7 @@ fn run_schedule(command: SyncScheduleCommands) -> Result<()> {
 
 fn run_status(args: SyncStatusArgs) -> Result<()> {
     let Some(config) = resolved_sync_config()? else {
-        println!("Sync is not configured. Run `paceflow sync config` first.");
+        println!("Sync is not configured. Run `vba sync config` first.");
         return Ok(());
     };
 
@@ -365,7 +365,7 @@ fn print_env_override_notice() {
 
     println!(
         "{} is currently set but will be ignored because a saved sync configuration is now present. \
-         Unset it (or run `paceflow sync reset`) if you intended to use the environment value.",
+         Unset it (or run `vba sync reset`) if you intended to use the environment value.",
         active.join(", ")
     );
 }

@@ -44,14 +44,14 @@ fn render_quality_report(
     if rows.is_empty() {
         if show_branch_hint {
             out.push_str(
-                "No ticket-style task rows matched. Try `paceflow quality --group-by branch` or `--overall`.\n",
+                "No ticket-style task rows matched. Try `vba quality --group-by branch` or `--overall`.\n",
             );
         } else if repo_auto_injected {
             out.push_str(
-                "No quality rows found for the current repo. Run `paceflow ingest` first, or pass `--all-projects` to include data from other ingested repos.\n",
+                "No quality rows found for the current repo. Run `vba ingest` first, or pass `--all-projects` to include data from other ingested repos.\n",
             );
         } else {
-            out.push_str("No quality rows found. Run `paceflow ingest` first.\n");
+            out.push_str("No quality rows found. Run `vba ingest` first.\n");
         }
         return out;
     }
@@ -279,8 +279,8 @@ mod tests {
 
         let rendered = render_quality_report(&[], &report, true, false);
         assert!(rendered.contains("No ticket-style task rows matched."));
-        assert!(rendered.contains("`paceflow quality --group-by branch`"));
-        assert!(!rendered.contains("Run `paceflow ingest` first."));
+        assert!(rendered.contains("`vba quality --group-by branch`"));
+        assert!(!rendered.contains("Run `vba ingest` first."));
     }
 
     #[test]
