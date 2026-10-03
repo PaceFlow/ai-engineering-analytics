@@ -1,0 +1,20 @@
+---
+source: tests/metrics_regression.rs
+expression: lifecycle
+---
+Quality Metrics
+Heavy commits analyzed: 3
+
+┌─────────────────┬─────────────────┬────────┐
+│ Signal          │ Value           │ Status │
+├─────────────────┼─────────────────┼────────┤
+│ Code churn      │ 1.47% (59/4006) │ good   │
+│ Bug-after-merge │ 33.33% (1/3)    │ risk   │
+│ Reverts         │ 0.00% (0/3)     │ good   │
+└─────────────────┴─────────────────┴────────┘
+
+Legend:
+- Code churn: share of AI-added lines on heavy AI commits that were later removed within the churn window.
+- Bug-after-merge: share of merged heavy AI commits that drew a later fix-like commit within 60 days.
+- Reverts: share of heavy AI commits that were later reverted.
+- Status: lower is better for all quality signals.

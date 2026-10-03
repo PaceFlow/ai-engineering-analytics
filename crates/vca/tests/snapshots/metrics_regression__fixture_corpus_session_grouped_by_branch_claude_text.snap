@@ -1,0 +1,13 @@
+---
+source: tests/metrics_regression.rs
+expression: session
+---
+Session Metrics
+
+Branch                        Sessions     Prompts    First Chg            Loop           Error       To Commit       No Output
+staging                              1        1.00          0.0            0.0%            0.0%            0.0%            0.0%
+
+Legend:
+- Prompts = avg prompts per session.
+- First Chg = avg minutes to first accepted code change.
+- Loop, Error, To Commit, and No Output = percentage rates.

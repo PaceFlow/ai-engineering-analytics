@@ -6,61 +6,72 @@ on:
       - "v*.*.*"
 
 jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Verify release versions
+        run: python3 packaging/publish.py --check-tag
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - run: python3 -m unittest discover -s packaging -p "test_*.py"
+      - name: Verify standalone source packages
+        run: python3 packaging/verify_packages.py
+
   test:
+    needs: validate
     name: test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os:
-          - ubuntu-24.04
-          - windows-2022
-          - macos-14
+        os: [ubuntu-24.04, windows-2022, macos-14]
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
-      - name: Run tests
-        run: cargo test --all-targets --quiet
+      - run: cargo test --workspace --all-targets --locked --quiet
 
   package:
-    name: package (${{ matrix.target }})
+    name: package (${{ matrix.product }}, ${{ matrix.platform.target }})
     needs: test
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.platform.os }}
     strategy:
       fail-fast: false
       matrix:
-        include:
+        product: [vca, paceflow]
+        platform:
           - os: windows-2022
             target: x86_64-pc-windows-msvc
-            archive_name: paceflow-x86_64-pc-windows-msvc
-            binary_name: paceflow.exe
-            archive_ext: zip
+            ext: zip
+            binary_ext: .exe
           - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
-            archive_name: paceflow-x86_64-unknown-linux-gnu
-            binary_name: paceflow
-            archive_ext: tar.gz
+            ext: tar.gz
+            binary_ext: ""
           - os: macos-14
             target: aarch64-apple-darwin
-            archive_name: paceflow-aarch64-apple-darwin
-            binary_name: paceflow
-            archive_ext: tar.gz
+            ext: tar.gz
+            binary_ext: ""
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - name: Build release binary
-        run: cargo build --release --bin paceflow
+        run: cargo build --locked --release -p ${{ matrix.product == 'vca' && 'vibe-coding-analytics' || 'paceflow' }} --bin ${{ matrix.product }}
       - name: Package archive (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $archiveName = "${{ matrix.archive_name }}"
+          $archiveName = "${{ matrix.product }}-${{ matrix.platform.target }}"
           $stageDir = Join-Path "dist" $archiveName
           New-Item -ItemType Directory -Force -Path $stageDir | Out-Null
-          Copy-Item "target/release/${{ matrix.binary_name }}" $stageDir
-          Copy-Item "packaging/INSTALL.md" $stageDir
+          Copy-Item "target/release/${{ matrix.product }}.exe" $stageDir
+          Copy-Item "crates/${{ matrix.product }}/README.md" $stageDir
+          Copy-Item "LICENSE" $stageDir
           $archivePath = Join-Path "dist" "$archiveName.zip"
-          Compress-Archive -Path "$stageDir/*" -DestinationPath $archivePath -Force
+          Compress-Archive -Path $stageDir -DestinationPath $archivePath -Force
           $hash = (Get-FileHash $archivePath -Algorithm SHA256).Hash.ToLower()
           "$hash  $(Split-Path $archivePath -Leaf)" | Out-File "$archivePath.sha256" -Encoding ascii
       - name: Package archive (Unix)
@@ -68,24 +79,32 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          archive_name="${{ matrix.archive_name }}"
+          archive_name="${{ matrix.product }}-${{ matrix.platform.target }}"
           stage_dir="dist/${archive_name}"
           mkdir -p "${stage_dir}"
-          cp "target/release/${{ matrix.binary_name }}" "${stage_dir}/"
-          cp packaging/INSTALL.md "${stage_dir}/"
+          cp "target/release/${{ matrix.product }}" "${stage_dir}/"
+          cp "crates/${{ matrix.product }}/README.md" LICENSE "${stage_dir}/"
           tar -C dist -czf "dist/${archive_name}.tar.gz" "${archive_name}"
           shasum -a 256 "dist/${archive_name}.tar.gz" > "dist/${archive_name}.tar.gz.sha256"
-      - name: Upload packaged artifacts
-        uses: actions/upload-artifact@v4
+      - name: Verify archive layout and execution
+        shell: bash
+        run: python3 packaging/verify_archive.py "${{ matrix.product }}" "${{ matrix.platform.target }}" "${GITHUB_REF_NAME#v}"
+      - uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.archive_name }}
+          name: ${{ matrix.product }}-${{ matrix.platform.target }}
           path: |
-            dist/*.${{ matrix.archive_ext }}
-            dist/*.${{ matrix.archive_ext }}.sha256
+            dist/*.${{ matrix.platform.ext }}
+            dist/*.${{ matrix.platform.ext }}.sha256
+
+  crates:
+    needs: package
+    uses: ./.github/workflows/publish.yml
+    secrets:
+      CRATES_PUBLISH_TOKEN: ${{ secrets.CRATES_PUBLISH_TOKEN }}
 
   publish:
-    name: publish release
-    needs: package
+    name: Publish GitHub release
+    needs: crates
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -100,3 +119,28 @@ jobs:
         with:
           body_path: packaging/RELEASE_NOTES.md
           files: dist/*
+
+  install-prebuilt:
+    name: Install published binaries (${{ matrix.os }})
+    needs: publish
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2022, macos-14]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-binstall
+      - name: Verify prebuilt installation from release metadata
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          cargo binstall --no-confirm --strategies crate-meta-data --root "$RUNNER_TEMP/analytics-install" "vibe-coding-analytics@$version" "paceflow@$version"
+          "$RUNNER_TEMP/analytics-install/bin/vca" --version
+          "$RUNNER_TEMP/analytics-install/bin/paceflow" --version

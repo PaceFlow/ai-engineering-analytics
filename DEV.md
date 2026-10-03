@@ -18,10 +18,10 @@ cargo run -- quality
 Use the standard Rust workflow:
 
 ```bash
-cargo build
-cargo test
+cargo build --workspace
+cargo test --workspace --all-targets
 cargo fmt
-cargo clippy --all-targets --all-features
+cargo clippy --workspace --all-targets --all-features
 ```
 
 ## Live GitHub Test

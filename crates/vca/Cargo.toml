@@ -1,0 +1,57 @@
+[package]
+name = "vibe-coding-analytics"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Vibe Coding Analytics: local-first analytics for agent-assisted engineering."
+readme = "README.md"
+default-run = "vca"
+autobins = false
+include = ["/src/**", "/build.rs", "/Cargo.toml", "/Cargo.lock", "/README.md", "/USER_GUIDE.md", "/LICENSE"]
+
+[lib]
+name = "vca"
+
+[[bin]]
+name = "vca"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+dirs.workspace = true
+md5.workspace = true
+chrono.workspace = true
+similar.workspace = true
+terminal_size.workspace = true
+regex.workspace = true
+percent-encoding.workspace = true
+reqwest.workspace = true
+tokio.workspace = true
+rayon.workspace = true
+ratatui.workspace = true
+fs2.workspace = true
+tempfile.workspace = true
+
+[dev-dependencies]
+assert_cmd.workspace = true
+insta.workspace = true
+
+[features]
+test-support = []
+
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/vca-{ target }{ archive-suffix }"
+bin-dir = "vca-{ target }/{ bin }{ binary-ext }"
+pkg-fmt = "tgz"
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-fmt = "zip"
