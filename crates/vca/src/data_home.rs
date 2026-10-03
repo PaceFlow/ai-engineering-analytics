@@ -52,7 +52,7 @@ pub fn lock_at(home: &Path) -> Result<DataLock> {
     loop {
         match file.try_lock_exclusive() {
             Ok(()) => return Ok(DataLock { _file: file }),
-            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+            Err(err) if err.raw_os_error() == fs2::lock_contended_error().raw_os_error() => {
                 ensure!(
                     started.elapsed() < Duration::from_secs(30),
                     "Analytics database is busy. Wait for the other analytics command to finish and retry."
