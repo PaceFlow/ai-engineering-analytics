@@ -1,5 +1,8 @@
 # AI Engineering Analytics
 
+[![Website](https://img.shields.io/badge/website-paceflow.io-blue)](https://www.paceflow.io)
+[![GitHub](https://img.shields.io/badge/github-PaceFlow-black)](https://github.com/PaceFlow)
+
 `paceflow` is a local-first CLI for understanding whether coding-agent work is actually helping.
 
 It reads local Claude Code, Codex, Cursor, and OpenCode history plus git metadata, then turns that evidence into four practical report views:
