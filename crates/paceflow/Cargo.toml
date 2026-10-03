@@ -1,0 +1,46 @@
+[package]
+name = "paceflow"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Local engineering analytics with optional Paceflow backend synchronization."
+readme = "README.md"
+default-run = "paceflow"
+autobins = false
+include = ["/src/**", "/build.rs", "/Cargo.toml", "/Cargo.lock", "/README.md", "/USER_GUIDE.md", "/LICENSE"]
+
+[[bin]]
+name = "paceflow"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+dirs.workspace = true
+md5.workspace = true
+chrono.workspace = true
+regex.workspace = true
+reqwest.workspace = true
+tokio.workspace = true
+vca = { package = "vibe-coding-analytics", path = "../vca", version = "=0.3.0" }
+
+[dev-dependencies]
+tempfile.workspace = true
+assert_cmd.workspace = true
+insta.workspace = true
+vca = { package = "vibe-coding-analytics", path = "../vca", version = "=0.3.0", features = ["test-support"] }
+
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/paceflow-{ target }{ archive-suffix }"
+bin-dir = "paceflow-{ target }/{ bin }{ binary-ext }"
+pkg-fmt = "tgz"
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-fmt = "zip"

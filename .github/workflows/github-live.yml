@@ -40,4 +40,4 @@ jobs:
           echo "Skipping live GitHub test: missing PACEFLOW_GITHUB_TOKEN secret"
       - name: Run live GitHub test
         if: steps.config.outputs.enabled == 'true'
-        run: cargo test --test github_live -- --ignored --nocapture
+        run: cargo test -p paceflow --test github_live -- --ignored --nocapture

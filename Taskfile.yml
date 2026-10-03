@@ -15,7 +15,7 @@ tasks:
   build-release:
     desc: Build the release binary with profiling-friendly project settings
     cmds:
-      - cargo build --release
+      - cargo build --release -p paceflow
 
   profile:
     desc: "Profile the release binary with samply. Example: task profile -- ingest"

@@ -1,0 +1,16 @@
+---
+source: tests/metrics_regression.rs
+expression: session_weekly
+---
+Session Metrics
+
+Week        Provider                      Sessions     Prompts    First Chg            Loop           Error       To Commit       No Output
+2026-03-02  codex                                1      117.00        342.5            0.0%          100.0%          100.0%            0.0%
+2026-03-02  cursor                               1        1.00          0.0            0.0%            0.0%            0.0%            0.0%
+2026-03-09  claude                               1        1.00          0.0            0.0%            0.0%          100.0%            0.0%
+2026-03-09  codex                                1       15.00        298.3            0.0%          100.0%          100.0%            0.0%
+
+Legend:
+- Prompts = avg prompts per session.
+- First Chg = avg minutes to first accepted code change.
+- Loop, Error, To Commit, and No Output = percentage rates.
