@@ -243,7 +243,8 @@ fn migrate(source: &Path, target: &Path) -> Result<()> {
             token_copy.persist_noclobber(&token_target)?;
         }
     }
-    File::open(&staged)?.sync_all()?;
+    // Windows requires a writable handle to flush the completed database copy.
+    OpenOptions::new().write(true).open(&staged)?.sync_all()?;
     fs::rename(&staged, target)?;
     Ok(())
 }
