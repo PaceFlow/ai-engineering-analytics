@@ -1,23 +1,20 @@
-[package]
-name = "paceflow"
-version = "0.2.5"
+[workspace]
+members = ["crates/vca", "crates/paceflow"]
+default-members = ["crates/paceflow"]
+resolver = "3"
+
+[workspace.package]
+version = "0.3.0"
 edition = "2024"
-default-run = "paceflow"
-description = "Local-first CLI that turns AI coding session history and git metadata into engineering analytics."
 license = "MIT"
 repository = "https://github.com/PaceFlow/ai-engineering-analytics"
 homepage = "https://github.com/PaceFlow/ai-engineering-analytics"
-readme = "README.md"
 keywords = ["analytics", "ai", "cli", "git", "developer-tools"]
 categories = ["command-line-utilities", "development-tools"]
 
-[[bin]]
-name = "paceflow"
-path = "src/main.rs"
-
-[dependencies]
-clap = { version = "4.5.60", features = ["derive"] }
-rusqlite = { version = "0.38.0", features = ["bundled"] }
+[workspace.dependencies]
+clap = { version = "4.5.60", features = ["derive", "string"] }
+rusqlite = { version = "0.38.0", features = ["bundled", "backup"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = { version = "1.0.149", features = ["raw_value"] }
 anyhow = "1.0.102"
@@ -33,19 +30,10 @@ reqwest = { version = "0.12.24", default-features = false, features = ["json", "
 tokio = { version = "1.48.0", features = ["net", "rt", "sync", "time"] }
 rayon = "1.12.0"
 ratatui = "0.30.0"
-
-[dev-dependencies]
+fs2 = "0.4.3"
+tempfile = "3.23.0"
 assert_cmd = "2.1.1"
 insta = { version = "1.43.2", features = ["yaml"] }
-tempfile = "3.23.0"
 
 [profile.release]
 debug = "line-tables-only"
-
-[package.metadata.binstall]
-pkg-url = "{ repo }/releases/download/v{ version }/paceflow-{ target }{ archive-suffix }"
-bin-dir = "paceflow-{ target }/{ bin }{ binary-ext }"
-pkg-fmt = "tgz"
-
-[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
-pkg-fmt = "zip"

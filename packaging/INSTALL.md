@@ -1,3 +1,9 @@
+# Installing VCA or Paceflow
+
+Each package installs only its matching executable. Install either or both with `cargo install --locked vibe-coding-analytics` / `cargo install --locked paceflow`, or `cargo binstall vibe-coding-analytics` / `cargo binstall paceflow`. Both use shared analytics in `~/.vca/vca.db` and automatically import historical data; see the [upgrade guide](../README.md#automatic-history-discovery-in-030).
+
+The platform instructions below use Paceflow as the example. For VCA, use `vca` as the command and download `vca-{target}` instead of `paceflow-{target}`. Each ZIP or tarball contains a matching product-and-target directory.
+
 # `paceflow` Install Notes
 
 `paceflow` is a single-file CLI binary. Download the archive for your platform, extract it, and run:
@@ -86,7 +92,7 @@ For macOS Apple Silicon, replace `paceflow-x86_64-unknown-linux-gnu` with `pacef
 macOS/Linux, for a local development build:
 
 ```bash
-cargo install --path .
+cargo install --path crates/paceflow --locked
 paceflow --help
 paceflow --version           # paceflow 0.2.0 (<git-sha> clean, <commit-time>)
 ```
@@ -111,7 +117,7 @@ exec zsh
 Windows PowerShell, for a local development build:
 
 ```powershell
-cargo install --path .
+cargo install --path crates/paceflow --locked
 paceflow --help
 paceflow --version           # paceflow 0.2.0 (<git-sha> clean, <commit-time>)
 ```
@@ -161,7 +167,7 @@ paceflow --help
 ```bash
 git clone https://github.com/PaceFlow/ai-engineering-analytics.git
 cd ai-engineering-analytics
-cargo install --path . --force
+cargo install --path crates/paceflow --locked --force
 ```
 
 ## macOS Gatekeeper
@@ -192,4 +198,4 @@ xattr -dr com.apple.quarantine paceflow-aarch64-apple-darwin
 - `PACEFLOW_OPENCODE_DB_PATH` points to a custom OpenCode database
 - `PACEFLOW_GITHUB_TOKEN` overrides the saved GitHub token for PR sync
 
-Local analytics state lives under `~/.paceflow/paceflow.db` by default. The source assistant and git data remains in its original location.
+Local analytics state lives under `~/.vca/vca.db` by default. The source assistant and git data remains in its original location.

@@ -1,36 +1,38 @@
-# `paceflow` v0.2.5
+# VCA and Paceflow 0.3.0
 
-This release makes the Git pre-commit hook coexist cleanly with the [pre-commit](https://pre-commit.com) framework and other existing hooks, and repairs a Windows setup failure.
+This release separates the local analytics product into `vibe-coding-analytics` (Vibe Coding Analytics) and `paceflow`. Each crate installs only its own command. Paceflow includes the same analytics and adds backend synchronization, schedules, and setup hooks.
 
-Download the archive for your platform from the Assets section below, extract it, and run `paceflow --help`.
+Install either or both with `cargo install --locked vibe-coding-analytics` and `cargo install --locked paceflow`, or choose the matching prebuilt archive.
 
-## Highlights
+## Automatic history discovery in 0.3.0
 
-- **Composite pre-commit hook**: `paceflow hooks install` now installs a hook that runs the Paceflow setup gate **and then** your repository's own pre-commit checks. A `.pre-commit-config.yaml` (ruff, formatting, etc.) is invoked on commit instead of being silently skipped, so local commits no longer pass checks that CI later fails.
-- **Coexistence with existing hooks**: an existing non-Paceflow hook is now backed up and chained instead of refused. Pass `paceflow hooks install --force` to overwrite it instead; `paceflow hooks uninstall` restores the original.
-- **Windows repair**: because Paceflow owns a single composite hook, you no longer need to run `pre-commit install` — avoiding the `ExecutableNotFoundError: Executable /bin/sh not found` failure its migration caused. If that migration already happened, `paceflow hooks install` detects and repairs it.
-- **Clearer status**: `paceflow hooks status` reports whether your `.pre-commit-config.yaml` will actually run and warns when it won't (e.g. `pre-commit` is not on `PATH`, or a legacy hook is still installed).
+Both commands use the same analytics database at `~/.vca/vca.db`. On the first data-using command, either executable automatically discovers and copies previous history from these locations:
 
-## Upgrade Notes
+- `~/.paceflow/paceflow.db`
+- `~/.aieng/aieng.db`
+- `~/.aea/aea.db`
+- `~/.vibe/vca.db` (original VCA)
 
-- No database migration is required.
-- Re-run `paceflow hooks install` in each repo to upgrade an existing Paceflow hook to the composite form.
-- Existing commands continue to work:
-  - `paceflow ingest`
-  - `paceflow session`
-  - `paceflow delivery`
-  - `paceflow quality`
-  - `paceflow cost`
-  - `paceflow sync`
-  - `paceflow tui`
+Switching directly from an older Paceflow installation to VCA preserves your history without requiring you to run the new Paceflow first. Help and version commands do not migrate or create data.
 
-## Requirements
+An existing valid `~/.vca/vca.db` always wins. Otherwise, the most recent usable historical database is selected by recorded session, code-change, or commit activity. If no activity timestamp exists, file modification time is used. Ties follow the order above. The application prints its selection and retains every original; databases are not merged.
 
-- Git must be installed and available on `PATH`.
-- Cursor, Codex, Claude Code, or OpenCode local session data must exist on the machine.
-- To run pre-commit-framework checks from the hook, install [`pre-commit`](https://pre-commit.com) and ensure it is on `PATH`.
+Migration includes committed SQLite WAL data, upgrades and validates a temporary copy, and installs it atomically under a cross-process lock. Interrupted migration is retryable. If historical files exist but none can be read or upgraded, the command explains the failure rather than starting with empty history. A saved GitHub token is copied from the selected installation only if no shared token exists. Backend credentials stay separate under `~/.paceflow`.
 
-If Cursor data lives in a non-standard location, use:
+Analytics-home precedence is `VCA_HOME`, `PACEFLOW_HOME`, `AIENG_HOME`, `AEA_HOME`, then your normal home. Each override names a **parent home directory**, not a database file; discovery is limited to that home. For example, `VCA_HOME=/tmp/analytics` puts shared data in `/tmp/analytics/.vca/vca.db`.
 
-- `PACEFLOW_CURSOR_STATE_PATH`
-- `PACEFLOW_CURSOR_HISTORY_PATH`
+Upgrade older executables before using them again: they continue writing to their old databases, and changes made there after migration are not automatically merged. Both 0.3.0 commands share ingestion, reports, caches, and GitHub credentials. `ingest --fresh` rebuilds this shared data and resets upload cursors; it preserves credentials and original source history.
+
+### Recovery
+
+Keep the original historical databases until you have verified the upgrade. If migration fails, fix permissions or restore a valid backup at the reported source path and retry. If a canonical database already exists, it is never overwritten automatically, including when it is corrupt. Stop running analytics commands and move the canonical database and any `-wal`/`-shm` sidecars aside to a backup location before restoring a complete backup or retrying discovery. Do not delete the historical originals to troubleshoot migration.
+
+## Configuration and compatibility
+
+VCA uses `VCA_GITHUB_TOKEN`, `VCA_CURSOR_STATE_PATH`, `VCA_CURSOR_HISTORY_PATH`, and `VCA_OPENCODE_DB_PATH`. Paceflow retains the corresponding `PACEFLOW_*` overrides with shared `VCA_*` fallbacks. Backend credentials and scheduling remain in `~/.paceflow`; VCA does not authenticate with or contact the Paceflow backend.
+
+Existing Paceflow hooks and schedules continue invoking `paceflow`. Upgrade that executable before continuing scheduled use. Normalized event identities and backend payloads are preserved.
+
+## Release assets
+
+Both products have Windows x86_64 ZIPs, Linux x86_64 tarballs, macOS ARM64 tarballs, and SHA-256 checksums. ZIP and tarball layouts both include a product-and-target directory to match `cargo-binstall` metadata.

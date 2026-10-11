@@ -1,0 +1,11 @@
+---
+source: tests/metrics_regression.rs
+expression: quality
+---
+Quality Metrics
+
+Branch                           Heavy    Churn Rate    Bug Rate   Revert Rate
+staging                              0           N/A         N/A           N/A
+
+Legend:
+- Churn Rate, Bug Rate, and Revert Rate = percentage rates.
