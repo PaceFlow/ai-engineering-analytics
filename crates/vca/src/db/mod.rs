@@ -5,25 +5,7 @@ use std::path::Path;
 use crate::change_intel::schema::init_change_intel_schema;
 use crate::path_utils::{detect_repo_root, path_to_string, to_rel_path};
 
-/// A connection that owns the cross-process analytics lock for its lifetime.
-pub struct Database {
-    connection: Connection,
-    _lock: crate::data_home::DataLock,
-}
-
-impl std::ops::Deref for Database {
-    type Target = Connection;
-    fn deref(&self) -> &Connection {
-        &self.connection
-    }
-}
-impl std::ops::DerefMut for Database {
-    fn deref_mut(&mut self) -> &mut Connection {
-        &mut self.connection
-    }
-}
-
-pub fn open() -> Result<Database> {
+pub fn open() -> Result<Connection> {
     open_at_home(&crate::data_home::home()?)
 }
 
@@ -31,8 +13,8 @@ pub fn database_path() -> Result<std::path::PathBuf> {
     crate::data_home::database_path()
 }
 
-/// Rebuild under the same lock used by ordinary analytics and backend sync.
-pub fn open_fresh() -> Result<Database> {
+/// Rebuild under the same lock that serializes migration and schema setup.
+pub fn open_fresh() -> Result<Connection> {
     let home = crate::data_home::home()?;
     let lock = crate::data_home::lock_at(&home)?;
     let path = home.join(".vca/vca.db");
@@ -53,22 +35,24 @@ pub fn reset_database() -> Result<()> {
     Ok(())
 }
 
-fn open_at_home(home: &Path) -> Result<Database> {
+fn open_at_home(home: &Path) -> Result<Connection> {
     let lock = crate::data_home::lock_at(home)?;
     crate::data_home::prepare_at(home)?;
     finish_open(&home.join(".vca/vca.db"), lock)
 }
 
-fn finish_open(path: &Path, lock: crate::data_home::DataLock) -> Result<Database> {
+/// The cross-process lock covers migration and schema setup only. Once the
+/// connection is ready the lock is released so concurrent commands coexist
+/// through SQLite's WAL mode and busy timeout, as they did before shared
+/// storage was introduced.
+fn finish_open(path: &Path, lock: crate::data_home::DataLock) -> Result<Connection> {
     let conn = Connection::open(path)?;
     conn.busy_timeout(std::time::Duration::from_secs(30))?;
     tune_connection(&conn)?;
     init_app_schema(&conn)?;
     conn.pragma_update(None, "user_version", crate::data_home::SCHEMA_VERSION)?;
-    Ok(Database {
-        connection: conn,
-        _lock: lock,
-    })
+    drop(lock);
+    Ok(conn)
 }
 
 /// Apply performance pragmas to the main paceflow sqlite connection.
@@ -2191,6 +2175,28 @@ mod tests {
         let _conn = open()?;
 
         assert!(tempdir.path().join(".vca").join("vca.db").is_file());
+        Ok(())
+    }
+
+    #[test]
+    fn open_connection_releases_the_data_lock_for_concurrent_commands() -> Result<()> {
+        let _guard = lock_env();
+        let tempdir = tempdir()?;
+        let _home = ScopedEnvVar::set("VCA_HOME", tempdir.path());
+
+        let first = open()?;
+        // Another command must still be able to migrate, open, and query while
+        // this connection stays alive; only setup is serialized.
+        let _lock = crate::data_home::lock_at(tempdir.path())?;
+        drop(_lock);
+        let second = open()?;
+        first.execute(
+            "INSERT INTO metadata_sessions(provider, session_id) VALUES ('codex', 'a')",
+            [],
+        )?;
+        let count: i64 =
+            second.query_row("SELECT COUNT(*) FROM metadata_sessions", [], |r| r.get(0))?;
+        assert_eq!(count, 1);
         Ok(())
     }
 }

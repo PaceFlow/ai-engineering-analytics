@@ -74,8 +74,12 @@ pub fn ensure_ready() -> Result<()> {
 pub(crate) fn prepare_at(home: &Path) -> Result<()> {
     let target = home.join(".vca/vca.db");
     if target.exists() {
-        inspect(&target).with_context(|| format!(
-            "Cannot use analytics database {}. Preserve this file and restore a valid backup before retrying.", target.display()))?;
+        // Only the cheap identity check runs on the hot path. A full integrity
+        // check per command would scan the entire database on every startup.
+        read_only(&target)
+            .and_then(|conn| validate(&conn))
+            .with_context(|| format!(
+                "Cannot use analytics database {}. Preserve this file and restore a valid backup before retrying.", target.display()))?;
         return Ok(());
     }
     let mut candidates = Vec::new();
@@ -137,14 +141,8 @@ fn read_only(path: &Path) -> Result<Connection> {
     Ok(conn)
 }
 
-/// Validate application identity, integrity, and supported schema without writes.
-fn inspect(path: &Path) -> Result<f64> {
-    let conn = read_only(path)?;
-    let integrity: String = conn.query_row("PRAGMA quick_check", [], |row| row.get(0))?;
-    ensure!(
-        integrity == "ok",
-        "SQLite integrity check failed: {integrity}"
-    );
+/// Validate application identity and supported schema without writes.
+fn validate(conn: &Connection) -> Result<()> {
     let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     ensure!(
         (0..=SCHEMA_VERSION).contains(&version),
@@ -154,7 +152,7 @@ fn inspect(path: &Path) -> Result<f64> {
         ("metadata_sessions", &["id", "provider", "session_id"][..]),
         ("metadata_repositories", &["id", "repo_root"][..]),
     ] {
-        let columns = columns(&conn, table)?;
+        let columns = columns(conn, table)?;
         ensure!(
             required
                 .iter()
@@ -162,6 +160,19 @@ fn inspect(path: &Path) -> Result<f64> {
             "Not a supported analytics database: {table} is missing required columns"
         );
     }
+    Ok(())
+}
+
+/// Full integrity check plus the latest recorded activity, used to rank
+/// historical candidates and to verify a freshly migrated copy.
+fn inspect(path: &Path) -> Result<f64> {
+    let conn = read_only(path)?;
+    let integrity: String = conn.query_row("PRAGMA quick_check", [], |row| row.get(0))?;
+    ensure!(
+        integrity == "ok",
+        "SQLite integrity check failed: {integrity}"
+    );
+    validate(&conn)?;
     let mut latest: Option<f64> = None;
     for (table, names) in [
         ("metadata_sessions", &["started_at", "ended_at"][..]),

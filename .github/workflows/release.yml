@@ -96,15 +96,13 @@ jobs:
             dist/*.${{ matrix.platform.ext }}
             dist/*.${{ matrix.platform.ext }}.sha256
 
-  crates:
-    needs: package
-    uses: ./.github/workflows/publish.yml
-    secrets:
-      CRATES_PUBLISH_TOKEN: ${{ secrets.CRATES_PUBLISH_TOKEN }}
-
+  # The GitHub release is created before crates.io publication: registry
+  # uploads are immutable, so a failed release step must stay retryable on the
+  # same tag without leaving published crates whose binstall metadata points at
+  # assets that do not exist.
   publish:
     name: Publish GitHub release
-    needs: crates
+    needs: package
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -120,9 +118,15 @@ jobs:
           body_path: packaging/RELEASE_NOTES.md
           files: dist/*
 
+  crates:
+    needs: publish
+    uses: ./.github/workflows/publish.yml
+    secrets:
+      CRATES_PUBLISH_TOKEN: ${{ secrets.CRATES_PUBLISH_TOKEN }}
+
   install-prebuilt:
     name: Install published binaries (${{ matrix.os }})
-    needs: publish
+    needs: crates
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false

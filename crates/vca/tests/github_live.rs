@@ -86,7 +86,7 @@ struct LiveGitHubFixture {
     _tempdir: TempDir,
     _paceflow_home: ScopedEnvVar,
     _github_token: ScopedEnvVar,
-    conn: vca::db::Database,
+    conn: Connection,
     config: LiveGitHubConfig,
     summary: github::types::GitHubSyncSummary,
 }
