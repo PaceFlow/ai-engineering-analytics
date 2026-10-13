@@ -14,6 +14,7 @@ pub mod ingest_progress;
 pub mod insights;
 pub mod path_utils;
 pub mod providers;
+pub mod tui;
 
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;

@@ -1,7 +1,8 @@
 //! Shared number formatting for the CLI and TUI. Estimated values carry `~`.
 
 pub fn usd(value: Option<f64>) -> String {
-    match value {
+    // `+ 0.0` turns the -0.0 of an empty float sum into 0.0.
+    match value.map(|value| value + 0.0) {
         None => "—".to_string(),
         Some(value) if value.abs() >= 100.0 => format!("~${value:.0}"),
         Some(value) => format!("~${value:.2}"),
@@ -9,7 +10,7 @@ pub fn usd(value: Option<f64>) -> String {
 }
 
 pub fn usd_plain(value: Option<f64>) -> String {
-    match value {
+    match value.map(|value| value + 0.0) {
         None => "—".to_string(),
         Some(value) => format!("${value:.2}"),
     }

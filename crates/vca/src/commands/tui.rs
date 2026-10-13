@@ -414,6 +414,9 @@ pub fn run(args: TuiArgs) -> Result<()> {
 }
 
 pub fn run_for(args: TuiArgs, context: crate::app::AppContext) -> Result<()> {
+    if !args.classic {
+        return crate::tui::run_for(args, context);
+    }
     let mut app = App::new(args);
     app.context = context;
     app.reload()?;
@@ -1593,6 +1596,8 @@ mod tests {
         let mut app = App::new(TuiArgs {
             all_projects: true,
             limit: 50,
+            here: false,
+            classic: true,
         });
         app.reports.session = vec![
             SessionReportRow {
