@@ -37,6 +37,10 @@ pub struct Cli {
 }
 
 #[derive(Subcommand)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "parsed once per process; boxing would complicate the flattened vca commands"
+)]
 pub enum Commands {
     #[command(flatten)]
     Analytics(vca::cli::Commands),

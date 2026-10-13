@@ -219,6 +219,9 @@ pub fn run_for(verbose: bool, args: IngestArgs, context: crate::app::AppContext)
         );
     }
 
+    crate::db::session_store::refresh_session_roots(&db)?;
+    crate::insights::refresh(&db)?;
+
     progress.finish();
 
     let github_token_configured = github::auth::github_token_source_for(context)?.is_some();

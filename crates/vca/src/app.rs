@@ -67,6 +67,12 @@ pub fn run(
         Commands::EventStream(args) => commands::event_stream::run(args),
         Commands::GitHub(args) => commands::github::run_for(args, context),
         Commands::Tui(args) => commands::tui::run_for(args, context),
+        Commands::Usage(args) => commands::insights::run_usage(args, context),
+        Commands::Quota(args) => commands::insights::run_quota(args, context),
+        Commands::Sessions(args) => commands::insights::run_sessions(args, context),
+        Commands::Tasks(args) => commands::insights::run_tasks(args, context),
+        Commands::Show(args) => commands::insights::run_show(args, context),
+        Commands::Context(args) => commands::insights::run_context(args, context),
     }
 }
 

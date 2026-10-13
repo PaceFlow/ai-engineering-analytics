@@ -1,0 +1,10 @@
+---
+source: crates/vca/tests/metrics_regression.rs
+expression: output
+---
+cost band  Sessions  Tasks  API-equiv  Share  Fresh tok  Med $/task  Done  Stalled  Loops
+>$20              1      1    ~$58.15    85%      10.9M     ~$58.15  100%        0      0
+$5–20             1      1    ~$10.59    15%       1.8M     ~$10.59  100%        0      0
+unpriced          5      5          —     0%          0           —    0%        0      0
+
+all data · ~ = API list-price estimate (pricing 2026-10-06), not an invoice
