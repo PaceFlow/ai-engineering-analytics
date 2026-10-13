@@ -361,7 +361,57 @@ pub fn refresh_heuristic_labels(conn: &Connection) -> Result<()> {
             exchange_feedback(&text),
         )?;
     }
+
+    // Why later work changed earlier AI lines: only a fix-like ask is evidence.
+    let mut stmt = conn.prepare(
+        "SELECT r.from_provider, r.from_session, r.from_task, r.to_provider, r.to_session, r.to_task,
+                COALESCE(t.title, '')
+         FROM derived_task_relation r
+         LEFT JOIN derived_task t
+           ON t.provider = r.to_provider AND t.session_id = r.to_session AND t.task_index = r.to_task
+         WHERE r.relation_kind = 'touches_earlier_ai_lines'",
+    )?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                (
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ),
+                (
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, i64>(5)?,
+                ),
+                row.get::<_, String>(6)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for (from, to, later_ask) in rows {
+        insert(
+            conn,
+            "relation",
+            &crate::insights::relations::relation_unit_key(&from, &to),
+            "rework_kind",
+            rework_kind(&later_ask),
+        )?;
+    }
     Ok(())
+}
+
+/// Heuristic rework kind from the later task's first request.
+pub fn rework_kind(later_ask: &str) -> &'static str {
+    if crate::analytics::is_fix_like_commit_message(later_ask)
+        || contains_any(
+            &later_ask.to_lowercase(),
+            &["error", "failing", "crash", "wrong", "doesn't work"],
+        )
+    {
+        "defect_correction"
+    } else {
+        "unclear"
+    }
 }
 
 #[cfg(test)]

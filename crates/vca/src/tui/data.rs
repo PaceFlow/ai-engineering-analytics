@@ -94,6 +94,13 @@ pub struct OverviewData {
     pub legacy_sessions: i64,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct ReworkData {
+    pub split: explore::rework::SpendSplit,
+    pub defects: Vec<explore::rework::DefectRow>,
+    pub relations: usize,
+}
+
 #[derive(Debug, Clone)]
 pub enum Data {
     Overview(Box<OverviewData>),
@@ -106,7 +113,7 @@ pub enum Data {
     Contributors(Vec<QuotaContributor>),
     ContextGroups(Vec<ContextGroupRow>),
     ContextItems(Vec<ContextItemRow>),
-    Ladder(Vec<LadderRow>),
+    Ladder(Vec<LadderRow>, Box<ReworkData>),
     Practices(Vec<PracticeRow>),
     Compare(Vec<CompareColumn>),
     /// An action finished; the text is shown in the footer.
@@ -144,7 +151,14 @@ pub fn fetch(conn: &Connection, query: &Query) -> Result<Data> {
             constraint.as_ref().map(|(dim, key)| (*dim, key.as_str())),
             300,
         )?),
-        Query::Ladder(filters) => Data::Ladder(explore::delivery::delivery_ladder(conn, filters)?),
+        Query::Ladder(filters) => Data::Ladder(
+            explore::delivery::delivery_ladder(conn, filters)?,
+            Box::new(ReworkData {
+                split: explore::rework::spend_split(conn, filters)?,
+                defects: explore::rework::suspected_defects(conn, filters)?,
+                relations: explore::rework::relations(conn, filters)?.len(),
+            }),
+        ),
         Query::Practices(filters) => Data::Practices(explore::practices::practices(conn, filters)?),
         Query::Compare(keys) => Data::Compare(explore::compare::compare_tasks(conn, keys)?),
         Query::Action(action) => act(conn, action)?,

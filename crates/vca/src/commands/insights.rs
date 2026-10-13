@@ -5,8 +5,8 @@ use rusqlite::Connection;
 
 use crate::app::AppContext;
 use crate::cli::{
-    ContextArgs, InsightFilterArgs, QuotaArgs, QuotaCommands, SessionsArgs, ShowArgs, TasksArgs,
-    UsageArgs,
+    ContextArgs, InsightFilterArgs, QuotaArgs, QuotaCommands, ReworkArgs, SessionsArgs, ShowArgs,
+    TasksArgs, UsageArgs,
 };
 use crate::db;
 use crate::explore::{
@@ -1073,6 +1073,160 @@ pub fn run_context(args: ContextArgs, _context: AppContext) -> Result<()> {
     );
     println!(
         "Token sizes are estimates calibrated to observed context growth. Instruction refs are path matches, not proof of cause."
+    );
+    Ok(())
+}
+
+pub fn run_rework(args: ReworkArgs, _context: AppContext) -> Result<()> {
+    let conn = open()?;
+    let filters = filters_from_args(&args.filters);
+    let split = explore::rework::spend_split(&conn, &filters)?;
+    let defects = explore::rework::suspected_defects(&conn, &filters)?;
+    let relations: Vec<_> = explore::rework::relations(&conn, &filters)?
+        .into_iter()
+        .filter(|r| {
+            args.kind
+                .as_deref()
+                .is_none_or(|kind| r.rework_kind.as_deref() == Some(kind))
+        })
+        .collect();
+    if args.filters.json {
+        return print_json(&serde_json::json!({
+            "spend": split,
+            "suspected_defects": defects,
+            "relations": relations,
+        }));
+    }
+    let share = |value: f64| {
+        if split.total > 0.0 {
+            format!("{:.0}%", value / split.total * 100.0)
+        } else {
+            "—".into()
+        }
+    };
+    println!("Spend by kind of work (disjoint; loop > correction > requirement change > normal)");
+    print!(
+        "{}",
+        fmt::table(
+            &["Kind", ">API-eq", ">Share"],
+            &[
+                vec![
+                    "unproductive loops".into(),
+                    fmt::usd(Some(split.loops)),
+                    share(split.loops)
+                ],
+                vec![
+                    "corrections".into(),
+                    fmt::usd(Some(split.corrections)),
+                    share(split.corrections)
+                ],
+                vec![
+                    "requirement changes".into(),
+                    fmt::usd(Some(split.requirement_changes)),
+                    share(split.requirement_changes),
+                ],
+                vec![
+                    "other work".into(),
+                    fmt::usd(Some(split.normal)),
+                    share(split.normal)
+                ],
+                vec!["total".into(), fmt::usd(Some(split.total)), "100%".into()],
+            ],
+        )
+    );
+    println!(
+        "{} of {} turns have a feedback label (heuristic unless classified).\n",
+        split.classified_turns, split.turns
+    );
+
+    println!("Suspected AI-related defects (origin tasks whose AI lines later work changed)");
+    if defects.is_empty() {
+        println!("  none in this period\n");
+    } else {
+        let rows: Vec<Vec<String>> = defects
+            .iter()
+            .take(args.filters.limit)
+            .map(|d| {
+                vec![
+                    format!("L{}", d.level),
+                    fmt::when(d.started_at.as_deref()),
+                    format!("{}:{}#{}", d.origin.0, short_id(&d.origin.1), d.origin.2),
+                    fmt::truncate(&d.title, 40),
+                    d.corrections.to_string(),
+                    d.overlap_lines.to_string(),
+                    fmt::usd(Some(d.correction_cost)),
+                    fmt::truncate(&d.signals.join("; "), 70),
+                ]
+            })
+            .collect();
+        print!(
+            "{}",
+            fmt::table(
+                &[
+                    "Level",
+                    "Started",
+                    "Origin task",
+                    "First request",
+                    ">Later",
+                    ">Lines",
+                    ">Correction $",
+                    "Signals"
+                ],
+                &rows,
+            )
+        );
+        println!(
+            "Correction $ is the later tasks' cost split by overlap; it is not added to totals.\n"
+        );
+    }
+
+    println!("Relations (later task changed lines an earlier task's AI wrote)");
+    if relations.is_empty() {
+        println!("  none");
+    } else {
+        let rows: Vec<Vec<String>> = relations
+            .iter()
+            .take(args.filters.limit)
+            .map(|r| {
+                vec![
+                    fmt::when(r.to_ts.as_deref()),
+                    fmt::truncate(&r.from_title, 30),
+                    fmt::truncate(&r.to_title, 30),
+                    r.relation_kind
+                        .replace("touches_earlier_ai_lines", "changed AI lines"),
+                    fmt::label(
+                        r.rework_kind.as_deref(),
+                        r.rework_source.as_deref(),
+                        r.rework_band.as_deref(),
+                    ),
+                    r.overlap_lines.to_string(),
+                    r.gap_hours
+                        .map(|h| format!("{h:.0}h"))
+                        .unwrap_or_else(|| "—".into()),
+                    fmt::usd(r.to_cost),
+                ]
+            })
+            .collect();
+        print!(
+            "{}",
+            fmt::table(
+                &[
+                    "When",
+                    "Earlier task",
+                    "Later task",
+                    "Relation",
+                    "Rework kind",
+                    ">Lines",
+                    ">Gap",
+                    ">Later $"
+                ],
+                &rows,
+            )
+        );
+    }
+    print_footer(&filters);
+    println!(
+        "Later work touching AI-written lines is correlation, not proof that the AI caused a defect."
     );
     Ok(())
 }

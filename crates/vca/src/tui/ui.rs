@@ -216,7 +216,7 @@ fn render_body(frame: &mut TermFrame<'_>, app: &App, area: Rect) {
         (Screen::ContextItems { .. }, Data::ContextItems(_)) => {
             render_context_items(frame, app, area)
         }
-        (Screen::Delivery, Data::Ladder(_)) => render_ladder(frame, app, area),
+        (Screen::Delivery, Data::Ladder(..)) => render_ladder(frame, app, area),
         (Screen::Practices, Data::Practices(_)) => render_practices(frame, app, area),
         (Screen::Compare { .. }, Data::Compare(_)) => render_compare(frame, app, area),
         _ => frame.render_widget(Paragraph::new(Span::styled("loading…", dim())), area),
@@ -1858,10 +1858,15 @@ fn render_context_items(frame: &mut TermFrame<'_>, app: &App, area: Rect) {
 
 fn render_ladder(frame: &mut TermFrame<'_>, app: &App, area: Rect) {
     let current = app.frame();
-    let Some(Data::Ladder(rows)) = current.data.as_ref() else {
+    let Some(Data::Ladder(rows, rework)) = current.data.as_ref() else {
         return;
     };
-    let parts = split_footer(area);
+    let outer = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(6), Constraint::Length(9)])
+        .split(area);
+    render_rework(frame, rework, outer[1]);
+    let parts = split_footer(outer[0]);
     let table_rows: Vec<Row> = rows
         .iter()
         .map(|r| {
@@ -1934,6 +1939,90 @@ fn render_ladder(frame: &mut TermFrame<'_>, app: &App, area: Rect) {
             dim(),
         )),
         parts[1],
+    );
+}
+
+fn render_rework(frame: &mut TermFrame<'_>, rework: &super::data::ReworkData, area: Rect) {
+    let split = &rework.split;
+    let share = |value: f64| {
+        if split.total > 0.0 {
+            format!("{:.0}%", value / split.total * 100.0)
+        } else {
+            "—".into()
+        }
+    };
+    let mut lines = vec![Line::from(vec![
+        Span::styled("Spend  ", Style::default().fg(CY)),
+        Span::styled(
+            format!(
+                "loops {} {}",
+                fmt::usd(Some(split.loops)),
+                share(split.loops)
+            ),
+            Style::default().fg(if split.loops > 0.0 { RD } else { SU }),
+        ),
+        Span::raw(" · "),
+        Span::styled(
+            format!(
+                "corrections {} {}",
+                fmt::usd(Some(split.corrections)),
+                share(split.corrections)
+            ),
+            Style::default().fg(if split.corrections > 0.0 { AM } else { SU }),
+        ),
+        Span::raw(" · "),
+        Span::styled(
+            format!(
+                "requirement changes {} {}",
+                fmt::usd(Some(split.requirement_changes)),
+                share(split.requirement_changes)
+            ),
+            Style::default().fg(SU),
+        ),
+        Span::raw(" · "),
+        Span::styled(
+            format!("other {}", fmt::usd(Some(split.normal))),
+            Style::default().fg(SU),
+        ),
+    ])];
+    lines.push(Line::from(Span::styled(
+        format!(
+            "{} relations where later work changed earlier AI lines · suspected defects by evidence level:",
+            rework.relations
+        ),
+        dim(),
+    )));
+    if rework.defects.is_empty() {
+        lines.push(Line::from(Span::styled("  none", dim())));
+    }
+    for defect in rework.defects.iter().take(5) {
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("  L{} ", defect.level),
+                Style::default().fg(if defect.level >= 3 { RD } else { AM }),
+            ),
+            Span::styled(
+                format!("{:<36}", fmt::truncate(&defect.title, 34)),
+                Style::default().fg(BR),
+            ),
+            Span::styled(
+                format!(
+                    "{} later · {} lines · corrections {} · {}",
+                    defect.corrections,
+                    defect.overlap_lines,
+                    fmt::usd(Some(defect.correction_cost)),
+                    fmt::truncate(&defect.signals.join("; "), 60)
+                ),
+                Style::default().fg(SU),
+            ),
+        ]));
+    }
+    frame.render_widget(
+        Paragraph::new(lines).block(panel_block(
+            "Rework · touched AI-written lines (correlation, not cause) · `vca rework` for the full list",
+            false,
+        )),
+        area,
     );
 }
 

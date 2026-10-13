@@ -1,0 +1,21 @@
+---
+source: crates/vca/tests/metrics_regression.rs
+expression: output
+---
+Spend by kind of work (disjoint; loop > correction > requirement change > normal)
+Kind                  API-eq  Share
+unproductive loops    ~$0.00     0%
+corrections           ~$1.26     2%
+requirement changes   ~$0.00     0%
+other work           ~$67.47    98%
+total                ~$68.73   100%
+127 of 129 turns have a feedback label (heuristic unless classified).
+
+Suspected AI-related defects (origin tasks whose AI lines later work changed)
+  none in this period
+
+Relations (later task changed lines an earlier task's AI wrote)
+  none
+
+all data · ~ = API list-price estimate (pricing 2026-10-06), not an invoice
+Later work touching AI-written lines is correlation, not proof that the AI caused a defect.

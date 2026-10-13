@@ -3880,7 +3880,7 @@ fn load_repo_commit_messages(repo_root: &str) -> Result<HashMap<String, String>>
     Ok(messages)
 }
 
-fn is_fix_like_commit_message(message: &str) -> bool {
+pub(crate) fn is_fix_like_commit_message(message: &str) -> bool {
     static FIX_KEYWORD_RE: OnceLock<Regex> = OnceLock::new();
     let regex = FIX_KEYWORD_RE.get_or_init(|| {
         Regex::new(r"(?i)\b(fix|fixes|fixed|bug|bugs|hotfix|hotfixes|patch|patches|broken|regression|regressions)\b")

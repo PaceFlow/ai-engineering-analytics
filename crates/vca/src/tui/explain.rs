@@ -413,7 +413,7 @@ pub fn explain(app: &App) -> Option<(String, Vec<String>)> {
             ));
             lines.push("Enter opens the session's Context tab.".into());
         }
-        (_, Data::Ladder(rows)) => {
+        (_, Data::Ladder(rows, _)) => {
             let row = rows.get(i)?;
             title = format!("Delivery ladder: {}", row.intent);
             lines.push(
