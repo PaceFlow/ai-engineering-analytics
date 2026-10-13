@@ -3683,7 +3683,7 @@ fn looks_like_hex_hash(token: &str) -> bool {
 }
 
 fn shorten_repo(path: &str) -> String {
-    if let Some(home) = dirs::home_dir()
+    if let Some(home) = crate::path_utils::agent_home()
         && let Some(shortened) = strip_home_prefix(path, &home)
     {
         return shortened;

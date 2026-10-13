@@ -96,7 +96,7 @@ pub fn opencode_db_path_for(context: crate::app::AppContext) -> Result<PathBuf> 
         return Ok(PathBuf::from(path));
     }
 
-    let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Home directory not found"))?;
+    let home = crate::path_utils::require_agent_home()?;
     Ok(home
         .join(".local")
         .join("share")
