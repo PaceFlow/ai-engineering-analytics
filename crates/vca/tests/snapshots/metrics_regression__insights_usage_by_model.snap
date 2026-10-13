@@ -1,0 +1,10 @@
+---
+source: crates/vca/tests/metrics_regression.rs
+expression: output
+---
+Model          API-equiv  Share  Reported  Fresh tok  Cache read  Output  Sessions  Calls  Gaps
+gpt-5.3-codex    ~$68.73   100%         —      12.6M      113.3M    705k         2   1130
+Σ total          ~$68.73   100%         —      12.6M      113.3M    705k             1130
+
+all data · ~ = API list-price estimate (pricing 2026-10-06), not an invoice
+Fresh tok = uncached input + cache writes + output. Reported = provider-reported cost (OpenCode).

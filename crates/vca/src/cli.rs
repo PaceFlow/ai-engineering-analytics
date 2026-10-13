@@ -21,7 +21,7 @@ pub const VERSION: &str = concat!(
     env!("VCA_GIT_COMMIT_TIME"),
     ")"
 );
-const TOP_LEVEL_AFTER_HELP: &str = "Quick start:\n  vca ingest\n  vca session\n  vca delivery\n  vca quality\n  vca cost\n  vca tui\n\nOptional GitHub setup:\n  vca github token\n\nManual validation:\n  vca event-stream --stream session-base\n\nDiscover options:\n  vca <command> --help";
+const TOP_LEVEL_AFTER_HELP: &str = "Quick start:\n  vca ingest\n  vca tui\n  vca sessions\n  vca tasks\n  vca usage\n  vca quota\n  vca context\n  vca session\n  vca delivery\n  vca quality\n  vca cost\n\nOptional GitHub setup:\n  vca github token\n\nManual validation:\n  vca event-stream --stream session-base\n\nDiscover options:\n  vca <command> --help";
 
 #[derive(Parser)]
 #[command(
@@ -57,6 +57,170 @@ pub enum Commands {
     #[command(name = "tui")]
     /// Launch the interactive terminal dashboard
     Tui(TuiArgs),
+    /// Token usage and API-equivalent cost by tool, model, project, session or time
+    #[command(after_help = USAGE_AFTER_HELP)]
+    Usage(UsageArgs),
+    /// Subscription quota windows: observed percentages and token burn
+    #[command(after_help = QUOTA_AFTER_HELP)]
+    Quota(QuotaArgs),
+    /// Rank or group root sessions (subagents included) by cost, tokens or activity
+    #[command(after_help = SESSIONS_AFTER_HELP)]
+    Sessions(SessionsArgs),
+    /// Tasks inside sessions: time and cost to completion, by model and harness
+    #[command(after_help = TASKS_AFTER_HELP)]
+    Tasks(TasksArgs),
+    /// Show one session: tasks, agents, usage by model, context and commits
+    Show(ShowArgs),
+    /// What filled the context and what carrying it cost
+    #[command(after_help = CONTEXT_AFTER_HELP)]
+    Context(ContextArgs),
+}
+
+const USAGE_AFTER_HELP: &str = "Examples:\n  vca usage                       # by tool, last 30 days\n  vca usage --group-by model\n  vca usage --group-by session --limit 20\n  vca usage --group-by hour --days 2\n\nEvery usage event is counted once, so groups add up to the total. Costs are API list-price estimates.";
+const QUOTA_AFTER_HELP: &str = "Examples:\n  vca quota\n  vca quota --provider codex --days 7\n  vca quota mark claude --kind limit_hit          # record that you hit a limit now\n  vca quota mark claude --at 2026-10-03T15:47:00Z --kind limit_hit\n\nCodex logs quota percentages; other tools only show token burn per window.";
+const SESSIONS_AFTER_HELP: &str = "Examples:\n  vca sessions                    # most expensive first\n  vca sessions --sort tokens\n  vca sessions --group-by cost    # cost bands; also tokens, model, tool, project, intent, outcome, week\n  vca sessions --provider claude --search parser";
+const TASKS_AFTER_HELP: &str = "Examples:\n  vca tasks                                   # most expensive tasks\n  vca tasks --sort time --completed-only\n  vca tasks --group-by model --group-by tool --intent feature\n\nWithout the optional classifier every session is one task.";
+const CONTEXT_AFTER_HELP: &str = "Examples:\n  vca context                     # by kind (instructions, tool results, baseline, ...)\n  vca context --group-by dir      # which directories cost the most to keep in context\n  vca context --group-by instruction\n  vca context --session 93cba0e8 --group-by target";
+
+#[derive(Args, Debug, Clone)]
+pub struct InsightFilterArgs {
+    /// Only include the last N days (0 = all time)
+    #[arg(long, default_value_t = 30)]
+    pub days: u32,
+    /// Start date (YYYY-MM-DD), overrides --days
+    #[arg(long)]
+    pub from: Option<String>,
+    /// End date (YYYY-MM-DD)
+    #[arg(long)]
+    pub to: Option<String>,
+    /// Tool filter (claude, codex, cursor, opencode); repeatable
+    #[arg(long)]
+    pub provider: Vec<String>,
+    /// Model substring filter
+    #[arg(long)]
+    pub model: Option<String>,
+    /// Repository root filter
+    #[arg(long)]
+    pub repo: Option<String>,
+    /// Limit to the git repository of the current directory
+    #[arg(long)]
+    pub here: bool,
+    /// Text search in titles, first requests, branches and ids
+    #[arg(long)]
+    pub search: Option<String>,
+    /// Intent label filter (e.g. feature, bug_fix, research_explain)
+    #[arg(long)]
+    pub intent: Option<String>,
+    /// Outcome label filter (e.g. completed_verified, stalled)
+    #[arg(long)]
+    pub outcome: Option<String>,
+    /// Minimum API-equivalent cost
+    #[arg(long)]
+    pub min_cost: Option<f64>,
+    /// Max rows
+    #[arg(long, default_value_t = 30)]
+    pub limit: usize,
+    /// Print JSON instead of a table
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct UsageArgs {
+    #[command(flatten)]
+    pub filters: InsightFilterArgs,
+    /// tool | model | project | session | agent | day | hour
+    #[arg(long, default_value = "tool")]
+    pub group_by: String,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct QuotaArgs {
+    #[command(subcommand)]
+    pub command: Option<QuotaCommands>,
+    #[command(flatten)]
+    pub filters: InsightFilterArgs,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum QuotaCommands {
+    /// Record a quota observation (e.g. you hit a limit)
+    Mark {
+        /// Tool the observation applies to (claude, cursor, codex, opencode)
+        provider: String,
+        /// When it happened (RFC 3339); defaults to now
+        #[arg(long)]
+        at: Option<String>,
+        /// limit_hit | reset | plan_change | note
+        #[arg(long, default_value = "limit_hit")]
+        kind: String,
+        /// Free-text note
+        #[arg(long)]
+        note: Option<String>,
+    },
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct SessionsArgs {
+    #[command(flatten)]
+    pub filters: InsightFilterArgs,
+    /// cost | tokens | fresh | cache | started | turns | failures | agents
+    #[arg(long, default_value = "cost")]
+    pub sort: String,
+    /// Group instead of listing: cost | tokens | model | tool | project | intent | outcome | branch | week | day
+    #[arg(long)]
+    pub group_by: Option<String>,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct TasksArgs {
+    #[command(flatten)]
+    pub filters: InsightFilterArgs,
+    /// cost | cost-to-complete | tokens | time | wall | started | attempts | failures
+    #[arg(long, default_value = "cost")]
+    pub sort: String,
+    /// Group by one or more dimensions (model, tool, intent, project, cost, tokens, week)
+    #[arg(long)]
+    pub group_by: Vec<String>,
+    /// Only tasks with an observed completion
+    #[arg(long)]
+    pub completed_only: bool,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct ShowArgs {
+    /// Session id, id prefix, or provider:id
+    pub session: String,
+    #[arg(long)]
+    pub tasks: bool,
+    #[arg(long)]
+    pub agents: bool,
+    #[arg(long)]
+    pub usage: bool,
+    #[arg(long)]
+    pub context: bool,
+    #[arg(long)]
+    pub delivery: bool,
+    /// Turn-by-turn timeline
+    #[arg(long)]
+    pub turns: bool,
+    /// Rows per section
+    #[arg(long, default_value_t = 15)]
+    pub limit: usize,
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct ContextArgs {
+    #[command(flatten)]
+    pub filters: InsightFilterArgs,
+    /// kind | tool | dir | mcp | instruction | purpose | target
+    #[arg(long, default_value = "kind")]
+    pub group_by: String,
+    /// Restrict to one session (id, prefix or provider:id)
+    #[arg(long)]
+    pub session: Option<String>,
 }
 
 #[derive(Args, Debug, Clone)]

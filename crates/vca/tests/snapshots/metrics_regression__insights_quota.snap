@@ -1,0 +1,30 @@
+---
+source: crates/vca/tests/metrics_regression.rs
+expression: output
+---
+Tool   Window        Start → reset              Quota used  Tokens  API-equiv  Notes
+codex  primary 5h    03-11 13:13 → 03-11 18:13  0% → 0%          0          —
+codex  secondary 7d  03-11 13:13 → 03-18 13:14  0% → 0%          0          —
+codex  primary 5h    03-10 11:39 → 03-10 16:39  2% → 9%      12.6M     ~$5.91
+codex  secondary 7d  03-10 06:39 → 03-17 06:39  1% → 8%      31.2M    ~$16.60  99m unobserved
+codex  primary 5h    03-10 06:39 → 03-10 11:39  3% → 11%     12.2M     ~$7.20  99m unobserved
+codex  primary 5h    03-09 07:23 → 03-09 12:23  0% → 4%       4.9M     ~$3.91  56m unobserved
+codex  secondary 7d  03-09 07:23 → 03-16 07:23  0% → 1%       4.3M     ~$2.87  56m unobserved
+codex  primary 5h    03-06 12:49 → 03-06 17:49  0% → 12%     10.0M     ~$4.46
+codex  secondary 7d  03-05 06:58 → 03-12 06:58  0% → 15%     51.2M    ~$27.00  1343m unobserved
+codex  primary 5h    03-06 06:29 → 03-06 11:29  0% → 6%       6.8M     ~$5.27  100m unobserved
+codex  primary 5h    03-05 12:39 → 03-05 17:39  0% → 12%     16.0M     ~$8.55  31m unobserved
+codex  primary 5h    03-05 06:58 → 03-05 11:58  0% → 18%     17.3M     ~$7.98  35m unobserved
+codex  primary 5h    03-04 13:55 → 03-04 18:55  0% → 7%       7.0M     ~$4.68  50m unobserved
+codex  secondary 7d  03-03 09:41 → 03-10 09:41  0% → 10%     33.1M    ~$17.76  1547m unobserved
+codex  primary 5h    03-04 07:53 → 03-04 12:53  0% → 8%       7.1M     ~$3.81
+codex  primary 5h    03-03 14:51 → 03-03 19:51  0% → 6%       7.0M     ~$3.93
+codex  primary 5h    03-03 09:41 → 03-03 14:41  0% → 10%      6.7M     ~$3.59  191m unobserved
+
+Largest contributors to codex primary 5h (allocated by token cost share, not causal):
+Session         Title                                               Δ quota  Tokens  API-equiv  Notes
+codex:019cb311  Can you investigate the current implementation an…  ≈18.0pp   17.3M     ~$7.98  244k background
+
+all data · ~ = API list-price estimate (pricing 2026-10-06), not an invoice
+Observed % comes from provider logs (Codex). Other tools record no quota data: windows show token burn only.
+Log a limit you hit with `vca quota mark claude --kind limit_hit` to compare future windows.

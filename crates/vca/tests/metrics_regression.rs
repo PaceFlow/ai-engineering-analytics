@@ -1367,3 +1367,75 @@ fn first_token(value: &str) -> anyhow::Result<&str> {
         .next()
         .ok_or_else(|| anyhow::anyhow!("missing token in value {}", value))
 }
+
+#[test]
+fn insight_commands_match_snapshots() -> anyhow::Result<()> {
+    let env = TestEnv::new_live_fixture()?;
+    env.ingest()?;
+
+    let cases: [(&str, &[&str]); 7] = [
+        ("insights_usage_by_tool", &["usage", "--days", "0"]),
+        (
+            "insights_usage_by_model",
+            &["usage", "--days", "0", "--group-by", "model"],
+        ),
+        ("insights_sessions", &["sessions", "--days", "0"]),
+        (
+            "insights_sessions_by_cost_band",
+            &["sessions", "--days", "0", "--group-by", "cost"],
+        ),
+        ("insights_tasks", &["tasks", "--days", "0"]),
+        ("insights_quota", &["quota", "--days", "0"]),
+        ("insights_context_by_kind", &["context", "--days", "0"]),
+    ];
+    for (name, args) in cases {
+        let output = env.normalize_output(env.run_paceflow(args)?);
+        insta::assert_snapshot!(name, output);
+    }
+    Ok(())
+}
+
+#[test]
+fn usage_groups_are_additive() -> anyhow::Result<()> {
+    let env = TestEnv::new_live_fixture()?;
+    env.ingest()?;
+    let total = |group: &str| -> anyhow::Result<(f64, i64)> {
+        let json = env.run_paceflow(&[
+            "usage",
+            "--days",
+            "0",
+            "--json",
+            "--limit",
+            "1000",
+            "--group-by",
+            group,
+        ])?;
+        let rows: Vec<serde_json::Value> = serde_json::from_str(&json)?;
+        Ok((
+            rows.iter().filter_map(|row| row["cost"].as_f64()).sum(),
+            rows.iter().filter_map(|row| row["tokens"].as_i64()).sum(),
+        ))
+    };
+    let (tool_cost, tool_tokens) = total("tool")?;
+    for group in ["model", "session", "day", "agent"] {
+        let (cost, tokens) = total(group)?;
+        assert_eq!(tokens, tool_tokens, "token totals differ for {group}");
+        assert!(
+            (cost - tool_cost).abs() < 1e-6,
+            "cost totals differ for {group}"
+        );
+    }
+    assert!(tool_tokens > 0);
+    Ok(())
+}
+
+#[test]
+fn second_ingest_keeps_insight_tables_stable() -> anyhow::Result<()> {
+    let env = TestEnv::new_live_fixture()?;
+    env.ingest()?;
+    let before = env.run_paceflow(&["tasks", "--days", "0", "--json"])?;
+    env.ingest()?;
+    let after = env.run_paceflow(&["tasks", "--days", "0", "--json"])?;
+    assert_eq!(before, after);
+    Ok(())
+}

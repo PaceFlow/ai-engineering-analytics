@@ -1,0 +1,15 @@
+---
+source: crates/vca/tests/metrics_regression.rs
+expression: output
+---
+kind              Items  Sessions  Tokens   Write    Carry  Rebuild    Total  /session  Unused  Avg carried
+tool_result        1404         2    661k  ~$2.29  ~$12.27   ~$8.88  ~$23.45   ~$11.72     90%           63
+unexplained         578         2    859k  ~$2.03   ~$8.99   ~$6.30  ~$17.32    ~$8.66       —           65
+assistant_output    922         2    479k  ~$1.24   ~$7.60   ~$5.26  ~$14.11    ~$7.06       —           65
+baseline              2         2     12k  ~$0.09   ~$1.70   ~$1.03   ~$2.82    ~$1.41       —          564
+system_prompt        25         2     16k  ~$0.04   ~$0.26   ~$0.13   ~$0.44    ~$0.22       —           55
+user_message        132         2     416  ~$0.00   ~$0.01   ~$0.00   ~$0.01    ~$0.01       —           54
+
+all data · ~ = API list-price estimate (pricing 2026-10-06), not an invoice
+Write = cost when the item entered context; Carry = cache reads on every later call; Rebuild = extra cost when the cache expired.
+Token sizes are estimates calibrated to observed context growth. Instruction refs are path matches, not proof of cause.

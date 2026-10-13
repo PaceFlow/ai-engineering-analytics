@@ -3,6 +3,7 @@ pub mod delivery;
 pub mod event_stream;
 pub mod github;
 pub mod ingest;
+pub mod insights;
 pub mod quality;
 pub mod report_layout;
 pub mod report_scope;

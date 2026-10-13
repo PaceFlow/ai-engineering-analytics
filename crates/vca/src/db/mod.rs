@@ -702,6 +702,7 @@ pub(crate) fn init_metadata_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(&indexes)?;
     conn.execute_batch(session_store::SESSION_STORE_SCHEMA)?;
     session_store::apply_data_migrations(conn)?;
+    crate::insights::init_schema(conn)?;
     conn.execute_batch(
         "CREATE INDEX IF NOT EXISTS idx_metadata_sessions_model
             ON metadata_sessions(model_id, provider);",
