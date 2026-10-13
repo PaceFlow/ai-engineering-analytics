@@ -233,6 +233,17 @@ pub fn exchange_feedback(user_text: &str) -> &'static str {
     "other"
 }
 
+/// Store one heuristic label (used by other insight modules too).
+pub(crate) fn insert_heuristic(
+    conn: &Connection,
+    unit_kind: &str,
+    unit_key: &str,
+    question: &str,
+    label: &str,
+) -> Result<()> {
+    insert(conn, unit_kind, unit_key, question, label)
+}
+
 fn insert(
     conn: &Connection,
     unit_kind: &str,

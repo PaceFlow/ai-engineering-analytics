@@ -551,6 +551,7 @@ pub fn assignment_state(turns: &[TurnFacts], turn_index: usize, level: Level) ->
         "idle_minutes_before": current.idle_minutes_before.map(|m| m.round()),
         "events_before": current.events_before,
         "recent_turns": recent,
+        "current_turn": current_turn_block(current, level, &mut redactions),
     });
     let est = estimate_tokens(&state);
     BuiltState {
@@ -559,6 +560,31 @@ pub fn assignment_state(turns: &[TurnFacts], turn_index: usize, level: Level) ->
         redactions,
         est_tokens: est,
     }
+}
+
+/// What the agent did in a turn: tool summary, edits, checks and (at
+/// `conversation` and above) its reply.
+fn current_turn_block(turn: &TurnFacts, level: Level, redactions: &mut usize) -> Value {
+    let edits = turn.tools.iter().filter(|t| t.category == "edit").count();
+    let checks: Vec<Value> = turn
+        .tools
+        .iter()
+        .filter(|t| t.validation_kind.is_some())
+        .map(|t| {
+            let failed = t.exit_code.is_some_and(|code| code != 0) || t.status == "error";
+            json!({"kind": t.validation_kind, "result": if failed { "fail" } else { "pass" }})
+        })
+        .collect();
+    let mut block = json!({
+        "tools": turn.tool_summary(level),
+        "files_edited": turn.files.iter().take(8).map(|f| redact(f).0).collect::<Vec<_>>(),
+        "edit_calls": edits,
+        "checks": checks,
+    });
+    if let Some(text) = assistant_text(turn, level, 600, redactions) {
+        block["assistant"] = Value::String(text);
+    }
+    block
 }
 
 /// One-line description of a turn for the completion choice options.

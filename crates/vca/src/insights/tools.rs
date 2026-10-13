@@ -37,8 +37,100 @@ pub fn tool_category(tool_name: &str, target: Option<&str>) -> &'static str {
         "task" | "agent" | "subagent" | "spawn_agent" => "agent",
         "todowrite" | "update_plan" | "exitplanmode" | "enterplanmode" | "todo_write"
         | "taskcreate" | "taskupdate" => "plan",
+        name if is_ask_tool(name) => "ask",
         _ => "other",
     }
+}
+
+/// Tools the agent uses to ask the user a question.
+pub fn is_ask_tool(tool_name: &str) -> bool {
+    matches!(
+        tool_name.to_ascii_lowercase().as_str(),
+        "askuserquestion"
+            | "ask_user_question"
+            | "request_user_input"
+            | "ask_followup_question"
+            | "askfollowupquestion"
+            | "question"
+    )
+}
+
+/// Test files by path convention (any language).
+pub fn is_test_path(path: &str) -> bool {
+    let lower = path.replace('\\', "/").to_ascii_lowercase();
+    let file = lower.rsplit('/').next().unwrap_or(&lower);
+    lower.contains("/tests/")
+        || lower.starts_with("tests/")
+        || lower.contains("/test/")
+        || lower.starts_with("test/")
+        || lower.contains("__tests__/")
+        || lower.contains("/spec/")
+        || file.starts_with("test_")
+        || file.contains("_test.")
+        || file.contains(".test.")
+        || file.contains("_spec.")
+        || file.contains(".spec.")
+        || file.ends_with("tests.rs")
+        || file.ends_with("test.go")
+}
+
+/// Shell commands that only read or search files (`cat`, `sed -n`, `rg`, …),
+/// as agents like Codex explore through the shell: `Some("read" | "search")`.
+pub fn shell_read_kind(command: &str) -> Option<&'static str> {
+    let first = command
+        .split("&&")
+        .map(str::trim)
+        .find(|segment| !segment.is_empty() && !segment.starts_with("cd "))?;
+    let program = first.split_whitespace().next()?.rsplit('/').next()?;
+    match program {
+        "rg" | "grep" | "egrep" | "fgrep" | "find" | "fd" | "ls" | "tree" | "ag" | "ack" => {
+            Some("search")
+        }
+        "cat" | "head" | "tail" | "nl" | "less" | "more" | "bat" | "wc" | "jq" | "awk" => {
+            Some("read")
+        }
+        "sed" if first.contains(" -n") => Some("read"),
+        "git"
+            if [
+                "git log",
+                "git show",
+                "git blame",
+                "git grep",
+                "git ls-files",
+            ]
+            .iter()
+            .any(|cmd| first.starts_with(cmd)) =>
+        {
+            Some("search")
+        }
+        _ => None,
+    }
+}
+
+/// Commands that show a diff or the pending change for review.
+pub fn is_diff_check(command: &str) -> bool {
+    let lower = command.to_ascii_lowercase();
+    [
+        "git diff",
+        "git show",
+        "gh pr diff",
+        "git log -p",
+        "git status",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+/// A slash command at the start of a user message (`/review`, `/grill-me`).
+pub fn slash_command(user_text: &str) -> Option<String> {
+    let first = user_text.split_whitespace().next()?;
+    let name = first.strip_prefix('/')?;
+    (!name.is_empty()
+        && name.len() <= 40
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | ':')))
+    .then(|| name.to_ascii_lowercase())
 }
 
 /// Classify a shell command as a validation run.
@@ -166,6 +258,28 @@ pub fn mcp_server(tool_name: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn detects_test_paths_ask_tools_diffs_and_slash_commands() {
+        assert!(is_test_path("crates/vca/tests/metrics_regression.rs"));
+        assert!(is_test_path("src/parser_test.go"));
+        assert!(is_test_path("web/src/App.test.tsx"));
+        assert!(is_test_path("pkg/test_parser.py"));
+        assert!(!is_test_path("src/parser.rs"));
+        assert!(is_ask_tool("AskUserQuestion"));
+        assert_eq!(tool_category("AskUserQuestion", None), "ask");
+        assert!(is_diff_check("git diff --stat"));
+        assert_eq!(
+            slash_command("/code-review high"),
+            Some("code-review".into())
+        );
+        assert_eq!(slash_command("/home/user is the path"), None);
+        assert_eq!(slash_command("please review"), None);
+        assert_eq!(shell_read_kind("sed -n 1,80p src/main.rs"), Some("read"));
+        assert_eq!(shell_read_kind("cd repo && rg -n parse_ts"), Some("search"));
+        assert_eq!(shell_read_kind("cargo test"), None);
+        assert_eq!(shell_read_kind("sed -i s/a/b/ f"), None);
+    }
 
     #[test]
     fn classifies_validation_commands() {

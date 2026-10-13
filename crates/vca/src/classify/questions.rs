@@ -5,7 +5,7 @@
 use serde_json::{Map, Value, json};
 
 /// Bump when instructions or criteria change; cached results are keyed by it.
-pub const QUESTION_SET_VERSION: &str = "2026-10-q1";
+pub const QUESTION_SET_VERSION: &str = "2026-10-q2";
 
 pub const INTENTS: [(&str, &str); 12] = [
     ("feature", "Adding new user-visible behavior or capability."),
@@ -138,6 +138,147 @@ pub const REWORK_KINDS: [(&str, &str); 7] = [
     ("unclear", "Cannot tell from the evidence."),
 ];
 
+/// What the user's message asks for (Q17).
+pub const REQUEST_KINDS: [(&str, &str); 12] = [
+    (
+        "new_request",
+        "Starts a new piece of work or a new question.",
+    ),
+    (
+        "plan_handoff",
+        "Gives the user's own plan, design or step-by-step approach for the agent to follow or critique.",
+    ),
+    (
+        "spec_criteria",
+        "States acceptance criteria, expected behaviour, constraints or how to verify the result.",
+    ),
+    (
+        "clarification_answer",
+        "Answers a question the agent asked or supplies information it requested.",
+    ),
+    (
+        "refinement",
+        "Asks to polish, simplify or adjust output that already works.",
+    ),
+    (
+        "correction",
+        "Says the output is wrong, broken or misunderstood and asks for a fix.",
+    ),
+    (
+        "requirement_change",
+        "Changes or adds requirements; the earlier output was not wrong for the earlier ask.",
+    ),
+    (
+        "question_explain",
+        "Asks how or why something works, to understand the code or the change.",
+    ),
+    (
+        "review_request",
+        "Asks the agent to review, audit or check code, a diff, a plan or a pull request.",
+    ),
+    (
+        "approve_continue",
+        "Approves and asks to continue with the next step.",
+    ),
+    (
+        "ship_commit",
+        "Asks to commit, push, open a pull request or release.",
+    ),
+    (
+        "other",
+        "None of the above (thanks, small talk, a bare command).",
+    ),
+];
+
+/// What kind of work happened in this turn (Q18).
+pub const TURN_STAGES: [(&str, &str); 13] = [
+    (
+        "explore_codebase",
+        "Reading and searching the existing code, data or docs to understand them; no edits.",
+    ),
+    (
+        "research_external",
+        "Looking up external documentation, APIs, libraries or the web.",
+    ),
+    (
+        "plan_design",
+        "Producing or discussing a plan, design, approach or task list before building.",
+    ),
+    (
+        "clarify_requirements",
+        "Asking or answering questions about what is wanted; resolving assumptions.",
+    ),
+    ("implement", "Writing or changing product code."),
+    (
+        "write_tests",
+        "Writing or changing tests as the main activity.",
+    ),
+    (
+        "verify_run",
+        "Running tests, builds, the app or checks to verify behaviour, without changing code.",
+    ),
+    (
+        "debug_fix",
+        "Diagnosing and fixing a failure, error or bug that showed up.",
+    ),
+    (
+        "review",
+        "Reviewing code, a diff, a plan or a pull request for problems.",
+    ),
+    (
+        "refine_polish",
+        "Simplifying, renaming, cleaning up or adjusting already-working code.",
+    ),
+    (
+        "docs",
+        "Writing documentation, comments, changelog or instruction files.",
+    ),
+    (
+        "ship",
+        "Committing, pushing, opening a pull request or releasing.",
+    ),
+    ("chat_other", "Conversation without substantial work."),
+];
+
+/// Yes/no observations about one turn (Q19): (id, true when…, false when…).
+pub const TURN_FLAGS: [(&str, &str, &str); 7] = [
+    (
+        "asks_agent_to_ask",
+        "The user tells the agent to ask questions, list open questions or state its assumptions before acting.",
+        "The user does not ask for questions or assumptions.",
+    ),
+    (
+        "demands_minimal_change",
+        "The user asks for minimal, targeted changes or forbids unrequested changes or rewrites.",
+        "No request to keep changes minimal.",
+    ),
+    (
+        "cites_sources",
+        "The user points the agent to concrete sources: a ticket, docs, specific files, data or existing implementations.",
+        "No concrete sources are referenced.",
+    ),
+    (
+        "agent_asked_questions",
+        "The agent asked the user clarifying questions or for a decision before acting.",
+        "The agent acted without asking.",
+    ),
+    (
+        "agent_claimed_done_without_evidence",
+        "The agent says the work is done or working without running or showing any check (tests, run output, diff).",
+        "Completion claims are backed by visible checks, or no completion is claimed.",
+    ),
+    (
+        "unrequested_changes",
+        "The agent changed things the user did not ask for: extra features, rewrites, unrelated files, scope creep.",
+        "Changes stay within what was asked.",
+    ),
+    (
+        "tests_changed_to_pass",
+        "The agent weakened, deleted or rewrote tests so that they pass instead of fixing the code.",
+        "Tests were not weakened to make them pass.",
+    ),
+];
+
 pub const PROBLEMS: [(&str, &str, &str); 7] = [
     (
         "p_repeated_failure",
@@ -188,6 +329,9 @@ pub fn labels_for(question: &str) -> Option<Vec<&'static str>> {
         "framing" => vec!["0", "1", "2", "3"],
         "progress" => vec!["0", "1", "2", "3", "4"],
         "frustration" => vec!["0", "1", "2"],
+        "request_kind" => names(&REQUEST_KINDS),
+        "turn_stage" => names(&TURN_STAGES),
+        id if TURN_FLAGS.iter().any(|(name, _, _)| *name == id) => vec!["true", "false"],
         id if PROBLEMS.iter().any(|(name, _, _)| *name == id) => vec!["true", "false"],
         _ => return None,
     })
@@ -197,6 +341,8 @@ pub fn labels_for(question: &str) -> Option<Vec<&'static str>> {
 pub fn unit_kind_for(question: &str) -> &'static str {
     match question {
         "feedback" | "frustration" => "exchange",
+        "request_kind" | "turn_stage" => "turn",
+        id if TURN_FLAGS.iter().any(|(name, _, _)| *name == id) => "turn",
         "rework_kind" => "relation",
         _ => "task",
     }
@@ -293,6 +439,39 @@ pub fn exchange_questions() -> Map<String, Value> {
             &["Neutral.", "Mild impatience.", "Clear frustration."],
         ),
     );
+    questions
+}
+
+/// Q17–Q19 about one turn: request kind, stage and flags. Text-dependent
+/// questions are skipped at `evidence_only`.
+pub fn turn_questions(level: crate::classify::state::Level) -> Map<String, Value> {
+    use crate::classify::state::Level;
+    let mut questions = Map::new();
+    questions.insert(
+        "turn_stage".into(),
+        choice(
+            "What kind of work happens in this turn: the user's new message and everything the agent does until the next user message (see current_turn)? Judge by the actions, not by what the agent says it did.",
+            &TURN_STAGES,
+        ),
+    );
+    if level == Level::EvidenceOnly {
+        return questions;
+    }
+    questions.insert(
+        "request_kind".into(),
+        choice("What does the user's new message ask for?", &REQUEST_KINDS),
+    );
+    for (id, yes, no) in TURN_FLAGS {
+        if level < Level::Conversation
+            && matches!(
+                id,
+                "agent_asked_questions" | "agent_claimed_done_without_evidence"
+            )
+        {
+            continue;
+        }
+        questions.insert(id.into(), noul("Does this hold for this turn?", yes, no));
+    }
     questions
 }
 

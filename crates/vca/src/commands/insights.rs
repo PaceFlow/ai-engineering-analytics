@@ -1,12 +1,12 @@
-//! `usage`, `quota`, `sessions`, `tasks`, `show` and `context` commands.
+//! `usage`, `quota`, `sessions`, `tasks`, `show`, `context`, `rework`, `habits` and `stages` commands.
 
 use anyhow::{Result, bail};
 use rusqlite::Connection;
 
 use crate::app::AppContext;
 use crate::cli::{
-    ContextArgs, InsightFilterArgs, QuotaArgs, QuotaCommands, ReworkArgs, SessionsArgs, ShowArgs,
-    TasksArgs, UsageArgs,
+    ContextArgs, HabitsArgs, InsightFilterArgs, QuotaArgs, QuotaCommands, ReworkArgs, SessionsArgs,
+    ShowArgs, StagesArgs, TasksArgs, UsageArgs,
 };
 use crate::db;
 use crate::explore::{
@@ -1227,6 +1227,213 @@ pub fn run_rework(args: ReworkArgs, _context: AppContext) -> Result<()> {
     print_footer(&filters);
     println!(
         "Later work touching AI-written lines is correlation, not proof that the AI caused a defect."
+    );
+    Ok(())
+}
+
+fn pct(value: f64) -> String {
+    format!("{:.0}%", value * 100.0)
+}
+
+pub fn run_habits(args: HabitsArgs, _context: AppContext) -> Result<()> {
+    let conn = open()?;
+    let filters = filters_from_args(&args.filters);
+    if let Some(habit) = &args.habit {
+        let Some(id) = explore::habits::resolve_habit(habit) else {
+            bail!("unknown habit '{habit}' (1–12)");
+        };
+        if args.list {
+            let rows = explore::habits::habit_tasks(&conn, &filters, id)?;
+            if args.filters.json {
+                return print_json(&rows);
+            }
+            let table: Vec<Vec<String>> = rows
+                .iter()
+                .take(args.filters.limit)
+                .map(|r| {
+                    vec![
+                        fmt::when(r.started_at.as_deref()),
+                        format!("{}:{}#{}", r.task.0, short_id(&r.task.1), r.task.2),
+                        fmt::truncate(&r.title, 36),
+                        r.value.replace('_', " "),
+                        r.source.clone(),
+                        fmt::truncate(r.stage_path.as_deref().unwrap_or("—"), 34),
+                        fmt::usd(r.cost),
+                        fmt::truncate(&r.evidence, 60),
+                    ]
+                })
+                .collect();
+            println!("{}", id.replace('_', " "));
+            print!(
+                "{}",
+                fmt::table(
+                    &[
+                        "Started",
+                        "Task",
+                        "First request",
+                        "Value",
+                        "Source",
+                        "Stages",
+                        ">API-eq",
+                        "Evidence"
+                    ],
+                    &table
+                )
+            );
+            print_footer(&filters);
+            return Ok(());
+        }
+    }
+    let rows: Vec<_> = explore::habits::habits(&conn, &filters)?
+        .into_iter()
+        .filter(|r| {
+            args.habit
+                .as_deref()
+                .and_then(explore::habits::resolve_habit)
+                .is_none_or(|id| id == r.id)
+        })
+        .collect();
+    if args.filters.json {
+        return print_json(&rows);
+    }
+    let table: Vec<Vec<String>> = rows
+        .iter()
+        .map(|r| {
+            let pair = |a: f64, b: f64, n_a: usize, n_b: usize| {
+                if n_a == 0 || n_b == 0 {
+                    "·".to_string()
+                } else {
+                    format!("{} vs {}", pct(a), pct(b))
+                }
+            };
+            vec![
+                r.name.to_string(),
+                r.adoption.map(pct).unwrap_or_else(|| "—".into()),
+                format!("{}/{}", r.followed, r.followed + r.not_followed),
+                pct(r.classified_share),
+                pair(r.with.completed, r.without.completed, r.with.n, r.without.n),
+                pair(
+                    r.with.corrections,
+                    r.without.corrections,
+                    r.with.n,
+                    r.without.n,
+                ),
+                pair(r.with.loops, r.without.loops, r.with.n, r.without.n),
+                format!(
+                    "{} vs {}",
+                    fmt::usd(r.with.median_cost),
+                    fmt::usd(r.without.median_cost)
+                ),
+                if r.weak {
+                    "signal".into()
+                } else if r.low_n {
+                    "low n".into()
+                } else {
+                    String::new()
+                },
+            ]
+        })
+        .collect();
+    print!(
+        "{}",
+        fmt::table(
+            &[
+                "Habit",
+                ">Followed",
+                ">n",
+                ">Jev",
+                "Done (with vs without)",
+                "Corrections",
+                "Loops",
+                "Median cost",
+                "Note"
+            ],
+            &table
+        )
+    );
+    print_footer(&filters);
+    println!(
+        "Followed = share of tasks where the habit applies. Jev = decisions that used classifier labels (others heuristic)."
+    );
+    println!(
+        "With vs without compares tasks that followed the habit to those that did not; correlation, not causation."
+    );
+    Ok(())
+}
+
+pub fn run_stages(args: StagesArgs, _context: AppContext) -> Result<()> {
+    let conn = open()?;
+    let filters = filters_from_args(&args.filters);
+    let summary = explore::stages::stage_summary(&conn, &filters)?;
+    if args.filters.json {
+        return print_json(&summary);
+    }
+    if summary.stages.is_empty() {
+        println!("No turns in this period.");
+        return Ok(());
+    }
+    println!("Work by stage");
+    let table: Vec<Vec<String>> = summary
+        .stages
+        .iter()
+        .map(|r| {
+            vec![
+                explore::stages::label(&r.stage).to_string(),
+                r.turns.to_string(),
+                r.tasks.to_string(),
+                fmt::usd(Some(r.cost)),
+                pct(r.share),
+                format!("{}/{}", r.classified_turns, r.turns),
+            ]
+        })
+        .collect();
+    print!(
+        "{}",
+        fmt::table(
+            &["Stage", ">Turns", ">Tasks", ">API-eq", ">Share", ">Jev"],
+            &table
+        )
+    );
+    println!("\nMost common task paths");
+    let table: Vec<Vec<String>> = summary
+        .paths
+        .iter()
+        .take(args.filters.limit.min(15))
+        .map(|r| {
+            vec![
+                fmt::truncate(&r.path, 60),
+                r.tasks.to_string(),
+                format!("{}/{}", r.completed, r.tasks),
+                fmt::usd(r.median_cost),
+            ]
+        })
+        .collect();
+    print!(
+        "{}",
+        fmt::table(&["Path", ">Tasks", ">Done", ">Median cost"], &table)
+    );
+    println!("\nSession kinds (≥60% of cost in one kind of work, else mixed)");
+    let table: Vec<Vec<String>> = summary
+        .session_kinds
+        .iter()
+        .map(|r| {
+            vec![
+                r.kind.clone(),
+                r.sessions.to_string(),
+                fmt::usd(Some(r.cost)),
+            ]
+        })
+        .collect();
+    print!("{}", fmt::table(&["Kind", ">Sessions", ">API-eq"], &table));
+    let requests: Vec<String> = summary
+        .request_kinds
+        .iter()
+        .map(|(kind, n)| format!("{} {n}", kind.replace('_', " ")))
+        .collect();
+    println!("\nRequests: {}", requests.join(" · "));
+    print_footer(&filters);
+    println!(
+        "Stages are heuristic until classified (`vca classify run`); Jev = turns labelled by the classifier or you."
     );
     Ok(())
 }

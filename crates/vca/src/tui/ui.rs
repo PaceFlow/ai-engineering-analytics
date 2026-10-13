@@ -1036,6 +1036,29 @@ fn render_detail(
                                 .unwrap_or_default(),
                         ),
                         left(fmt::truncate(&t.user_text, 90)),
+                        left(
+                            t.request_kind
+                                .as_deref()
+                                .map(|r| r.replace('_', " "))
+                                .unwrap_or_default(),
+                        ),
+                        colored(
+                            t.stage
+                                .as_deref()
+                                .map(|stage| {
+                                    format!(
+                                        "{}{}",
+                                        crate::insights::stages::short_stage(stage),
+                                        match t.stage_source.as_deref() {
+                                            Some("heuristic") => " h",
+                                            Some("override") => "✎",
+                                            _ => "",
+                                        }
+                                    )
+                                })
+                                .unwrap_or_default(),
+                            CY,
+                        ),
                         right(format!("{}/{}", t.edit_calls, t.tool_calls)),
                         colored(validation, if t.validation_failures > 0 { RD } else { GN }),
                         right(fmt::tokens(t.tokens)),
@@ -1063,6 +1086,8 @@ fn render_detail(
                     "Time",
                     "Task",
                     "You said",
+                    "Asked for",
+                    "Stage",
                     ">Edit/tools",
                     "Validation",
                     ">Tokens",
@@ -1074,11 +1099,13 @@ fn render_detail(
                     Constraint::Length(11),
                     Constraint::Length(4),
                     Constraint::Min(24),
+                    Constraint::Length(16),
+                    Constraint::Length(11),
                     Constraint::Length(10),
                     Constraint::Length(8),
                     Constraint::Length(7),
                     Constraint::Length(8),
-                    Constraint::Length(26),
+                    Constraint::Length(22),
                 ],
                 rows,
                 selected,
@@ -1091,7 +1118,14 @@ fn render_detail(
                 .map(|t| {
                     Row::new(vec![
                         left(format!("T{}", t.task_index)),
-                        left(fmt::truncate(&t.title, 50)),
+                        left(match &t.stage_path {
+                            Some(path) => format!(
+                                "{} · {}",
+                                fmt::truncate(&t.title, 32),
+                                fmt::truncate(path, 40)
+                            ),
+                            None => fmt::truncate(&t.title, 50),
+                        }),
                         left(fmt::label(
                             t.intent.as_deref(),
                             t.intent_source.as_deref(),
@@ -1159,7 +1193,7 @@ fn render_detail(
                 body,
                 &[
                     "Task",
-                    "First request / attempt",
+                    "First request · stages / attempt",
                     "Intent",
                     "Outcome",
                     "Done",

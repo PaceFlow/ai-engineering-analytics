@@ -482,3 +482,56 @@ fn classify_popup_estimates_then_reports_missing_key() -> Result<()> {
     assert!(app.popup.is_none());
     Ok(())
 }
+
+#[test]
+fn conversation_shows_stages_and_practices_show_habits() -> Result<()> {
+    let mut app = app()?;
+    key(&mut app, KeyCode::Char('2'));
+    key(&mut app, KeyCode::Enter);
+    let conversation = render(&app, 160, 40);
+    assert!(
+        conversation.contains("Stage") && conversation.contains("Asked for"),
+        "{conversation}"
+    );
+    assert!(
+        conversation.contains(" h"),
+        "heuristic stage marker: {conversation}"
+    );
+    key(&mut app, KeyCode::Char('6'));
+    let practices = render(&app, 160, 50);
+    assert!(
+        practices.contains("Plan first, and do it yourself"),
+        "{practices}"
+    );
+    assert!(
+        practices.contains("Write tests that can fail"),
+        "{practices}"
+    );
+    Ok(())
+}
+
+#[test]
+fn edit_popup_sets_turn_stage() -> Result<()> {
+    let mut app = app()?;
+    key(&mut app, KeyCode::Char('2'));
+    key(&mut app, KeyCode::Enter);
+    key(&mut app, KeyCode::Char('e'));
+    for _ in 0..2 {
+        key(&mut app, KeyCode::Char('j'));
+    }
+    while !matches!(
+        &app.popup,
+        Some(super::app::Popup::Edit { target, field, choice })
+            if target.fields()[*field].1[*choice] == "review"
+    ) {
+        key(&mut app, KeyCode::Right);
+    }
+    key(&mut app, KeyCode::Enter);
+    assert_eq!(
+        app.message.as_deref(),
+        Some("turn_stage = review (your label)")
+    );
+    let screen = render(&app, 160, 40);
+    assert!(screen.contains("review✎"), "{screen}");
+    Ok(())
+}

@@ -48,6 +48,9 @@ pub fn set_label(
             )?;
         }
     }
+    if matches!(unit_kind, "turn" | "task") {
+        crate::insights::refresh_label_dependents(conn)?;
+    }
     Ok(())
 }
 

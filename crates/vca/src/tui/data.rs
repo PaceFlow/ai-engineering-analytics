@@ -159,7 +159,12 @@ pub fn fetch(conn: &Connection, query: &Query) -> Result<Data> {
                 relations: explore::rework::relations(conn, filters)?.len(),
             }),
         ),
-        Query::Practices(filters) => Data::Practices(explore::practices::practices(conn, filters)?),
+        Query::Practices(filters) => {
+            let mut rows =
+                explore::habits::as_practice_rows(explore::habits::habits(conn, filters)?);
+            rows.extend(explore::practices::practices(conn, filters)?);
+            Data::Practices(rows)
+        }
         Query::Compare(keys) => Data::Compare(explore::compare::compare_tasks(conn, keys)?),
         Query::Action(action) => act(conn, action)?,
     })

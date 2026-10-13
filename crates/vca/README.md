@@ -174,6 +174,8 @@ vca tasks --completed-only        # time and cost to complete each task
 vca show <session-id>             # tasks, agents, usage, context, commits of one session
 vca context --group-by dir        # what filled the context and what carrying it cost
 vca rework                        # later work that changed earlier AI lines, defect evidence
+vca stages                        # work by stage: explore, plan, implement, verify, review…
+vca habits                        # the team's 12 habits: adoption and outcomes
 vca tui                           # interactive explorer with drill-down
 ```
 

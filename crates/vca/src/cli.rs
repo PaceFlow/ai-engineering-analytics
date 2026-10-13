@@ -77,6 +77,11 @@ pub enum Commands {
     /// Later AI work that changed earlier AI lines, defect evidence and correction spend
     #[command(after_help = REWORK_AFTER_HELP)]
     Rework(ReworkArgs),
+    /// The team's 12 habits: how often each is followed and what that correlates with
+    #[command(after_help = HABITS_AFTER_HELP)]
+    Habits(HabitsArgs),
+    /// Work stages: cost by stage (explore, plan, implement, verify, review…), stage paths, session kinds
+    Stages(StagesArgs),
     /// Model prices (LiteLLM's public price map): status, update, show a model
     Pricing(PricingArgs),
     /// Optional AI task splitting and labels via Jev on OpenRouter (opt-in, previewable)
@@ -85,6 +90,26 @@ pub enum Commands {
 }
 
 const REWORK_AFTER_HELP: &str = "Examples:\n  vca rework                          # spend split, suspected defects, relations\n  vca rework --kind defect_correction\n  vca rework --days 90 --here\n\nEvidence levels: L0 AI lines later changed · L1 later fix signal · L2 fix linked to a bug issue ·\nL3 classifier says defect correction · L4 confirmed by you. Correlation, not causation.";
+
+const HABITS_AFTER_HELP: &str = "Examples:\n  vca habits                       # adoption and outcomes for all 12 habits\n  vca habits --habit 7 --list      # tasks behind one habit, with evidence\n  vca habits --days 90 --here\n\nLabels come from local heuristics until you classify with Jev (`vca classify run`), which adds\nturn stages, request kinds and flags such as unrequested changes. Correlation, not causation.";
+
+#[derive(Args, Debug, Clone)]
+pub struct HabitsArgs {
+    #[command(flatten)]
+    pub filters: InsightFilterArgs,
+    /// One habit (number or id), e.g. 7 or 07_tests_can_fail
+    #[arg(long)]
+    pub habit: Option<String>,
+    /// List the tasks behind the habit (needs --habit)
+    #[arg(long, requires = "habit")]
+    pub list: bool,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct StagesArgs {
+    #[command(flatten)]
+    pub filters: InsightFilterArgs,
+}
 
 #[derive(Args, Debug, Clone)]
 pub struct PricingArgs {
