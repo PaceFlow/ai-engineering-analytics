@@ -557,7 +557,7 @@ fn read_purpose(
     }
     let target = item.target.as_deref()?;
     let path = target.split(" :: ").next().unwrap_or(target).trim();
-    let basename = path.rsplit('/').next().unwrap_or(path);
+    let basename = path.rsplit(['/', '\\']).next().unwrap_or(path);
     let later = |ts: &Option<i64>| match (item.ts, ts) {
         (Some(item_ts), Some(ts)) => *ts >= item_ts,
         _ => true,
@@ -600,11 +600,14 @@ fn instruction_references(
         let Some(sources) = item.source.as_deref() else {
             continue;
         };
-        for path in sources.lines().filter(|line| line.starts_with('/')) {
+        for path in sources
+            .lines()
+            .filter(|line| std::path::Path::new(line).is_absolute() || line.starts_with('/'))
+        {
             let lines = cache
                 .entry(path.to_string())
                 .or_insert_with(|| extract_path_references(path));
-            let file_name = path.rsplit('/').next().unwrap_or(path);
+            let file_name = path.rsplit(['/', '\\']).next().unwrap_or(path);
             for (line, reference) in lines.iter() {
                 refs.push((reference.clone(), format!("{file_name}:{line}")));
             }

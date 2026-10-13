@@ -308,7 +308,7 @@ fn evidence_for(turn: &crate::classify::state::TurnFacts) -> TurnEvidence {
                     && ["plan", "design", "spec", "rfc", "adr"].iter().any(|cue| {
                         target
                             .to_ascii_lowercase()
-                            .rsplit('/')
+                            .rsplit(['/', '\\'])
                             .next()
                             .unwrap_or("")
                             .contains(cue)

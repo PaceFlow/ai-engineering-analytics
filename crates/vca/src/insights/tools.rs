@@ -228,8 +228,9 @@ pub fn target_dir(target: &str, repo_root: Option<&str>, depth: usize) -> String
         .trim()
         .trim_matches('"')
         .trim_matches('\'')
-        .to_string();
+        .replace('\\', "/");
     if let Some(root) = repo_root {
+        let root = root.replace('\\', "/");
         let root = root.trim_end_matches('/');
         if let Some(stripped) = path.strip_prefix(root) {
             path = stripped.trim_start_matches('/').to_string();
@@ -258,6 +259,22 @@ pub fn mcp_server(tool_name: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn target_dir_handles_windows_paths() {
+        assert_eq!(
+            target_dir(
+                r"C:\work\repo\src\cost\pricing.rs",
+                Some(r"C:\work\repo"),
+                3
+            ),
+            "src/cost/"
+        );
+        assert_eq!(
+            target_dir("/work/repo/src/a.rs", Some("/work/repo/"), 3),
+            "src/"
+        );
+    }
 
     #[test]
     fn detects_test_paths_ask_tools_diffs_and_slash_commands() {

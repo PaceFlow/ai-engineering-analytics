@@ -28,7 +28,8 @@ jobs:
           fi
       - name: Skip live Jev test
         if: steps.config.outputs.enabled != 'true'
-        run: echo "Skipping live Jev test: missing OPENROUTER_KEY secret"
+        run: |
+          echo "Skipping live Jev test: missing OPENROUTER_KEY secret"
       - name: Run live Jev test
         if: steps.config.outputs.enabled == 'true'
         run: cargo test -p vibe-coding-analytics --test jev_live -- --ignored --nocapture --test-threads=1

@@ -98,8 +98,8 @@ impl Filters {
 }
 
 pub fn short_repo(repo: &str) -> String {
-    repo.trim_end_matches('/')
-        .rsplit('/')
+    repo.trim_end_matches(['/', '\\'])
+        .rsplit(['/', '\\'])
         .next()
         .unwrap_or(repo)
         .to_string()
@@ -2096,6 +2096,18 @@ pub fn session_commits(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn short_repo_takes_the_folder_name_on_any_os() {
+        assert_eq!(
+            super::short_repo("/work/fixture-paceflow/"),
+            "fixture-paceflow"
+        );
+        assert_eq!(
+            super::short_repo(r"C:\work\fixture-paceflow"),
+            "fixture-paceflow"
+        );
+    }
+
     use super::*;
 
     fn task(
