@@ -69,18 +69,18 @@ impl TestEnv {
             &home,
             &["__REPO_PACEFLOW__", "__REPO_CURSOR__", "__HOME__"],
             &[
-                &json_escaped(&paceflow_repo.to_string_lossy()),
-                &json_escaped(&cursor_dir.to_string_lossy()),
-                &json_escaped(&home.to_string_lossy()),
+                &fixture_path(&paceflow_repo.to_string_lossy()),
+                &fixture_path(&cursor_dir.to_string_lossy()),
+                &fixture_path(&home.to_string_lossy()),
             ],
         )?;
         copy_claude_sessions(
             &home,
             &["__REPO_PACEFLOW__", "__REPO_CURSOR__", "__HOME__"],
             &[
-                &json_escaped(&paceflow_repo.to_string_lossy()),
-                &json_escaped(&cursor_dir.to_string_lossy()),
-                &json_escaped(&home.to_string_lossy()),
+                &fixture_path(&paceflow_repo.to_string_lossy()),
+                &fixture_path(&cursor_dir.to_string_lossy()),
+                &fixture_path(&home.to_string_lossy()),
             ],
         )?;
         install_cursor_fixture(&home, &paceflow_repo, &cursor_dir)?;
@@ -830,9 +830,11 @@ fn padded_home(root: &Path) -> anyhow::Result<PathBuf> {
     Ok(home)
 }
 
-/// A path as it must appear inside a JSON string (backslashes escaped).
-fn json_escaped(text: &str) -> String {
-    let quoted = serde_json::to_string(text).expect("string serializes");
+/// A path as written into fixture JSON. Forward slashes on every OS (Windows
+/// accepts them), so serialized tool inputs are the same length everywhere
+/// and token estimates do not depend on backslash escaping.
+fn fixture_path(text: &str) -> String {
+    let quoted = serde_json::to_string(&text.replace('\\', "/")).expect("string serializes");
     quoted[1..quoted.len() - 1].to_string()
 }
 
@@ -1281,9 +1283,9 @@ fn rewrite_cursor_db(
              '__HOME__', ?3
          )",
         (
-            json_escaped(&paceflow_repo.to_string_lossy()),
-            json_escaped(&cursor_dir.to_string_lossy()),
-            json_escaped(&home.to_string_lossy()),
+            fixture_path(&paceflow_repo.to_string_lossy()),
+            fixture_path(&cursor_dir.to_string_lossy()),
+            fixture_path(&home.to_string_lossy()),
         ),
     )?;
     Ok(())
