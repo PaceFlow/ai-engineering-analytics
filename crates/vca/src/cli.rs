@@ -74,6 +74,132 @@ pub enum Commands {
     /// What filled the context and what carrying it cost
     #[command(after_help = CONTEXT_AFTER_HELP)]
     Context(ContextArgs),
+    /// Optional AI task splitting and labels via Jev on OpenRouter (opt-in, previewable)
+    #[command(after_help = CLASSIFY_AFTER_HELP)]
+    Classify(ClassifyArgs),
+}
+
+const CLASSIFY_AFTER_HELP: &str = "Examples:\n  vca classify plan --days 7                 # what would be sent, estimated cost\n  vca classify preview <session> --pass segment\n  vca classify key set                       # or export OPENROUTER_API_KEY\n  vca classify run --days 7 --max-usd 0.05 --yes\n  vca classify set <session> --task 0 intent bug_fix\n  vca classify set-turn <session> 5 1        # move turn 5 to task 1\n  vca classify eval\n\nNothing is sent unless you run `classify run` and confirm. Without it, each session is one task\nand labels come from local heuristics (marked h).";
+
+#[derive(Args, Debug, Clone)]
+pub struct ClassifyArgs {
+    #[command(subcommand)]
+    pub command: ClassifyCommands,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct ClassifySelectArgs {
+    #[command(flatten)]
+    pub filters: InsightFilterArgs,
+    /// Specific sessions (id, prefix or provider:id); repeatable
+    #[arg(long)]
+    pub session: Vec<String>,
+    /// Content level: evidence_only | user_text | conversation | full
+    #[arg(long)]
+    pub level: Option<String>,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum ClassifyCommands {
+    /// Count units, tokens and cost a run would send (sends nothing)
+    Plan(ClassifySelectArgs),
+    /// Print the exact request one unit would send
+    Preview {
+        /// Session id, prefix or provider:id
+        session: String,
+        /// segment | feedback | labels | completion
+        #[arg(long, default_value = "labels")]
+        pass: String,
+        /// Turn (segment, feedback) or task (labels, completion) index
+        #[arg(long)]
+        unit: Option<i64>,
+        /// Content level override
+        #[arg(long)]
+        level: Option<String>,
+    },
+    /// Send the selection to the classifier
+    Run {
+        #[command(flatten)]
+        select: ClassifySelectArgs,
+        /// Stop before spending more than this (USD)
+        #[arg(long, default_value_t = 0.50)]
+        max_usd: f64,
+        /// Comma list: segment, feedback, labels, completion, all
+        #[arg(long, default_value = "all")]
+        passes: String,
+        /// Do not ask for confirmation
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Settings, key source, spend and label coverage
+    Status,
+    /// Manage the OpenRouter API key
+    Key {
+        #[command(subcommand)]
+        command: ClassifyKeyCommands,
+    },
+    /// Change classifier settings
+    Config {
+        /// Default content level
+        #[arg(long)]
+        level: Option<String>,
+        /// Monthly classifier budget (USD)
+        #[arg(long)]
+        monthly_budget: Option<f64>,
+        /// Only send these projects (glob on repo root); repeatable
+        #[arg(long)]
+        allow_project: Vec<String>,
+        /// Never send these projects (glob on repo root); repeatable
+        #[arg(long)]
+        deny_project: Vec<String>,
+        /// Clear allow and deny lists before adding
+        #[arg(long)]
+        reset_projects: bool,
+    },
+    /// Override a label (wins over classifier and heuristic labels)
+    Set {
+        session: String,
+        /// Task index (task questions)
+        #[arg(long, conflicts_with = "turn")]
+        task: Option<i64>,
+        /// Turn index (exchange questions such as feedback)
+        #[arg(long)]
+        turn: Option<i64>,
+        /// Question id, e.g. intent, outcome, feedback, p_repeated_failure
+        question: String,
+        label: String,
+        #[arg(long)]
+        note: Option<String>,
+    },
+    /// Move a user turn (and the turns after it, until the next assignment) to a task
+    SetTurn {
+        session: String,
+        turn: i64,
+        task: i64,
+    },
+    /// Set the turn where a task was completed (`none` = not completed)
+    SetCompletion {
+        session: String,
+        task: i64,
+        turn: String,
+    },
+    /// Remove all manual overrides for a session
+    ClearOverrides { session: String },
+    /// Accuracy of classifier and heuristic labels against your overrides and gold labels
+    Eval {
+        #[arg(long)]
+        question: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum ClassifyKeyCommands {
+    /// Save a key (reads stdin when omitted)
+    Set { key: Option<String> },
+    /// Delete the saved key
+    Delete,
 }
 
 const USAGE_AFTER_HELP: &str = "Examples:\n  vca usage                       # by tool, last 30 days\n  vca usage --group-by model\n  vca usage --group-by session --limit 20\n  vca usage --group-by hour --days 2\n\nEvery usage event is counted once, so groups add up to the total. Costs are API list-price estimates.";
