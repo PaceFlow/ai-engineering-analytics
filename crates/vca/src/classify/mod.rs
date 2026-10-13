@@ -3,6 +3,7 @@
 pub mod client;
 pub mod config;
 pub mod heuristic;
+pub mod overrides;
 pub mod questions;
 pub mod run;
 pub mod state;

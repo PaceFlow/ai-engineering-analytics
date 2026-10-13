@@ -382,3 +382,99 @@ fn narrow_terminal_still_renders() -> Result<()> {
     assert!(screen.contains("Sessions"));
     Ok(())
 }
+
+#[test]
+fn edit_popup_saves_task_label_override() -> Result<()> {
+    let mut app = app()?;
+    key(&mut app, KeyCode::Char('2'));
+    key(&mut app, KeyCode::Enter);
+    key(&mut app, KeyCode::Tab);
+    assert!(matches!(
+        app.frame().screen,
+        Screen::Detail {
+            tab: DetailTab::Tasks,
+            ..
+        }
+    ));
+    key(&mut app, KeyCode::Char('e'));
+    let popup = render(&app, 140, 44);
+    assert!(
+        popup.contains("intent") && popup.contains("completed at"),
+        "{popup}"
+    );
+    // outcome field → "stalled", save.
+    key(&mut app, KeyCode::Char('j'));
+    while !matches!(
+        &app.popup,
+        Some(super::app::Popup::Edit { target, field, choice })
+            if target.fields()[*field].1[*choice] == "stalled"
+    ) {
+        key(&mut app, KeyCode::Right);
+    }
+    key(&mut app, KeyCode::Enter);
+    assert!(app.popup.is_none());
+    let message = app.message.clone().unwrap_or_default();
+    assert_eq!(message, "outcome = stalled (your label)");
+    let screen = render(&app, 140, 44);
+    assert!(screen.contains('✎'), "override glyph: {message} {screen}");
+    Ok(())
+}
+
+#[test]
+fn edit_popup_on_turn_starts_a_new_task() -> Result<()> {
+    let mut app = app()?;
+    key(&mut app, KeyCode::Char('2'));
+    key(&mut app, KeyCode::Enter);
+    let before = match app.frame().data.as_ref() {
+        Some(super::data::Data::Detail(Some(detail))) => detail.tasks.len(),
+        _ => 0,
+    };
+    key(&mut app, KeyCode::Char('j'));
+    key(&mut app, KeyCode::Char('e'));
+    key(&mut app, KeyCode::Char('j'));
+    // "starts task" options: T1.., new task, clear → pick "new task".
+    let Some(super::app::Popup::Edit { target, .. }) = app.popup.clone() else {
+        panic!("edit popup expected");
+    };
+    let options = target.fields()[1].1.clone();
+    let new_task = options.iter().position(|o| o == "new task").unwrap();
+    for _ in 0..new_task {
+        key(&mut app, KeyCode::Right);
+    }
+    key(&mut app, KeyCode::Enter);
+    let after = match app.frame().data.as_ref() {
+        Some(super::data::Data::Detail(Some(detail))) => detail.tasks.len(),
+        _ => 0,
+    };
+    assert_eq!(after, before + 1, "{:?}", app.message);
+    Ok(())
+}
+
+#[test]
+fn classify_popup_estimates_then_reports_missing_key() -> Result<()> {
+    let _lock = crate::test_support::lock_env();
+    let home = tempfile::tempdir()?;
+    let _home = crate::test_support::ScopedEnvVar::set("VCA_HOME", home.path());
+    let _key = crate::test_support::ScopedEnvVar::unset("OPENROUTER_API_KEY");
+    let mut app = app()?;
+    key(&mut app, KeyCode::Char('2'));
+    key(&mut app, KeyCode::Char('K'));
+    let Some(super::app::Popup::Classify { plan, .. }) = app.popup.clone() else {
+        panic!("classify popup expected");
+    };
+    let plan = plan.expect("plan computed");
+    assert!(plan.est_tokens > 0);
+    let screen = render(&app, 140, 44);
+    assert!(
+        screen.contains("Classify with Jev") && screen.contains("conversation"),
+        "{screen}"
+    );
+    key(&mut app, KeyCode::Enter);
+    let Some(super::app::Popup::Classify { error, .. }) = app.popup.clone() else {
+        panic!("popup stays open on error");
+    };
+    assert!(error.unwrap_or_default().contains("No OpenRouter key"));
+    key(&mut app, KeyCode::Esc);
+    assert!(app.popup.is_none());
+    Ok(())
+}

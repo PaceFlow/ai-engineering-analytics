@@ -79,7 +79,7 @@ pub struct RunOptions {
     pub dry_run: bool,
 }
 
-#[derive(Debug, Clone, Default, serde::Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
 pub struct RunSummary {
     pub run_id: Option<i64>,
     pub sessions: usize,

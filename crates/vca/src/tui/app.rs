@@ -8,7 +8,10 @@ use std::cell::Cell;
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
-use super::data::{Data, Loader, Query};
+use super::data::{Action, Data, Loader, Query};
+use crate::classify::questions::FEEDBACK;
+use crate::classify::run::RunSummary;
+use crate::classify::state::Level;
 use crate::explore::{
     Bucket, ContextDim, CostBand, Filters, GroupDim, QuotaWindowRow, SessionSort, TaskSort,
     merge_filters,
@@ -182,6 +185,184 @@ pub enum Popup {
     Search {
         text: String,
     },
+    /// Correct labels, task boundaries or completion (`e`).
+    Edit {
+        target: EditTarget,
+        field: usize,
+        choice: usize,
+    },
+    /// Consent screen for sending a selection to the classifier (`K`).
+    Classify {
+        sessions: Vec<(String, String)>,
+        level: Level,
+        max_usd: f64,
+        plan: Option<Box<RunSummary>>,
+        pending: Option<&'static str>,
+        error: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum EditTarget {
+    Task {
+        provider: String,
+        session: String,
+        task: i64,
+        turns: Vec<i64>,
+        intent: Option<String>,
+        outcome: Option<String>,
+    },
+    Turn {
+        provider: String,
+        session: String,
+        turn: i64,
+        task: Option<i64>,
+        tasks: i64,
+        feedback: Option<String>,
+    },
+}
+
+pub const CLEAR: &str = "(remove my label)";
+
+impl EditTarget {
+    pub fn title(&self) -> String {
+        match self {
+            Self::Task { task, session, .. } => {
+                format!("T{task} · {}", crate::explore::short_id(session))
+            }
+            Self::Turn { turn, session, .. } => {
+                format!("turn {turn} · {}", crate::explore::short_id(session))
+            }
+        }
+    }
+
+    /// Editable fields with their options; the last option clears the override.
+    pub fn fields(&self) -> Vec<(&'static str, Vec<String>)> {
+        let owned = |labels: &[&str]| -> Vec<String> {
+            labels
+                .iter()
+                .map(|l| l.to_string())
+                .chain([CLEAR.to_string()])
+                .collect()
+        };
+        match self {
+            Self::Task { turns, .. } => {
+                let mut fields = vec![("intent", owned(&INTENTS)), ("outcome", owned(&OUTCOMES))];
+                if !turns.is_empty() {
+                    let options = turns
+                        .iter()
+                        .map(|turn| format!("turn {turn}"))
+                        .chain(["not completed".to_string(), CLEAR.to_string()])
+                        .collect();
+                    fields.push(("completed at", options));
+                }
+                fields
+            }
+            Self::Turn { tasks, .. } => {
+                let feedback: Vec<&str> = FEEDBACK.iter().map(|(name, _)| *name).collect();
+                let task_options = (0..*tasks)
+                    .map(|task| format!("T{task}"))
+                    .chain(["new task".to_string(), CLEAR.to_string()])
+                    .collect();
+                vec![
+                    ("feedback", owned(&feedback)),
+                    ("starts task", task_options),
+                ]
+            }
+        }
+    }
+
+    /// Option index of the current value of each field.
+    pub fn current(&self, field: usize) -> usize {
+        let fields = self.fields();
+        let Some((_, options)) = fields.get(field) else {
+            return 0;
+        };
+        let find = |value: Option<&str>| {
+            value
+                .and_then(|v| options.iter().position(|o| o == v))
+                .unwrap_or(0)
+        };
+        match (self, field) {
+            (Self::Task { intent, .. }, 0) => find(intent.as_deref()),
+            (Self::Task { outcome, .. }, 1) => find(outcome.as_deref()),
+            (Self::Turn { feedback, .. }, 0) => find(feedback.as_deref()),
+            (Self::Turn { task, .. }, 1) => task.map(|t| t as usize).unwrap_or(0),
+            _ => 0,
+        }
+    }
+
+    pub fn action(&self, field: usize, choice: usize) -> Option<Action> {
+        let fields = self.fields();
+        let (name, options) = fields.get(field)?;
+        let option = options.get(choice)?.clone();
+        let cleared = option == CLEAR;
+        Some(match self {
+            Self::Task {
+                provider,
+                session,
+                task,
+                ..
+            } => {
+                if *name == "completed at" {
+                    let completion = if cleared {
+                        None
+                    } else if option == "not completed" {
+                        Some(None)
+                    } else {
+                        Some(option.strip_prefix("turn ")?.parse().ok())
+                    };
+                    Action::SetCompletion {
+                        provider: provider.clone(),
+                        session: session.clone(),
+                        task: *task,
+                        completion,
+                    }
+                } else {
+                    Action::SetLabel {
+                        unit_kind: "task".into(),
+                        unit_key: crate::classify::heuristic::task_unit_key(
+                            provider, session, *task,
+                        ),
+                        question: name.to_string(),
+                        label: (!cleared).then_some(option),
+                    }
+                }
+            }
+            Self::Turn {
+                provider,
+                session,
+                turn,
+                tasks,
+                ..
+            } => {
+                if *name == "starts task" {
+                    let task = if cleared {
+                        None
+                    } else if option == "new task" {
+                        Some(*tasks)
+                    } else {
+                        Some(option.strip_prefix('T')?.parse::<i64>().ok()?)
+                    };
+                    Action::AssignTurn {
+                        provider: provider.clone(),
+                        session: session.clone(),
+                        turn: *turn,
+                        task,
+                    }
+                } else {
+                    Action::SetLabel {
+                        unit_kind: "exchange".into(),
+                        unit_key: crate::classify::heuristic::turn_unit_key(
+                            provider, session, *turn,
+                        ),
+                        question: "feedback".into(),
+                        label: (!cleared).then_some(option),
+                    }
+                }
+            }
+        })
+    }
 }
 
 pub const TIME_PRESETS: [(u32, &str); 4] = [(7, "7d"), (30, "30d"), (90, "90d"), (0, "all")];
@@ -232,6 +413,8 @@ pub struct App {
     pub should_quit: bool,
     pub time_preset: usize,
     pub title: &'static str,
+    /// Request id of the latest write or classifier action.
+    pub action_request: u64,
 }
 
 pub fn date_from_days(days: u32) -> Option<String> {
@@ -258,6 +441,7 @@ impl App {
             should_quit: false,
             time_preset: 1,
             title,
+            action_request: 0,
         };
         app.push(Frame::new(Screen::Overview, filters));
         app
@@ -346,6 +530,10 @@ impl App {
     /// Apply finished results to the frames that asked for them.
     pub fn drain(&mut self) {
         for (id, result) in self.loader.poll() {
+            if id == self.action_request {
+                self.on_action_result(result);
+                continue;
+            }
             for frame in self.frames.iter_mut() {
                 if frame.request == id {
                     frame.loading = false;
@@ -500,6 +688,8 @@ impl App {
             KeyCode::Char('o') => self.drill_alternative(),
             KeyCode::Char('R') => self.load(),
             KeyCode::Char('M') => self.log_limit_hit(),
+            KeyCode::Char('e') => self.open_edit(),
+            KeyCode::Char('K') => self.open_classify(),
             _ => {}
         }
     }
@@ -936,6 +1126,179 @@ impl App {
         self.push(frame);
     }
 
+    /// Run a write or classifier action on the loader thread.
+    pub fn act(&mut self, action: Action) {
+        let id = self.next_request;
+        self.next_request += 1;
+        self.action_request = id;
+        self.loader.request(id, Query::Action(action));
+        self.drain();
+    }
+
+    fn on_action_result(&mut self, result: Result<Data, String>) {
+        let classify = matches!(self.popup, Some(Popup::Classify { .. }));
+        match result {
+            Ok(Data::ClassifyPlan(summary)) => {
+                if let Some(Popup::Classify { plan, pending, .. }) = self.popup.as_mut() {
+                    *plan = Some(summary);
+                    *pending = None;
+                }
+            }
+            Ok(Data::Done(text)) => {
+                let preview = matches!(
+                    self.popup,
+                    Some(Popup::Classify {
+                        pending: Some("preview"),
+                        ..
+                    })
+                );
+                if preview {
+                    self.popup = Some(Popup::Explain {
+                        title: "Exact request for the first task (labels pass)".into(),
+                        lines: text.lines().map(str::to_string).collect(),
+                    });
+                    return;
+                }
+                if classify {
+                    self.popup = None;
+                }
+                self.message = Some(text);
+                self.load();
+            }
+            Ok(_) => {}
+            Err(error) => {
+                if let Some(Popup::Classify {
+                    error: slot,
+                    pending,
+                    ..
+                }) = self.popup.as_mut()
+                {
+                    *slot = Some(error);
+                    *pending = None;
+                } else {
+                    self.message = Some(format!("Could not save: {error}"));
+                }
+            }
+        }
+    }
+
+    /// What `e` edits for the selected row, if anything.
+    pub fn edit_target(&self) -> Option<EditTarget> {
+        let frame = self.frame();
+        match (&frame.screen, frame.data.as_ref()?) {
+            (Screen::Detail { tab, .. }, Data::Detail(Some(detail))) => match tab {
+                DetailTab::Tasks => {
+                    let task = detail.tasks.get(frame.selected)?;
+                    let turns = detail
+                        .turns
+                        .iter()
+                        .filter(|turn| turn.task_index == Some(task.task_index))
+                        .map(|turn| turn.turn_index)
+                        .collect();
+                    Some(EditTarget::Task {
+                        provider: task.provider.clone(),
+                        session: task.session_id.clone(),
+                        task: task.task_index,
+                        turns,
+                        intent: task.intent.clone(),
+                        outcome: task.outcome.clone(),
+                    })
+                }
+                DetailTab::Conversation => {
+                    let turn = detail.turns.get(frame.selected)?;
+                    Some(EditTarget::Turn {
+                        provider: detail.session.provider.clone(),
+                        session: turn.session_id.clone(),
+                        turn: turn.turn_index,
+                        task: turn.task_index,
+                        tasks: detail.tasks.len() as i64,
+                        feedback: turn.feedback.clone(),
+                    })
+                }
+                _ => None,
+            },
+            (_, Data::Tasks(rows)) => {
+                let task = rows.get(frame.selected)?;
+                Some(EditTarget::Task {
+                    provider: task.provider.clone(),
+                    session: task.session_id.clone(),
+                    task: task.task_index,
+                    turns: Vec::new(),
+                    intent: task.intent.clone(),
+                    outcome: task.outcome.clone(),
+                })
+            }
+            _ => None,
+        }
+    }
+
+    fn open_edit(&mut self) {
+        match self.edit_target() {
+            Some(target) => {
+                let choice = target.current(0);
+                self.popup = Some(Popup::Edit {
+                    target,
+                    field: 0,
+                    choice,
+                });
+            }
+            None => {
+                self.message = Some(
+                    "e edits a task (Tasks list, session Tasks tab) or a turn (Conversation tab)"
+                        .into(),
+                )
+            }
+        }
+    }
+
+    /// Sessions `K` would classify: marked rows, else the selected one.
+    pub fn classify_selection(&self) -> Vec<(String, String)> {
+        let mut sessions: Vec<(String, String)> = Vec::new();
+        let mut add = |provider: &str, session: &str| {
+            let key = (provider.to_string(), session.to_string());
+            if !sessions.contains(&key) {
+                sessions.push(key);
+            }
+        };
+        if !self.marked.is_empty() {
+            for (provider, session, _) in &self.marked {
+                add(provider, session);
+            }
+            return sessions;
+        }
+        let frame = self.frame();
+        if let Screen::Detail {
+            provider, session, ..
+        } = &frame.screen
+        {
+            add(provider, session);
+        } else if let Some((provider, session, _)) = self.selected_task_key() {
+            add(&provider, &session);
+        }
+        sessions
+    }
+
+    fn open_classify(&mut self) {
+        let sessions = self.classify_selection();
+        if sessions.is_empty() {
+            self.message =
+                Some("Select a session or task (or mark several with m), then press K".into());
+            return;
+        }
+        let level = crate::classify::config::ClassifierConfig::load()
+            .map(|config| config.level())
+            .unwrap_or(Level::Conversation);
+        self.popup = Some(Popup::Classify {
+            sessions: sessions.clone(),
+            level,
+            max_usd: 0.10,
+            plan: None,
+            pending: Some("plan"),
+            error: None,
+        });
+        self.act(Action::ClassifyPlan { sessions, level });
+    }
+
     fn log_limit_hit(&mut self) {
         let frame = self.frame();
         let provider = match (frame.data.as_ref(), &frame.screen) {
@@ -974,6 +1337,140 @@ impl App {
     fn on_popup_key(&mut self, key: KeyEvent) {
         let popup = self.popup.take().expect("popup present");
         match popup {
+            Popup::Edit {
+                target,
+                mut field,
+                mut choice,
+            } => {
+                let fields = target.fields();
+                let options = fields.get(field).map(|(_, o)| o.len()).unwrap_or(1).max(1);
+                match key.code {
+                    KeyCode::Esc | KeyCode::Char('e') => return,
+                    KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => {
+                        field = (field + 1) % fields.len().max(1);
+                        choice = target.current(field);
+                    }
+                    KeyCode::Up | KeyCode::Char('k') | KeyCode::BackTab => {
+                        field = (field + fields.len().max(1) - 1) % fields.len().max(1);
+                        choice = target.current(field);
+                    }
+                    KeyCode::Right | KeyCode::Char('l') | KeyCode::Char(' ') => {
+                        choice = (choice + 1) % options
+                    }
+                    KeyCode::Left | KeyCode::Char('h') => choice = (choice + options - 1) % options,
+                    KeyCode::Enter => {
+                        if let Some(action) = target.action(field, choice) {
+                            self.act(action);
+                        }
+                        return;
+                    }
+                    _ => {}
+                }
+                self.popup = Some(Popup::Edit {
+                    target,
+                    field,
+                    choice,
+                });
+            }
+            Popup::Classify {
+                sessions,
+                mut level,
+                mut max_usd,
+                plan,
+                pending,
+                error,
+            } => {
+                let busy = pending.is_some();
+                match key.code {
+                    KeyCode::Esc | KeyCode::Char('K') => {
+                        if pending == Some("run") {
+                            self.message = Some(
+                                "Classification keeps running; results appear when it finishes"
+                                    .into(),
+                            );
+                        }
+                    }
+                    KeyCode::Left | KeyCode::Right | KeyCode::Char('l') if !busy => {
+                        const LEVELS: [Level; 4] = [
+                            Level::EvidenceOnly,
+                            Level::UserText,
+                            Level::Conversation,
+                            Level::Full,
+                        ];
+                        let index = LEVELS.iter().position(|l| *l == level).unwrap_or(2);
+                        let next = if key.code == KeyCode::Left {
+                            index + 3
+                        } else {
+                            index + 1
+                        };
+                        level = LEVELS[next % 4];
+                        self.popup = Some(Popup::Classify {
+                            sessions: sessions.clone(),
+                            level,
+                            max_usd,
+                            plan: None,
+                            pending: Some("plan"),
+                            error: None,
+                        });
+                        self.act(Action::ClassifyPlan { sessions, level });
+                    }
+                    KeyCode::Char('+') | KeyCode::Char('=') | KeyCode::Char('-') if !busy => {
+                        max_usd = if key.code == KeyCode::Char('-') {
+                            (max_usd / 2.0).max(0.01)
+                        } else {
+                            (max_usd * 2.0).min(5.0)
+                        };
+                        self.popup = Some(Popup::Classify {
+                            sessions,
+                            level,
+                            max_usd,
+                            plan,
+                            pending,
+                            error,
+                        });
+                    }
+                    KeyCode::Char('p') if !busy => {
+                        let first = sessions[0].clone();
+                        self.popup = Some(Popup::Classify {
+                            sessions,
+                            level,
+                            max_usd,
+                            plan,
+                            pending: Some("preview"),
+                            error: None,
+                        });
+                        self.act(Action::ClassifyPreview {
+                            session: first,
+                            level,
+                        });
+                    }
+                    KeyCode::Enter if !busy => {
+                        self.popup = Some(Popup::Classify {
+                            sessions: sessions.clone(),
+                            level,
+                            max_usd,
+                            plan,
+                            pending: Some("run"),
+                            error: None,
+                        });
+                        self.act(Action::ClassifyRun {
+                            sessions,
+                            level,
+                            max_usd,
+                        });
+                    }
+                    _ => {
+                        self.popup = Some(Popup::Classify {
+                            sessions,
+                            level,
+                            max_usd,
+                            plan,
+                            pending,
+                            error,
+                        })
+                    }
+                }
+            }
             Popup::Help | Popup::Explain { .. } => match key.code {
                 KeyCode::Esc
                 | KeyCode::Char('q')
