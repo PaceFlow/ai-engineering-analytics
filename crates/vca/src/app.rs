@@ -73,6 +73,7 @@ pub fn run(
         Commands::Tasks(args) => commands::insights::run_tasks(args, context),
         Commands::Show(args) => commands::insights::run_show(args, context),
         Commands::Context(args) => commands::insights::run_context(args, context),
+        Commands::Classify(args) => commands::classify::run(args, context),
     }
 }
 

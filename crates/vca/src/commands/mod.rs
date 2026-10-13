@@ -1,3 +1,4 @@
+pub mod classify;
 pub mod cost;
 pub mod delivery;
 pub mod event_stream;
