@@ -90,6 +90,78 @@ Key signals:
 
 Cost uses provider-reported token buckets when available. When a provider does not store token usage, Paceflow estimates text tokens from local session text and applies known model pricing where it can identify the model. Unknown models stay unpriced instead of inventing a dollar value.
 
+## Conversations, Usage, Quota And Tasks
+
+The commands below look at the conversations themselves: where tokens and money went, how close you are to subscription limits, what each conversation tried to do, and how long and how much each piece of work took.
+
+```bash
+paceflow usage --group-by model        # tokens and API-equivalent $ by tool, model, project, session, agent, day or hour
+paceflow quota                         # quota windows: observed % (Codex) or token burn (others)
+paceflow quota mark claude --kind limit_hit   # record that you just hit a limit
+paceflow sessions --sort cost          # root sessions with subagents rolled in
+paceflow tasks --completed-only --sort cost-to-complete
+paceflow show <session-id>             # tasks, agents, usage by model, context, commits
+paceflow context --group-by dir        # what filled the context and what carrying it cost
+paceflow rework                        # later work that changed earlier AI lines
+paceflow tui                           # interactive explorer with drill-down
+```
+
+All of them take `--days N` (default 30, `0` = all time), `--from/--to`, `--provider`, `--model`, `--repo` or `--here`, `--search`, `--intent`, `--outcome`, `--min-cost`, `--limit` and `--json`.
+
+### Three ledgers that are never mixed
+
+- **Tokens** are what the tool logged per API call (Claude: once per message id; Codex: per `token_count` delta, reasoning counted inside output; OpenCode: per message; Cursor: `tokenCount` when present, otherwise a text estimate marked `~`).
+- **Money** is an *API list-price equivalent* from the versioned pricing table (`~$`), or the provider-reported cost where one exists (OpenCode). On a subscription this is value consumed, not an invoice. Set how each tool is billed in `~/.vca/billing.json`.
+- **Quota** is only shown as a percentage where the tool logs it (Codex `rate_limits`). Claude Code, Cursor and OpenCode show token burn inside assumed windows (Claude 5 h and weekly by default) plus any limit hits you record with `quota mark`.
+
+Every usage event belongs to exactly one session and one task, so grouped totals add up to the overall total.
+
+### Sessions, subagents and tasks
+
+A session is the container; subagent transcripts (Claude `subagents/`, OpenCode child sessions, Cursor sub-composers) are child sessions whose spend rolls up into their root. A **task** is one goal inside a session. Without classification every session is one task. With classification (below) long sessions are split into tasks, and turns that return to an earlier goal rejoin that task.
+
+For each task you get the start time, the completion time and how it was decided (`override` > `jev` > `commit` > `validation_pass`; otherwise not observed complete), wall and active time (idle gaps over 30 minutes removed), cost to completion and cost after completion. Attempts are edit batches closed by a validation run (test, build, lint, typecheck); three or more consecutive failures with the same error signature and no new information from you mark an **unproductive loop**.
+
+`paceflow tasks` compares cost and time per task by model and harness. Compare like with like: filter by `--intent` and look at tasks of similar size.
+
+### Context ledger
+
+`paceflow context` and the session Context tab show what entered each conversation's context and what it cost: the one-time write and the cost of carrying it on every later call until compaction or `/clear`. Item sizes are estimates calibrated to the observed per-call context growth; the remainder is shown as baseline (system prompt and tool schemas the transcript does not log) and residual. Reads are tagged startup/used/unused, and reads whose path matches a line in CLAUDE.md or AGENTS.md show that reference. Cache rebuilds after idle gaps or model switches are listed with their extra cost. Cursor has no composition data.
+
+### Rework and defect evidence
+
+`paceflow rework` lists relations where a later task removed or rewrote lines an earlier AI task added (same file, within 30 days, at least 3 lines), with a rework kind (heuristic, classifier or your label). Origin tasks get an evidence level:
+
+- `L0` AI lines later changed
+- `L1` the later request or a later commit reads like a fix
+- `L2` the later fix is linked to a bug issue
+- `L3` the classifier labels the change a defect correction (confidence ≥ 0.7)
+- `L4` you confirmed it
+
+Requirement changes, refinements and continuations are never counted as defects. Spend is split into disjoint categories with precedence loop > correction > requirement change > other, so the parts add up to the total. All of this is correlation, not proof that the AI caused a defect.
+
+### Optional classification with Jev
+
+Labels (intent, outcome, progress, framing, problems, user feedback, rework kind) come from local heuristics, marked `h`. You can opt in to TypeSafe's Jev decision model through OpenRouter, which also splits sessions into tasks and picks completion turns:
+
+```bash
+paceflow classify plan --days 7                    # units, tokens, estimated cost; sends nothing
+paceflow classify preview <session> --pass segment # the exact redacted request
+paceflow classify key set                          # or export OPENROUTER_API_KEY
+paceflow classify run --days 7 --max-usd 0.05      # asks for confirmation (or --yes)
+paceflow classify status
+paceflow classify set <session> --task 0 intent bug_fix     # your labels always win
+paceflow classify set-turn <session> 5 1                    # turn 5 starts task 1
+paceflow classify set-completion <session> 0 7              # task 0 completed at turn 7 (`none` = not completed)
+paceflow classify eval                                      # accuracy against your labels
+```
+
+Content levels are `evidence_only`, `user_text`, `conversation` (default; code blocks stripped) and `full`. Secrets, emails and home paths are always redacted. Requests ask for zero data retention and do not fall back to other providers. Answers are cached by content, so re-running only sends what changed; runs stop at `--max-usd` and the monthly budget in `~/.vca/classifier.json`. In the TUI, `K` shows the same estimate and consent screen for the selected sessions and `e` edits labels, task starts and completion turns.
+
+### Interactive explorer
+
+`paceflow tui` opens the explorer (`--classic` opens the previous dashboard). `1`–`7` switch screens, `Enter` drills into the selected row, `Esc` returns exactly where you were, `[`/`]` step through siblings, `u` toggles sessions/tasks, `f` filters, `/` searches, `x` explains a number, `m`/`c` mark and compare, `M` logs a quota limit hit, `R` reloads and `?` lists everything.
+
 ## Status Bands
 
 `--overall` summaries attach `good`, `watch`, and `risk` labels using opinionated thresholds so you can scan a report quickly.

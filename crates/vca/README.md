@@ -162,6 +162,32 @@ The reports answer four questions:
 
 For metric definitions, status bands, grouped report behavior, and interpretation guidance, see [docs/USER_GUIDE.md](https://github.com/PaceFlow/ai-engineering-analytics/blob/main/docs/USER_GUIDE.md).
 
+## Conversations, Usage, Quota And Tasks
+
+Beyond the four reports, `vca` explains the conversations themselves:
+
+```bash
+vca usage --group-by model        # where tokens and API-equivalent $ went
+vca quota                         # quota windows: observed % (Codex) or token burn
+vca sessions --sort cost          # root sessions with subagents rolled in
+vca tasks --completed-only        # time and cost to complete each task
+vca show <session-id>             # tasks, agents, usage, context, commits of one session
+vca context --group-by dir        # what filled the context and what carrying it cost
+vca rework                        # later work that changed earlier AI lines, defect evidence
+vca tui                           # interactive explorer with drill-down
+```
+
+Sessions are split into **tasks** (one goal each). Without classification each session is one task. The optional classifier (`vca classify`, opt-in, previewable and budget-capped) uses TypeSafe's Jev model through OpenRouter to split long sessions into tasks, decide when each was completed, and label intent, outcome and user feedback. Your own labels (`vca classify set`, or `e` in the TUI) always win. See the [User Guide](USER_GUIDE.md#conversations-usage-quota-and-tasks).
+
+## Provider Assumptions
+
+- **Claude Code**: usage is counted once per API message id (the transcript repeats it per content block), timestamped per call and priced per model; 1-hour cache writes are priced separately. `subagents/agent-*.jsonl` files become child sessions of their parent. Attachments (CLAUDE.md, skills, MCP and tool listings) feed the context ledger. There is no local quota telemetry.
+- **Codex**: one usage event per `token_count` delta; `output_tokens` already includes reasoning, so reasoning is never billed twice. `rate_limits` (5-hour and weekly windows, plan) are stored as observed quota. `apply_patch` custom tool calls count as accepted edits, and command exit codes classify validation runs. Parent links for Codex subagents are read from `session_meta.source` when present.
+- **OpenCode**: usage per message, with `cost` kept as provider-reported cost (it may be 0 on subscription routes). `parent_id` links child sessions; tool parts become tool calls.
+- **Cursor**: bubble `tokenCount` is used when present, otherwise tokens are estimated from text (`~`). `auto`/`default` models are unpriced. Sub-composers become child sessions. Context composition is not available.
+- **Pricing** is a versioned table (`crates/vca/pricing/pricing.json`) with exact, alias and family matches. Unknown models stay unpriced. Amounts are API list-price estimates, not invoices; describe how each tool is billed in `~/.vca/billing.json`.
+- **Re-ingest**: sessions are re-parsed whenever their source changes, so running sessions pick up new turns. Sessions whose source was deleted (for example by Claude Code cleanup) keep their stored data. The first ingest after upgrading prints how the corrected accounting changed totals and writes it to `~/.vca/logs/migration-v2.txt`.
+
 ## Common Options
 
 `session`, `delivery`, `quality`, and `cost` share the same filter interface:
