@@ -904,8 +904,9 @@ struct UsageGroupTotals {
 }
 
 fn refresh_session_cost_events(conn: &Connection) -> Result<()> {
-    // Usage of each root session, including its subagents, grouped by model so
-    // mixed-model sessions are priced per model. Reasoning already contained in
+    // Usage of each root session, including its subagents, priced per usage
+    // row: each row is one API call, so long-context tiers apply per request
+    // (legacy session totals use base rates). Reasoning already contained in
     // output tokens (Codex, Claude thinking) is never billed a second time.
     let mut usage_stmt = conn.prepare(
         "SELECT
@@ -913,20 +914,20 @@ fn refresh_session_cost_events(conn: &Connection) -> Result<()> {
              t.root_session_id,
              NULLIF(TRIM(u.model_name), '') AS model_name,
              u.reasoning_in_output,
-             SUM(u.input_tokens),
-             SUM(u.cached_input_tokens),
-             SUM(u.cache_creation_tokens),
-             SUM(u.output_tokens),
-             SUM(u.reasoning_tokens),
-             SUM(u.total_tokens),
-             SUM(u.actual_cost_usd),
-             MAX(CASE WHEN u.cost_source = 'actual' THEN 1 ELSE 0 END),
-             MAX(CASE WHEN u.cost_source = 'estimated_text_tokens' THEN 1 ELSE 0 END),
-             SUM(u.cache_creation_1h_tokens)
+             COALESCE(u.input_tokens, 0),
+             COALESCE(u.cached_input_tokens, 0),
+             COALESCE(u.cache_creation_tokens, 0),
+             COALESCE(u.output_tokens, 0),
+             COALESCE(u.reasoning_tokens, 0),
+             COALESCE(u.total_tokens, 0),
+             u.actual_cost_usd,
+             CASE WHEN u.cost_source = 'actual' THEN 1 ELSE 0 END,
+             CASE WHEN u.cost_source = 'estimated_text_tokens' THEN 1 ELSE 0 END,
+             COALESCE(u.cache_creation_1h_tokens, 0),
+             CASE WHEN COALESCE(u.token_source, '') = 'legacy' THEN 0 ELSE 1 END
          FROM fact_session_usage u
          JOIN view_session_tree t
-           ON t.provider = u.provider AND t.session_id = u.session_id
-         GROUP BY t.provider, t.root_session_id, model_name, u.reasoning_in_output",
+           ON t.provider = u.provider AND t.session_id = u.session_id",
     )?;
     #[derive(Default)]
     struct SessionUsage {
@@ -957,6 +958,7 @@ fn refresh_session_cost_events(conn: &Connection) -> Result<()> {
             row.get::<_, i64>(11)?,
             row.get::<_, i64>(12)?,
             row.get::<_, i64>(13)?,
+            row.get::<_, i64>(14)? != 0,
         ))
     })?;
     for row in rows {
@@ -970,6 +972,7 @@ fn refresh_session_cost_events(conn: &Connection) -> Result<()> {
             has_actual,
             has_text,
             cache_write_1h,
+            per_call,
         ) = row?;
         let entry = by_session
             .entry((provider.clone(), session_id))
@@ -1000,6 +1003,7 @@ fn refresh_session_cost_events(conn: &Connection) -> Result<()> {
                         output_tokens: totals.output_tokens,
                         reasoning_tokens: totals.reasoning_tokens,
                         reasoning_in_output: reasoning_in_output != 0,
+                        per_call,
                     },
                 )
                 .map(|priced| priced.cost_usd)

@@ -190,7 +190,7 @@ pub fn refresh_context_ledger(conn: &Connection) -> Result<()> {
         }
         let mut session_items = items.remove(&key).unwrap_or_default();
         let info = sessions.get(&key);
-        let ledger = build_ledger(&session_calls, &mut session_items, table);
+        let ledger = build_ledger(&session_calls, &mut session_items, &table);
 
         for (index, call) in session_calls.iter().enumerate() {
             let row = &ledger.calls[index];
@@ -441,18 +441,19 @@ fn build_ledger(calls: &[Call], items: &mut [Item], table: &pricing::PricingTabl
             row.cache_event = "rebuild";
         }
         if let Some((entry, _)) = entry {
+            let rates = entry.rates(call.context());
             let write_5m = (call.cache_write - call.cache_write_1h).max(0) as f64;
-            let read_cost = call.cache_read as f64 * entry.cache_read / 1e6;
-            let write_cost = (call.fresh_input as f64 * entry.input
-                + write_5m * entry.cache_write_5m()
-                + call.cache_write_1h as f64 * entry.cache_write_1h())
+            let read_cost = call.cache_read as f64 * rates.cache_read / 1e6;
+            let write_cost = (call.fresh_input as f64 * rates.input
+                + write_5m * rates.cache_write_5m
+                + call.cache_write_1h as f64 * rates.cache_write_1h)
                 / 1e6;
             let input_cost = read_cost + write_cost;
             row.input_cost = Some(input_cost);
             let total_tokens = context.max(1) as f64;
             let (carried_cost, new_cost, rebuild) = if row.cache_event == "rebuild" {
                 let carried_share = write_cost * (carried_before / total_tokens).min(1.0);
-                let would_have = carried_before * entry.cache_read / 1e6;
+                let would_have = carried_before * rates.cache_read / 1e6;
                 (
                     carried_share + read_cost,
                     write_cost - carried_share,

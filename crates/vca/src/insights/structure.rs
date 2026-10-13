@@ -239,6 +239,7 @@ pub fn refresh_session_structure(conn: &Connection) -> Result<()> {
                         output_tokens: usage.output,
                         reasoning_tokens: usage.reasoning,
                         reasoning_in_output: usage.reasoning_in_output,
+                        per_call: usage.token_source != "legacy",
                     },
                 )
             });
