@@ -56,7 +56,7 @@ struct LifecycleSummarySnapshot {
 impl TestEnv {
     fn new_live_fixture() -> anyhow::Result<Self> {
         let tempdir = TempDir::new()?;
-        let home = tempdir.path().to_path_buf();
+        let home = padded_home(tempdir.path())?;
         let work_dir = home.join("work");
         let paceflow_repo = work_dir.join("fixture-paceflow");
         let cursor_dir = work_dir.join("fixture-cursor");
@@ -69,18 +69,18 @@ impl TestEnv {
             &home,
             &["__REPO_PACEFLOW__", "__REPO_CURSOR__", "__HOME__"],
             &[
-                &paceflow_repo.to_string_lossy(),
-                &cursor_dir.to_string_lossy(),
-                &home.to_string_lossy(),
+                &json_escaped(&paceflow_repo.to_string_lossy()),
+                &json_escaped(&cursor_dir.to_string_lossy()),
+                &json_escaped(&home.to_string_lossy()),
             ],
         )?;
         copy_claude_sessions(
             &home,
             &["__REPO_PACEFLOW__", "__REPO_CURSOR__", "__HOME__"],
             &[
-                &paceflow_repo.to_string_lossy(),
-                &cursor_dir.to_string_lossy(),
-                &home.to_string_lossy(),
+                &json_escaped(&paceflow_repo.to_string_lossy()),
+                &json_escaped(&cursor_dir.to_string_lossy()),
+                &json_escaped(&home.to_string_lossy()),
             ],
         )?;
         install_cursor_fixture(&home, &paceflow_repo, &cursor_dir)?;
@@ -127,6 +127,7 @@ impl TestEnv {
             .env_remove("HOMEDRIVE")
             .env_remove("HOMEPATH")
             .env_remove("XDG_CONFIG_HOME")
+            .env_remove("CODEX_HOME")
             .env_remove("VCA_GITHUB_TOKEN")
             .output()?;
 
@@ -811,6 +812,30 @@ fn event_stream_matches_snapshots() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Fixture home path with the same length on every OS (temp roots differ:
+/// `/tmp/.tmpX`, `/var/folders/…/T/.tmpX`, `C:\\Users\\…\\Temp\\.tmpX`), so
+/// text-length based estimates such as context token sizes do not depend on
+/// where the test runs.
+const FIXTURE_HOME_LEN: usize = 110;
+
+fn padded_home(root: &Path) -> anyhow::Result<PathBuf> {
+    let root_len = root.to_string_lossy().chars().count();
+    anyhow::ensure!(
+        root_len + 2 <= FIXTURE_HOME_LEN,
+        "temp dir {} is too long for the fixture home",
+        root.display()
+    );
+    let home = root.join("h".repeat(FIXTURE_HOME_LEN - root_len - 1));
+    fs::create_dir_all(&home)?;
+    Ok(home)
+}
+
+/// A path as it must appear inside a JSON string (backslashes escaped).
+fn json_escaped(text: &str) -> String {
+    let quoted = serde_json::to_string(text).expect("string serializes");
+    quoted[1..quoted.len() - 1].to_string()
+}
+
 fn path_variants(path: &Path) -> Vec<String> {
     let mut variants = Vec::new();
     push_path_variant(&mut variants, &path.to_string_lossy());
@@ -825,6 +850,8 @@ fn push_path_variant(variants: &mut Vec<String>, path: &str) {
         path.to_string(),
         path.replace('\\', "/"),
         path.replace('/', "\\"),
+        // As it appears inside JSON text on Windows.
+        path.replace('\\', "\\\\"),
     ] {
         if !candidate.is_empty() && !variants.contains(&candidate) {
             variants.push(candidate);
@@ -1254,9 +1281,9 @@ fn rewrite_cursor_db(
              '__HOME__', ?3
          )",
         (
-            paceflow_repo.to_string_lossy().to_string(),
-            cursor_dir.to_string_lossy().to_string(),
-            home.to_string_lossy().to_string(),
+            json_escaped(&paceflow_repo.to_string_lossy()),
+            json_escaped(&cursor_dir.to_string_lossy()),
+            json_escaped(&home.to_string_lossy()),
         ),
     )?;
     Ok(())

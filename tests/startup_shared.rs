@@ -13,6 +13,7 @@ fn command(home: &Path) -> Command {
     command.current_dir(home)
         .env("VCA_HOME", home)
         .env("VCA_PRICING_OFFLINE", "1")
+        .env_remove("CODEX_HOME")
         .env("HOME", home)
         .env("USERPROFILE", home)
         .env("XDG_CONFIG_HOME", home.join(".config"))
