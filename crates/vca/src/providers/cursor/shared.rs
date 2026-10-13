@@ -104,6 +104,11 @@ pub(crate) struct CursorBubbleEvent {
     /// Per-message wall-clock timestamp (ISO-8601) sourced from the bubble's own
     /// `createdAt`. `None` for legacy inline `conversation` rows that don't carry one.
     pub timestamp: Option<String>,
+    pub bubble_id: Option<String>,
+    pub model_name: Option<String>,
+    /// Provider-reported token counts when the bubble carries `tokenCount`.
+    pub input_tokens: Option<i64>,
+    pub output_tokens: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -278,6 +283,16 @@ struct BubbleSlim<'a> {
     created_at: Option<JsonValue>,
     #[serde(rename = "toolFormerData", borrow, default)]
     tool_former_data: Option<&'a RawValue>,
+    #[serde(rename = "tokenCount", default)]
+    token_count: Option<TokenCountSlim>,
+}
+
+#[derive(Deserialize)]
+struct TokenCountSlim {
+    #[serde(rename = "inputTokens")]
+    input_tokens: Option<i64>,
+    #[serde(rename = "outputTokens")]
+    output_tokens: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -557,6 +572,10 @@ pub(crate) fn build_seed_graph(
             text: bubble.text.clone(),
             order_key: idx as i64,
             timestamp: None,
+            bubble_id: None,
+            model_name: None,
+            input_tokens: None,
+            output_tokens: None,
         });
     }
 
@@ -746,11 +765,20 @@ fn populate_bubbles(
                 .unwrap_or(rowid);
             let model_name = slim.model_info.as_ref().and_then(|m| m.model_name.clone());
 
+            let (input_tokens, output_tokens) = slim
+                .token_count
+                .as_ref()
+                .map(|count| (count.input_tokens, count.output_tokens))
+                .unwrap_or((None, None));
             graphs[graph_idx].bubble_events.push(CursorBubbleEvent {
                 role,
                 text,
                 order_key,
                 timestamp: bubble_ts.clone(),
+                bubble_id: Some(bubble_id.to_string()),
+                model_name: model_name.clone(),
+                input_tokens: input_tokens.filter(|value| *value > 0),
+                output_tokens: output_tokens.filter(|value| *value > 0),
             });
 
             if graphs[graph_idx].model_name.is_none() {

@@ -4,11 +4,35 @@ use anyhow::Result;
 use rusqlite::Connection;
 use std::path::{Path, PathBuf};
 
-use crate::db;
+use crate::db::session_store::{self, AcceptedChangeRecord, AgentKind, SessionRecord};
 use crate::ingest_progress::IngestProgressObserver;
 
 pub fn plan_session_files() -> Result<Vec<PathBuf>> {
     shared::plan_session_files()
+}
+
+/// Main session files plus subagent transcripts, for code-change extraction.
+pub fn plan_change_sources() -> Result<Vec<PathBuf>> {
+    let mut sources = Vec::new();
+    for main in shared::plan_session_files()? {
+        let subagents = shared::discover_subagent_files(&main);
+        sources.push(main);
+        sources.extend(subagents);
+    }
+    Ok(sources)
+}
+
+/// Session id for a parsed transcript: subagent transcripts get a child id.
+pub(crate) fn effective_session_id(path: &Path, parsed: &shared::ParsedClaudeSession) -> String {
+    let in_subagents_dir = path
+        .parent()
+        .and_then(|dir| dir.file_name())
+        .and_then(|name| name.to_str())
+        == Some("subagents");
+    match (&parsed.agent_id, in_subagents_dir) {
+        (Some(agent_id), true) => subagent_session_id(&parsed.session_id, agent_id),
+        _ => parsed.session_id.clone(),
+    }
 }
 
 pub fn ingest_planned_sessions(
@@ -50,120 +74,143 @@ pub fn ingest_planned_sessions(
 }
 
 fn ingest_session(path: &Path, db: &Connection) -> Result<usize> {
+    let subagent_files = shared::discover_subagent_files(path);
+    let source_key = path.to_string_lossy().to_string();
+    let fingerprint = combined_fingerprint(path, &subagent_files);
+    if !session_store::source_needs_ingest(db, "claude", &source_key, &fingerprint)? {
+        return Ok(0);
+    }
+
     let parsed = shared::parse_session_file(path)?;
     if parsed.session_id.trim().is_empty() {
         return Ok(0);
     }
-    if parsed.visible_messages.is_empty()
+    let mut written = 0usize;
+    let mut session_ids: Vec<String> = Vec::new();
+    if !(parsed.visible_messages.is_empty()
         && parsed.structured_writes.is_empty()
-        && parsed.usage_events.is_empty()
+        && parsed.usage.is_empty())
     {
-        return Ok(0);
-    }
+        let record = main_record(&parsed);
+        written += session_store::store_session_record(db, &record)?;
+        session_ids.push(record.session_id.clone());
 
-    let source_file = parsed.source_file.clone();
-    let already_exists = db::session_exists(db, &parsed.session_id)?;
-    let usage_already_exists = db::session_usage_exists(db, "claude", &parsed.session_id)?;
-    if already_exists {
-        db::upsert_metadata_session_with_model(
-            db,
-            "claude",
-            &parsed.session_id,
-            parsed.session_cwd.as_deref(),
-            parsed.started_at.as_deref(),
-            parsed.ended_at.as_deref().or(parsed.started_at.as_deref()),
-            Some(&source_file),
-            Some("claude"),
-            parsed.model_name.as_deref(),
-        )?;
-        if usage_already_exists {
-            return Ok(0);
+        for subagent_file in &subagent_files {
+            let child = match shared::parse_session_file(subagent_file) {
+                Ok(child) => child,
+                Err(error) => {
+                    eprintln!("Warning: skipping {:?}: {}", subagent_file, error);
+                    continue;
+                }
+            };
+            if child.visible_messages.is_empty() && child.usage.is_empty() {
+                continue;
+            }
+            let meta = shared::read_subagent_meta(subagent_file);
+            let record = subagent_record(&parsed, &child, subagent_file, meta.as_ref());
+            written += session_store::store_session_record(db, &record)?;
+            session_ids.push(record.session_id.clone());
         }
-        let mut written = 0usize;
-        for usage in parsed.usage_events {
-            db::ingest_session_usage(
-                db,
-                "claude",
-                &parsed.session_id,
-                parsed.ended_at.as_deref().or(parsed.started_at.as_deref()),
-                parsed.model_name.as_deref(),
-                usage.input_tokens,
-                usage.cache_read_input_tokens,
-                usage.cache_creation_input_tokens,
-                usage.output_tokens,
-                0,
-                usage.total_tokens,
-                None,
-                "estimated_from_tokens",
-            )?;
-            written += 1;
-        }
-        return Ok(written);
     }
 
-    db::upsert_metadata_session_with_model(
-        db,
-        "claude",
-        &parsed.session_id,
-        parsed.session_cwd.as_deref(),
-        parsed.started_at.as_deref(),
-        parsed.ended_at.as_deref().or(parsed.started_at.as_deref()),
-        Some(&source_file),
-        Some("claude"),
-        parsed.model_name.as_deref(),
-    )?;
-    let mut written = 1usize;
-
-    for usage in &parsed.usage_events {
-        db::ingest_session_usage(
-            db,
-            "claude",
-            &parsed.session_id,
-            parsed.ended_at.as_deref().or(parsed.started_at.as_deref()),
-            parsed.model_name.as_deref(),
-            usage.input_tokens,
-            usage.cache_read_input_tokens,
-            usage.cache_creation_input_tokens,
-            usage.output_tokens,
-            0,
-            usage.total_tokens,
-            None,
-            "estimated_from_tokens",
-        )?;
-        written += 1;
-    }
-
-    for message in parsed.visible_messages {
-        let words = message.text.split_whitespace().count() as i64;
-        if words == 0 {
-            continue;
-        }
-        db::ingest_session_message(
-            db,
-            "claude",
-            &parsed.session_id,
-            message.role.as_str(),
-            &message.text,
-            words,
-            message.timestamp.as_deref(),
-        )?;
-        written += 1;
-    }
-
-    for change in parsed.structured_writes {
-        db::ingest_accepted_code_change(
-            db,
-            "claude",
-            &parsed.session_id,
-            &change.abs_path,
-            change.added_lines,
-            change.removed_lines,
-            change.timestamp.as_deref(),
-        )?;
-        written += 1;
-    }
-
+    let ids: Vec<&str> = session_ids.iter().map(String::as_str).collect();
+    session_store::mark_source_ingested(db, "claude", &source_key, &fingerprint, &ids)?;
     Ok(written)
+}
+
+fn combined_fingerprint(path: &Path, subagent_files: &[std::path::PathBuf]) -> String {
+    let mut parts = vec![session_store::file_fingerprint(path).unwrap_or_default()];
+    for file in subagent_files {
+        parts.push(session_store::file_fingerprint(file).unwrap_or_default());
+    }
+    parts.join("|")
+}
+
+pub(crate) fn subagent_session_id(parent_session_id: &str, agent_id: &str) -> String {
+    format!("{parent_session_id}/agent-{agent_id}")
+}
+
+fn base_record(parsed: &shared::ParsedClaudeSession, session_id: &str) -> SessionRecord {
+    let mut record = SessionRecord::new("claude", session_id);
+    record.source_path = Some(parsed.source_file.clone());
+    record.project_path = parsed.session_cwd.clone();
+    record.started_at = parsed.started_at.clone();
+    record.ended_at = parsed.ended_at.clone().or(parsed.started_at.clone());
+    record.git_branch = parsed.git_branch.clone();
+    record.client_version = parsed.client_version.clone();
+    record.entrypoint = parsed.entrypoint.clone();
+    record.title = parsed.title.clone();
+    record.messages = parsed.message_records();
+    record.usage = parsed.usage.clone();
+    record.tool_calls = parsed.tool_calls.clone();
+    record.events = parsed.events.clone();
+    record.context_injections = parsed.context_injections.clone();
+    record.accepted_changes = parsed
+        .structured_writes
+        .iter()
+        .map(|change| AcceptedChangeRecord {
+            abs_path: change.abs_path.clone(),
+            lines_added: change.added_lines,
+            lines_removed: change.removed_lines,
+            ts: change.timestamp.clone(),
+        })
+        .collect();
+    record.model = record
+        .primary_model_from_usage()
+        .or(parsed.model_name.clone());
+    record
+}
+
+fn main_record(parsed: &shared::ParsedClaudeSession) -> SessionRecord {
+    let mut record = base_record(parsed, &parsed.session_id);
+    // Tool results of Task/Agent calls name the child agent; store the child session id.
+    for call in &mut record.tool_calls {
+        if let Some(agent_id) = call.child_session_id.take() {
+            call.child_session_id = Some(subagent_session_id(&parsed.session_id, &agent_id));
+        }
+    }
+    record
+}
+
+fn subagent_record(
+    parent: &shared::ParsedClaudeSession,
+    child: &shared::ParsedClaudeSession,
+    file: &Path,
+    meta: Option<&serde_json::Value>,
+) -> SessionRecord {
+    let agent_id = child.agent_id.clone().unwrap_or_else(|| {
+        file.file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or_default()
+            .trim_start_matches("agent-")
+            .to_string()
+    });
+    let session_id = subagent_session_id(&parent.session_id, &agent_id);
+    let mut record = base_record(child, &session_id);
+    record.source_path = Some(file.to_string_lossy().to_string());
+    record.project_path = child.session_cwd.clone().or(parent.session_cwd.clone());
+    record.parent_session_id = Some(parent.session_id.clone());
+    record.agent_kind = AgentKind::Subagent;
+    record.agent_type = meta
+        .and_then(|meta| meta.get("agentType"))
+        .and_then(serde_json::Value::as_str)
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            parent
+                .tool_calls
+                .iter()
+                .find(|call| call.child_session_id.as_deref() == Some(agent_id.as_str()))
+                .and_then(|call| call.agent_type.clone())
+        });
+    record.title = meta
+        .and_then(|meta| meta.get("description"))
+        .and_then(serde_json::Value::as_str)
+        .map(ToOwned::to_owned)
+        .or(record.title);
+    record.git_branch = record.git_branch.or(parent.git_branch.clone());
+    // Subagent edits are already attributed to the parent via agent progress records
+    // in older transcripts; keep accepted changes on the child where they happened.
+    record
 }
 
 #[cfg(test)]

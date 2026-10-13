@@ -10,6 +10,10 @@ use super::utils::diff_line_counts;
 pub(crate) mod shared;
 
 use crate::db;
+use crate::db::session_store::{
+    self, AcceptedChangeRecord, AgentKind, MessageRecord, SessionRecord, TokenSource,
+    ToolCallRecord, UsageRecord,
+};
 use crate::ingest_progress::IngestProgressObserver;
 use crate::path_utils::strip_file_scheme;
 use shared::{
@@ -140,6 +144,25 @@ pub fn ingest_planned_sessions_for(
     )
 }
 
+/// Composer-level attributes that are cheap to read from the raw JSON.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ComposerAttributes {
+    #[serde(default)]
+    subagent_composer_ids: Vec<String>,
+    #[serde(default)]
+    sub_composer_ids: Vec<String>,
+    #[serde(default)]
+    is_best_of_n_parent: bool,
+    created_on_branch: Option<String>,
+    name: Option<String>,
+    unified_mode: Option<String>,
+}
+
+fn composer_attributes(raw: &str) -> ComposerAttributes {
+    serde_json::from_str(raw).unwrap_or_default()
+}
+
 pub(crate) fn ingest_planned_sessions_from_source(
     db: &Connection,
     vscdb: &Connection,
@@ -159,95 +182,61 @@ pub(crate) fn ingest_planned_sessions_from_source(
     if let Some(observer) = progress.as_mut() {
         observer.set_phase("existing sessions");
     }
-    // Partition composer rows into (already-ingested, new) by batch-querying
-    // `metadata_sessions` once. Already-ingested sessions only need a cheap
-    // metadata refresh and can skip the expensive `bubbleId:%` scan entirely.
-    let candidate_ids: Vec<&str> = composer_rows
-        .iter()
-        .map(|(key, _)| key.strip_prefix("composerData:").unwrap_or(key.as_str()))
-        .collect();
-    let already_present = db::sessions_present(db, &candidate_ids)?;
-
-    let (existing_rows, new_rows): (Vec<_>, Vec<_>) = composer_rows.iter().partition(|(key, _)| {
-        let sid = key.strip_prefix("composerData:").unwrap_or(key.as_str());
-        already_present.contains(sid)
-    });
-
-    let mut total_rows = 0usize;
-
-    if let Some(observer) = progress.as_mut() {
-        observer.set_phase("refreshing existing");
-    }
-    // Fast path: already-ingested sessions. We only need the small composer JSON
-    // (`started_at`, `ended_at`, `project_path`, `model_name`) to refresh metadata;
-    // we deliberately skip the per-session bubble scan and graph construction.
-    for (key, raw) in &existing_rows {
+    // Composer JSON grows with every message, so its hash is the session
+    // fingerprint. Unchanged sessions skip the expensive `bubbleId:%` scan.
+    let mut attributes: HashMap<String, ComposerAttributes> = HashMap::new();
+    let mut parent_of: HashMap<String, (String, AgentKind)> = HashMap::new();
+    let mut fingerprints: HashMap<String, String> = HashMap::new();
+    for (key, raw) in composer_rows {
         let session_id = key.strip_prefix("composerData:").unwrap_or(key.as_str());
-        if let Some(seed) = build_seed_graph(key, raw, source_file)
-            && let Err(e) = db::upsert_metadata_session_with_model(
-                db,
-                "cursor",
-                &seed.composer_id,
-                seed.project_path.as_deref(),
-                seed.started_at.as_deref(),
-                seed.ended_at.as_deref().or(seed.started_at.as_deref()),
-                Some("cursor"),
-                Some("cursor"),
-                seed.model_name.as_deref(),
-            )
-            && verbose
-        {
-            eprintln!("[cursor] metadata refresh failed: {}", e);
+        let attrs = composer_attributes(raw);
+        for child in &attrs.subagent_composer_ids {
+            parent_of.insert(child.clone(), (session_id.to_string(), AgentKind::Subagent));
         }
-
-        if !db::session_usage_exists(db, "cursor", session_id)?
-            && let Some(mut seed) = build_seed_graph(key, raw, source_file)
-        {
-            match hydrate_session_bubbles(vscdb, &mut seed) {
-                Ok(()) => match ingest_cursor_text_usage(
-                    db,
-                    &seed,
-                    seed.started_at.as_deref(),
-                    seed.model_name.as_deref(),
-                ) {
-                    Ok(n) => total_rows += n,
-                    Err(e) if verbose => {
-                        eprintln!("[cursor] usage backfill failed for {}: {}", session_id, e);
-                    }
-                    Err(_) => {}
-                },
-                Err(e) if verbose => {
-                    eprintln!("[cursor] bubble hydrate failed for {}: {}", session_id, e);
-                }
-                Err(_) => {}
-            }
+        for child in &attrs.sub_composer_ids {
+            let kind = if attrs.is_best_of_n_parent {
+                AgentKind::BestOfN
+            } else {
+                AgentKind::Subagent
+            };
+            parent_of
+                .entry(child.clone())
+                .or_insert((session_id.to_string(), kind));
         }
+        attributes.insert(session_id.to_string(), attrs);
+        fingerprints.insert(
+            session_id.to_string(),
+            format!("{:x}", md5::compute(raw.as_bytes())),
+        );
+    }
 
-        if let Some(observer) = progress.as_mut() {
+    let mut changed_rows: Vec<(String, String)> = Vec::new();
+    for (key, raw) in composer_rows {
+        let session_id = key.strip_prefix("composerData:").unwrap_or(key.as_str());
+        let fingerprint = fingerprints.get(session_id).cloned().unwrap_or_default();
+        if session_store::source_needs_ingest(db, "cursor", session_id, &fingerprint)? {
+            changed_rows.push((key.clone(), raw.clone()));
+        } else if let Some(observer) = progress.as_mut() {
             observer.advance(key);
         }
     }
 
-    // Slow path: new sessions get the full graph build + ingest.
-    if !new_rows.is_empty() {
+    let mut total_rows = 0usize;
+    if !changed_rows.is_empty() {
         if let Some(observer) = progress.as_mut() {
             observer.set_phase("seed graphs");
         }
-        let new_row_owned: Vec<(String, String)> = new_rows
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
         let graphs = match progress.as_mut() {
             Some(obs) => load_cursor_session_graphs_from_rows_with_observer(
                 vscdb,
                 source_file,
-                &new_row_owned,
+                &changed_rows,
                 Some(&mut **obs),
             )?,
             None => load_cursor_session_graphs_from_rows_with_observer(
                 vscdb,
                 source_file,
-                &new_row_owned,
+                &changed_rows,
                 None,
             )?,
         };
@@ -259,21 +248,35 @@ pub(crate) fn ingest_planned_sessions_from_source(
         if let Some(observer) = progress.as_mut() {
             observer.set_phase("writing sessions");
         }
-        for (key, _value) in &new_rows {
+        for (key, _value) in &changed_rows {
             let session_id = key.strip_prefix("composerData:").unwrap_or(key.as_str());
-            let Some(graph) = by_session.get(session_id) else {
-                continue;
-            };
-
-            match ingest_session_graph(db, graph, history_index, verbose) {
-                Ok(0) => {}
-                Ok(n) => total_rows += n,
-                Err(e) => {
-                    if verbose {
-                        eprintln!("[cursor] skipping session: {}", e);
+            let fingerprint = fingerprints.get(session_id).cloned().unwrap_or_default();
+            if let Some(graph) = by_session.get(session_id) {
+                let record = build_session_record(
+                    graph,
+                    history_index,
+                    attributes.get(session_id),
+                    parent_of.get(session_id),
+                    verbose,
+                );
+                if let Some(record) = record {
+                    match session_store::store_session_record(db, &record) {
+                        Ok(written) => total_rows += written,
+                        Err(e) => {
+                            if verbose {
+                                eprintln!("[cursor] skipping session: {}", e);
+                            }
+                        }
                     }
                 }
             }
+            session_store::mark_source_ingested(
+                db,
+                "cursor",
+                session_id,
+                &fingerprint,
+                &[session_id],
+            )?;
 
             if let Some(observer) = progress.as_mut() {
                 observer.advance(key);
@@ -539,47 +542,24 @@ fn build_history_index(history_root: &Path) -> HistoryIndex {
 
 // ── Session ingestion ─────────────────────────────────────────────────────────
 
-fn ingest_session_graph(
-    db: &Connection,
+fn build_session_record(
     graph: &CursorSessionGraph,
     history_index: &HistoryIndex,
+    attributes: Option<&ComposerAttributes>,
+    parent: Option<&(String, AgentKind)>,
     verbose: bool,
-) -> Result<usize> {
+) -> Option<SessionRecord> {
     let visible_message_count = graph
         .messages()
         .iter()
         .filter(|bubble| bubble.text.as_deref().is_some_and(|text| !text.is_empty()))
         .count();
     if visible_message_count == 0 {
-        return Ok(0);
+        return None;
     }
 
     let session_id = &graph.composer_id;
     let timestamp = graph.started_at.clone();
-    let last_updated = graph.ended_at.clone();
-    let project_path = graph.project_path.clone();
-    let model_name = graph.model_name.clone();
-
-    let already_exists = db::session_exists(db, session_id)?;
-    let usage_already_exists = db::session_usage_exists(db, "cursor", session_id)?;
-    if already_exists {
-        db::upsert_metadata_session_with_model(
-            db,
-            "cursor",
-            session_id,
-            project_path.as_deref(),
-            timestamp.as_deref(),
-            last_updated.as_deref().or(timestamp.as_deref()),
-            Some("cursor"),
-            Some("cursor"),
-            model_name.as_deref(),
-        )?;
-        if usage_already_exists {
-            return Ok(0);
-        }
-        return ingest_cursor_text_usage(db, graph, timestamp.as_deref(), model_name.as_deref());
-    }
-
     let session_start_ms = graph.created_at_ms.unwrap_or(0);
     let session_end_ms = graph.last_updated_at_ms.unwrap_or(i64::MAX);
 
@@ -594,20 +574,26 @@ fn ingest_session_graph(
         );
     }
 
-    db::begin_session_with_model(
-        db,
-        "cursor",
-        session_id,
-        project_path.as_deref(),
-        timestamp.as_deref(),
-        last_updated.as_deref().or(timestamp.as_deref()),
-        Some("cursor"),
-        model_name.as_deref(),
-    )?;
-    let mut written = 1usize;
-    written += ingest_cursor_text_usage(db, graph, timestamp.as_deref(), model_name.as_deref())?;
+    let mut record = SessionRecord::new("cursor", session_id.clone());
+    record.source_path = Some("cursor".to_string());
+    record.project_path = graph.project_path.clone();
+    record.started_at = timestamp.clone();
+    record.ended_at = graph.ended_at.clone().or(timestamp.clone());
+    if let Some(attributes) = attributes {
+        record.git_branch = attributes.created_on_branch.clone();
+        record.title = attributes
+            .name
+            .clone()
+            .filter(|name| !name.trim().is_empty())
+            .or(graph.subtitle.clone());
+        record.entrypoint = attributes.unified_mode.clone();
+    }
+    if let Some((parent_id, kind)) = parent {
+        record.parent_session_id = Some(parent_id.clone());
+        record.agent_kind = *kind;
+    }
 
-    for bubble in graph.messages() {
+    for (index, bubble) in graph.messages().iter().enumerate() {
         let role = match bubble.role {
             Some(CursorBubbleRole::User) => "user",
             Some(CursorBubbleRole::Assistant) => "assistant",
@@ -617,43 +603,53 @@ fn ingest_session_graph(
             Some(text) if !text.is_empty() => text,
             _ => continue,
         };
-        let words = text.split_whitespace().count();
         // Prefer the bubble's own per-message timestamp; fall back to the
         // session-level composer `createdAt` only when a bubble lacks one
         // (e.g. legacy inline `conversation` rows).
-        let message_ts = bubble.timestamp.as_deref().or(timestamp.as_deref());
-        db::ingest_session_message(
-            db,
-            "cursor",
-            session_id,
-            role,
-            text,
-            words as i64,
-            message_ts,
-        )?;
-        written += 1;
+        record.messages.push(MessageRecord {
+            key: bubble
+                .bubble_id
+                .clone()
+                .unwrap_or_else(|| format!("conv:{index}")),
+            ts: bubble.timestamp.clone().or(timestamp.clone()),
+            role: role.to_string(),
+            text: text.clone(),
+            is_compaction_summary: false,
+        });
     }
 
-    let mut loc_events_pushed = 0usize;
+    record.usage = cursor_usage_records(graph);
+    for call in &graph.tool_calls {
+        record.tool_calls.push(ToolCallRecord {
+            key: format!("{}:{}", call.bubble_id, call.call_id),
+            ts: call.timestamp.clone(),
+            tool_name: call.name.clone(),
+            target: call.path_hints.first().cloned(),
+            output_in_context: true,
+            status: match call.status.as_deref() {
+                Some("completed") => "ok",
+                Some("error") | Some("failed") => "error",
+                Some("cancelled") | Some("aborted") | Some("rejected") => "rejected",
+                _ => "unknown",
+            }
+            .to_string(),
+            ..ToolCallRecord::default()
+        });
+    }
+
     let resolved_file_edits = aggregate_file_edits(&resolve_tool_call_edits(graph));
     for edit in &resolved_file_edits {
         // Use the earliest real edit timestamp for this file; only fall back to
         // the session-level timestamp when the edit carried none.
-        let change_ts = edit.timestamp.as_deref().or(timestamp.as_deref());
-        db::ingest_accepted_code_change(
-            db,
-            "cursor",
-            session_id,
-            &edit.abs_path,
-            edit.added_lines,
-            edit.removed_lines,
-            change_ts,
-        )?;
-        loc_events_pushed += 1;
-        written += 1;
+        record.accepted_changes.push(AcceptedChangeRecord {
+            abs_path: edit.abs_path.clone(),
+            lines_added: edit.added_lines,
+            lines_removed: edit.removed_lines,
+            ts: edit.timestamp.clone().or(timestamp.clone()),
+        });
     }
 
-    if loc_events_pushed == 0 {
+    if record.accepted_changes.is_empty() {
         let mut fallback_paths: Vec<String> = graph
             .legacy_targets
             .iter()
@@ -672,37 +668,83 @@ fn ingest_session_graph(
         for file_path in fallback_paths {
             let (lines_added, lines_removed) =
                 loc_from_history(&file_path, session_start_ms, session_end_ms, history_index);
-            db::ingest_accepted_code_change(
-                db,
-                "cursor",
-                session_id,
-                &file_path,
+            record.accepted_changes.push(AcceptedChangeRecord {
+                abs_path: file_path,
                 lines_added,
                 lines_removed,
-                timestamp.as_deref(),
-            )?;
-            loc_events_pushed += 1;
-            written += 1;
+                ts: timestamp.clone(),
+            });
         }
     }
 
-    if loc_events_pushed == 0
+    if record.accepted_changes.is_empty()
         && let (Some(added), Some(removed)) = (graph.total_lines_added, graph.total_lines_removed)
         && (added > 0 || removed > 0)
     {
-        db::ingest_accepted_code_change(
-            db,
-            "cursor",
-            session_id,
-            "__total__",
-            added,
-            removed,
-            timestamp.as_deref(),
-        )?;
-        written += 1;
+        record.accepted_changes.push(AcceptedChangeRecord {
+            abs_path: "__total__".to_string(),
+            lines_added: added,
+            lines_removed: removed,
+            ts: timestamp.clone(),
+        });
     }
 
-    Ok(written)
+    record.model = graph
+        .model_name
+        .clone()
+        .or_else(|| record.primary_model_from_usage());
+    Some(record)
+}
+
+/// Provider-reported bubble token counts when present; otherwise one
+/// text-length estimate for the whole session.
+fn cursor_usage_records(graph: &CursorSessionGraph) -> Vec<UsageRecord> {
+    let reported: Vec<UsageRecord> = graph
+        .messages()
+        .iter()
+        .filter(|bubble| bubble.input_tokens.is_some() || bubble.output_tokens.is_some())
+        .enumerate()
+        .map(|(index, bubble)| {
+            let mut usage = UsageRecord::new(
+                bubble
+                    .bubble_id
+                    .clone()
+                    .unwrap_or_else(|| format!("bubble:{index}")),
+            );
+            usage.ts = bubble.timestamp.clone().or(graph.started_at.clone());
+            usage.model = bubble.model_name.clone().or(graph.model_name.clone());
+            usage.input_tokens = bubble.input_tokens.unwrap_or(0);
+            usage.output_tokens = bubble.output_tokens.unwrap_or(0);
+            usage
+        })
+        .collect();
+    if !reported.is_empty() {
+        return reported;
+    }
+
+    let mut input_tokens = 0i64;
+    let mut output_tokens = 0i64;
+    for bubble in graph.events_for_text_token_estimate() {
+        let Some(text) = bubble.text.as_deref() else {
+            continue;
+        };
+        let tokens = estimate_tokens_from_text(text);
+        match bubble.role {
+            Some(CursorBubbleRole::User) => input_tokens += tokens,
+            Some(CursorBubbleRole::Assistant) => output_tokens += tokens,
+            None => {}
+        }
+    }
+    if input_tokens + output_tokens <= 0 {
+        return Vec::new();
+    }
+    let mut usage = UsageRecord::new("estimate");
+    usage.ts = graph.started_at.clone();
+    usage.model = graph.model_name.clone();
+    usage.input_tokens = input_tokens;
+    usage.output_tokens = output_tokens;
+    usage.token_source = TokenSource::EstimatedText;
+    vec![usage]
 }
 
 fn ingest_cursor_text_usage(

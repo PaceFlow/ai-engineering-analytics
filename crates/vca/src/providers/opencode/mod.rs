@@ -6,7 +6,10 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::db;
+use crate::db::session_store::{
+    self, AcceptedChangeRecord, AgentKind, MessageRecord, SessionRecord, ToolCallRecord,
+    UsageRecord,
+};
 use crate::ingest_progress::IngestProgressObserver;
 
 const PROVIDER: &str = "opencode";
@@ -18,19 +21,28 @@ struct OpenCodeSession {
     started_at: Option<String>,
     ended_at: Option<String>,
     model_name: Option<String>,
+    parent_id: Option<String>,
+    title: Option<String>,
+    fingerprint: String,
     messages: Vec<OpenCodeMessage>,
     usage_events: Vec<OpenCodeUsageEvent>,
+    tool_calls: Vec<ToolCallRecord>,
 }
 
 #[derive(Debug, Clone)]
 struct OpenCodeMessage {
+    key: String,
     role: String,
     text: String,
     timestamp: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 struct OpenCodeUsageEvent {
+    key: String,
+    timestamp: Option<String>,
+    model_name: Option<String>,
+    provider_id: Option<String>,
     input_tokens: i64,
     cached_input_tokens: i64,
     cache_creation_tokens: i64,
@@ -139,108 +151,128 @@ fn ingest_db(path: &Path, analytics: &Connection) -> Result<usize> {
     let mut written = 0usize;
 
     for session in sessions {
-        let already_exists = db::session_exists(analytics, &session.id)?;
-        let usage_already_exists = db::session_usage_exists(analytics, PROVIDER, &session.id)?;
-        db::upsert_metadata_session_with_model(
+        let diff_file = diff_root
+            .as_deref()
+            .map(|root| root.join(format!("{}.json", session.id)));
+        let fingerprint = format!(
+            "{}|{}",
+            session.fingerprint,
+            diff_file
+                .as_deref()
+                .and_then(session_store::file_fingerprint)
+                .unwrap_or_default()
+        );
+        let source_key = format!("{source_path}#{}", session.id);
+        if !session_store::source_needs_ingest(analytics, PROVIDER, &source_key, &fingerprint)? {
+            continue;
+        }
+
+        let changes = match diff_root.as_deref() {
+            Some(diff_root) => parse_accepted_changes(diff_root, &session)?,
+            None => Vec::new(),
+        };
+        let record = session_record(&session, &source_path, changes);
+        written += session_store::store_session_record(analytics, &record)?;
+        session_store::mark_source_ingested(
             analytics,
             PROVIDER,
-            &session.id,
-            session.directory.as_deref(),
-            session.started_at.as_deref(),
-            session
-                .ended_at
-                .as_deref()
-                .or(session.started_at.as_deref()),
-            Some(&source_path),
-            Some(PROVIDER),
-            session.model_name.as_deref(),
+            &source_key,
+            &fingerprint,
+            &[session.id.as_str()],
         )?;
-
-        if already_exists && usage_already_exists {
-            continue;
-        }
-
-        if !already_exists {
-            written += 1;
-        }
-        if !usage_already_exists {
-            for usage in &session.usage_events {
-                db::ingest_session_usage(
-                    analytics,
-                    PROVIDER,
-                    &session.id,
-                    session
-                        .ended_at
-                        .as_deref()
-                        .or(session.started_at.as_deref()),
-                    session.model_name.as_deref(),
-                    usage.input_tokens,
-                    usage.cached_input_tokens,
-                    usage.cache_creation_tokens,
-                    usage.output_tokens,
-                    usage.reasoning_tokens,
-                    usage.total_tokens,
-                    usage.actual_cost_usd,
-                    if usage.actual_cost_usd.unwrap_or(0.0) > 0.0 {
-                        "actual"
-                    } else {
-                        "estimated_from_tokens"
-                    },
-                )?;
-                written += 1;
-            }
-        }
-        if already_exists {
-            continue;
-        }
-
-        for message in &session.messages {
-            let words = message.text.split_whitespace().count();
-            if words == 0 {
-                continue;
-            }
-            db::ingest_session_message(
-                analytics,
-                PROVIDER,
-                &session.id,
-                &message.role,
-                &message.text,
-                words as i64,
-                message.timestamp.as_deref(),
-            )?;
-            written += 1;
-        }
-
-        if let Some(diff_root) = diff_root.as_deref() {
-            for change in parse_accepted_changes(diff_root, &session)? {
-                db::ingest_accepted_code_change(
-                    analytics,
-                    PROVIDER,
-                    &session.id,
-                    &change.file_path,
-                    change.added_lines,
-                    change.removed_lines,
-                    session
-                        .ended_at
-                        .as_deref()
-                        .or(session.started_at.as_deref()),
-                )?;
-                written += 1;
-            }
-        }
     }
 
     Ok(written)
 }
 
+fn session_record(
+    session: &OpenCodeSession,
+    source_path: &str,
+    changes: Vec<OpenCodeAcceptedChange>,
+) -> SessionRecord {
+    let mut record = SessionRecord::new(PROVIDER, session.id.clone());
+    record.source_path = Some(source_path.to_string());
+    record.project_path = session.directory.clone();
+    record.started_at = session.started_at.clone();
+    record.ended_at = session.ended_at.clone().or(session.started_at.clone());
+    record.title = session.title.clone();
+    if let Some(parent) = session.parent_id.as_deref().filter(|id| !id.is_empty()) {
+        record.parent_session_id = Some(parent.to_string());
+        record.agent_kind = AgentKind::Subagent;
+    }
+    record.messages = session
+        .messages
+        .iter()
+        .map(|message| MessageRecord {
+            key: message.key.clone(),
+            ts: message.timestamp.clone(),
+            role: message.role.clone(),
+            text: message.text.clone(),
+            is_compaction_summary: false,
+        })
+        .collect();
+    record.usage = session
+        .usage_events
+        .iter()
+        .map(|usage| {
+            let mut out = UsageRecord::new(usage.key.clone());
+            out.ts = usage.timestamp.clone();
+            out.model = usage.model_name.clone();
+            out.provider_route = usage.provider_id.clone();
+            out.input_tokens = usage.input_tokens;
+            out.cache_read_tokens = usage.cached_input_tokens;
+            out.cache_write_tokens = usage.cache_creation_tokens;
+            out.output_tokens = usage.output_tokens;
+            out.reasoning_tokens = usage.reasoning_tokens;
+            out.reasoning_in_output = false;
+            out.reported_cost_usd = usage.actual_cost_usd;
+            out
+        })
+        .collect();
+    record.tool_calls = session.tool_calls.clone();
+    let change_ts = session.ended_at.clone().or(session.started_at.clone());
+    record.accepted_changes = changes
+        .into_iter()
+        .map(|change| AcceptedChangeRecord {
+            abs_path: change.file_path,
+            lines_added: change.added_lines,
+            lines_removed: change.removed_lines,
+            ts: change_ts.clone(),
+        })
+        .collect();
+    record.model = record
+        .primary_model_from_usage()
+        .or(session.model_name.clone());
+    record
+}
+
+fn table_columns(source: &Connection, table: &str) -> Result<Vec<String>> {
+    let mut stmt = source.prepare(&format!("PRAGMA table_info({table})"))?;
+    let columns = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(columns)
+}
+
 fn parse_sessions(path: &Path) -> Result<Vec<OpenCodeSession>> {
     let source = open_readonly_db(path)?;
-    let mut stmt = source.prepare(
-        "SELECT s.id, s.directory, s.time_created, s.time_updated, p.worktree
+    let session_columns = table_columns(&source, "session")?;
+    let optional = |name: &str| {
+        if session_columns.iter().any(|column| column == name) {
+            format!("s.{name}")
+        } else {
+            "NULL".to_string()
+        }
+    };
+    let sql = format!(
+        "SELECT s.id, s.directory, s.time_created, s.time_updated, p.worktree, {}, {}
          FROM session s
          LEFT JOIN project p ON p.id = s.project_id
          ORDER BY s.time_created, s.id",
-    )?;
+        optional("parent_id"),
+        optional("title")
+    );
+    let mut stmt = source.prepare(&sql)?;
 
     let rows = stmt
         .query_map([], |row| {
@@ -251,19 +283,22 @@ fn parse_sessions(path: &Path) -> Result<Vec<OpenCodeSession>> {
                 directory.or(worktree),
                 row.get::<_, i64>(2)?,
                 row.get::<_, i64>(3)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<String>>(6)?,
             ))
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
 
     let mut sessions = Vec::new();
-    for (id, directory, created_ms, updated_ms) in rows {
+    for (id, directory, created_ms, updated_ms, parent_id, title) in rows {
         let messages = parse_message_rows(&source, &id)?;
         let model_name = latest_model_name(&messages);
         let usage_events = messages
             .iter()
-            .filter_map(|message| message.usage)
+            .filter_map(|message| message.usage.clone())
             .collect();
-        let parts = parse_text_parts(&source, &id)?;
+        let (parts, tool_calls, part_count) = parse_parts(&source, &id)?;
+        let fingerprint = format!("{updated_ms}:{}:{part_count}", messages.len());
         let visible_messages = build_visible_messages(messages, parts);
         sessions.push(OpenCodeSession {
             id,
@@ -271,8 +306,12 @@ fn parse_sessions(path: &Path) -> Result<Vec<OpenCodeSession>> {
             started_at: ms_to_iso(created_ms),
             ended_at: ms_to_iso(updated_ms),
             model_name,
+            parent_id,
+            title,
+            fingerprint,
             messages: visible_messages,
             usage_events,
+            tool_calls,
         });
     }
 
@@ -312,7 +351,27 @@ fn parse_message_rows(source: &Connection, session_id: &str) -> Result<Vec<Messa
                     .and_then(Value::as_str)
             })
             .map(ToOwned::to_owned);
-        let usage = parse_opencode_usage(&parsed);
+        let mut usage = parse_opencode_usage(&parsed);
+        let timestamp = parsed
+            .get("time")
+            .and_then(|time| time.get("completed").or_else(|| time.get("created")))
+            .and_then(Value::as_i64)
+            .and_then(ms_to_iso)
+            .or_else(|| ms_to_iso(created_ms));
+        if let Some(usage) = usage.as_mut() {
+            usage.key = id.clone();
+            usage.timestamp = timestamp;
+            usage.model_name = model_name.clone();
+            usage.provider_id = parsed
+                .get("providerID")
+                .or_else(|| {
+                    parsed
+                        .get("model")
+                        .and_then(|model| model.get("providerID"))
+                })
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned);
+        }
 
         Ok(MessageRow {
             id,
@@ -350,6 +409,10 @@ fn parse_opencode_usage(parsed: &Value) -> Option<OpenCodeUsageEvent> {
         .filter(|value| *value > 0.0);
 
     Some(OpenCodeUsageEvent {
+        key: String::new(),
+        timestamp: None,
+        model_name: None,
+        provider_id: None,
         input_tokens,
         cached_input_tokens,
         cache_creation_tokens,
@@ -360,41 +423,134 @@ fn parse_opencode_usage(parsed: &Value) -> Option<OpenCodeUsageEvent> {
     })
 }
 
-fn parse_text_parts(source: &Connection, session_id: &str) -> Result<HashMap<String, Vec<String>>> {
+type TextParts = HashMap<String, Vec<(String, String)>>;
+
+/// Text parts per message plus tool calls, and the total number of parts.
+fn parse_parts(
+    source: &Connection,
+    session_id: &str,
+) -> Result<(TextParts, Vec<ToolCallRecord>, usize)> {
     let mut stmt = source.prepare(
-        "SELECT message_id, data
+        "SELECT message_id, data, id
          FROM part
          WHERE session_id = ?1
          ORDER BY time_created, id",
     )?;
 
-    let mut parts: HashMap<String, Vec<String>> = HashMap::new();
+    let mut parts: TextParts = HashMap::new();
+    let mut tool_calls = Vec::new();
+    let mut count = 0usize;
     let rows = stmt.query_map(params![session_id], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
     })?;
 
     for row in rows {
-        let (message_id, data) = row?;
+        let (message_id, data, part_id) = row?;
+        count += 1;
         let parsed: Value = serde_json::from_str(&data).unwrap_or(Value::Null);
-        if parsed.get("type").and_then(Value::as_str) != Some("text") {
-            continue;
+        match parsed.get("type").and_then(Value::as_str) {
+            Some("text") => {
+                let Some(text) = parsed.get("text").and_then(Value::as_str) else {
+                    continue;
+                };
+                if text.trim().is_empty() {
+                    continue;
+                }
+                parts
+                    .entry(message_id)
+                    .or_default()
+                    .push((part_id, text.to_string()));
+            }
+            Some("tool") => tool_calls.push(tool_call_from_part(&part_id, &parsed)),
+            _ => {}
         }
-        let Some(text) = parsed.get("text").and_then(Value::as_str) else {
-            continue;
-        };
-        if text.trim().is_empty() {
-            continue;
-        }
-        parts.entry(message_id).or_default().push(text.to_string());
     }
 
-    Ok(parts)
+    Ok((parts, tool_calls, count))
 }
 
-fn build_visible_messages(
-    messages: Vec<MessageRow>,
-    mut parts: HashMap<String, Vec<String>>,
-) -> Vec<OpenCodeMessage> {
+fn tool_call_from_part(part_id: &str, part: &Value) -> ToolCallRecord {
+    let state = part.get("state").unwrap_or(&Value::Null);
+    let input = state.get("input").unwrap_or(&Value::Null);
+    let text = |value: &Value, key: &str| {
+        value
+            .get(key)
+            .and_then(Value::as_str)
+            .filter(|text| !text.trim().is_empty())
+            .map(ToOwned::to_owned)
+    };
+    let target = text(input, "filePath")
+        .or_else(|| text(input, "file_path"))
+        .or_else(|| text(input, "path"))
+        .or_else(|| text(input, "command"))
+        .or_else(|| text(input, "pattern"))
+        .or_else(|| text(input, "url"))
+        .or_else(|| text(input, "query"))
+        .or_else(|| text(input, "description"));
+    let output = state
+        .get("output")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let error = state.get("error").and_then(Value::as_str);
+    let status = match state.get("status").and_then(Value::as_str) {
+        Some("completed") => "ok",
+        Some("error") => "error",
+        Some("running") | Some("pending") => "unknown",
+        Some(other) if other.contains("abort") => "interrupted",
+        _ => "unknown",
+    };
+    let exit_code = state
+        .get("metadata")
+        .and_then(|meta| meta.get("exit").or_else(|| meta.get("exitCode")))
+        .and_then(Value::as_i64);
+    let time = state.get("time");
+    let ms = |key: &str| {
+        time.and_then(|time| time.get(key))
+            .and_then(Value::as_i64)
+            .and_then(ms_to_iso)
+    };
+    ToolCallRecord {
+        key: part
+            .get("callID")
+            .and_then(Value::as_str)
+            .unwrap_or(part_id)
+            .to_string(),
+        ts: ms("start"),
+        ended_ts: ms("end"),
+        tool_name: part
+            .get("tool")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+            .to_string(),
+        target,
+        input_chars: input.to_string().chars().count() as i64,
+        output_chars: output.chars().count() as i64,
+        output_in_context: true,
+        status: if exit_code.is_some_and(|code| code != 0) {
+            "error".to_string()
+        } else {
+            status.to_string()
+        },
+        exit_code,
+        error_head: error.map(ToOwned::to_owned).or_else(|| {
+            exit_code
+                .is_some_and(|code| code != 0)
+                .then(|| output.chars().take(600).collect())
+        }),
+        child_session_id: state
+            .get("metadata")
+            .and_then(|meta| meta.get("sessionId"))
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        agent_type: text(input, "subagent_type"),
+    }
+}
+
+fn build_visible_messages(messages: Vec<MessageRow>, mut parts: TextParts) -> Vec<OpenCodeMessage> {
     let mut out = Vec::new();
 
     for message in messages {
@@ -408,8 +564,9 @@ fn build_visible_messages(
         let Some(text_parts) = parts.remove(&message.id) else {
             continue;
         };
-        for text in text_parts {
+        for (part_id, text) in text_parts {
             out.push(OpenCodeMessage {
+                key: part_id,
                 role: role.to_string(),
                 text,
                 timestamp: message.timestamp.clone(),
@@ -525,6 +682,10 @@ mod tests {
         assert_eq!(
             usage,
             OpenCodeUsageEvent {
+                key: String::new(),
+                timestamp: None,
+                model_name: None,
+                provider_id: None,
                 input_tokens: 1199,
                 cached_input_tokens: 130560,
                 cache_creation_tokens: 7,
@@ -613,7 +774,7 @@ mod tests {
         init_app_schema(&analytics)?;
         let written = ingest_db(&db_path, &analytics)?;
 
-        assert_eq!(written, 4);
+        assert_eq!(written, 5);
         let model: String = analytics.query_row(
             "SELECT mm.model_name
              FROM metadata_sessions s

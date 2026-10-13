@@ -80,7 +80,7 @@ pub fn plan_provider_code_changes_for(
         }),
         "claude" => Ok(ProviderCodeChangePlan {
             provider,
-            sources: crate::providers::claude::plan_session_files()?,
+            sources: crate::providers::claude::plan_change_sources()?,
         }),
         "cursor" => Ok(ProviderCodeChangePlan {
             provider,
