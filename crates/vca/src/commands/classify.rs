@@ -443,12 +443,43 @@ pub struct EvalRow {
     pub accuracy: f64,
     pub macro_f1: f64,
     pub top_confusions: Vec<(String, String, usize)>,
+    /// Expected calibration error over 5 confidence bins (classifier only).
+    pub ece: Option<f64>,
+    /// Accuracy and coverage of answers with confidence ≥ 0.6.
+    pub confident_accuracy: Option<f64>,
+    pub confident_coverage: Option<f64>,
+}
+
+/// ECE and accuracy/coverage at the confident threshold from (confidence, correct) pairs.
+fn calibration(points: &[(f64, bool)]) -> (Option<f64>, Option<f64>, Option<f64>) {
+    if points.is_empty() {
+        return (None, None, None);
+    }
+    let mut ece = 0.0;
+    for bin in 0..5 {
+        let (low, high) = (bin as f64 / 5.0, (bin + 1) as f64 / 5.0);
+        let members: Vec<&(f64, bool)> = points
+            .iter()
+            .filter(|(c, _)| *c >= low && (*c < high || (bin == 4 && *c <= 1.0)))
+            .collect();
+        if members.is_empty() {
+            continue;
+        }
+        let confidence = members.iter().map(|(c, _)| c).sum::<f64>() / members.len() as f64;
+        let accuracy = members.iter().filter(|(_, ok)| *ok).count() as f64 / members.len() as f64;
+        ece += members.len() as f64 / points.len() as f64 * (confidence - accuracy).abs();
+    }
+    let confident: Vec<&(f64, bool)> = points.iter().filter(|(c, _)| *c >= 0.6).collect();
+    let confident_accuracy = (!confident.is_empty())
+        .then(|| confident.iter().filter(|(_, ok)| *ok).count() as f64 / confident.len() as f64);
+    let coverage = confident.len() as f64 / points.len() as f64;
+    (Some(ece), confident_accuracy, Some(coverage))
 }
 
 /// Compare stored labels with gold labels (overrides count as gold).
 pub fn evaluate(conn: &Connection, question: Option<&str>) -> Result<Vec<EvalRow>> {
     let mut stmt = conn.prepare(
-        "SELECT g.question_id, r.source, g.label, r.label
+        "SELECT g.question_id, r.source, g.label, r.label, r.confidence
          FROM classification_gold g
          JOIN classification_result r
            ON r.unit_kind = g.unit_kind AND r.unit_key = g.unit_key AND r.question_id = g.question_id
@@ -457,15 +488,25 @@ pub fn evaluate(conn: &Connection, question: Option<&str>) -> Result<Vec<EvalRow
          ORDER BY g.question_id, r.source",
     )?;
     let mut pairs: BTreeMap<(String, String), Vec<(String, String)>> = BTreeMap::new();
+    let mut confidences: BTreeMap<(String, String), Vec<(f64, bool)>> = BTreeMap::new();
     for row in stmt.query_map(params![question], |row| {
         Ok((
             row.get::<_, String>(0)?,
             row.get::<_, String>(1)?,
             row.get::<_, String>(2)?,
             row.get::<_, String>(3)?,
+            row.get::<_, Option<f64>>(4)?,
         ))
     })? {
-        let (question, source, gold, predicted) = row?;
+        let (question, source, gold, predicted, confidence) = row?;
+        if source == "jev"
+            && let Some(confidence) = confidence
+        {
+            confidences
+                .entry((question.clone(), source.clone()))
+                .or_default()
+                .push((confidence, gold == predicted));
+        }
         pairs
             .entry((question, source))
             .or_default()
@@ -474,6 +515,12 @@ pub fn evaluate(conn: &Connection, question: Option<&str>) -> Result<Vec<EvalRow
     Ok(pairs
         .into_iter()
         .map(|((question, source), pairs)| {
+            let (ece, confident_accuracy, confident_coverage) = calibration(
+                confidences
+                    .get(&(question.clone(), source.clone()))
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]),
+            );
             let n = pairs.len();
             let correct = pairs.iter().filter(|(g, p)| g == p).count();
             let classes: BTreeSet<&String> = pairs.iter().flat_map(|(g, p)| [g, p]).collect();
@@ -518,6 +565,9 @@ pub fn evaluate(conn: &Connection, question: Option<&str>) -> Result<Vec<EvalRow
                 accuracy: correct as f64 / n.max(1) as f64,
                 macro_f1: f1s.iter().sum::<f64>() / f1s.len().max(1) as f64,
                 top_confusions: top,
+                ece,
+                confident_accuracy,
+                confident_coverage,
             }
         })
         .collect())
@@ -544,6 +594,14 @@ fn eval(conn: &Connection, question: Option<&str>, json: bool) -> Result<()> {
                 row.n.to_string(),
                 format!("{:.0}%", row.accuracy * 100.0),
                 format!("{:.2}", row.macro_f1),
+                row.ece
+                    .map(|e| format!("{e:.2}"))
+                    .unwrap_or_else(|| "·".into()),
+                match (row.confident_accuracy, row.confident_coverage) {
+                    (Some(a), Some(c)) => format!("{:.0}% @ {:.0}%", a * 100.0, c * 100.0),
+                    (None, Some(_)) => "— @ 0%".into(),
+                    _ => "·".into(),
+                },
                 row.top_confusions
                     .iter()
                     .map(|(g, p, n)| format!("{g}→{p} ×{n}"))
