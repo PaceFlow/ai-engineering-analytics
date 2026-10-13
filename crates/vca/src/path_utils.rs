@@ -17,6 +17,37 @@ fn unquote(input: &str) -> &str {
     trimmed
 }
 
+/// The home directory coding agents use for their histories.
+///
+/// Honors the environment like the agents themselves (Node's `os.homedir()`
+/// reads `USERPROFILE` on Windows and `HOME` elsewhere) before asking the OS:
+/// on Windows `dirs::home_dir()` ignores `USERPROFILE`.
+pub fn agent_home() -> Option<PathBuf> {
+    let from_env = |key: &str| {
+        std::env::var_os(key)
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+    };
+    #[cfg(windows)]
+    let found = from_env("USERPROFILE").or_else(|| from_env("HOME"));
+    #[cfg(not(windows))]
+    let found = from_env("HOME");
+    found.or_else(dirs::home_dir)
+}
+
+/// `agent_home()` or an error for callers that cannot continue without it.
+pub fn require_agent_home() -> anyhow::Result<PathBuf> {
+    agent_home().ok_or_else(|| anyhow::anyhow!("Home directory not found"))
+}
+
+/// Codex keeps its data in `$CODEX_HOME`, else `~/.codex`.
+pub fn codex_home() -> anyhow::Result<PathBuf> {
+    if let Some(dir) = std::env::var_os("CODEX_HOME").filter(|value| !value.is_empty()) {
+        return Ok(PathBuf::from(dir));
+    }
+    Ok(require_agent_home()?.join(".codex"))
+}
+
 pub fn resolve_path(raw_path: &str, workdir: Option<&str>, session_cwd: Option<&str>) -> PathBuf {
     let cleaned = unquote(raw_path);
     let path = Path::new(cleaned);
@@ -192,6 +223,20 @@ fn detect_git_top_level(query_dir: &Path) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn agent_home_follows_environment_and_codex_home() {
+        let _lock = crate::test_support::lock_env();
+        let dir = tempfile::tempdir().unwrap();
+        let home_var = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+        let _home = crate::test_support::ScopedEnvVar::set(home_var, dir.path());
+        let _codex = crate::test_support::ScopedEnvVar::unset("CODEX_HOME");
+        assert_eq!(agent_home().as_deref(), Some(dir.path()));
+        assert_eq!(codex_home().unwrap(), dir.path().join(".codex"));
+        let elsewhere = dir.path().join("codex-data");
+        let _codex = crate::test_support::ScopedEnvVar::set("CODEX_HOME", &elsewhere);
+        assert_eq!(codex_home().unwrap(), elsewhere);
+    }
+
     use super::*;
     use anyhow::Result;
     use tempfile::tempdir;

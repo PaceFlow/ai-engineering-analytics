@@ -140,7 +140,7 @@ const CLAUDE_EDIT_PARSER_NAME: &str = "claude_edit_v1";
 const CLAUDE_WRITE_PARSER_NAME: &str = "claude_write_v1";
 
 pub(crate) fn plan_session_files() -> Result<Vec<PathBuf>> {
-    let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Home directory not found"))?;
+    let home = crate::path_utils::require_agent_home()?;
     let root = home.join(".claude").join("projects");
     if !root.exists() {
         return Ok(Vec::new());

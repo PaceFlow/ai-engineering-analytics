@@ -61,8 +61,7 @@ pub fn ingest_planned_sessions(
 }
 
 fn codex_sessions_dir() -> Result<PathBuf> {
-    let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Home directory not found"))?;
-    Ok(home.join(".codex").join("sessions"))
+    Ok(crate::path_utils::codex_home()?.join("sessions"))
 }
 
 /// Recursively collect all .jsonl files under `root`.
