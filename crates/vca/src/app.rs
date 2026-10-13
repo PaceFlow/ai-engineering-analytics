@@ -74,6 +74,8 @@ pub fn run(
         Commands::Show(args) => commands::insights::run_show(args, context),
         Commands::Context(args) => commands::insights::run_context(args, context),
         Commands::Rework(args) => commands::insights::run_rework(args, context),
+        Commands::Habits(args) => commands::insights::run_habits(args, context),
+        Commands::Stages(args) => commands::insights::run_stages(args, context),
         Commands::Pricing(args) => commands::pricing::run(args),
         Commands::Classify(args) => commands::classify::run(args, context),
     }

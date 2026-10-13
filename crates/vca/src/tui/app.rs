@@ -9,7 +9,7 @@ use std::cell::Cell;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use super::data::{Action, Data, Loader, Query};
-use crate::classify::questions::FEEDBACK;
+use crate::classify::questions::{FEEDBACK, REQUEST_KINDS, TURN_STAGES};
 use crate::classify::run::RunSummary;
 use crate::classify::state::Level;
 use crate::explore::{
@@ -219,6 +219,8 @@ pub enum EditTarget {
         task: Option<i64>,
         tasks: i64,
         feedback: Option<String>,
+        stage: Option<String>,
+        request_kind: Option<String>,
     },
 }
 
@@ -264,9 +266,13 @@ impl EditTarget {
                     .map(|task| format!("T{task}"))
                     .chain(["new task".to_string(), CLEAR.to_string()])
                     .collect();
+                let stages: Vec<&str> = TURN_STAGES.iter().map(|(name, _)| *name).collect();
+                let requests: Vec<&str> = REQUEST_KINDS.iter().map(|(name, _)| *name).collect();
                 vec![
                     ("feedback", owned(&feedback)),
                     ("starts task", task_options),
+                    ("stage", owned(&stages)),
+                    ("asked for", owned(&requests)),
                 ]
             }
         }
@@ -288,6 +294,8 @@ impl EditTarget {
             (Self::Task { outcome, .. }, 1) => find(outcome.as_deref()),
             (Self::Turn { feedback, .. }, 0) => find(feedback.as_deref()),
             (Self::Turn { task, .. }, 1) => task.map(|t| t as usize).unwrap_or(0),
+            (Self::Turn { stage, .. }, 2) => find(stage.as_deref()),
+            (Self::Turn { request_kind, .. }, 3) => find(request_kind.as_deref()),
             _ => 0,
         }
     }
@@ -351,12 +359,17 @@ impl EditTarget {
                         task,
                     }
                 } else {
+                    let (unit_kind, question) = match *name {
+                        "stage" => ("turn", "turn_stage"),
+                        "asked for" => ("turn", "request_kind"),
+                        _ => ("exchange", "feedback"),
+                    };
                     Action::SetLabel {
-                        unit_kind: "exchange".into(),
+                        unit_kind: unit_kind.into(),
                         unit_key: crate::classify::heuristic::turn_unit_key(
                             provider, session, *turn,
                         ),
-                        question: "feedback".into(),
+                        question: question.into(),
                         label: (!cleared).then_some(option),
                     }
                 }
@@ -1213,6 +1226,8 @@ impl App {
                         task: turn.task_index,
                         tasks: detail.tasks.len() as i64,
                         feedback: turn.feedback.clone(),
+                        stage: turn.stage.clone(),
+                        request_kind: turn.request_kind.clone(),
                     })
                 }
                 _ => None,

@@ -419,8 +419,8 @@ fn set_label(
     let unit_key = match (unit_kind, task, turn) {
         ("task", Some(task), None) => task_unit_key(&provider, &session_id, task),
         ("task", None, None) => task_unit_key(&provider, &session_id, 0),
-        ("exchange", None, Some(turn)) => turn_unit_key(&provider, &session_id, turn),
-        ("exchange", _, None) => bail!("{question} is a per-turn question; pass --turn"),
+        ("exchange" | "turn", None, Some(turn)) => turn_unit_key(&provider, &session_id, turn),
+        ("exchange" | "turn", _, None) => bail!("{question} is a per-turn question; pass --turn"),
         _ => bail!(
             "{question} takes {}",
             if unit_kind == "task" {

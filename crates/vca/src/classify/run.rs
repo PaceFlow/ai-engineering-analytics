@@ -17,7 +17,7 @@ use crate::classify::config::ClassifierConfig;
 use crate::classify::heuristic::{task_unit_key, turn_unit_key};
 use crate::classify::questions::{
     QUESTION_SET_VERSION, completion_question, exchange_questions, rework_question,
-    task_assignment_question, task_label_questions,
+    task_assignment_question, task_label_questions, turn_questions,
 };
 use crate::classify::state::{
     BuiltState, Level, TurnFacts, assignment_state, estimate_tokens, exchange_state, head_tail,
@@ -40,6 +40,7 @@ pub struct Passes {
     pub labels: bool,
     pub completion: bool,
     pub rework: bool,
+    pub stages: bool,
 }
 
 impl Passes {
@@ -49,6 +50,7 @@ impl Passes {
         labels: true,
         completion: true,
         rework: true,
+        stages: true,
     };
 
     pub fn parse(value: &str) -> Option<Self> {
@@ -58,6 +60,7 @@ impl Passes {
             labels: false,
             completion: false,
             rework: false,
+            stages: false,
         };
         for part in value.split(',').map(str::trim) {
             match part {
@@ -67,6 +70,7 @@ impl Passes {
                 "labels" | "tasks" => passes.labels = true,
                 "completion" => passes.completion = true,
                 "rework" | "relations" => passes.rework = true,
+                "stages" | "stage" => passes.stages = true,
                 _ => return None,
             }
         }
@@ -211,10 +215,11 @@ fn execute(
     }
     runner.summary.sessions = selected.len();
 
-    if options.passes.segment && options.level > Level::EvidenceOnly {
+    let segment = options.passes.segment && options.level > Level::EvidenceOnly;
+    if segment || options.passes.stages {
         let mut changed = false;
         for (session, turns) in &selected {
-            changed |= runner.segment_session(session, turns)?;
+            changed |= runner.segment_session(session, turns, segment, options.passes.stages)?;
         }
         if changed && !options.dry_run {
             crate::insights::structure::refresh_session_structure(conn)?;
@@ -684,7 +689,16 @@ impl Runner<'_> {
     // ── Passes ───────────────────────────────────────────────────────────
 
     /// Assign every user turn to a task. Returns whether stored assignments changed.
-    fn segment_session(&mut self, session: &SessionRef, turns: &[TurnFacts]) -> Result<bool> {
+    /// Per user turn, one request with the task-assignment question (when
+    /// `segment`) and the stage, request-kind and flag questions (when
+    /// `stages`). Returns whether stored task assignments changed.
+    fn segment_session(
+        &mut self,
+        session: &SessionRef,
+        turns: &[TurnFacts],
+        segment: bool,
+        stages: bool,
+    ) -> Result<bool> {
         let overrides: BTreeMap<i64, i64> = {
             let mut stmt = self.conn.prepare(
                 "SELECT turn_index, task_index FROM task_turn_assignment
@@ -699,16 +713,36 @@ impl Runner<'_> {
         let mut assigned: Vec<(i64, Option<f64>)> = Vec::with_capacity(turns.len());
         let mut answered = 0usize;
         for (position, turn) in turns.iter().enumerate() {
-            if let Some(task) = overrides.get(&turn.index) {
+            let key = turn_unit_key(&session.provider, &session.session_id, turn.index);
+            let fixed = if let Some(task) = overrides.get(&turn.index) {
                 if !tasks.iter().any(|(index, _)| index == task) {
                     tasks.push((*task, task_request_text(turn)));
                 }
-                assigned.push((*task, Some(1.0)));
-                continue;
-            }
-            if position == 0 {
-                tasks.push((0, task_request_text(turn)));
-                assigned.push((0, None));
+                Some((*task, Some(1.0)))
+            } else if position == 0 || !segment {
+                if position == 0 {
+                    tasks.push((0, task_request_text(turn)));
+                }
+                let previous = if position == 0 {
+                    0
+                } else {
+                    assigned[position - 1].0
+                };
+                Some((previous, None))
+            } else {
+                None
+            };
+            if let Some(entry) = fixed {
+                if stages {
+                    let build = |level: Level| {
+                        (
+                            assignment_state(turns, position, level),
+                            turn_questions(level),
+                        )
+                    };
+                    self.ask("turn", &key, &build)?;
+                }
+                assigned.push(entry);
                 continue;
             }
             let current = assigned[position - 1].0;
@@ -729,11 +763,13 @@ impl Runner<'_> {
                     built.state["note"] =
                         Value::String("The user cleared the context before this message.".into());
                 }
-                let questions =
+                let mut questions =
                     task_assignment_question(Some((&current_label, &current_request)), &open);
+                if stages {
+                    questions.extend(turn_questions(level));
+                }
                 (built, questions)
             };
-            let key = turn_unit_key(&session.provider, &session.session_id, turn.index);
             let asked = self.ask("turn", &key, &build)?;
             let mut choice = (current, None);
             if let Some(asked) = asked
@@ -1324,6 +1360,7 @@ mod tests {
             labels: false,
             completion: false,
             rework: false,
+            stages: false,
         };
         run(
             &conn,
@@ -1394,7 +1431,8 @@ mod tests {
         let (conn, session) = seeded()?;
         let summary = plan(&conn, &config(), &[session], Level::Conversation)?;
         assert!(summary.est_tokens > 0);
-        assert_eq!(summary.units.get("turn"), Some(&3));
+        // Every turn gets stage questions; turns after the first also get task assignment.
+        assert_eq!(summary.units.get("turn"), Some(&4));
         assert_eq!(summary.units.get("exchange"), Some(&3));
         let runs: i64 =
             conn.query_row("SELECT COUNT(*) FROM classifier_run", [], |row| row.get(0))?;
@@ -1495,6 +1533,7 @@ mod tests {
             labels: false,
             completion: false,
             rework: true,
+            stages: false,
         };
         let late = SessionRef {
             provider: "claude".into(),
@@ -1521,6 +1560,43 @@ mod tests {
             (label.as_str(), source.as_str()),
             ("requirement_change", "jev")
         );
+        Ok(())
+    }
+
+    #[test]
+    fn stage_questions_ride_with_task_assignment_and_cover_turn_zero() -> Result<()> {
+        let (conn, session) = seeded()?;
+        let client = scripted();
+        run(
+            &conn,
+            &client,
+            &config(),
+            std::slice::from_ref(&session),
+            &options(1.0),
+        )?;
+        let requests = client.requests.lock().unwrap().clone();
+        let turn_requests: Vec<_> = requests
+            .iter()
+            .filter(|r| r.state["unit"] == "user_turn")
+            .collect();
+        assert_eq!(turn_requests.len(), 4, "one request per user turn");
+        let first = turn_requests[0];
+        assert!(first.questions.contains_key("turn_stage"));
+        assert!(!first.questions.contains_key("task_assignment"));
+        assert!(turn_requests[1..].iter().all(|r| {
+            r.questions.contains_key("task_assignment")
+                && r.questions.contains_key("turn_stage")
+                && r.questions.contains_key("request_kind")
+                && r.questions.contains_key("unrequested_changes")
+        }));
+        assert!(first.state.get("current_turn").is_some());
+        let stages: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM classification_result
+             WHERE source = 'jev' AND unit_kind = 'turn' AND question_id = 'turn_stage' AND superseded_by IS NULL",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(stages, 4);
         Ok(())
     }
 }

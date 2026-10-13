@@ -1374,7 +1374,7 @@ fn insight_commands_match_snapshots() -> anyhow::Result<()> {
     let env = TestEnv::new_live_fixture()?;
     env.ingest()?;
 
-    let cases: [(&str, &[&str]); 9] = [
+    let cases: [(&str, &[&str]); 11] = [
         ("insights_usage_by_tool", &["usage", "--days", "0"]),
         (
             "insights_usage_by_model",
@@ -1393,6 +1393,8 @@ fn insight_commands_match_snapshots() -> anyhow::Result<()> {
             "insights_classify_plan",
             &["classify", "plan", "--days", "0"],
         ),
+        ("insights_habits", &["habits", "--days", "0"]),
+        ("insights_stages", &["stages", "--days", "0"]),
     ];
     for (name, args) in cases {
         let output = env.normalize_output(env.run_paceflow(args)?);

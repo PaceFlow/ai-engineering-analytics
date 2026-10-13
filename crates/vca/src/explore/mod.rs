@@ -8,8 +8,10 @@ pub mod bands;
 pub mod compare;
 pub mod delivery;
 pub mod format;
+pub mod habits;
 pub mod practices;
 pub mod rework;
+pub mod stages;
 
 use anyhow::Result;
 use rusqlite::{Connection, ToSql, params_from_iter};
@@ -187,6 +189,8 @@ pub struct TaskRow {
     pub outcome: Option<String>,
     pub outcome_source: Option<String>,
     pub outcome_band: Option<String>,
+    /// Compressed work stages, e.g. `explore→plan→implement→verify`.
+    pub stage_path: Option<String>,
 }
 
 impl TaskRow {
@@ -325,7 +329,8 @@ const TASK_COLUMNS: &str = "
     t.lines_changed, t.subagents, t.primary_model, COALESCE(t.models, ''), t.model_changes,
     t.repo_root, t.git_branch, t.tokens_total, t.fresh_tokens, t.cost_total_usd,
     t.cost_to_complete_usd, t.post_completion_cost_usd, t.subagent_cost_usd, t.unpriced_tokens,
-    t.estimated_tokens, t.commits, li.label, li.source, li.band, lo.label, lo.source, lo.band";
+    t.estimated_tokens, t.commits, li.label, li.source, li.band, lo.label, lo.source, lo.band,
+    ts.stage_path";
 
 const TASK_JOINS: &str = "
     FROM derived_task t
@@ -334,7 +339,9 @@ const TASK_JOINS: &str = "
      AND li.unit_key = t.provider || '|' || t.session_id || '|' || t.task_index
     LEFT JOIN view_label_effective lo
       ON lo.unit_kind = 'task' AND lo.question_id = 'outcome'
-     AND lo.unit_key = t.provider || '|' || t.session_id || '|' || t.task_index";
+     AND lo.unit_key = t.provider || '|' || t.session_id || '|' || t.task_index
+    LEFT JOIN derived_task_stage ts
+      ON ts.provider = t.provider AND ts.session_id = t.session_id AND ts.task_index = t.task_index";
 
 fn task_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskRow> {
     Ok(TaskRow {
@@ -379,6 +386,7 @@ fn task_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskRow> {
         outcome: row.get(38)?,
         outcome_source: row.get(39)?,
         outcome_band: row.get(40)?,
+        stage_path: row.get::<_, Option<String>>(41)?.filter(|p| !p.is_empty()),
     })
 }
 
@@ -1726,6 +1734,9 @@ pub struct TurnRow {
     pub feedback: Option<String>,
     pub feedback_source: Option<String>,
     pub task_index: Option<i64>,
+    pub stage: Option<String>,
+    pub stage_source: Option<String>,
+    pub request_kind: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -1848,11 +1859,13 @@ pub fn session_detail(
         "SELECT d.session_id, d.turn_index, d.started_at, COALESCE(d.user_text_head, ''), d.user_chars,
                 d.assistant_chars, d.tool_calls, d.edit_calls, d.validation_runs,
                 d.validation_failures, d.tokens_total, d.api_equiv_usd, COALESCE(d.model_names, ''),
-                l.label, l.source
+                l.label, l.source, st.stage, st.stage_source, st.request_kind
          FROM derived_turn d
          LEFT JOIN view_label_effective l
            ON l.unit_kind = 'exchange' AND l.question_id = 'feedback'
           AND l.unit_key = d.provider || '|' || d.session_id || '|' || d.turn_index
+         LEFT JOIN derived_turn_stage st
+           ON st.provider = d.provider AND st.session_id = d.session_id AND st.turn_index = d.turn_index
          WHERE d.provider = ?1 AND d.session_id = ?2
          ORDER BY d.turn_index",
     )?;
@@ -1875,6 +1888,9 @@ pub fn session_detail(
                 feedback: row.get(13)?,
                 feedback_source: row.get(14)?,
                 task_index: None,
+                stage: row.get(15)?,
+                stage_source: row.get(16)?,
+                request_kind: row.get(17)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -2135,6 +2151,7 @@ mod tests {
             outcome: None,
             outcome_source: None,
             outcome_band: None,
+            stage_path: None,
         }
     }
 

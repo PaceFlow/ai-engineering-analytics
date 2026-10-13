@@ -1,0 +1,21 @@
+---
+source: crates/vca/tests/metrics_regression.rs
+expression: output
+---
+Habit                              Followed    n  Jev  Done (with vs without)  Corrections  Loops     Median cost        Note
+Know what done looks like                0%  0/5   0%  ·                       ·            ·         — vs ~$24.81       low n
+Plan first, and do it yourself          25%  1/4   0%  100% vs 33%             100% vs 33%  0% vs 0%  ~$7.50 vs ~$42.12  low n
+Make it ask, not assume                 25%  1/4   0%  100% vs 33%             100% vs 33%  0% vs 0%  ~$42.12 vs ~$7.50  low n
+Ground it in what exists                50%  2/4   0%  100% vs 0%              100% vs 0%   0% vs 0%  ~$24.81 vs —       low n
+Work in small slices                   100%  4/4   0%  ·                       ·            ·         ~$24.81 vs —       low n
+Push for the minimal diff                 —  0/0   0%  ·                       ·            ·         — vs —             low n
+Write tests that can fail                0%  0/4   0%  ·                       ·            ·         — vs ~$24.81       low n
+Ask for evidence, not reports           50%  2/4   0%  100% vs 0%              100% vs 0%   0% vs 0%  ~$24.81 vs —       low n
+Get an independent review               75%  3/4   0%  67% vs 0%               67% vs 0%    0% vs 0%  ~$24.81 vs —       low n
+Defend it without AI (signal)             —  0/0   0%  ·                       ·            ·         — vs —             signal
+Review your own PR first (signal)      100%  2/2   0%  ·                       ·            ·         ~$24.81 vs —       signal
+Turn corrections into rules               —  0/0   0%  ·                       ·            ·         — vs —             low n
+
+all data · ~ = API list-price estimate (pricing litellm@2026-10-13), not an invoice
+Followed = share of tasks where the habit applies. Jev = decisions that used classifier labels (others heuristic).
+With vs without compares tasks that followed the habit to those that did not; correlation, not causation.

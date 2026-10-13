@@ -158,6 +158,32 @@ paceflow classify eval                                      # accuracy against y
 
 Content levels are `evidence_only`, `user_text`, `conversation` (default; code blocks stripped) and `full`. Secrets, emails and home paths are always redacted. Requests ask for zero data retention and do not fall back to other providers. Answers are cached by content, so re-running only sends what changed; runs stop at `--max-usd` and the monthly budget in `~/.vca/classifier.json`. In the TUI, `K` shows the same estimate and consent screen for the selected sessions and `e` edits labels, task starts and completion turns.
 
+### Work stages and the 12 habits
+
+Every user turn gets a **stage** (what kind of work happened: explore, research, plan, clarify, implement, tests, verify, debug, review, refine, docs, ship) and a **request kind** (what you asked for: new request, your own plan, acceptance criteria, clarification, refinement, correction, requirement change, "how does it work", review, approve, ship). Without classification these come from tool evidence and keywords (marked `h`). `paceflow classify run` asks Jev for them on every turn, in the same request as task splitting. Jev also answers per-turn flags: you asked the agent to ask, minimal change demanded, sources cited, the agent asked questions, done claimed without evidence, unrequested changes, and tests changed to pass.
+
+```bash
+paceflow stages                      # cost and turns per stage, common task paths, session kinds
+paceflow habits                      # adoption and outcomes for the 12 habits
+paceflow habits --habit 7 --list     # the tasks behind one habit, with the evidence for each
+```
+
+Habits are judged per task as followed, not followed, n/a (e.g. nothing was built) or unknown:
+- 01 know done
+- 02 plan first
+- 03 make it ask
+- 04 ground it
+- 05 small slices
+- 06 minimal diff
+- 07 tests that can fail
+- 08 evidence, not reports
+- 09 independent review
+- 10 defend without AI (signal only)
+- 11 self-review (signal only)
+- 12 corrections into rules (instruction files changed after repeated corrections)
+
+`paceflow habits` compares tasks that followed a habit with those that did not on completion, corrections, loops and median cost, with sample sizes. The comparison is correlation, not causation. In the TUI, the Conversation tab shows the stage and request of each turn, the Tasks tab shows each task's stage path, Practices lists the habits first, and `e` on a turn corrects its stage or request kind. Your corrections become gold labels for `paceflow classify eval`.
+
 ### Interactive explorer
 
 `paceflow tui` opens the explorer (`--classic` opens the previous dashboard). `1`–`7` switch screens, `Enter` drills into the selected row, `Esc` returns exactly where you were, `[`/`]` step through siblings, `u` toggles sessions/tasks, `f` filters, `/` searches, `x` explains a number, `m`/`c` mark and compare, `M` logs a quota limit hit, `R` reloads and `?` lists everything.
