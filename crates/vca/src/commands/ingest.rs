@@ -139,6 +139,7 @@ pub fn run_for(verbose: bool, args: IngestArgs, context: crate::app::AppContext)
     {
         {
             let mut observer = progress.stage("Session Events", 1);
+            crate::db::session_store::refresh_session_roots(&db)?;
             analytics::refresh_session_events(&db)?;
             observer.advance("session events refreshed");
         }

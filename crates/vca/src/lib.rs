@@ -9,6 +9,7 @@ pub mod error;
 pub mod event_identity;
 pub mod github;
 pub mod ingest_progress;
+pub mod insights;
 pub mod path_utils;
 pub mod providers;
 

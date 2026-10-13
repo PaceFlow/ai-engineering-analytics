@@ -13,7 +13,6 @@ use std::time::Instant;
 use crate::change_intel::commit_assoc::git_scan::load_commit_diff;
 use crate::change_intel::types::LineSide;
 use crate::cli::{EventCategory, EventStreamArgs, EventStreamKind, GroupBy, ReportArgs};
-use crate::cost::pricing::{TokenUsage, estimate_cost_usd};
 use crate::event_identity;
 use crate::ingest_progress::IngestProgressObserver;
 
@@ -728,36 +727,40 @@ pub fn refresh_session_events(conn: &Connection) -> Result<()> {
            ON msg.provider = s.provider
           AND msg.session_id = s.session_id
          LEFT JOIN (
-             SELECT provider, session_id,
-                    SUM(lines_added) AS added_lines,
-                    SUM(lines_removed) AS removed_lines
-             FROM fact_session_code_change
-             WHERE source_kind = 'accepted_change'
-             GROUP BY provider, session_id
+             SELECT t.provider, t.root_session_id AS session_id,
+                    SUM(c.lines_added) AS added_lines,
+                    SUM(c.lines_removed) AS removed_lines
+             FROM fact_session_code_change c
+             JOIN view_session_tree t
+               ON t.provider = c.provider AND t.session_id = c.session_id
+             WHERE c.source_kind = 'accepted_change'
+             GROUP BY t.provider, t.root_session_id
          ) ch
            ON ch.provider = s.provider
           AND ch.session_id = s.session_id
          LEFT JOIN (
              SELECT
-                 provider,
-                 session_id,
+                 t.provider,
+                 t.root_session_id AS session_id,
                  MIN(
                      CASE
-                         WHEN change_ts IS NOT NULL
-                          AND source_kind IN ('accepted_change', 'tool_write')
-                          AND (lines_added > 0 OR lines_removed > 0)
-                         THEN change_ts
+                         WHEN c.change_ts IS NOT NULL
+                          AND c.source_kind IN ('accepted_change', 'tool_write')
+                          AND (c.lines_added > 0 OR c.lines_removed > 0)
+                         THEN c.change_ts
                      END
                  ) AS first_accepted_change_at,
                  MAX(
                      CASE
-                         WHEN source_kind IN ('accepted_change', 'tool_write')
-                          AND (lines_added > 0 OR lines_removed > 0)
+                         WHEN c.source_kind IN ('accepted_change', 'tool_write')
+                          AND (c.lines_added > 0 OR c.lines_removed > 0)
                          THEN 1 ELSE 0
                      END
                  ) AS accepted_output_flag
-             FROM fact_session_code_change
-             GROUP BY provider, session_id
+             FROM fact_session_code_change c
+             JOIN view_session_tree t
+               ON t.provider = c.provider AND t.session_id = c.session_id
+             GROUP BY t.provider, t.root_session_id
          ) out
            ON out.provider = s.provider
           AND out.session_id = s.session_id
@@ -778,11 +781,12 @@ pub fn refresh_session_events(conn: &Connection) -> Result<()> {
          ) sig
            ON sig.provider = s.provider
           AND sig.session_id = s.session_id
-         WHERE s.started_at IS NOT NULL
+         WHERE COALESCE(NULLIF(s.root_session_id, ''), s.session_id) = s.session_id
+           AND (s.started_at IS NOT NULL
             OR msg.user_word_count IS NOT NULL
             OR ch.added_lines IS NOT NULL
             OR ch.removed_lines IS NOT NULL
-            OR out.accepted_output_flag IS NOT NULL
+            OR out.accepted_output_flag IS NOT NULL)
          ORDER BY productivity_ended_at DESC NULLS LAST",
         idle_gap_minutes = FIRST_CHANGE_IDLE_GAP_MINUTES,
     ))?;
@@ -888,7 +892,129 @@ pub fn refresh_session_events(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Token totals for one (session tree, model, reasoning accounting) group.
+#[derive(Debug, Default, Clone, Copy)]
+struct UsageGroupTotals {
+    input_tokens: i64,
+    cached_input_tokens: i64,
+    cache_creation_tokens: i64,
+    output_tokens: i64,
+    reasoning_tokens: i64,
+    total_tokens: i64,
+}
+
 fn refresh_session_cost_events(conn: &Connection) -> Result<()> {
+    // Usage of each root session, including its subagents, grouped by model so
+    // mixed-model sessions are priced per model. Reasoning already contained in
+    // output tokens (Codex, Claude thinking) is never billed a second time.
+    let mut usage_stmt = conn.prepare(
+        "SELECT
+             t.provider,
+             t.root_session_id,
+             NULLIF(TRIM(u.model_name), '') AS model_name,
+             u.reasoning_in_output,
+             SUM(u.input_tokens),
+             SUM(u.cached_input_tokens),
+             SUM(u.cache_creation_tokens),
+             SUM(u.output_tokens),
+             SUM(u.reasoning_tokens),
+             SUM(u.total_tokens),
+             SUM(u.actual_cost_usd),
+             MAX(CASE WHEN u.cost_source = 'actual' THEN 1 ELSE 0 END),
+             MAX(CASE WHEN u.cost_source = 'estimated_text_tokens' THEN 1 ELSE 0 END),
+             SUM(u.cache_creation_1h_tokens)
+         FROM fact_session_usage u
+         JOIN view_session_tree t
+           ON t.provider = u.provider AND t.session_id = u.session_id
+         GROUP BY t.provider, t.root_session_id, model_name, u.reasoning_in_output",
+    )?;
+    #[derive(Default)]
+    struct SessionUsage {
+        totals: UsageGroupTotals,
+        estimated_cost: Option<f64>,
+        all_priced: bool,
+        any_priced: bool,
+        actual_cost: Option<f64>,
+        has_actual: bool,
+        has_text_estimate: bool,
+    }
+    let mut by_session: HashMap<(String, String), SessionUsage> = HashMap::new();
+    let rows = usage_stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, Option<String>>(2)?,
+            row.get::<_, i64>(3)?,
+            UsageGroupTotals {
+                input_tokens: row.get(4)?,
+                cached_input_tokens: row.get(5)?,
+                cache_creation_tokens: row.get(6)?,
+                output_tokens: row.get(7)?,
+                reasoning_tokens: row.get(8)?,
+                total_tokens: row.get(9)?,
+            },
+            row.get::<_, Option<f64>>(10)?,
+            row.get::<_, i64>(11)?,
+            row.get::<_, i64>(12)?,
+            row.get::<_, i64>(13)?,
+        ))
+    })?;
+    for row in rows {
+        let (
+            provider,
+            session_id,
+            model,
+            reasoning_in_output,
+            totals,
+            actual,
+            has_actual,
+            has_text,
+            cache_write_1h,
+        ) = row?;
+        let entry = by_session
+            .entry((provider.clone(), session_id))
+            .or_insert_with(|| SessionUsage {
+                all_priced: true,
+                ..SessionUsage::default()
+            });
+        entry.totals.input_tokens += totals.input_tokens;
+        entry.totals.cached_input_tokens += totals.cached_input_tokens;
+        entry.totals.cache_creation_tokens += totals.cache_creation_tokens;
+        entry.totals.output_tokens += totals.output_tokens;
+        entry.totals.reasoning_tokens += totals.reasoning_tokens;
+        entry.totals.total_tokens += totals.total_tokens;
+        if let Some(actual) = actual {
+            *entry.actual_cost.get_or_insert(0.0) += actual;
+        }
+        entry.has_actual |= has_actual > 0;
+        entry.has_text_estimate |= has_text > 0;
+        let priced = model.as_deref().and_then(|model| {
+            crate::cost::pricing::table()
+                .estimate(
+                    model,
+                    crate::cost::pricing::UsageForPricing {
+                        input_tokens: totals.input_tokens,
+                        cache_read_tokens: totals.cached_input_tokens,
+                        cache_write_tokens: totals.cache_creation_tokens,
+                        cache_write_1h_tokens: cache_write_1h,
+                        output_tokens: totals.output_tokens,
+                        reasoning_tokens: totals.reasoning_tokens,
+                        reasoning_in_output: reasoning_in_output != 0,
+                    },
+                )
+                .map(|priced| priced.cost_usd)
+        });
+        match priced {
+            Some(cost) => {
+                *entry.estimated_cost.get_or_insert(0.0) += cost;
+                entry.any_priced = true;
+            }
+            None if totals.total_tokens > 0 => entry.all_priced = false,
+            None => {}
+        }
+    }
+    drop(usage_stmt);
+
     let mut stmt = conn.prepare(
         "SELECT
              ep.provider,
@@ -897,27 +1023,12 @@ fn refresh_session_cost_events(conn: &Connection) -> Result<()> {
              ep.repo_key,
              ep.member_email,
              ep.device_id,
-             COALESCE(NULLIF(TRIM(MAX(u.model_name)), ''), ep.model_name) AS model_name,
+             ep.model_name,
              ep.started_at,
              ep.ended_at,
              ep.accepted_total_changed_lines,
-             CASE WHEN ep.accepted_total_changed_lines > 0 THEN 1 ELSE 0 END AS accepted_output_flag,
-             COALESCE(SUM(u.input_tokens), 0) AS input_tokens,
-             COALESCE(SUM(u.cached_input_tokens), 0) AS cached_input_tokens,
-             COALESCE(SUM(u.cache_creation_tokens), 0) AS cache_creation_tokens,
-             COALESCE(SUM(u.output_tokens), 0) AS output_tokens,
-             COALESCE(SUM(u.reasoning_tokens), 0) AS reasoning_tokens,
-             COALESCE(SUM(u.total_tokens), 0) AS total_tokens,
-             SUM(u.actual_cost_usd) AS actual_cost_usd,
-             MAX(CASE WHEN u.cost_source = 'actual' THEN 1 ELSE 0 END) AS has_actual,
-             MAX(CASE WHEN u.cost_source = 'estimated_text_tokens' THEN 1 ELSE 0 END) AS has_text_estimate
-         FROM event_session_productivity ep
-         LEFT JOIN fact_session_usage u
-           ON u.provider = ep.provider
-          AND u.session_id = ep.session_id
-         GROUP BY
-             ep.provider, ep.session_id, ep.repo_root, ep.repo_key, ep.member_email, ep.device_id,
-             ep.model_name, ep.started_at, ep.ended_at, ep.accepted_total_changed_lines",
+             CASE WHEN ep.accepted_total_changed_lines > 0 THEN 1 ELSE 0 END AS accepted_output_flag
+         FROM event_session_productivity ep",
     )?;
     let rows = stmt.query_map([], |row| {
         Ok((
@@ -932,15 +1043,6 @@ fn refresh_session_cost_events(conn: &Connection) -> Result<()> {
             row.get::<_, Option<String>>(8)?,
             row.get::<_, i64>(9)?,
             row.get::<_, i64>(10)?,
-            row.get::<_, i64>(11)?,
-            row.get::<_, i64>(12)?,
-            row.get::<_, i64>(13)?,
-            row.get::<_, i64>(14)?,
-            row.get::<_, i64>(15)?,
-            row.get::<_, i64>(16)?,
-            row.get::<_, Option<f64>>(17)?,
-            row.get::<_, i64>(18)?,
-            row.get::<_, i64>(19)?,
         ))
     })?;
 
@@ -957,37 +1059,23 @@ fn refresh_session_cost_events(conn: &Connection) -> Result<()> {
             ended_at,
             accepted_total_changed_lines,
             accepted_output_flag,
-            input_tokens,
-            cached_input_tokens,
-            cache_creation_tokens,
-            output_tokens,
-            reasoning_tokens,
-            total_tokens,
-            actual_cost_usd,
-            has_actual,
-            has_text_estimate,
         ) = row?;
-        let estimated_cost_usd = model_name.as_deref().and_then(|model| {
-            estimate_cost_usd(
-                model,
-                TokenUsage {
-                    input_tokens,
-                    cached_input_tokens,
-                    cache_creation_tokens,
-                    output_tokens,
-                    reasoning_tokens,
-                },
-            )
-        });
-        let cost_source = if has_actual > 0 && actual_cost_usd.unwrap_or(0.0) > 0.0 {
+        let usage = by_session.remove(&(provider.clone(), session_id.clone()));
+        let usage = usage.unwrap_or_default();
+        let totals = usage.totals;
+        // A partially priced session keeps its estimate; the unpriced remainder
+        // is visible through tokens.
+        let estimated_cost_usd = usage.any_priced.then_some(usage.estimated_cost).flatten();
+        let cost_source = if usage.has_actual && usage.actual_cost.unwrap_or(0.0) > 0.0 {
             "actual"
-        } else if estimated_cost_usd.is_some() && has_text_estimate > 0 {
+        } else if estimated_cost_usd.is_some() && usage.has_text_estimate {
             "estimated_text_tokens"
-        } else if estimated_cost_usd.is_some() && total_tokens > 0 {
+        } else if estimated_cost_usd.is_some() && totals.total_tokens > 0 {
             "estimated_from_tokens"
         } else {
             "tokens_unpriced"
         };
+        let _ = usage.all_priced;
         conn.execute(
             "INSERT INTO event_session_cost (
                 provider, session_id, repo_root, repo_key, member_email, device_id, model_name,
@@ -1007,14 +1095,14 @@ fn refresh_session_cost_events(conn: &Connection) -> Result<()> {
                 ended_at,
                 accepted_total_changed_lines,
                 accepted_output_flag,
-                input_tokens,
-                cached_input_tokens,
-                cache_creation_tokens,
-                output_tokens,
-                reasoning_tokens,
-                total_tokens,
+                totals.input_tokens,
+                totals.cached_input_tokens,
+                totals.cache_creation_tokens,
+                totals.output_tokens,
+                totals.reasoning_tokens,
+                totals.total_tokens,
                 estimated_cost_usd,
-                actual_cost_usd,
+                usage.actual_cost,
                 cost_source
             ],
         )?;
@@ -3522,7 +3610,7 @@ fn is_error_continuation(text_lower: &str) -> bool {
     PHRASES.iter().any(|phrase| text_lower.contains(phrase))
 }
 
-fn first_error_line(text: &str) -> Option<&str> {
+pub(crate) fn first_error_line(text: &str) -> Option<&str> {
     for line in text.lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() {
@@ -3535,7 +3623,7 @@ fn first_error_line(text: &str) -> Option<&str> {
     None
 }
 
-fn normalize_signature(text: &str) -> String {
+pub(crate) fn normalize_signature(text: &str) -> String {
     let mut tokens = Vec::new();
     for raw in text.split_whitespace() {
         let trimmed = raw.trim_matches(|c: char| {
