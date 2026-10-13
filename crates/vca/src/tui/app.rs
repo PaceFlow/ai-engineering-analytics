@@ -584,7 +584,7 @@ impl App {
             (_, Data::Contributors(rows)) => rows.len(),
             (_, Data::ContextGroups(rows)) => rows.len(),
             (_, Data::ContextItems(rows)) => rows.len(),
-            (_, Data::Ladder(rows)) => rows.len(),
+            (_, Data::Ladder(rows, _)) => rows.len(),
             (_, Data::Practices(rows)) => rows.len(),
             (_, Data::Compare(columns)) => columns.first().map(|c| c.values.len()).unwrap_or(0),
             _ => 0,
@@ -1009,7 +1009,7 @@ impl App {
                 }
                 detail
             }),
-            (_, Data::Ladder(rows)) => rows.get(selected).map(|row| {
+            (_, Data::Ladder(rows, _)) => rows.get(selected).map(|row| {
                 self.child(
                     Screen::List {
                         unit: Unit::Tasks,

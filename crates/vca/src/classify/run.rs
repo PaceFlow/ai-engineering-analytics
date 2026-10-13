@@ -16,8 +16,8 @@ use crate::classify::client::{
 use crate::classify::config::ClassifierConfig;
 use crate::classify::heuristic::{task_unit_key, turn_unit_key};
 use crate::classify::questions::{
-    QUESTION_SET_VERSION, completion_question, exchange_questions, task_assignment_question,
-    task_label_questions,
+    QUESTION_SET_VERSION, completion_question, exchange_questions, rework_question,
+    task_assignment_question, task_label_questions,
 };
 use crate::classify::state::{
     BuiltState, Level, TurnFacts, assignment_state, estimate_tokens, exchange_state, head_tail,
@@ -39,6 +39,7 @@ pub struct Passes {
     pub feedback: bool,
     pub labels: bool,
     pub completion: bool,
+    pub rework: bool,
 }
 
 impl Passes {
@@ -47,6 +48,7 @@ impl Passes {
         feedback: true,
         labels: true,
         completion: true,
+        rework: true,
     };
 
     pub fn parse(value: &str) -> Option<Self> {
@@ -55,6 +57,7 @@ impl Passes {
             feedback: false,
             labels: false,
             completion: false,
+            rework: false,
         };
         for part in value.split(',').map(str::trim) {
             match part {
@@ -63,6 +66,7 @@ impl Passes {
                 "feedback" | "exchanges" => passes.feedback = true,
                 "labels" | "tasks" => passes.labels = true,
                 "completion" => passes.completion = true,
+                "rework" | "relations" => passes.rework = true,
                 _ => return None,
             }
         }
@@ -234,6 +238,18 @@ fn execute(
         }
     }
 
+    if options.passes.rework {
+        let selected_keys: Vec<(String, String)> = selected
+            .iter()
+            .map(|(session, _)| (session.provider.clone(), session.session_id.clone()))
+            .collect();
+        for relation in load_relations(conn)? {
+            if selected_keys.contains(&(relation.to.0.clone(), relation.to.1.clone())) {
+                runner.classify_relation(&relation)?;
+            }
+        }
+    }
+
     runner.summary.est_usd = config.estimate_usd(runner.summary.est_tokens);
     if let Some(run_id) = runner.run_id {
         let summary = &runner.summary;
@@ -293,6 +309,75 @@ fn load_tasks(conn: &Connection, session: &SessionRef) -> Result<Vec<TaskRef>> {
         })
     })?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// Smallest overlap worth asking about; smaller overlaps keep the heuristic.
+const MIN_RELATION_LINES: i64 = 5;
+
+#[derive(Debug, Clone)]
+struct RelationRef {
+    from: (String, String, i64),
+    to: (String, String, i64),
+    lines: i64,
+    files: i64,
+    gap_hours: Option<f64>,
+}
+
+fn load_relations(conn: &Connection) -> Result<Vec<RelationRef>> {
+    let mut stmt = conn.prepare(
+        "SELECT from_provider, from_session, from_task, to_provider, to_session, to_task,
+                overlap_lines, overlap_files, gap_hours
+         FROM derived_task_relation
+         WHERE relation_kind = 'touches_earlier_ai_lines' AND overlap_lines >= ?1",
+    )?;
+    let rows = stmt.query_map(params![MIN_RELATION_LINES], |row| {
+        Ok(RelationRef {
+            from: (row.get(0)?, row.get(1)?, row.get(2)?),
+            to: (row.get(3)?, row.get(4)?, row.get(5)?),
+            lines: row.get(6)?,
+            files: row.get(7)?,
+            gap_hours: row.get(8)?,
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// First request and evidence summary of one task, at a content level.
+fn task_side(
+    conn: &Connection,
+    task: &(String, String, i64),
+    level: Level,
+    redactions: &mut usize,
+) -> Result<Value> {
+    let session = SessionRef {
+        provider: task.0.clone(),
+        session_id: task.1.clone(),
+        repo_root: None,
+    };
+    let turns = load_turns(conn, &task.0, &task.1)?;
+    let info = load_tasks(conn, &session)?
+        .into_iter()
+        .find(|t| t.index == task.2);
+    let Some(info) = info else {
+        return Ok(json!({"missing": true}));
+    };
+    let built = task_state(
+        &info.harness,
+        &turns,
+        &info.turns,
+        info.commits,
+        info.subagents,
+        Level::EvidenceOnly,
+    );
+    let mut side = json!({"turns": info.turns.len(), "evidence": built.state["evidence"]});
+    if level > Level::EvidenceOnly
+        && let Some(first) = turns.iter().find(|turn| info.turns.contains(&turn.index))
+    {
+        let (text, count) = redact(&head_tail(&first.user, 600));
+        *redactions += count;
+        side["first_request"] = Value::String(text);
+    }
+    Ok(side)
 }
 
 fn cache_key(model: &str, level: Level, questions: &Map<String, Value>, state: &Value) -> String {
@@ -870,6 +955,50 @@ impl Runner<'_> {
         Ok(())
     }
 
+    fn classify_relation(&mut self, relation: &RelationRef) -> Result<()> {
+        let conn = self.conn;
+        let feedback: Vec<String> = {
+            let prefix = format!("{}|{}|", relation.to.0, relation.to.1);
+            let mut stmt = conn.prepare(
+                "SELECT label FROM view_label_effective
+                 WHERE unit_kind = 'exchange' AND question_id = 'feedback' AND source <> 'heuristic'
+                   AND substr(unit_key, 1, length(?1)) = ?1",
+            )?;
+            stmt.query_map(params![prefix], |row| row.get(0))?
+                .collect::<rusqlite::Result<_>>()?
+        };
+        let build = |level: Level| {
+            let mut redactions = 0;
+            let earlier =
+                task_side(conn, &relation.from, level, &mut redactions).unwrap_or(Value::Null);
+            let mut later =
+                task_side(conn, &relation.to, level, &mut redactions).unwrap_or(Value::Null);
+            if !feedback.is_empty() {
+                later["prior_feedback_labels"] = json!(feedback);
+            }
+            let state = json!({
+                "unit": "relation",
+                "earlier_task": earlier,
+                "later_task": later,
+                "hours_between": relation.gap_hours.map(|h| h.round()),
+                "overlap": {"files": relation.files, "lines_changed": relation.lines},
+            });
+            let est_tokens = estimate_tokens(&state);
+            (
+                BuiltState {
+                    state,
+                    level,
+                    redactions,
+                    est_tokens,
+                },
+                rework_question(),
+            )
+        };
+        let key = crate::insights::relations::relation_unit_key(&relation.from, &relation.to);
+        self.ask("relation", &key, &build)?;
+        Ok(())
+    }
+
     fn defect_report_after(
         &self,
         session: &SessionRef,
@@ -1194,6 +1323,7 @@ mod tests {
             feedback: false,
             labels: false,
             completion: false,
+            rework: false,
         };
         run(
             &conn,
@@ -1301,6 +1431,96 @@ mod tests {
         )?;
         // canned answers carry no probabilities, so no later turn qualifies.
         assert_eq!(mark, None);
+        Ok(())
+    }
+
+    #[test]
+    fn rework_pass_labels_relations_between_tasks() -> Result<()> {
+        let conn = Connection::open_in_memory()?;
+        crate::db::init_app_schema(&conn)?;
+        for (id, day, ask) in [
+            ("early", "01", "Add the parser"),
+            ("late", "03", "Fix the parser crash"),
+        ] {
+            let mut record = SessionRecord::new("claude", id);
+            record.started_at = Some(format!("2026-10-{day}T10:00:00Z"));
+            record.ended_at = Some(format!("2026-10-{day}T11:00:00Z"));
+            record.messages = vec![message(
+                "u1",
+                &format!("2026-10-{day}T10:00:00Z"),
+                "user",
+                ask,
+            )];
+            store_session_record(&conn, &record)?;
+        }
+        crate::db::session_store::refresh_session_roots(&conn)?;
+        for (session, ts, side) in [
+            ("early", "2026-10-01T10:05:00Z", "+"),
+            ("late", "2026-10-03T10:05:00Z", "-"),
+        ] {
+            conn.execute(
+                "INSERT INTO fact_session_code_change(provider, session_id, change_ts, repo_root, rel_path, source_kind)
+                 VALUES ('claude', ?1, ?2, '/repo', 'src/p.rs', 'tool_write')",
+                params![session, ts],
+            )?;
+            let id = conn.last_insert_rowid();
+            for hash in ["a", "b", "c", "d", "e", "f"] {
+                conn.execute(
+                    "INSERT INTO fact_session_code_change_line_hashes(code_change_id, side, line_hash, count)
+                     VALUES (?1, ?2, ?3, 1)",
+                    params![id, side, hash],
+                )?;
+            }
+        }
+        crate::insights::refresh(&conn)?;
+        let heuristic: String = conn.query_row(
+            "SELECT label FROM view_label_effective WHERE unit_kind = 'relation'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(heuristic, "defect_correction");
+        let client = ScriptedClient::new(|request| {
+            assert_eq!(request.state["unit"], "relation");
+            assert_eq!(
+                request.state["earlier_task"]["first_request"],
+                "Add the parser"
+            );
+            Ok(canned_response(request, |_, _| {
+                ("requirement_change".into(), 0.8)
+            }))
+        });
+        let passes = Passes {
+            segment: false,
+            feedback: false,
+            labels: false,
+            completion: false,
+            rework: true,
+        };
+        let late = SessionRef {
+            provider: "claude".into(),
+            session_id: "late".into(),
+            repo_root: Some("/repo".into()),
+        };
+        run(
+            &conn,
+            &client,
+            &config(),
+            &[late],
+            &RunOptions {
+                passes,
+                ..options(1.0)
+            },
+        )?;
+        assert_eq!(client.calls(), 1);
+        let (label, source): (String, String) = conn.query_row(
+            "SELECT label, source FROM view_label_effective WHERE unit_kind = 'relation'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(
+            (label.as_str(), source.as_str()),
+            ("requirement_change", "jev")
+        );
         Ok(())
     }
 }

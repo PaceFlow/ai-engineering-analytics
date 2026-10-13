@@ -370,6 +370,10 @@ fn practices_and_delivery_screens_render() -> Result<()> {
     key(&mut app, KeyCode::Char('5'));
     let delivery = render(&app, 150, 40);
     assert!(delivery.contains("Mainline"), "{delivery}");
+    assert!(
+        delivery.contains("Rework") && delivery.contains("corrections"),
+        "{delivery}"
+    );
     Ok(())
 }
 

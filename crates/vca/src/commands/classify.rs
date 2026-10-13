@@ -273,7 +273,7 @@ fn run_classifier(
 ) -> Result<()> {
     let level = level_of(select, config)?;
     let passes = Passes::parse(passes).ok_or_else(|| {
-        anyhow::anyhow!("--passes takes segment, feedback, labels, completion or all")
+        anyhow::anyhow!("--passes takes segment, feedback, labels, completion, rework or all")
     })?;
     let Some(key) = config::api_key()? else {
         bail!(

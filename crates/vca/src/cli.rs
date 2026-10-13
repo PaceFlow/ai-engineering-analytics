@@ -74,9 +74,23 @@ pub enum Commands {
     /// What filled the context and what carrying it cost
     #[command(after_help = CONTEXT_AFTER_HELP)]
     Context(ContextArgs),
+    /// Later AI work that changed earlier AI lines, defect evidence and correction spend
+    #[command(after_help = REWORK_AFTER_HELP)]
+    Rework(ReworkArgs),
     /// Optional AI task splitting and labels via Jev on OpenRouter (opt-in, previewable)
     #[command(after_help = CLASSIFY_AFTER_HELP)]
     Classify(ClassifyArgs),
+}
+
+const REWORK_AFTER_HELP: &str = "Examples:\n  vca rework                          # spend split, suspected defects, relations\n  vca rework --kind defect_correction\n  vca rework --days 90 --here\n\nEvidence levels: L0 AI lines later changed · L1 later fix signal · L2 fix linked to a bug issue ·\nL3 classifier says defect correction · L4 confirmed by you. Correlation, not causation.";
+
+#[derive(Args, Debug, Clone)]
+pub struct ReworkArgs {
+    #[command(flatten)]
+    pub filters: InsightFilterArgs,
+    /// Only relations with this rework kind (defect_correction, requirement_change, refinement, …)
+    #[arg(long)]
+    pub kind: Option<String>,
 }
 
 const CLASSIFY_AFTER_HELP: &str = "Examples:\n  vca classify plan --days 7                 # what would be sent, estimated cost\n  vca classify preview <session> --pass segment\n  vca classify key set                       # or export OPENROUTER_API_KEY\n  vca classify run --days 7 --max-usd 0.05 --yes\n  vca classify set <session> --task 0 intent bug_fix\n  vca classify set-turn <session> 5 1        # move turn 5 to task 1\n  vca classify eval\n\nNothing is sent unless you run `classify run` and confirm. Without it, each session is one task\nand labels come from local heuristics (marked h).";
@@ -124,7 +138,7 @@ pub enum ClassifyCommands {
         /// Stop before spending more than this (USD)
         #[arg(long, default_value_t = 0.50)]
         max_usd: f64,
-        /// Comma list: segment, feedback, labels, completion, all
+        /// Comma list: segment, feedback, labels, completion, rework, all
         #[arg(long, default_value = "all")]
         passes: String,
         /// Do not ask for confirmation
