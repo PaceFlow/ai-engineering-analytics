@@ -239,9 +239,15 @@ pub struct IngestArgs {
 
 #[derive(Args, Debug, Clone)]
 pub struct TuiArgs {
-    /// Show results across all tracked projects instead of defaulting to the current repo
+    /// Show results across all tracked projects (default for the explorer; the classic dashboard scopes to the current repo)
     #[arg(long)]
     pub all_projects: bool,
+    /// Limit the explorer to the git repository of the current directory
+    #[arg(long)]
+    pub here: bool,
+    /// Open the previous 4-tab metrics dashboard instead of the explorer
+    #[arg(long)]
+    pub classic: bool,
     /// Max number of grouped rows to display
     #[arg(long, default_value_t = 50)]
     pub limit: usize,

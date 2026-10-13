@@ -5,7 +5,10 @@
 //! field name says `reported`.
 
 pub mod bands;
+pub mod compare;
+pub mod delivery;
 pub mod format;
+pub mod practices;
 
 use anyhow::Result;
 use rusqlite::{Connection, ToSql, params_from_iter};
@@ -33,6 +36,11 @@ pub struct Filters {
     pub token_band: Option<TokenBand>,
     /// Restrict to one root session.
     pub session: Option<(String, String)>,
+    /// Restrict to explicit tasks (provider, session, task index), e.g. a
+    /// practice comparison or a marked selection.
+    pub task_keys: Vec<(String, String, i64)>,
+    /// Label shown for `task_keys` in breadcrumbs.
+    pub task_keys_label: Option<String>,
 }
 
 impl Filters {
@@ -74,6 +82,13 @@ impl Filters {
         }
         if let Some((provider, session)) = &self.session {
             chips.push(format!("session: {provider}:{}", short_id(session)));
+        }
+        if !self.task_keys.is_empty() {
+            chips.push(
+                self.task_keys_label
+                    .clone()
+                    .unwrap_or_else(|| format!("{} selected tasks", self.task_keys.len())),
+            );
         }
         chips
     }
@@ -282,6 +297,21 @@ fn task_where(filters: &Filters) -> Where {
     if let Some((provider, session)) = &filters.session {
         w.push("t.provider = ?", provider.clone());
         w.push("t.session_id = ?", session.clone());
+    }
+    if !filters.task_keys.is_empty() {
+        let placeholders: Vec<String> = filters
+            .task_keys
+            .iter()
+            .map(|(provider, session, task)| {
+                w.params
+                    .push(Box::new(format!("{provider}|{session}|{task}")));
+                format!("?{}", w.params.len())
+            })
+            .collect();
+        w.raw(&format!(
+            "(t.provider || '|' || t.session_id || '|' || t.task_index) IN ({})",
+            placeholders.join(",")
+        ));
     }
     w
 }
@@ -933,6 +963,10 @@ pub fn merge_filters(base: &Filters, extra: &Filters) -> Filters {
     merged.token_band = extra.token_band.or(merged.token_band);
     merged.min_cost = extra.min_cost.or(merged.min_cost);
     merged.session = extra.session.clone().or(merged.session);
+    if !extra.task_keys.is_empty() {
+        merged.task_keys = extra.task_keys.clone();
+        merged.task_keys_label = extra.task_keys_label.clone();
+    }
     merged
 }
 
@@ -1618,7 +1652,20 @@ pub fn context_items(
     filters: &Filters,
     limit: usize,
 ) -> Result<Vec<ContextItemRow>> {
-    let w = context_where(filters);
+    context_items_for(conn, filters, None, limit)
+}
+
+/// Context items, optionally restricted to one group of a context dimension.
+pub fn context_items_for(
+    conn: &Connection,
+    filters: &Filters,
+    group: Option<(ContextDim, &str)>,
+    limit: usize,
+) -> Result<Vec<ContextItemRow>> {
+    let mut w = context_where(filters);
+    if let Some((dim, key)) = group {
+        w.push(&format!("{} = ?", dim.sql()), key.to_string());
+    }
     let sql = format!(
         "SELECT c.provider, c.session_id, c.item_key, c.ts, c.kind, c.tool_name, c.target, c.tokens,
                 c.entered_call, c.carried_calls, c.write_usd, c.carry_usd, c.rebuild_usd,
