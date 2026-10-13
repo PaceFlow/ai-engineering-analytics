@@ -3,13 +3,13 @@ source: crates/vca/tests/metrics_regression.rs
 expression: output
 ---
 Started      Task                 First request                             Model          Intent              Outcome                   Wall  Active  Cost→done  Att  Loops  Done by
-03-03 09:41  codex:019cb311#0     Can you investigate the current impleme…  gpt-5.3-codex  bug_fix h           completed_verified h    167h38   16h47    ~$57.08   36         validation_pass
-03-10 06:41  codex:019cd678#0     Can you investigate the current impleme…  gpt-5.3-codex  bug_fix h           completed_verified h     30h58    2h07    ~$10.30    9         validation_pass
+03-03 09:41  codex:019cb311#0     Can you investigate the current impleme…  gpt-5.3-codex  bug_fix h           completed_verified h    167h38   16h47    ~$42.12   36         validation_pass
+03-10 06:41  codex:019cd678#0     Can you investigate the current impleme…  gpt-5.3-codex  bug_fix h           completed_verified h     30h58    2h07     ~$7.50    9         validation_pass
 03-15 12:05  opencode:ses_open#0  hi                                                       research_explain h  unclear h                    —      0m          —    0         none
 03-15 12:00  opencode:ses_open#0  add an opencode fixture file                             bug_fix h           completed_unverified h       —      0m          —    1         none
 03-10 09:20  claude:11111111#0    Please review the implementation and ke…                 review h            completed_unverified h       —      2m          —    1         none
 03-05 07:02  cursor:b052dae4#0    Readme update and data refresh                           research_explain h  unclear h                    —      0m          —    0         none
 —            cursor:fe3cc3e4#0                                                             other h             unclear h                    —      0m          —    0         none
 
-all data · ~ = API list-price estimate (pricing 2026-10-06), not an invoice
+all data · ~ = API list-price estimate (pricing litellm@2026-10-13), not an invoice
 Cost→done = spend until the completion point (total when not completed). Done by: commit, validation_pass, jev, override or none.

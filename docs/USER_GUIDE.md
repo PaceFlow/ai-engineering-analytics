@@ -111,7 +111,7 @@ All of them take `--days N` (default 30, `0` = all time), `--from/--to`, `--prov
 ### Three ledgers that are never mixed
 
 - **Tokens** are what the tool logged per API call (Claude: once per message id; Codex: per `token_count` delta, reasoning counted inside output; OpenCode: per message; Cursor: `tokenCount` when present, otherwise a text estimate marked `~`).
-- **Money** is an *API list-price equivalent* from the versioned pricing table (`~$`), or the provider-reported cost where one exists (OpenCode). On a subscription this is value consumed, not an invoice. Set how each tool is billed in `~/.vca/billing.json`.
+- **Money** is an *API list-price equivalent* computed from [LiteLLM's public model price map](https://github.com/BerriAI/litellm/blob/main/model_prices_and_context_window.json) (`~$`), or the provider-reported cost where one exists (OpenCode). On a subscription this is value consumed, not an invoice. Set how each tool is billed in `~/.vca/billing.json`. `paceflow ingest` refreshes the price map at most once a day (a bundled copy is used offline or with `VCA_PRICING_OFFLINE=1`); `paceflow pricing show <model>` shows how a model resolves and its rates, and `paceflow pricing update` refreshes now. Long-context tiers are applied per API call, as LiteLLM does.
 - **Quota** is only shown as a percentage where the tool logs it (Codex `rate_limits`). Claude Code, Cursor and OpenCode show token burn inside assumed windows (Claude 5 h and weekly by default) plus any limit hits you record with `quota mark`.
 
 Every usage event belongs to exactly one session and one task, so grouped totals add up to the overall total.

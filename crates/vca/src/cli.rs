@@ -77,12 +77,35 @@ pub enum Commands {
     /// Later AI work that changed earlier AI lines, defect evidence and correction spend
     #[command(after_help = REWORK_AFTER_HELP)]
     Rework(ReworkArgs),
+    /// Model prices (LiteLLM's public price map): status, update, show a model
+    Pricing(PricingArgs),
     /// Optional AI task splitting and labels via Jev on OpenRouter (opt-in, previewable)
     #[command(after_help = CLASSIFY_AFTER_HELP)]
     Classify(ClassifyArgs),
 }
 
 const REWORK_AFTER_HELP: &str = "Examples:\n  vca rework                          # spend split, suspected defects, relations\n  vca rework --kind defect_correction\n  vca rework --days 90 --here\n\nEvidence levels: L0 AI lines later changed · L1 later fix signal · L2 fix linked to a bug issue ·\nL3 classifier says defect correction · L4 confirmed by you. Correlation, not causation.";
+
+#[derive(Args, Debug, Clone)]
+pub struct PricingArgs {
+    #[command(subcommand)]
+    pub command: Option<PricingCommands>,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum PricingCommands {
+    /// Where prices come from and when they were fetched (default)
+    Status,
+    /// Download the latest LiteLLM price map now
+    Update,
+    /// Show how a model name resolves and its rates per million tokens
+    Show {
+        model: String,
+        /// Prompt size (input + cache tokens) of one request, to show tier rates
+        #[arg(long, default_value_t = 0)]
+        prompt_tokens: i64,
+    },
+}
 
 #[derive(Args, Debug, Clone)]
 pub struct ReworkArgs {
@@ -375,6 +398,9 @@ pub struct IngestArgs {
     /// (GitHub token) are not touched.
     #[arg(long)]
     pub fresh: bool,
+    /// Do not download LiteLLM model prices; use the cached or bundled copy
+    #[arg(long)]
+    pub offline_pricing: bool,
 }
 
 #[derive(Args, Debug, Clone)]

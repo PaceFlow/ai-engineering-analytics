@@ -28,6 +28,11 @@ pub fn run_for(verbose: bool, args: IngestArgs, context: crate::app::AppContext)
     } else {
         db::open()?
     };
+    if args.offline_pricing {
+        crate::cost::pricing::reload();
+    } else if let Some(message) = crate::cost::litellm::refresh_price_map(false).message() {
+        println!("{message}");
+    }
     let accounting_before = if args.fresh {
         None
     } else {

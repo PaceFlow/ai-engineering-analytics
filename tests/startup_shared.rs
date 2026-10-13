@@ -12,6 +12,7 @@ fn command(home: &Path) -> Command {
     let mut command = Command::cargo_bin(binary_name()).unwrap();
     command.current_dir(home)
         .env("VCA_HOME", home)
+        .env("VCA_PRICING_OFFLINE", "1")
         .env("HOME", home)
         .env("USERPROFILE", home)
         .env("XDG_CONFIG_HOME", home.join(".config"))

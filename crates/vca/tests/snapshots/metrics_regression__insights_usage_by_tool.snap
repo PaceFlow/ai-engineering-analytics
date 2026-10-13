@@ -3,8 +3,8 @@ source: crates/vca/tests/metrics_regression.rs
 expression: output
 ---
 Tool     API-equiv  Share  Reported  Fresh tok  Cache read  Output  Sessions  Calls  Gaps
-codex      ~$68.73   100%         —      12.6M      113.3M    705k         2   1130
-Σ total    ~$68.73   100%         —      12.6M      113.3M    705k             1130
+codex      ~$50.58   100%         —      12.6M      113.3M    705k         2   1130
+Σ total    ~$50.58   100%         —      12.6M      113.3M    705k             1130
 
-all data · ~ = API list-price estimate (pricing 2026-10-06), not an invoice
+all data · ~ = API list-price estimate (pricing litellm@2026-10-13), not an invoice
 Fresh tok = uncached input + cache writes + output. Reported = provider-reported cost (OpenCode).

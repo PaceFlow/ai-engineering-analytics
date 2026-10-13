@@ -120,6 +120,7 @@ impl TestEnv {
             .args(args)
             .current_dir(&self.home)
             .env("VCA_HOME", &self.home)
+            .env("VCA_PRICING_OFFLINE", "1")
             .env_remove("PACEFLOW_GITHUB_TOKEN")
             .env("HOME", &self.home)
             .env("USERPROFILE", &self.home)
