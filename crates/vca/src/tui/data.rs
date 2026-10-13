@@ -9,6 +9,11 @@ use rusqlite::Connection;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 
+use crate::classify::client::OpenRouterClient;
+use crate::classify::config::ClassifierConfig;
+use crate::classify::overrides;
+use crate::classify::run::{self as classify_run, Passes, RunOptions, RunSummary, SessionRef};
+use crate::classify::state::Level;
 use crate::explore::{
     self, Bucket, ContextDim, ContextGroupRow, ContextItemRow, Filters, GroupDim, GroupRow,
     QuotaContributor, QuotaWindowRow, SessionDetail, SessionRow, SessionSort, TaskRow, TaskSort,
@@ -30,6 +35,43 @@ pub enum Query {
     Ladder(Filters),
     Practices(Filters),
     Compare(Vec<(String, String, i64)>),
+    /// Writes and classifier calls, run on the loader thread like queries.
+    Action(Action),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Action {
+    SetLabel {
+        unit_kind: String,
+        unit_key: String,
+        question: String,
+        label: Option<String>,
+    },
+    AssignTurn {
+        provider: String,
+        session: String,
+        turn: i64,
+        task: Option<i64>,
+    },
+    SetCompletion {
+        provider: String,
+        session: String,
+        task: i64,
+        completion: Option<Option<i64>>,
+    },
+    ClassifyPlan {
+        sessions: Vec<(String, String)>,
+        level: Level,
+    },
+    ClassifyPreview {
+        session: (String, String),
+        level: Level,
+    },
+    ClassifyRun {
+        sessions: Vec<(String, String)>,
+        level: Level,
+        max_usd: f64,
+    },
 }
 
 #[derive(Debug, Clone, Default)]
@@ -67,6 +109,9 @@ pub enum Data {
     Ladder(Vec<LadderRow>),
     Practices(Vec<PracticeRow>),
     Compare(Vec<CompareColumn>),
+    /// An action finished; the text is shown in the footer.
+    Done(String),
+    ClassifyPlan(Box<RunSummary>),
 }
 
 pub fn fetch(conn: &Connection, query: &Query) -> Result<Data> {
@@ -102,6 +147,108 @@ pub fn fetch(conn: &Connection, query: &Query) -> Result<Data> {
         Query::Ladder(filters) => Data::Ladder(explore::delivery::delivery_ladder(conn, filters)?),
         Query::Practices(filters) => Data::Practices(explore::practices::practices(conn, filters)?),
         Query::Compare(keys) => Data::Compare(explore::compare::compare_tasks(conn, keys)?),
+        Query::Action(action) => act(conn, action)?,
+    })
+}
+
+fn session_refs(conn: &Connection, sessions: &[(String, String)]) -> Result<Vec<SessionRef>> {
+    sessions
+        .iter()
+        .map(|(provider, session_id)| {
+            let repo_root: Option<String> = conn.query_row(
+                "SELECT MAX(repo_root) FROM derived_task WHERE provider = ?1 AND session_id = ?2",
+                rusqlite::params![provider, session_id],
+                |row| row.get(0),
+            )?;
+            Ok(SessionRef {
+                provider: provider.clone(),
+                session_id: session_id.clone(),
+                repo_root,
+            })
+        })
+        .collect()
+}
+
+fn act(conn: &Connection, action: &Action) -> Result<Data> {
+    Ok(match action {
+        Action::SetLabel {
+            unit_kind,
+            unit_key,
+            question,
+            label,
+        } => {
+            overrides::set_label(conn, unit_kind, unit_key, question, label.as_deref(), None)?;
+            Data::Done(match label {
+                Some(label) => format!("{question} = {label} (your label)"),
+                None => format!("{question}: your label removed"),
+            })
+        }
+        Action::AssignTurn {
+            provider,
+            session,
+            turn,
+            task,
+        } => {
+            overrides::assign_turn(conn, provider, session, *turn, *task)?;
+            Data::Done(match task {
+                Some(task) => format!("Turn {turn} now starts task T{task}"),
+                None => format!("Turn {turn}: task override removed"),
+            })
+        }
+        Action::SetCompletion {
+            provider,
+            session,
+            task,
+            completion,
+        } => {
+            overrides::set_completion(conn, provider, session, *task, *completion)?;
+            Data::Done(match completion {
+                Some(Some(turn)) => format!("T{task} completed at turn {turn}"),
+                Some(None) => format!("T{task} marked not completed"),
+                None => format!("T{task}: completion override removed"),
+            })
+        }
+        Action::ClassifyPlan { sessions, level } => {
+            let config = ClassifierConfig::load()?;
+            let refs = session_refs(conn, sessions)?;
+            Data::ClassifyPlan(Box::new(classify_run::plan(conn, &config, &refs, *level)?))
+        }
+        Action::ClassifyPreview { session, level } => {
+            let config = ClassifierConfig::load()?;
+            let refs = session_refs(conn, std::slice::from_ref(session))?;
+            let preview = classify_run::preview(conn, &config, &refs[0], "labels", None, *level)?;
+            Data::Done(serde_json::to_string_pretty(&preview)?)
+        }
+        Action::ClassifyRun {
+            sessions,
+            level,
+            max_usd,
+        } => {
+            let config = ClassifierConfig::load()?;
+            let Some(key) = crate::classify::config::api_key()? else {
+                anyhow::bail!(
+                    "No OpenRouter key: set {} or run `vca classify key set`",
+                    crate::classify::config::KEY_ENV
+                );
+            };
+            let refs = session_refs(conn, sessions)?;
+            let client = OpenRouterClient::new(&config.endpoint, &key)?;
+            let options = RunOptions {
+                level: *level,
+                max_usd: *max_usd,
+                passes: Passes::ALL,
+                dry_run: false,
+            };
+            let summary = classify_run::run(conn, &client, &config, &refs, &options)?;
+            let mut text = format!(
+                "Classified: {} sent, {} cached, {} failed · ${:.5} · {} sessions split",
+                summary.sent, summary.cached, summary.failed, summary.cost_usd, summary.tasks_split
+            );
+            if let Some(reason) = summary.stopped {
+                text.push_str(&format!(" · stopped: {reason}"));
+            }
+            Data::Done(text)
+        }
     })
 }
 

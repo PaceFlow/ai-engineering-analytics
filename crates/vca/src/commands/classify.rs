@@ -9,6 +9,7 @@ use crate::app::AppContext;
 use crate::classify::client::OpenRouterClient;
 use crate::classify::config::{self, ClassifierConfig};
 use crate::classify::heuristic::{task_unit_key, turn_unit_key};
+use crate::classify::overrides;
 use crate::classify::questions::{labels_for, unit_kind_for};
 use crate::classify::run::{self, Passes, RunOptions, RunSummary, SessionRef};
 use crate::classify::state::Level;
@@ -134,12 +135,7 @@ pub fn run(args: ClassifyArgs, _context: AppContext) -> Result<()> {
             task,
         } => {
             let (provider, session_id) = resolve_session(&conn, &session)?;
-            conn.execute(
-                "INSERT OR REPLACE INTO task_turn_assignment(provider, session_id, turn_index, task_index, source, confidence)
-                 VALUES (?1, ?2, ?3, ?4, 'override', 1.0)",
-                params![provider, session_id, turn, task],
-            )?;
-            crate::insights::refresh(&conn)?;
+            overrides::assign_turn(&conn, &provider, &session_id, turn, Some(task))?;
             println!(
                 "Turn {turn} of {provider}:{session_id} now starts task {task} (later turns follow until the next assignment)."
             );
@@ -159,12 +155,7 @@ pub fn run(args: ClassifyArgs, _context: AppContext) -> Result<()> {
                         .map_err(|_| anyhow::anyhow!("turn must be a number or `none`"))?,
                 ),
             };
-            conn.execute(
-                "INSERT OR REPLACE INTO task_completion_mark(provider, session_id, task_index, completion_turn, source, confidence)
-                 VALUES (?1, ?2, ?3, ?4, 'override', 1.0)",
-                params![provider, session_id, task, completion],
-            )?;
-            crate::insights::refresh(&conn)?;
+            overrides::set_completion(&conn, &provider, &session_id, task, Some(completion))?;
             match completion {
                 Some(turn) => println!("Task {task} marked completed at turn {turn}."),
                 None => println!("Task {task} marked not completed."),
@@ -173,21 +164,7 @@ pub fn run(args: ClassifyArgs, _context: AppContext) -> Result<()> {
         }
         ClassifyCommands::ClearOverrides { session } => {
             let (provider, session_id) = resolve_session(&conn, &session)?;
-            let prefix = format!("{provider}|{session_id}|");
-            let mut removed = 0;
-            removed += conn.execute(
-                "DELETE FROM task_turn_assignment WHERE provider = ?1 AND session_id = ?2 AND source = 'override'",
-                params![provider, session_id],
-            )?;
-            removed += conn.execute(
-                "DELETE FROM task_completion_mark WHERE provider = ?1 AND session_id = ?2 AND source = 'override'",
-                params![provider, session_id],
-            )?;
-            removed += conn.execute(
-                "DELETE FROM classification_override WHERE substr(unit_key, 1, length(?1)) = ?1",
-                params![prefix],
-            )?;
-            crate::insights::refresh(&conn)?;
+            let removed = overrides::clear_session(&conn, &provider, &session_id)?;
             println!("Removed {removed} overrides.");
             Ok(())
         }
@@ -453,16 +430,7 @@ fn set_label(
             }
         ),
     };
-    conn.execute(
-        "INSERT OR REPLACE INTO classification_override(unit_kind, unit_key, question_id, label, note)
-         VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![unit_kind, unit_key, question, label, note],
-    )?;
-    conn.execute(
-        "INSERT OR REPLACE INTO classification_gold(unit_kind, unit_key, question_id, label, origin)
-         VALUES (?1, ?2, ?3, ?4, 'override')",
-        params![unit_kind, unit_key, question, label],
-    )?;
+    overrides::set_label(conn, unit_kind, &unit_key, question, Some(label), note)?;
     println!("{question} = {label} for {unit_key} (override).");
     Ok(())
 }

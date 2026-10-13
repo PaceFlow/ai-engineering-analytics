@@ -12,6 +12,7 @@ use super::app::{
     App, DetailTab, FILTER_FIELDS, Popup, Screen, TIME_PRESETS, Unit, UsageTab, usage_rows,
 };
 use super::data::{Data, OverviewData};
+use crate::classify::state::Level;
 use crate::explore::{
     ContextDim, GroupDim, SessionDetail, format as fmt, short_id, short_model, short_repo,
 };
@@ -2138,10 +2139,156 @@ fn render_popup(frame: &mut TermFrame<'_>, app: &App, popup: &Popup, area: Rect)
                 rect,
             );
         }
+        Popup::Edit {
+            target,
+            field,
+            choice,
+        } => {
+            let rect = centered(area, 64, 40);
+            frame.render_widget(Clear, rect);
+            let mut lines: Vec<Line> = Vec::new();
+            for (index, (name, options)) in target.fields().iter().enumerate() {
+                let value = if index == *field {
+                    options.get(*choice).cloned().unwrap_or_default()
+                } else {
+                    options
+                        .get(target.current(index))
+                        .cloned()
+                        .unwrap_or_default()
+                };
+                let (label_style, value_text) = if index == *field {
+                    (
+                        Style::default().fg(Color::Black).bg(CY),
+                        format!("◀ {value} ▶"),
+                    )
+                } else {
+                    (Style::default().fg(SU), format!("  {value}"))
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(format!(" {name:<13}"), label_style),
+                    Span::raw(" "),
+                    Span::styled(value_text, Style::default().fg(BR)),
+                ]));
+            }
+            lines.push(Line::raw(""));
+            lines.push(Line::from(Span::styled(
+                "Your labels win over classifier and heuristic labels and become gold labels for `vca classify eval`.",
+                dim(),
+            )));
+            frame.render_widget(
+                Paragraph::new(lines)
+                    .wrap(Wrap { trim: false })
+                    .block(panel_block(
+                        &format!(
+                            "Edit {} · ↑↓ field · ←→ value · Enter save · Esc cancel",
+                            target.title()
+                        ),
+                        true,
+                    )),
+                rect,
+            );
+        }
+        Popup::Classify {
+            sessions,
+            level,
+            max_usd,
+            plan,
+            pending,
+            error,
+        } => {
+            let rect = centered(area, 84, 56);
+            frame.render_widget(Clear, rect);
+            let text = |value: String| Span::styled(value, Style::default().fg(SU));
+            let mut lines = vec![Line::from(vec![
+                Span::styled(" Selection  ", Style::default().fg(CY)),
+                text(format!(
+                    "{} session{}",
+                    sessions.len(),
+                    if sessions.len() == 1 { "" } else { "s" }
+                )),
+            ])];
+            match plan {
+                Some(plan) => {
+                    let unit = |kind: &str| plan.units.get(kind).copied().unwrap_or(0);
+                    lines.push(Line::from(vec![
+                        Span::styled(" Units      ", Style::default().fg(CY)),
+                        text(format!(
+                            "{} turns to segment · {} exchanges · {} tasks (labels + completion)",
+                            unit("turn"),
+                            unit("exchange"),
+                            unit("task")
+                        )),
+                    ]));
+                    lines.push(Line::from(vec![
+                        Span::styled(" Cached     ", Style::default().fg(CY)),
+                        text(format!(
+                            "{} units · excluded by project rules: {}",
+                            plan.cached, plan.excluded_projects
+                        )),
+                    ]));
+                    lines.push(Line::from(vec![
+                        Span::styled(" Estimate   ", Style::default().fg(CY)),
+                        text(format!(
+                            "~{} input tokens · ~${:.4} · run cap ${:.2} · redactions {}",
+                            crate::explore::format::tokens(plan.est_tokens as i64),
+                            plan.est_usd,
+                            max_usd,
+                            plan.redactions
+                        )),
+                    ]));
+                }
+                None => lines.push(Line::from(Span::styled(" ⟳ estimating…", dim()))),
+            }
+            let levels = [
+                Level::EvidenceOnly,
+                Level::UserText,
+                Level::Conversation,
+                Level::Full,
+            ];
+            let mut level_spans = vec![Span::styled(" Content    ", Style::default().fg(CY))];
+            for candidate in levels {
+                let style = if candidate == *level {
+                    Style::default().fg(Color::Black).bg(CY)
+                } else {
+                    dim()
+                };
+                level_spans.push(Span::styled(format!(" {} ", candidate.as_str()), style));
+                level_spans.push(Span::raw(" "));
+            }
+            lines.push(Line::from(level_spans));
+            lines.push(Line::from(Span::styled(
+                "            code blocks stripped below `full`; secrets, emails and home paths always redacted",
+                dim(),
+            )));
+            lines.push(Line::raw(""));
+            lines.push(Line::from(Span::styled(
+                " Sent to OpenRouter → TypeSafe Jev (typesafe/jev-1.13) with zdr=true and fallbacks off.",
+                Style::default().fg(AM),
+            )));
+            if *pending == Some("run") {
+                lines.push(Line::from(Span::styled(
+                    " ⟳ classifying… other views refresh when it finishes",
+                    Style::default().fg(CY),
+                )));
+            }
+            if let Some(error) = error {
+                lines.push(Line::from(Span::styled(
+                    format!(" {error}"),
+                    Style::default().fg(RD),
+                )));
+            }
+            frame.render_widget(
+                Paragraph::new(lines).wrap(Wrap { trim: false }).block(panel_block(
+                    "Classify with Jev · ←→ content level · +/- cap · p preview · Enter send · Esc cancel",
+                    true,
+                )),
+                rect,
+            );
+        }
     }
 }
 
-const HELP: [(&str, &str); 24] = [
+const HELP: [(&str, &str); 26] = [
     (
         "1 … 7",
         "Overview · Sessions/Tasks · Groups · Usage & Quota · Delivery & Rework · Practices · Compare",
@@ -2173,12 +2320,20 @@ const HELP: [(&str, &str); 24] = [
     ("x", "explain the selected number or label"),
     ("o", "Practices: open the comparison group"),
     ("M", "log a quota limit hit now (quota windows)"),
+    (
+        "e",
+        "edit labels, task start or completion of the selected task or turn",
+    ),
+    (
+        "K",
+        "classify the selected or marked sessions with Jev (shows cost first)",
+    ),
     ("R", "reload"),
     ("q", "quit"),
     ("", ""),
     (
         "Classifier",
-        "Labels are heuristic (h) until you run `vca classify` with Jev.",
+        "Labels are heuristic (h) until you classify (K or `vca classify run`).",
     ),
     ("", ""),
 ];
