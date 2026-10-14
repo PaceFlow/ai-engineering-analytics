@@ -332,7 +332,8 @@ fn timeline(
                     u.fresh_tokens, u.cache_read_tokens, COALESCE(f.cache_creation_tokens, 0),
                     COALESCE(f.cache_creation_1h_tokens, 0), u.output_tokens,
                     COALESCE(f.reasoning_tokens, 0), u.total_tokens, u.context_tokens,
-                    u.api_equiv_usd, u.price_match, u.token_source, u.background_flag
+                    u.api_equiv_usd, u.price_match, u.token_source, u.background_flag,
+                    COALESCE(f.input_tokens, u.fresh_tokens - u.output_tokens)
              FROM derived_usage_event u
              LEFT JOIN fact_session_usage f ON f.id = u.usage_id
              WHERE u.provider = ?1 AND u.session_id = ?2
@@ -346,6 +347,7 @@ fn timeline(
                 row.get::<_, Option<i64>>(3)?,
                 json!({
                     "model": row.get::<_, String>(2)?,
+                    "input": row.get::<_, i64>(16)?,
                     "fresh": row.get::<_, i64>(4)?,
                     "cache_read": row.get::<_, i64>(5)?,
                     "cache_write": row.get::<_, i64>(6)?,
@@ -555,9 +557,16 @@ fn stats(conn: &Connection, detail: &SessionDetail, timeline: &[Entry]) -> Resul
         all_calls.clone(),
     );
     st.add(
-        "tokens.fresh_input",
+        "tokens.input_uncached",
         "Cost & tokens",
-        "Fresh input tokens",
+        "Input tokens, not from cache",
+        json!(sum("input")),
+        all_calls.clone(),
+    );
+    st.add(
+        "tokens.fresh",
+        "Cost & tokens",
+        "Fresh tokens (uncached input + output)",
         json!(sum("fresh")),
         all_calls.clone(),
     );

@@ -73,7 +73,8 @@ time.active_minutes: 128.7
 time.wall_minutes: 1859.2
 tokens.cache_read: 20224512
 tokens.cache_write: 0
-tokens.fresh_input: 1780823
+tokens.fresh: 1780823
+tokens.input_uncached: 1694585
 tokens.output: 86238
 tokens.reasoning: 44512
 tokens.total: 22005335

@@ -145,7 +145,7 @@ h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: v
   const turnInfo = new Map(DATA.turns.map((t) => [t.turn, t]));
 
   function callLine(m) {
-    return '<span class="pill">in ' + num(m.fresh) + '</span><span class="pill">cache r ' + num(m.cache_read) +
+    return '<span class="pill">in ' + num(m.input) + '</span><span class="pill">cache r ' + num(m.cache_read) +
       '</span><span class="pill">cache w ' + num(m.cache_write) + '</span><span class="pill">out ' + num(m.output) +
       (m.reasoning ? '</span><span class="pill">reason ' + num(m.reasoning) : '') + '</span><span class="pill">' +
       (m.cost == null ? 'unpriced' : usd(m.cost)) + '</span>';
