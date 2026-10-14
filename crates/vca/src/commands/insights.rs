@@ -5,8 +5,8 @@ use rusqlite::Connection;
 
 use crate::app::AppContext;
 use crate::cli::{
-    ContextArgs, HabitsArgs, InsightFilterArgs, QuotaArgs, QuotaCommands, ReworkArgs, SessionsArgs,
-    ShowArgs, StagesArgs, TasksArgs, UsageArgs,
+    ContextArgs, HabitsArgs, InsightFilterArgs, QuotaArgs, QuotaCommands, ReviewArgs, ReworkArgs,
+    SessionsArgs, ShowArgs, StagesArgs, TasksArgs, UsageArgs,
 };
 use crate::db;
 use crate::explore::{
@@ -974,6 +974,55 @@ pub fn run_show(args: ShowArgs, _context: AppContext) -> Result<()> {
 }
 
 /// Accept `provider:id`, a full id, or a unique id prefix.
+pub fn run_review(args: ReviewArgs, _context: AppContext) -> Result<()> {
+    let conn = open()?;
+    if let Some(path) = &args.check {
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| anyhow::anyhow!("cannot read {}: {e}", path.display()))?;
+        let expected: explore::review::Expectations = serde_json::from_str(&text)?;
+        let mismatches = explore::review::check(&conn, &expected)?;
+        if mismatches.is_empty() {
+            println!(
+                "{}: all {} approved numbers match",
+                expected.session,
+                expected.approved.len()
+            );
+            return Ok(());
+        }
+        for m in &mismatches {
+            let actual = m
+                .actual
+                .as_ref()
+                .map_or_else(|| "(no longer produced)".to_string(), |v| v.to_string());
+            println!("✗ {}: approved {} · now {}", m.id, m.expected, actual);
+        }
+        bail!(
+            "{} of {} approved numbers changed",
+            mismatches.len(),
+            expected.approved.len()
+        );
+    }
+    let input = args.session.as_deref().unwrap_or_default();
+    let (provider, session_id) = resolve_session(&conn, input)?;
+    let Some(data) = explore::review::review(&conn, &provider, &session_id)? else {
+        bail!("session {input} not found");
+    };
+    if args.json {
+        return print_json(&data);
+    }
+    let out = args.out.clone().unwrap_or_else(|| {
+        std::path::PathBuf::from(format!("review-{provider}-{}.html", short_id(&session_id)))
+    });
+    std::fs::write(&out, explore::review::render_html(&data)?)?;
+    println!(
+        "Wrote {} ({} timeline entries, {} numbers to review). Open it in a browser; it stays on this machine.",
+        out.display(),
+        data.timeline.len(),
+        data.stats.len()
+    );
+    Ok(())
+}
+
 pub fn resolve_session(conn: &Connection, input: &str) -> Result<(String, String)> {
     let (provider, prefix) = match input.split_once(':') {
         Some((provider, id)) if !provider.contains('/') => {

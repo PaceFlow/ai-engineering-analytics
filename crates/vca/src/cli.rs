@@ -71,6 +71,9 @@ pub enum Commands {
     Tasks(TasksArgs),
     /// Show one session: tasks, agents, usage by model, context and commits
     Show(ShowArgs),
+    /// Review one session in a local HTML page: timeline plus key numbers to approve or reject
+    #[command(after_help = REVIEW_AFTER_HELP)]
+    Review(ReviewArgs),
     /// What filled the context and what carrying it cost
     #[command(after_help = CONTEXT_AFTER_HELP)]
     Context(ContextArgs),
@@ -92,6 +95,24 @@ pub enum Commands {
 const REWORK_AFTER_HELP: &str = "Examples:\n  vca rework                          # spend split, suspected defects, relations\n  vca rework --kind defect_correction\n  vca rework --days 90 --here\n\nEvidence levels: L0 AI lines later changed · L1 later fix signal · L2 fix linked to a bug issue ·\nL3 classifier says defect correction · L4 confirmed by you. Correlation, not causation.";
 
 const HABITS_AFTER_HELP: &str = "Examples:\n  vca habits                       # adoption and outcomes for all 12 habits\n  vca habits --habit 7 --list      # tasks behind one habit, with evidence\n  vca habits --days 90 --here\n\nLabels come from local heuristics until you classify with Jev (`vca classify run`), which adds\nturn stages, request kinds and flags such as unrequested changes. Correlation, not causation.";
+
+const REVIEW_AFTER_HELP: &str = "Examples:\n  vca review 1a2b3c                         # writes review-<session>.html in the current directory\n  vca review claude:1a2b3c --out /tmp/r.html\n  vca review --check expectations.json         # exit 1 if an approved number changed\n\nThe page is a local file with the whole transcript; it is never uploaded. Mark each number ✓ or ✗,\nthen Export to get expectations JSON that `--check` (and the test suite) asserts.";
+
+#[derive(Args, Debug, Clone)]
+pub struct ReviewArgs {
+    /// Session id, id prefix, or provider:id (not needed with --check)
+    #[arg(required_unless_present = "check")]
+    pub session: Option<String>,
+    /// Where to write the HTML page (default review-<provider>-<id>.html)
+    #[arg(long)]
+    pub out: Option<std::path::PathBuf>,
+    /// Compare approved numbers in an expectations file instead of writing the page
+    #[arg(long, conflicts_with_all = ["out", "json"])]
+    pub check: Option<std::path::PathBuf>,
+    /// Print the review data as JSON instead of writing the page
+    #[arg(long)]
+    pub json: bool,
+}
 
 #[derive(Args, Debug, Clone)]
 pub struct HabitsArgs {

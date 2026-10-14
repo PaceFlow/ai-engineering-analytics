@@ -116,7 +116,22 @@ impl TestEnv {
     }
 
     fn run_paceflow(&self, args: &[&str]) -> anyhow::Result<String> {
-        let output = Command::cargo_bin("vca")?
+        let output = self.run_paceflow_output(args)?;
+
+        if !output.status.success() {
+            anyhow::bail!(
+                "paceflow {:?} failed\nstdout:\n{}\nstderr:\n{}",
+                args,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        Ok(String::from_utf8(output.stdout)?)
+    }
+
+    fn run_paceflow_output(&self, args: &[&str]) -> anyhow::Result<std::process::Output> {
+        Ok(Command::cargo_bin("vca")?
             .args(args)
             .current_dir(&self.home)
             .env("VCA_HOME", &self.home)
@@ -129,18 +144,7 @@ impl TestEnv {
             .env_remove("XDG_CONFIG_HOME")
             .env_remove("CODEX_HOME")
             .env_remove("VCA_GITHUB_TOKEN")
-            .output()?;
-
-        if !output.status.success() {
-            anyhow::bail!(
-                "paceflow {:?} failed\nstdout:\n{}\nstderr:\n{}",
-                args,
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
-
-        Ok(String::from_utf8(output.stdout)?)
+            .output()?)
     }
 
     fn ingest(&self) -> anyhow::Result<()> {
@@ -1429,6 +1433,62 @@ fn insight_commands_match_snapshots() -> anyhow::Result<()> {
         let output = env.normalize_output(env.run_paceflow(args)?);
         insta::assert_snapshot!(name, output);
     }
+    Ok(())
+}
+
+#[test]
+fn review_numbers_match_snapshot_and_check_round_trips() -> anyhow::Result<()> {
+    let env = TestEnv::new_live_fixture()?;
+    env.ingest()?;
+    let session = "codex:019cd678-8f72-7b43-a07f-d49cdbbb81c9";
+    let data: serde_json::Value =
+        serde_json::from_str(&env.run_paceflow(&["review", session, "--json"])?)?;
+    let stats: std::collections::BTreeMap<String, serde_json::Value> = data["stats"]
+        .as_array()
+        .expect("stats array")
+        .iter()
+        .map(|stat| {
+            (
+                stat["id"].as_str().unwrap_or("").to_string(),
+                stat["value"].clone(),
+            )
+        })
+        .collect();
+    insta::assert_yaml_snapshot!("review_codex_session_numbers", stats);
+
+    // Every number is backed by timeline entries that exist.
+    let entries = data["timeline"].as_array().expect("timeline").len() as u64;
+    for stat in data["stats"].as_array().expect("stats") {
+        for id in stat["entries"].as_array().expect("entries") {
+            assert!(id.as_u64().expect("entry id") < entries, "{stat}");
+        }
+    }
+
+    let write = |approved: &std::collections::BTreeMap<String, serde_json::Value>| {
+        let path = env.home.join("expectations.json");
+        let body = serde_json::json!({ "session": session, "approved": approved });
+        fs::write(&path, serde_json::to_string_pretty(&body)?)?;
+        anyhow::Ok(path)
+    };
+    let path = write(&stats)?;
+    let ok = env.run_paceflow(&["review", "--check", path.to_str().expect("utf-8")])?;
+    assert!(ok.contains("all"), "{ok}");
+
+    let mut changed = stats.clone();
+    changed.insert("cost.total_usd".into(), serde_json::json!(1.0));
+    changed.insert("no.such.number".into(), serde_json::json!(3));
+    let path = write(&changed)?;
+    let output = env.run_paceflow_output(&["review", "--check", path.to_str().expect("utf-8")])?;
+    assert!(!output.status.success());
+    let stdout = String::from_utf8(output.stdout)?;
+    assert!(
+        stdout.contains("✗ cost.total_usd: approved 1.0"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("✗ no.such.number: approved 3 · now (no longer produced)"),
+        "{stdout}"
+    );
     Ok(())
 }
 
