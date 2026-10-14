@@ -172,6 +172,7 @@ vca quota                         # quota windows: observed % (Codex) or token b
 vca sessions --sort cost          # root sessions with subagents rolled in
 vca tasks --completed-only        # time and cost to complete each task
 vca show <session-id>             # tasks, agents, usage, context, commits of one session
+vca review <session-id>           # local HTML page: full timeline + key numbers to approve/reject
 vca context --group-by dir        # what filled the context and what carrying it cost
 vca rework                        # later work that changed earlier AI lines, defect evidence
 vca stages                        # work by stage: explore, plan, implement, verify, review…
@@ -180,6 +181,10 @@ vca tui                           # interactive explorer with drill-down
 ```
 
 Sessions are split into **tasks** (one goal each). Without classification each session is one task. The optional classifier (`vca classify`, opt-in, previewable and budget-capped) uses TypeSafe's Jev model through OpenRouter to split long sessions into tasks, decide when each was completed, and label intent, outcome and user feedback. Your own labels (`vca classify set`, or `e` in the TUI) always win. See the [User Guide](USER_GUIDE.md#conversations-usage-quota-and-tasks).
+
+### Reviewing a session's numbers
+
+`vca review <session-id>` writes one self-contained HTML file (nothing is uploaded) with the session's whole timeline — messages, tool calls, every model call's tokens and cost, subagents, compactions, turn and task boundaries — next to about 60 numbers vca derives from it (cost and tokens by type, models, time, tool calls by category, validations, context by kind, commits, per-task cost, stage path and habit verdicts). Click a number to highlight the entries behind it, mark it ✓ or ✗ with a note, and **Export expectations**. `vca review --check expectations.json` then fails if any approved number changes, which is how real sessions become regression tests.
 
 ## Provider Assumptions
 

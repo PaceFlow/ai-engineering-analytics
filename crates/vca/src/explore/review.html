@@ -1,0 +1,337 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Session Review</title>
+<style>
+:root {
+  --bg: #f7f7f5; --panel: #ffffff; --ink: #1d1d1b; --muted: #6b6b66; --line: #e3e2dd;
+  --accent: #2f5fd0; --accent-soft: #e6edfb; --ok: #1f7a4d; --ok-soft: #e2f3ea;
+  --bad: #b3261e; --bad-soft: #fbe7e5; --warn: #8a5a00; --warn-soft: #fbf0d9;
+  --user: #2f5fd0; --assistant: #5b5b56; --tool: #7a4fb3; --call: #2f7f86; --event: #8a5a00;
+  --hl: #fff4bf;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  --sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #161615; --panel: #1f1f1d; --ink: #ecebe6; --muted: #a09f98; --line: #34332f;
+    --accent: #8aa9ff; --accent-soft: #23304f; --ok: #6fd3a0; --ok-soft: #173326;
+    --bad: #ff8a80; --bad-soft: #3d1d1a; --warn: #f0c060; --warn-soft: #3a2e12;
+    --user: #8aa9ff; --assistant: #c4c3bc; --tool: #c3a3f0; --call: #7fd0d6; --event: #f0c060;
+    --hl: #4a4220;
+  }
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; background: var(--bg); color: var(--ink); font: 14px/1.45 var(--sans); }
+header { position: sticky; top: 0; z-index: 5; background: var(--panel); border-bottom: 1px solid var(--line); padding: 10px 16px; }
+header h1 { font-size: 16px; margin: 0 0 2px; font-weight: 600; }
+header .sub { color: var(--muted); font-size: 12.5px; }
+header .bar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 8px; }
+.progress { font-variant-numeric: tabular-nums; color: var(--muted); font-size: 12.5px; margin-left: auto; }
+button, .btn { font: inherit; font-size: 12.5px; border: 1px solid var(--line); background: var(--panel); color: var(--ink); border-radius: 6px; padding: 4px 10px; cursor: pointer; }
+button:hover, .btn:hover { border-color: var(--accent); }
+button.on { background: var(--accent-soft); border-color: var(--accent); color: var(--accent); }
+input[type=search], input[type=text] { font: inherit; font-size: 13px; border: 1px solid var(--line); background: var(--panel); color: var(--ink); border-radius: 6px; padding: 4px 8px; }
+main { display: grid; grid-template-columns: minmax(0, 1fr) 440px; gap: 0; }
+@media (max-width: 1000px) { main { grid-template-columns: 1fr; } aside { position: static !important; max-height: none !important; border-left: 0 !important; border-top: 1px solid var(--line); } }
+#timeline { padding: 8px 16px 80px; min-width: 0; }
+aside { position: sticky; top: 92px; align-self: start; max-height: calc(100vh - 92px); overflow: auto; border-left: 1px solid var(--line); background: var(--panel); padding: 8px 14px 40px; }
+.turn { margin: 18px 0 6px; padding: 6px 10px; border-radius: 6px; background: var(--accent-soft); color: var(--ink); font-size: 12.5px; display: flex; gap: 10px; flex-wrap: wrap; align-items: baseline; }
+.turn b { font-weight: 600; }
+.turn .cost { margin-left: auto; font-variant-numeric: tabular-nums; }
+.e { display: grid; grid-template-columns: 64px 86px minmax(0, 1fr); gap: 8px; padding: 3px 6px; border-radius: 4px; align-items: baseline; }
+.e.sub { margin-left: 22px; border-left: 2px solid var(--line); padding-left: 8px; }
+.e:hover { background: color-mix(in srgb, var(--accent-soft) 45%, transparent); }
+.e.hl { background: var(--hl); }
+.e .t { color: var(--muted); font: 11.5px var(--mono); }
+.k { font: 600 10.5px var(--sans); text-transform: uppercase; letter-spacing: .04em; }
+.k.user { color: var(--user); } .k.assistant { color: var(--assistant); } .k.tool { color: var(--tool); }
+.k.call { color: var(--call); } .k.event, .k.compaction { color: var(--event); }
+.e .title { overflow-wrap: anywhere; }
+.e.user .title { font-weight: 600; }
+.pill { display: inline-block; font: 11.5px var(--mono); color: var(--muted); margin-right: 8px; }
+.badge { display: inline-block; font-size: 11px; padding: 0 6px; border-radius: 9px; background: var(--line); color: var(--muted); margin-right: 6px; }
+.badge.err { background: var(--bad-soft); color: var(--bad); }
+.badge.agent { background: var(--warn-soft); color: var(--warn); }
+details > summary { cursor: pointer; list-style: none; }
+details > summary::-webkit-details-marker { display: none; }
+details[open] > summary .title { white-space: normal; }
+pre.body { white-space: pre-wrap; overflow-wrap: anywhere; font: 12.5px/1.45 var(--mono); background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px; margin: 6px 0 4px; max-height: 480px; overflow: auto; }
+.meta { font: 11.5px var(--mono); color: var(--muted); margin: 4px 0; overflow-wrap: anywhere; }
+.chips { display: flex; flex-wrap: wrap; gap: 6px; margin: 4px 0 8px; }
+h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 18px 0 6px; font-weight: 600; }
+.stat { border-top: 1px solid var(--line); padding: 6px 0; }
+.stat .row { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: 8px; align-items: center; }
+.stat .label { cursor: pointer; overflow-wrap: anywhere; }
+.stat .label:hover { color: var(--accent); }
+.stat .label small { color: var(--muted); }
+.stat .val { font: 600 13px var(--mono); text-align: right; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; max-width: 200px; }
+.vote { display: flex; gap: 4px; }
+.vote button { width: 28px; padding: 2px 0; }
+.vote .ok.on { background: var(--ok-soft); border-color: var(--ok); color: var(--ok); }
+.vote .no.on { background: var(--bad-soft); border-color: var(--bad); color: var(--bad); }
+.stat.approved .val { color: var(--ok); }
+.stat.rejected .val { color: var(--bad); }
+.stat.changed .val { color: var(--warn); }
+.stat .note { width: 100%; margin-top: 4px; display: none; }
+.stat.rejected .note, .stat.has-note .note { display: block; }
+.stat .was { font-size: 12px; color: var(--warn); margin-top: 2px; }
+.stat.active { background: var(--accent-soft); border-radius: 6px; padding-left: 6px; padding-right: 6px; }
+.empty { color: var(--muted); padding: 30px 0; text-align: center; }
+.hint { color: var(--muted); font-size: 12px; margin: 6px 0 0; }
+</style>
+</head>
+<body>
+<header>
+  <h1 id="title">Session review</h1>
+  <div class="sub" id="sub"></div>
+  <div class="bar">
+    <input type="search" id="q" placeholder="Search timeline…" size="28">
+    <span class="chips" id="kinds"></span>
+    <button id="subs" class="on" title="Show subagent entries">subagents</button>
+    <button id="onlyhl" title="Show only entries behind the selected number">only selected</button>
+    <span class="progress" id="progress"></span>
+    <label class="btn" title="Load an earlier expectations file">Import<input type="file" id="import" accept=".json" hidden></label>
+    <button id="export" title="Download approved and rejected numbers">Export expectations</button>
+  </div>
+</header>
+<main>
+  <section id="timeline"></section>
+  <aside>
+    <p class="hint">Click a number's label to highlight the timeline entries behind it. Mark each ✓ or ✗; a ✗ asks for a note on what is wrong.</p>
+    <div class="chips" id="statfilter"></div>
+    <div id="stats"></div>
+  </aside>
+</main>
+<script id="data" type="application/json">/*__REVIEW_DATA__*/null</script>
+<script>
+(function () {
+  const DATA = JSON.parse(document.getElementById('data').textContent);
+  if (!DATA) { document.getElementById('timeline').innerHTML = '<p class="empty">No data embedded.</p>'; return; }
+  const S = DATA.detail.session;
+  const STORE = 'vca-review:' + DATA.key;
+  const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  const num = (n) => n == null ? '—' : Number(n).toLocaleString('en-US');
+  const usd = (n) => n == null ? '—' : '$' + Number(n).toFixed(Number(n) < 1 ? 4 : 2);
+  const time = (ts) => ts ? ts.replace(/^.*T/, '').replace(/(\.\d+)?(Z|[+-]\d\d:\d\d)$/, '').slice(0, 8) : '';
+
+  // Review state: id -> {state: 'ok'|'no', note, value}
+  let review = {};
+  try { review = JSON.parse(localStorage.getItem(STORE) || '{}') || {}; } catch (e) { review = {}; }
+  const save = () => { try { localStorage.setItem(STORE, JSON.stringify(review)); } catch (e) {} };
+  let previous = {};  // id -> value from an imported file, when it differs from now
+
+  document.getElementById('title').textContent = (S.title || '(untitled session)').slice(0, 140);
+  document.getElementById('sub').textContent = [
+    DATA.key, S.repo_root || '(no repo)', 'branch ' + (S.git_branch || '—'),
+    (S.started_at || '') + ' → ' + (S.ended_at || ''), 'pricing ' + DATA.pricing
+  ].join(' · ');
+
+  // ── Timeline ──
+  const KINDS = ['user', 'assistant', 'tool', 'call', 'event', 'compaction'];
+  const shown = new Set(KINDS);
+  let showSubs = true, onlyHl = false, query = '', selected = null, highlighted = new Set();
+  const kindsEl = document.getElementById('kinds');
+  KINDS.forEach((k) => {
+    const n = DATA.timeline.filter((e) => e.kind === k).length;
+    if (!n) return;
+    const b = document.createElement('button');
+    b.className = 'on'; b.textContent = k + ' ' + n;
+    b.onclick = () => { shown.has(k) ? shown.delete(k) : shown.add(k); b.classList.toggle('on'); renderTimeline(); };
+    kindsEl.appendChild(b);
+  });
+  const turnInfo = new Map(DATA.turns.map((t) => [t.turn, t]));
+
+  function callLine(m) {
+    return '<span class="pill">in ' + num(m.fresh) + '</span><span class="pill">cache r ' + num(m.cache_read) +
+      '</span><span class="pill">cache w ' + num(m.cache_write) + '</span><span class="pill">out ' + num(m.output) +
+      (m.reasoning ? '</span><span class="pill">reason ' + num(m.reasoning) : '') + '</span><span class="pill">' +
+      (m.cost == null ? 'unpriced' : usd(m.cost)) + '</span>';
+  }
+  function toolLine(m) {
+    const bits = ['<span class="badge">' + esc(m.category) + '</span>'];
+    if (m.validation) bits.push('<span class="badge">' + esc(m.validation) + '</span>');
+    if (m.status && m.status !== 'ok' && m.status !== 'success' && m.status !== 'unknown') bits.push('<span class="badge err">' + esc(m.status) + (m.exit_code != null ? ' ' + m.exit_code : '') + '</span>');
+    if (m.agent_type) bits.push('<span class="badge agent">' + esc(m.agent_type) + '</span>');
+    return bits.join('');
+  }
+  function entryHtml(e) {
+    const sub = e.agent !== 'main';
+    const cls = 'e ' + e.kind + (sub ? ' sub' : '') + (highlighted.has(e.id) ? ' hl' : '');
+    const agent = sub ? '<span class="badge agent" title="' + esc(e.agent) + '">sub ' + esc(e.agent.slice(0, 8)) + '</span>' : '';
+    let head = agent, expandable = false;
+    if (e.kind === 'call') head += callLine(e.meta) + '<span class="title">' + esc(e.title) + '</span>';
+    else if (e.kind === 'tool') { head += toolLine(e.meta) + '<span class="title">' + esc(e.title) + '</span>'; expandable = true; }
+    else { head += '<span class="title">' + esc(e.title || '(empty)') + '</span>'; expandable = e.body && e.body !== e.title; }
+    const left = '<span class="t">' + esc(time(e.ts)) + '</span><span class="k ' + e.kind + '">' + e.kind + '</span>';
+    if (!expandable) return '<div class="' + cls + '" data-id="' + e.id + '">' + left + '<div>' + head + '</div></div>';
+    return '<div class="' + cls + '" data-id="' + e.id + '">' + left + '<details data-id="' + e.id + '"><summary>' + head + '</summary></details></div>';
+  }
+  function visible(e) {
+    if (!shown.has(e.kind)) return false;
+    if (!showSubs && e.agent !== 'main') return false;
+    if (onlyHl && !highlighted.has(e.id)) return false;
+    if (query) {
+      const hay = (e.title + ' ' + e.body + ' ' + JSON.stringify(e.meta)).toLowerCase();
+      if (!hay.includes(query)) return false;
+    }
+    return true;
+  }
+  function renderTimeline() {
+    const out = [];
+    let lastTurn;
+    for (const e of DATA.timeline) {
+      if (!visible(e)) continue;
+      if (e.turn !== lastTurn && e.turn != null) {
+        const t = turnInfo.get(e.turn) || {};
+        out.push('<div class="turn"><b>Turn ' + e.turn + '</b>' +
+          (t.task != null ? '<span>Task T' + t.task + '</span>' : '<span>no task</span>') +
+          (t.stage ? '<span>stage ' + esc(t.stage) + '</span>' : '') +
+          (t.request_kind ? '<span>asked for ' + esc(t.request_kind) + '</span>' : '') +
+          '<span class="cost">' + usd(t.cost) + '</span></div>');
+        lastTurn = e.turn;
+      }
+      out.push(entryHtml(e));
+    }
+    const el = document.getElementById('timeline');
+    el.innerHTML = out.length ? out.join('') : '<p class="empty">Nothing matches the current filters.</p>';
+  }
+  // Bodies are filled on first open, to keep the page light.
+  document.getElementById('timeline').addEventListener('toggle', (ev) => {
+    const d = ev.target;
+    if (!d.open || d.dataset.filled) return;
+    const e = DATA.timeline[Number(d.dataset.id)];
+    let html = '';
+    if (e.kind === 'tool') {
+      const m = e.meta;
+      html += '<div class="meta">' + esc(m.tool) + ' · target ' + esc(m.target || '—') + ' · input ' + num(m.input_chars) +
+        ' chars · output ' + num(m.output_chars) + ' chars' + (m.in_context ? '' : ' (not in context)') +
+        (m.child_session ? ' · child ' + esc(m.child_session) : '') + '</div>';
+      if (m.target && m.target.length > 160) html += '<pre class="body">' + esc(m.target) + '</pre>';
+    }
+    if (e.body) html += '<pre class="body">' + esc(e.body) + '</pre>';
+    d.insertAdjacentHTML('beforeend', html || '<div class="meta">no further detail</div>');
+    d.dataset.filled = '1';
+  }, true);
+  document.getElementById('q').addEventListener('input', (ev) => { query = ev.target.value.trim().toLowerCase(); renderTimeline(); });
+  document.getElementById('subs').onclick = (ev) => { showSubs = !showSubs; ev.target.classList.toggle('on'); renderTimeline(); };
+  document.getElementById('onlyhl').onclick = (ev) => { onlyHl = !onlyHl; ev.target.classList.toggle('on'); renderTimeline(); };
+
+  // ── Stats ──
+  let statFilter = 'all';
+  const filtersEl = document.getElementById('statfilter');
+  ['all', 'unreviewed', 'rejected', 'changed'].forEach((f) => {
+    const b = document.createElement('button');
+    b.textContent = f; if (f === statFilter) b.className = 'on';
+    b.onclick = () => { statFilter = f; [...filtersEl.children].forEach((c) => c.classList.toggle('on', c === b)); renderStats(); };
+    filtersEl.appendChild(b);
+  });
+  const sameValue = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+  function stateOf(stat) {
+    const r = review[stat.id];
+    if (r && r.state && !sameValue(r.value, stat.value)) return 'changed';
+    if (r && r.state === 'ok') return 'approved';
+    if (r && r.state === 'no') return 'rejected';
+    if (stat.id in previous) return 'changed';
+    return 'open';
+  }
+  function renderStats() {
+    const groups = new Map();
+    for (const s of DATA.stats) {
+      const st = stateOf(s);
+      if (statFilter === 'unreviewed' && st !== 'open' && st !== 'changed') continue;
+      if (statFilter === 'rejected' && st !== 'rejected') continue;
+      if (statFilter === 'changed' && st !== 'changed') continue;
+      if (!groups.has(s.group)) groups.set(s.group, []);
+      groups.get(s.group).push(s);
+    }
+    const out = [];
+    for (const [group, stats] of groups) {
+      out.push('<h2>' + esc(group) + '</h2>');
+      for (const s of stats) {
+        const r = review[s.id] || {};
+        const st = stateOf(s);
+        const was = r.state && !sameValue(r.value, s.value) ? JSON.stringify(r.value) : (s.id in previous ? JSON.stringify(previous[s.id]) : null);
+        out.push('<div class="stat ' + st + (r.note ? ' has-note' : '') + (selected === s.id ? ' active' : '') + '" data-id="' + esc(s.id) + '">' +
+          '<div class="row"><span class="label" title="' + esc(s.id) + '">' + esc(s.label) +
+          (s.entries.length ? ' <small>(' + s.entries.length + ')</small>' : '') + '</span>' +
+          '<span class="val">' + esc(s.display) + '</span>' +
+          '<span class="vote"><button class="ok' + (r.state === 'ok' ? ' on' : '') + '" title="Looks right">✓</button>' +
+          '<button class="no' + (r.state === 'no' ? ' on' : '') + '" title="Wrong">✗</button></span></div>' +
+          (was ? '<div class="was">was ' + esc(was) + ' when reviewed</div>' : '') +
+          '<input type="text" class="note" placeholder="What is wrong? What should it be?" value="' + esc(r.note || '') + '"></div>');
+      }
+    }
+    document.getElementById('stats').innerHTML = out.join('') || '<p class="empty">No numbers in this view.</p>';
+    const done = DATA.stats.filter((s) => ['approved', 'rejected'].includes(stateOf(s))).length;
+    const bad = DATA.stats.filter((s) => stateOf(s) === 'rejected').length;
+    document.getElementById('progress').textContent = done + ' / ' + DATA.stats.length + ' reviewed · ' + bad + ' wrong';
+  }
+  const statById = new Map(DATA.stats.map((s) => [s.id, s]));
+  document.getElementById('stats').addEventListener('click', (ev) => {
+    const box = ev.target.closest('.stat'); if (!box) return;
+    const s = statById.get(box.dataset.id);
+    if (ev.target.closest('.label')) {
+      selected = selected === s.id ? null : s.id;
+      highlighted = new Set(selected ? s.entries : []);
+      renderTimeline(); renderStats();
+      const first = document.querySelector('.e.hl');
+      if (first) first.scrollIntoView({ block: 'center', behavior: 'smooth' });
+      return;
+    }
+    const vote = ev.target.closest('.vote button'); if (!vote) return;
+    const want = vote.classList.contains('ok') ? 'ok' : 'no';
+    const r = review[s.id] || {};
+    if (r.state === want && sameValue(r.value, s.value)) delete review[s.id];
+    else review[s.id] = { state: want, value: s.value, note: r.note || '' };
+    delete previous[s.id];
+    save(); renderStats();
+    if (want === 'no') { const n = document.querySelector('.stat[data-id="' + CSS.escape(s.id) + '"] .note'); if (n) n.focus(); }
+  });
+  document.getElementById('stats').addEventListener('change', (ev) => {
+    if (!ev.target.classList.contains('note')) return;
+    const id = ev.target.closest('.stat').dataset.id;
+    const s = statById.get(id);
+    const r = review[id] || { state: null, value: s.value };
+    r.note = ev.target.value; review[id] = r; save(); renderStats();
+  });
+
+  document.getElementById('export').onclick = () => {
+    const approved = {}, rejected = {};
+    for (const s of DATA.stats) {
+      const r = review[s.id]; if (!r || !sameValue(r.value, s.value)) continue;
+      if (r.state === 'ok') approved[s.id] = s.value;
+      if (r.state === 'no') rejected[s.id] = { value: s.value, note: r.note || '' };
+    }
+    const body = JSON.stringify({ session: DATA.key, pricing: DATA.pricing, approved, rejected }, null, 2) + '\n';
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(new Blob([body], { type: 'application/json' }));
+    a.download = 'expectations-' + DATA.key.replace(/[^a-z0-9]+/gi, '-').slice(0, 60) + '.json';
+    document.body.appendChild(a); a.click(); a.remove();
+  };
+  document.getElementById('import').onchange = (ev) => {
+    const file = ev.target.files[0]; if (!file) return;
+    file.text().then((text) => {
+      const x = JSON.parse(text);
+      for (const [id, value] of Object.entries(x.approved || {})) {
+        const s = statById.get(id);
+        if (s && sameValue(s.value, value)) review[id] = { state: 'ok', value, note: '' };
+        else previous[id] = value;
+      }
+      for (const [id, r] of Object.entries(x.rejected || {})) {
+        const s = statById.get(id);
+        if (s && sameValue(s.value, r.value)) review[id] = { state: 'no', value: r.value, note: r.note || '' };
+        else previous[id] = r.value;
+      }
+      save(); renderStats();
+    }).catch((e) => alert('Could not read that file: ' + e));
+  };
+
+  renderTimeline();
+  renderStats();
+})();
+</script>
+</body>
+</html>
