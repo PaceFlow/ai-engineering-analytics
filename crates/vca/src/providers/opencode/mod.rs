@@ -27,6 +27,8 @@ struct OpenCodeSession {
     messages: Vec<OpenCodeMessage>,
     usage_events: Vec<OpenCodeUsageEvent>,
     tool_calls: Vec<ToolCallRecord>,
+    /// Per-call edits from tool metadata; used when there is no session diff.
+    tool_edits: Vec<OpenCodeAcceptedChange>,
 }
 
 #[derive(Debug, Clone)]
@@ -57,6 +59,8 @@ struct OpenCodeAcceptedChange {
     file_path: String,
     added_lines: i64,
     removed_lines: i64,
+    /// When the edit happened; session diffs only have the session end.
+    ts: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -167,10 +171,15 @@ fn ingest_db(path: &Path, analytics: &Connection) -> Result<usize> {
             continue;
         }
 
-        let changes = match diff_root.as_deref() {
+        // The session diff (net change) wins; most sessions have none, so fall
+        // back to the per-call diffs in tool metadata.
+        let mut changes = match diff_root.as_deref() {
             Some(diff_root) => parse_accepted_changes(diff_root, &session)?,
             None => Vec::new(),
         };
+        if changes.is_empty() {
+            changes = session.tool_edits.clone();
+        }
         let record = session_record(&session, &source_path, changes);
         written += session_store::store_session_record(analytics, &record)?;
         session_store::mark_source_ingested(
@@ -237,7 +246,7 @@ fn session_record(
             abs_path: change.file_path,
             lines_added: change.added_lines,
             lines_removed: change.removed_lines,
-            ts: change_ts.clone(),
+            ts: change.ts.or_else(|| change_ts.clone()),
         })
         .collect();
     record.model = record
@@ -297,7 +306,8 @@ fn parse_sessions(path: &Path) -> Result<Vec<OpenCodeSession>> {
             .iter()
             .filter_map(|message| message.usage.clone())
             .collect();
-        let (parts, tool_calls, part_count) = parse_parts(&source, &id)?;
+        let (parts, tool_calls, tool_edits, part_count) =
+            parse_parts(&source, &id, directory.as_deref())?;
         let fingerprint = format!("{updated_ms}:{}:{part_count}", messages.len());
         let visible_messages = build_visible_messages(messages, parts);
         sessions.push(OpenCodeSession {
@@ -312,6 +322,7 @@ fn parse_sessions(path: &Path) -> Result<Vec<OpenCodeSession>> {
             messages: visible_messages,
             usage_events,
             tool_calls,
+            tool_edits,
         });
     }
 
@@ -425,11 +436,17 @@ fn parse_opencode_usage(parsed: &Value) -> Option<OpenCodeUsageEvent> {
 
 type TextParts = HashMap<String, Vec<(String, String)>>;
 
-/// Text parts per message plus tool calls, and the total number of parts.
+/// Text parts per message, tool calls, their edits, and the total number of parts.
 fn parse_parts(
     source: &Connection,
     session_id: &str,
-) -> Result<(TextParts, Vec<ToolCallRecord>, usize)> {
+    session_dir: Option<&str>,
+) -> Result<(
+    TextParts,
+    Vec<ToolCallRecord>,
+    Vec<OpenCodeAcceptedChange>,
+    usize,
+)> {
     let mut stmt = source.prepare(
         "SELECT message_id, data, id
          FROM part
@@ -439,6 +456,7 @@ fn parse_parts(
 
     let mut parts: TextParts = HashMap::new();
     let mut tool_calls = Vec::new();
+    let mut tool_edits = Vec::new();
     let mut count = 0usize;
     let rows = stmt.query_map(params![session_id], |row| {
         Ok((
@@ -465,12 +483,91 @@ fn parse_parts(
                     .or_default()
                     .push((part_id, text.to_string()));
             }
-            Some("tool") => tool_calls.push(tool_call_from_part(&part_id, &parsed)),
+            Some("tool") => {
+                let call = tool_call_from_part(&part_id, &parsed);
+                if call.status == "ok" {
+                    tool_edits.extend(edits_from_tool_part(&parsed, session_dir, &call.ts));
+                }
+                tool_calls.push(call);
+            }
             _ => {}
         }
     }
 
-    Ok((parts, tool_calls, count))
+    Ok((parts, tool_calls, tool_edits, count))
+}
+
+/// Lines changed by one completed `edit`, `apply_patch` or `write` call, from the
+/// diff OpenCode stores in the tool's metadata.
+fn edits_from_tool_part(
+    part: &Value,
+    session_dir: Option<&str>,
+    ts: &Option<String>,
+) -> Vec<OpenCodeAcceptedChange> {
+    let state = part.get("state").unwrap_or(&Value::Null);
+    let meta = state.get("metadata").unwrap_or(&Value::Null);
+    let change = |file: &str, entry: &Value| {
+        let counted = entry
+            .get("patch")
+            .and_then(Value::as_str)
+            .map(count_unified_patch_lines)
+            .unwrap_or((0, 0));
+        let int = |key: &str| entry.get(key).and_then(Value::as_i64);
+        let (added, removed) = (
+            int("additions").unwrap_or(counted.0),
+            int("deletions").unwrap_or(counted.1),
+        );
+        (added > 0 || removed > 0).then(|| OpenCodeAcceptedChange {
+            file_path: resolve_diff_path(session_dir, file)
+                .to_string_lossy()
+                .to_string(),
+            added_lines: added,
+            removed_lines: removed,
+            ts: ts.clone(),
+        })
+    };
+    let text = |value: &Value, key: &str| value.get(key).and_then(Value::as_str).map(str::to_owned);
+    match part.get("tool").and_then(Value::as_str) {
+        Some("edit") => meta
+            .get("filediff")
+            .and_then(|diff| change(&text(diff, "file")?, diff))
+            .into_iter()
+            .collect(),
+        Some("apply_patch") => meta
+            .get("files")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|file| {
+                change(
+                    &text(file, "filePath").or_else(|| text(file, "relativePath"))?,
+                    file,
+                )
+            })
+            .collect(),
+        // The previous content is not stored; count the written lines as added.
+        Some("write") => {
+            let input = state.get("input").unwrap_or(&Value::Null);
+            let lines = input
+                .get("content")
+                .and_then(Value::as_str)
+                .map(|content| content.lines().count() as i64)
+                .unwrap_or(0);
+            text(input, "filePath")
+                .filter(|_| lines > 0)
+                .map(|file| OpenCodeAcceptedChange {
+                    file_path: resolve_diff_path(session_dir, &file)
+                        .to_string_lossy()
+                        .to_string(),
+                    added_lines: lines,
+                    removed_lines: 0,
+                    ts: ts.clone(),
+                })
+                .into_iter()
+                .collect()
+        }
+        _ => Vec::new(),
+    }
 }
 
 fn tool_call_from_part(part_id: &str, part: &Value) -> ToolCallRecord {
@@ -609,6 +706,7 @@ fn parse_accepted_changes(
             file_path: file_path.to_string_lossy().to_string(),
             added_lines,
             removed_lines,
+            ts: None,
         });
     }
 
@@ -811,6 +909,93 @@ mod tests {
                 0
             )
         );
+        Ok(())
+    }
+
+    /// Most sessions have no `session_diff` file; their edits live in the
+    /// metadata of each completed edit / apply_patch / write call.
+    #[test]
+    fn counts_lines_from_tool_metadata_without_session_diff() -> Result<()> {
+        let tempdir = tempdir()?;
+        let db_path = tempdir.path().join("opencode.db");
+        let source = Connection::open(&db_path)?;
+        create_opencode_schema(&source)?;
+        seed_project(&source, "p1", "/tmp/game")?;
+        seed_session(
+            &source,
+            "s3",
+            "p1",
+            "/tmp/game",
+            1_786_000_000_000,
+            1_786_000_900_000,
+        )?;
+        seed_message(
+            &source,
+            "m1",
+            "s3",
+            1_786_000_000_100,
+            json!({"role":"user","model":{"providerID":"deepseek","modelID":"deepseek-v4-pro"}}),
+        )?;
+        seed_part(
+            &source,
+            "t0",
+            "m1",
+            "s3",
+            1_786_000_000_101,
+            json!({"type":"text","text":"fix the sampler"}),
+        )?;
+        let time = |start: i64| json!({"start": start, "end": start + 50});
+        let parts = [
+            json!({"type":"tool","tool":"edit","callID":"c1","state":{"status":"completed",
+                "input":{"filePath":"/tmp/game/src/sampler.h"},"time": time(1_786_000_100_000),
+                "metadata":{"filediff":{"file":"/tmp/game/src/sampler.h",
+                    "patch":"@@ -1,2 +1,3 @@\n a\n-b\n+c\n+d\n","additions":2,"deletions":1}}}}),
+            json!({"type":"tool","tool":"apply_patch","callID":"c2","state":{"status":"completed",
+                "input":{},"time": time(1_786_000_200_000),
+                "metadata":{"files":[
+                    {"filePath":"/tmp/game/src/a.c","relativePath":"src/a.c","type":"update","patch":"","additions":3,"deletions":0},
+                    {"filePath":"/tmp/game/src/b.c","relativePath":"src/b.c","type":"update","patch":"","additions":0,"deletions":0}]}}}),
+            json!({"type":"tool","tool":"write","callID":"c3","state":{"status":"completed",
+                "input":{"filePath":"src/new.txt","content":"one\ntwo\n"},"time": time(1_786_000_300_000),
+                "metadata":{"exists":false}}}),
+            json!({"type":"tool","tool":"edit","callID":"c4","state":{"status":"error",
+                "input":{"filePath":"/tmp/game/src/sampler.h"},"time": time(1_786_000_400_000),
+                "metadata":{"filediff":{"file":"/tmp/game/src/sampler.h","patch":"","additions":9,"deletions":9}}}}),
+        ];
+        for (index, part) in parts.into_iter().enumerate() {
+            seed_part(
+                &source,
+                &format!("t{}", index + 1),
+                "m1",
+                "s3",
+                1_786_000_000_200 + index as i64,
+                part,
+            )?;
+        }
+
+        let analytics = Connection::open_in_memory()?;
+        init_app_schema(&analytics)?;
+        ingest_db(&db_path, &analytics)?;
+
+        let mut stmt = analytics.prepare(
+            "SELECT abs_path, lines_added, lines_removed FROM fact_session_code_change
+             WHERE provider='opencode' AND session_id='s3' AND source_kind='accepted_change'
+             ORDER BY abs_path",
+        )?;
+        let changes: Vec<(String, i64, i64)> = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+            .collect::<std::result::Result<_, _>>()?;
+        let new_txt = std::path::Path::new("/tmp/game")
+            .join("src/new.txt")
+            .to_string_lossy()
+            .to_string();
+        let mut expected = vec![
+            ("/tmp/game/src/a.c".to_string(), 3, 0),
+            ("/tmp/game/src/sampler.h".to_string(), 2, 1),
+            (new_txt, 2, 0),
+        ];
+        expected.sort();
+        assert_eq!(changes, expected, "failed and empty edits are not counted");
         Ok(())
     }
 
