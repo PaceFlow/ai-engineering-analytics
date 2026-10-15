@@ -163,6 +163,12 @@ fn base_record(parsed: &shared::ParsedClaudeSession, session_id: &str) -> Sessio
 
 fn main_record(parsed: &shared::ParsedClaudeSession) -> SessionRecord {
     let mut record = base_record(parsed, &parsed.session_id);
+    // A resumed/forked session rolls up into the one it continued, like a subagent,
+    // so the sessions list shows one conversation with no call counted twice.
+    if let Some(origin) = &parsed.continued_from {
+        record.parent_session_id = Some(origin.clone());
+        record.agent_kind = AgentKind::Fork;
+    }
     // Tool results of Task/Agent calls name the child agent; store the child session id.
     for call in &mut record.tool_calls {
         if let Some(agent_id) = call.child_session_id.take() {
