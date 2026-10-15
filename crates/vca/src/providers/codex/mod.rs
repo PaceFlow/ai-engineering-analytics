@@ -168,6 +168,16 @@ struct PendingCall {
     index: usize,
 }
 
+/// A code-mode `exec` call (Codex CLI 0.160+): a script that calls inner tools.
+/// The inner calls arrive as `item_completed` events; the script's input and output
+/// are what enter the model context, so they are attributed to its first inner call.
+struct OpenWrapper {
+    call_id: String,
+    ts: Option<String>,
+    input_chars: i64,
+    first_inner: Option<usize>,
+}
+
 /// Parse one Codex rollout file into a normalized session record.
 fn parse_session(path: &PathBuf) -> Result<Option<SessionRecord>> {
     let file = std::fs::File::open(path)?;
@@ -237,6 +247,12 @@ fn parse_session(path: &PathBuf) -> Result<Option<SessionRecord>> {
     let mut current_model: Option<String> = None;
     let mut previous_totals = CodexTotals::default();
     let mut context_window: Option<i64> = None;
+    // Newer rollouts write exact per-response `token_usage_record` lines next to the
+    // cumulative `token_count` events; the records win when present (they also cover
+    // compaction calls), and token_count deltas are only the fallback.
+    let mut count_usage: Vec<UsageRecord> = Vec::new();
+    let mut saw_usage_records = false;
+    let mut wrapper: Option<OpenWrapper> = None;
     let mut line_no = 0usize;
 
     for line_result in lines {
@@ -321,13 +337,25 @@ fn parse_session(path: &PathBuf) -> Result<Option<SessionRecord>> {
                             usage.reasoning_in_output = true;
                             usage.context_window = context_window;
                             usage.provider_route = meta.model_provider.clone();
-                            record.usage.push(usage);
+                            count_usage.push(usage);
                         }
                     }
                     if let (Some(ts), Some(limits)) =
                         (ts.as_deref(), line.payload.get("rate_limits"))
                     {
                         push_rate_limits(&mut record, ts, limits);
+                    }
+                }
+                "item_completed" => {
+                    if let Some(item) = line.payload.get("item") {
+                        push_completed_item(
+                            &mut record,
+                            &mut wrapper,
+                            item,
+                            &line.payload,
+                            ts.clone(),
+                            line_no,
+                        );
                     }
                 }
                 "user_message" => {
@@ -395,6 +423,48 @@ fn parse_session(path: &PathBuf) -> Result<Option<SessionRecord>> {
                                 source: Some("developer".to_string()),
                                 chars: text.chars().count() as i64,
                             });
+                        }
+                    }
+                    ("custom_tool_call", _)
+                        if line.payload.get("name").and_then(Value::as_str) == Some("exec") =>
+                    {
+                        wrapper = Some(OpenWrapper {
+                            call_id: line
+                                .payload
+                                .get("call_id")
+                                .and_then(Value::as_str)
+                                .map(ToOwned::to_owned)
+                                .unwrap_or_else(|| format!("line:{line_no}")),
+                            ts: ts.clone(),
+                            input_chars: tool_arguments(&line.payload).chars().count() as i64,
+                            first_inner: None,
+                        });
+                    }
+                    ("custom_tool_call_output", _)
+                        if wrapper.as_ref().is_some_and(|open| {
+                            line.payload.get("call_id").and_then(Value::as_str)
+                                == Some(open.call_id.as_str())
+                        }) =>
+                    {
+                        let open = wrapper.take().expect("checked above");
+                        let output_chars = output_text(&line.payload).chars().count() as i64;
+                        match open
+                            .first_inner
+                            .and_then(|index| record.tool_calls.get_mut(index))
+                        {
+                            Some(call) => call.output_chars = output_chars,
+                            // A script that called no tools (pure computation, waits).
+                            None => record.tool_calls.push(ToolCallRecord {
+                                key: open.call_id,
+                                ts: open.ts,
+                                ended_ts: ts.clone(),
+                                tool_name: "exec".to_string(),
+                                input_chars: open.input_chars,
+                                output_chars,
+                                output_in_context: true,
+                                status: "ok".to_string(),
+                                ..ToolCallRecord::default()
+                            }),
                         }
                     }
                     ("function_call", _) | ("custom_tool_call", _) | ("local_shell_call", _) => {
@@ -508,12 +578,230 @@ fn parse_session(path: &PathBuf) -> Result<Option<SessionRecord>> {
                     _ => {}
                 }
             }
+            "token_usage_record" => {
+                if let Some(per_call) = line.payload.get("usage").filter(|usage| usage.is_object())
+                {
+                    saw_usage_records = true;
+                    let int = |key: &str| per_call.get(key).and_then(Value::as_i64).unwrap_or(0);
+                    let (input, cached) = (int("input_tokens"), int("cached_input_tokens"));
+                    let cache_write = int("cache_write_input_tokens");
+                    let key = line
+                        .payload
+                        .get("response_id")
+                        .and_then(Value::as_str)
+                        .map(|id| format!("resp:{id}"))
+                        .unwrap_or_else(|| format!("tur:{line_no}"));
+                    let mut usage = UsageRecord::new(key);
+                    usage.ts = ts.clone();
+                    usage.model = current_model.clone();
+                    usage.input_tokens = (input - cached - cache_write).max(0);
+                    usage.cache_read_tokens = cached;
+                    usage.cache_write_tokens = cache_write;
+                    usage.output_tokens = int("output_tokens");
+                    usage.reasoning_tokens = int("reasoning_output_tokens");
+                    usage.reasoning_in_output = true;
+                    usage.context_window = context_window;
+                    usage.provider_route = meta.model_provider.clone();
+                    record.usage.push(usage);
+                }
+            }
             _ => {}
         }
     }
 
+    if !saw_usage_records {
+        record.usage.extend(count_usage);
+    }
+    // Rollouts from Codex CLI 0.160+ record prompts as `UserMessage` items; drop the
+    // legacy `user_message` events if a file somehow carries both, so turns are not doubled.
+    if record
+        .messages
+        .iter()
+        .any(|message| message.key.starts_with("item:"))
+    {
+        record
+            .messages
+            .retain(|message| message.role != "user" || message.key.starts_with("item:"));
+    }
     record.model = record.primary_model_from_usage().or(current_model);
     Ok(Some(record))
+}
+
+/// One `item_completed` event (Codex CLI 0.160+): user prompts and the inner tool calls
+/// of code-mode `exec` scripts. Agent messages and reasoning are already covered by
+/// `response_item` lines, and `Extension` items mirror direct function calls.
+fn push_completed_item(
+    record: &mut SessionRecord,
+    wrapper: &mut Option<OpenWrapper>,
+    item: &Value,
+    payload: &Value,
+    ts: Option<String>,
+    line_no: usize,
+) {
+    let item_type = item.get("type").and_then(Value::as_str).unwrap_or("");
+    let ms_ts = |key: &str| {
+        payload
+            .get(key)
+            .and_then(Value::as_i64)
+            .and_then(chrono::DateTime::from_timestamp_millis)
+            .map(|at| at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+    };
+    let started = ms_ts("started_at_ms").or_else(|| ts.clone());
+    let ended = ms_ts("completed_at_ms").or_else(|| ts.clone());
+    let key = item
+        .get("id")
+        .and_then(Value::as_str)
+        .map(|id| format!("item:{id}"))
+        .unwrap_or_else(|| format!("item:line:{line_no}"));
+
+    let mut call = match item_type {
+        "UserMessage" => {
+            let text = item
+                .get("content")
+                .and_then(Value::as_array)
+                .map(|parts| {
+                    parts
+                        .iter()
+                        .filter_map(|part| part.get("text").and_then(Value::as_str))
+                        .collect::<Vec<_>>()
+                        .join("")
+                })
+                .unwrap_or_default();
+            if !text.trim().is_empty() {
+                record.messages.push(MessageRecord {
+                    key,
+                    ts: started,
+                    role: "user".to_string(),
+                    text,
+                    is_compaction_summary: false,
+                });
+            }
+            return;
+        }
+        "CommandExecution" => {
+            let target = item
+                .get("parsed_cmd")
+                .and_then(Value::as_array)
+                .and_then(|parsed| parsed.first())
+                .and_then(|first| first.get("cmd"))
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+                .or_else(|| {
+                    // ["pwsh.exe", "-Command", "<script>"]: the script is the last part.
+                    item.get("command")
+                        .and_then(Value::as_array)
+                        .and_then(|parts| parts.last())
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned)
+                });
+            let exit_code = item.get("exit_code").and_then(Value::as_i64);
+            let failed = exit_code.is_some_and(|code| code != 0);
+            let error_head = failed.then(|| {
+                let stderr = item.get("stderr").and_then(Value::as_str).unwrap_or("");
+                let text = if stderr.trim().is_empty() {
+                    item.get("aggregated_output")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                } else {
+                    stderr
+                };
+                text.chars().take(600).collect()
+            });
+            ToolCallRecord {
+                key,
+                ts: started,
+                ended_ts: ended,
+                tool_name: "exec_command".to_string(),
+                target,
+                output_in_context: true,
+                status: if failed { "error" } else { "ok" }.to_string(),
+                exit_code,
+                error_head,
+                ..ToolCallRecord::default()
+            }
+        }
+        "FileChange" => {
+            let completed = item.get("status").and_then(Value::as_str) == Some("completed");
+            let changes = item.get("changes").and_then(Value::as_object);
+            if completed {
+                for (path, change) in changes.into_iter().flatten() {
+                    let (added, removed) = file_change_counts(change);
+                    if added > 0 || removed > 0 {
+                        record.accepted_changes.push(AcceptedChangeRecord {
+                            abs_path: path.clone(),
+                            lines_added: added,
+                            lines_removed: removed,
+                            ts: ended.clone(),
+                        });
+                    }
+                }
+            }
+            ToolCallRecord {
+                key,
+                ts: started,
+                ended_ts: ended,
+                tool_name: "apply_patch".to_string(),
+                target: changes.and_then(|changes| changes.keys().next().cloned()),
+                output_in_context: true,
+                status: if completed { "ok" } else { "error" }.to_string(),
+                ..ToolCallRecord::default()
+            }
+        }
+        "ImageView" => ToolCallRecord {
+            key,
+            ts: started,
+            ended_ts: ended,
+            tool_name: "view_image".to_string(),
+            target: item
+                .get("path")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned),
+            output_in_context: true,
+            status: "ok".to_string(),
+            ..ToolCallRecord::default()
+        },
+        _ => return,
+    };
+
+    let index = record.tool_calls.len();
+    // Long-running commands can complete after their script returned; they stand alone.
+    if let Some(open) = wrapper.as_mut()
+        && open.first_inner.is_none()
+    {
+        open.first_inner = Some(index);
+        call.input_chars = open.input_chars;
+    }
+    record.tool_calls.push(call);
+}
+
+/// Lines added and removed by one `FileChange` entry (`add`, `update` or `delete`).
+fn file_change_counts(change: &Value) -> (i64, i64) {
+    let content_lines = || {
+        change
+            .get("content")
+            .and_then(Value::as_str)
+            .map(|text| text.lines().count() as i64)
+            .unwrap_or(0)
+    };
+    match change.get("type").and_then(Value::as_str) {
+        Some("add") => (content_lines(), 0),
+        Some("delete") => (0, content_lines()),
+        _ => {
+            let diff = change
+                .get("unified_diff")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let mut counts = (0, 0);
+            for line in diff.lines() {
+                if line.starts_with('+') && !line.starts_with("+++") {
+                    counts.0 += 1;
+                } else if line.starts_with('-') && !line.starts_with("---") {
+                    counts.1 += 1;
+                }
+            }
+            counts
+        }
+    }
 }
 
 /// Codex may record that a rollout was spawned by another session (subagent/fork).
@@ -916,6 +1204,179 @@ mod tests {
         assert_eq!(call.exit_code, Some(101));
         assert_eq!(call.status, "error");
         assert_eq!(call.target.as_deref(), Some("cargo test"));
+        Ok(())
+    }
+
+    fn write_rollout(dir: &std::path::Path, lines: &[Value]) -> anyhow::Result<PathBuf> {
+        let path = dir.join("rollout.jsonl");
+        let body: Vec<String> = lines.iter().map(Value::to_string).collect();
+        std::fs::write(&path, body.join("\n"))?;
+        Ok(path)
+    }
+
+    /// Codex CLI 0.160+ rollouts: prompts as `UserMessage` items, per-response
+    /// `token_usage_record` lines, and tools run inside code-mode `exec` scripts whose
+    /// inner calls arrive as `item_completed` events. Shapes follow a 0.161 rollout.
+    #[test]
+    fn parses_code_mode_rollout_items() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let item = |ts: &str, started_ms: i64, item: Value| {
+            json!({"timestamp": ts, "type": "event_msg", "payload": {"type": "item_completed",
+                "thread_id": "s2", "turn_id": "t1", "item": item,
+                "started_at_ms": started_ms, "completed_at_ms": started_ms + 500}})
+        };
+        let usage = |ts: &str, id: &str, input: i64, cached: i64, write: i64, output: i64| {
+            json!({"timestamp": ts, "type": "token_usage_record", "payload": {"thread_id": "s2",
+                "turn_id": "t1", "response_id": id, "usage": {"input_tokens": input,
+                "cached_input_tokens": cached, "cache_write_input_tokens": write,
+                "output_tokens": output, "reasoning_output_tokens": 7,
+                "total_tokens": input + output}}})
+        };
+        let path = write_rollout(
+            dir.path(),
+            &[
+                json!({"timestamp":"2026-10-11T21:17:40Z","type":"session_meta","payload":{"id":"s2","cwd":"/tmp/game","cli_version":"0.161.0","originator":"codex-tui","model_provider":"openai","base_instructions":{"text":"You are Codex."}}}),
+                json!({"timestamp":"2026-10-11T21:17:40.100Z","type":"event_msg","payload":{"type":"task_started","turn_id":"t1"}}),
+                json!({"timestamp":"2026-10-11T21:17:40.400Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<environment_context>\n  <cwd>/tmp/game</cwd>\n</environment_context>"}]}}),
+                json!({"timestamp":"2026-10-11T21:17:40.500Z","type":"turn_context","payload":{"turn_id":"t1","model":"gpt-6.1-sol"}}),
+                item(
+                    "2026-10-11T21:17:40.555Z",
+                    1_791_753_460_555,
+                    json!({"type":"UserMessage","id":"u1","content":[{"type":"text","text":"plan the first mission"}]}),
+                ),
+                json!({"timestamp":"2026-10-11T21:17:42.954Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Looking at the code."}]}}),
+                json!({"timestamp":"2026-10-11T21:17:44.482Z","type":"response_item","payload":{"type":"custom_tool_call","call_id":"w1","name":"exec","input":"text(await tools.exec_command({cmd:\"cargo test\"}));\nawait tools.apply_patch(\"...\");"}}),
+                usage("2026-10-11T21:17:44.536Z", "r1", 15_574, 0, 0, 145),
+                json!({"timestamp":"2026-10-11T21:17:44.540Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":15574,"cached_input_tokens":0,"output_tokens":145,"reasoning_output_tokens":7,"total_tokens":15719}},"rate_limits":null}}),
+                item(
+                    "2026-10-11T21:17:45.808Z",
+                    1_791_753_465_100,
+                    json!({"type":"CommandExecution","id":"exec-1","command":["pwsh.exe","-Command","cargo test"],"parsed_cmd":[{"type":"unknown","cmd":"cargo test"}],"source":"unified_exec_startup","status":"completed","stdout":"ok","stderr":"","exit_code":0}),
+                ),
+                item(
+                    "2026-10-11T21:17:46.000Z",
+                    1_791_753_465_900,
+                    json!({"type":"FileChange","id":"exec-2","status":"completed","changes":{
+                        "/tmp/game/src/mission.rs":{"type":"update","unified_diff":"@@ -1,2 +1,3 @@\n fn a() {}\n-fn b() {}\n+fn b() { c() }\n+fn c() {}\n","move_path":null},
+                        "/tmp/game/PLAN.md":{"type":"add","content":"# Plan\n\nStep 1\n"}}}),
+                ),
+                json!({"timestamp":"2026-10-11T21:17:46.200Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"w1","output":[{"type":"input_text","text":"Script completed\nOutput:\n"},{"type":"input_text","text":"{\"exit_code\":0,\"output\":\"ok\"}"}]}}),
+                // A long-running command that finishes after its script returned.
+                item(
+                    "2026-10-11T21:18:30.000Z",
+                    1_791_753_470_000,
+                    json!({"type":"CommandExecution","id":"exec-3","command":["pwsh.exe","-Command","./run-game.ps1"],"source":"unified_exec_startup","status":"completed","stdout":"","stderr":"crash: access violation","exit_code":1}),
+                ),
+                item(
+                    "2026-10-11T21:18:31.000Z",
+                    1_791_753_511_000,
+                    json!({"type":"ContextCompaction","id":"cc1"}),
+                ),
+                json!({"timestamp":"2026-10-11T21:18:40Z","type":"response_item","payload":{"type":"custom_tool_call","call_id":"w2","name":"exec","input":"await tools.wait(1000);"}}),
+                usage("2026-10-11T21:18:41Z", "r2", 16_000, 15_000, 300, 60),
+                json!({"timestamp":"2026-10-11T21:18:42Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"w2","output":"done"}}),
+                item(
+                    "2026-10-11T21:19:00.000Z",
+                    1_791_753_540_000,
+                    json!({"type":"UserMessage","id":"u2","content":[{"type":"text","text":"now run it"}]}),
+                ),
+                item(
+                    "2026-10-11T21:19:05.000Z",
+                    1_791_753_545_000,
+                    json!({"type":"ImageView","id":"exec-4","path":"file:///tmp/game/shot.png"}),
+                ),
+            ],
+        )?;
+        let record = parse_session(&path)?.expect("record");
+
+        let users: Vec<&str> = record
+            .messages
+            .iter()
+            .filter(|m| m.role == "user")
+            .map(|m| m.text.as_str())
+            .collect();
+        assert_eq!(users, ["plan the first mission", "now run it"]);
+        assert_eq!(
+            record.messages[0].ts.as_deref(),
+            Some("2026-10-11T21:17:40.555Z")
+        );
+
+        // Per-response records only: the token_count line must not add a second event.
+        assert_eq!(record.usage.len(), 2);
+        let second = &record.usage[1];
+        assert_eq!(
+            second.input_tokens, 700,
+            "input excludes cached and written"
+        );
+        assert_eq!(second.cache_read_tokens, 15_000);
+        assert_eq!(second.cache_write_tokens, 300);
+        assert_eq!(second.output_tokens, 60);
+        assert_eq!(second.model.as_deref(), Some("gpt-6.1-sol"));
+        let total: i64 = record.usage.iter().map(UsageRecord::total_tokens).sum();
+        assert_eq!(total, 15_574 + 145 + 16_000 + 60);
+
+        let calls: Vec<(&str, &str, Option<i64>)> = record
+            .tool_calls
+            .iter()
+            .map(|c| (c.tool_name.as_str(), c.status.as_str(), c.exit_code))
+            .collect();
+        assert_eq!(
+            calls,
+            [
+                ("exec_command", "ok", Some(0)),
+                ("apply_patch", "ok", None),
+                ("exec_command", "error", Some(1)),
+                ("exec", "ok", None),
+                ("view_image", "ok", None),
+            ]
+        );
+        let first = &record.tool_calls[0];
+        assert_eq!(first.target.as_deref(), Some("cargo test"));
+        assert!(first.input_chars > 0, "script input goes to its first call");
+        assert!(
+            first.output_chars > 0,
+            "script output goes to its first call"
+        );
+        assert_eq!(first.ts.as_deref(), Some("2026-10-11T21:17:45.100Z"));
+        assert_eq!(record.tool_calls[1].input_chars, 0);
+        assert_eq!(
+            record.tool_calls[2].error_head.as_deref(),
+            Some("crash: access violation")
+        );
+        assert_eq!(record.tool_calls[3].output_chars, 4);
+
+        let mut changes: Vec<(&str, i64, i64)> = record
+            .accepted_changes
+            .iter()
+            .map(|c| (c.abs_path.as_str(), c.lines_added, c.lines_removed))
+            .collect();
+        changes.sort();
+        assert_eq!(
+            changes,
+            [
+                ("/tmp/game/PLAN.md", 3, 0),
+                ("/tmp/game/src/mission.rs", 2, 1)
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_user_message_events_are_dropped_when_items_exist() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = write_rollout(
+            dir.path(),
+            &[
+                json!({"timestamp":"2026-10-11T10:00:00Z","type":"session_meta","payload":{"id":"s3","cwd":"/tmp/x"}}),
+                json!({"timestamp":"2026-10-11T10:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"hello"}}),
+                json!({"timestamp":"2026-10-11T10:00:01Z","type":"event_msg","payload":{"type":"item_completed","item":{"type":"UserMessage","id":"u1","content":[{"type":"text","text":"hello"}]}}}),
+            ],
+        )?;
+        let record = parse_session(&path)?.expect("record");
+        assert_eq!(
+            record.messages.iter().filter(|m| m.role == "user").count(),
+            1
+        );
         Ok(())
     }
 }
