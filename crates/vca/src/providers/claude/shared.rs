@@ -1,8 +1,6 @@
 use anyhow::Result;
 use serde_json::Value;
 use std::collections::HashMap;
-use std::fs::File;
-use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 use crate::change_intel::line_hash::{diff_with_hashes, hash_line, hashes_for_text, line_count};
@@ -75,6 +73,8 @@ pub(crate) struct ParsedClaudeSession {
     pub entrypoint: Option<String>,
     pub title: Option<String>,
     pub agent_id: Option<String>,
+    /// The session this one resumed or forked; its copied history was skipped.
+    pub continued_from: Option<String>,
 }
 
 impl ParsedClaudeSession {
@@ -152,31 +152,47 @@ pub(crate) fn plan_session_files() -> Result<Vec<PathBuf>> {
 }
 
 pub(crate) fn parse_session_file(path: &Path) -> Result<ParsedClaudeSession> {
-    let file = File::open(path)?;
-    let reader = BufReader::new(file);
+    let text = std::fs::read_to_string(path)?;
     let source_file = path.to_string_lossy().to_string();
     let fallback_session_id = path
         .file_stem()
         .and_then(|stem| stem.to_str())
         .unwrap_or_default()
         .to_string();
+    // A resumed or forked session starts its file with a copy of the earlier
+    // conversation, whose lines keep the earlier `sessionId`. Those calls are
+    // already counted in that session, so they are skipped here. Only applies
+    // when the file has lines of its own (subagent transcripts carry the parent's
+    // id throughout and are named after the agent).
+    let owns_lines = !fallback_session_id.is_empty()
+        && text.contains(&format!("\"sessionId\":\"{fallback_session_id}\""));
 
     let mut session_id = fallback_session_id.clone();
+    let mut continued_from: Option<String> = None;
     let mut session_cwd: Option<String> = None;
     let mut started_at: Option<String> = None;
     let mut ended_at: Option<String> = None;
     let mut state = ParseState::default();
 
-    for line_result in reader.lines() {
-        let raw = line_result?;
+    for raw in text.lines() {
         if raw.trim().is_empty() {
             continue;
         }
 
-        let parsed: Value = match serde_json::from_str(&raw) {
+        let parsed: Value = match serde_json::from_str(raw) {
             Ok(value) => value,
             Err(_) => continue,
         };
+
+        if owns_lines
+            && let Some(other) = parsed.get("sessionId").and_then(Value::as_str)
+            && !other.trim().is_empty()
+            && other != fallback_session_id
+            && parsed.get("agentId").is_none()
+        {
+            continued_from.get_or_insert_with(|| other.to_string());
+            continue;
+        }
 
         if let Some(found_session_id) = parsed.get("sessionId").and_then(Value::as_str)
             && !found_session_id.trim().is_empty()
@@ -247,6 +263,7 @@ pub(crate) fn parse_session_file(path: &Path) -> Result<ParsedClaudeSession> {
         entrypoint: state.entrypoint,
         title: state.title,
         agent_id: state.agent_id,
+        continued_from,
     })
 }
 
@@ -1227,6 +1244,52 @@ mod tests {
         );
         assert_eq!(parsed.structured_writes.len(), 1);
         assert_eq!(parsed.structured_writes[0].abs_path, "/tmp/repo/src/lib.rs");
+        Ok(())
+    }
+
+    /// `claude --resume` writes a new file that starts with a copy of the earlier
+    /// session's lines (still carrying its `sessionId`).
+    #[test]
+    fn resumed_session_skips_copied_history() -> Result<()> {
+        let tempdir = tempdir()?;
+        let path = tempdir.path().join("new-session.jsonl");
+        let assistant = |session: &str, id: &str, ts: &str, output: i64| {
+            json!({
+                "type": "assistant", "timestamp": ts, "sessionId": session, "cwd": "/tmp/repo",
+                "uuid": format!("u-{id}"),
+                "message": {"id": id, "model": "claude-opus-5-5", "role": "assistant",
+                    "usage": {"input_tokens": 10, "output_tokens": output},
+                    "content": [{"type": "text", "text": format!("reply {id}")}]}
+            })
+            .to_string()
+        };
+        let user = |session: &str, ts: &str, text: &str| {
+            json!({"type": "user", "timestamp": ts, "sessionId": session, "cwd": "/tmp/repo",
+                "message": {"role": "user", "content": text}})
+            .to_string()
+        };
+        fs::write(
+            &path,
+            [
+                user("old-session", "2026-09-02T16:33:06Z", "first ask"),
+                assistant("old-session", "m1", "2026-09-02T16:33:10Z", 100),
+                user("new-session", "2026-09-03T08:00:00Z", "continue"),
+                assistant("new-session", "m2", "2026-09-03T08:00:05Z", 7),
+            ]
+            .join("\n"),
+        )?;
+
+        let parsed = parse_session_file(&path)?;
+        assert_eq!(parsed.session_id, "new-session");
+        assert_eq!(parsed.continued_from.as_deref(), Some("old-session"));
+        assert_eq!(
+            parsed.usage.len(),
+            1,
+            "copied call is counted in old-session"
+        );
+        assert_eq!(parsed.usage[0].output_tokens, 7);
+        assert_eq!(parsed.visible_messages.len(), 2);
+        assert_eq!(parsed.started_at.as_deref(), Some("2026-09-03T08:00:00Z"));
         Ok(())
     }
 
