@@ -1854,7 +1854,7 @@ mod tests {
         )?;
         assert_eq!(
             repo_row.0,
-            std::fs::canonicalize(&repo_root)?.to_string_lossy()
+            crate::path_utils::canonicalize(&repo_root)?.to_string_lossy()
         );
         assert_eq!(repo_row.1, "sample-repo");
 

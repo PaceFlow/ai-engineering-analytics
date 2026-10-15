@@ -3700,8 +3700,8 @@ fn strip_home_prefix(path: &str, home: &Path) -> Option<String> {
         return Some(format!("~/{}", stripped.display()));
     }
 
-    let normalized_home = std::fs::canonicalize(home).ok()?;
-    let normalized_path = std::fs::canonicalize(path_obj).ok()?;
+    let normalized_home = crate::path_utils::canonicalize(home).ok()?;
+    let normalized_path = crate::path_utils::canonicalize(path_obj).ok()?;
     let stripped = normalized_path.strip_prefix(&normalized_home).ok()?;
     if stripped.as_os_str().is_empty() {
         return Some("~".to_string());
