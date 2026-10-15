@@ -3965,10 +3965,14 @@ fn load_issue_linked_bug_signal_candidates(
 }
 
 fn load_commit_added_hashes(conn: &Connection, repo_root: &str) -> Result<CommitPathHashCounts> {
+    // CROSS JOIN fixes the join order (repo's file changes first, then their
+    // hashes by primary key). Without ANALYZE statistics SQLite otherwise scans
+    // every '+' hash in the database through the (side, line_hash) index for
+    // each repo: ~20 s per repo on a 3M-row table. Same for the loaders below.
     let mut stmt = conn.prepare(
         "SELECT f.commit_sha, f.rel_path, h.line_hash, h.count
          FROM fact_commit_file_change f
-         JOIN fact_commit_file_change_line_hashes h ON h.file_change_id = f.id
+         CROSS JOIN fact_commit_file_change_line_hashes h ON h.file_change_id = f.id
          WHERE f.repo_root = ?1
            AND h.side = '+'",
     )?;
@@ -3999,7 +4003,7 @@ fn load_commit_removed_hashes(conn: &Connection, repo_root: &str) -> Result<Comm
     let mut stmt = conn.prepare(
         "SELECT f.commit_sha, f.rel_path, h.line_hash, h.count
          FROM fact_commit_file_change f
-         JOIN fact_commit_file_change_line_hashes h ON h.file_change_id = f.id
+         CROSS JOIN fact_commit_file_change_line_hashes h ON h.file_change_id = f.id
          WHERE f.repo_root = ?1
            AND h.side = '-'",
     )?;
@@ -4032,7 +4036,7 @@ fn load_session_added_availability(conn: &Connection, repo_root: &str) -> Result
          FROM (
             SELECT co.rel_path AS rel_path, hol.line_hash AS line_hash, co.provider AS provider, MAX(hol.count) AS provider_max
             FROM fact_session_code_change co
-            JOIN fact_session_code_change_line_hashes hol ON hol.code_change_id = co.id
+            CROSS JOIN fact_session_code_change_line_hashes hol ON hol.code_change_id = co.id
             WHERE co.repo_root = ?1
               AND co.rel_path IS NOT NULL
               AND hol.side = '+'
@@ -4515,13 +4519,13 @@ mod tests {
         let mut commit_stmt = conn.prepare(
             "SELECT f.rel_path, h.line_hash, h.count
              FROM fact_commit_file_change f
-             JOIN fact_commit_file_change_line_hashes h ON h.file_change_id = f.id
+             CROSS JOIN fact_commit_file_change_line_hashes h ON h.file_change_id = f.id
              WHERE f.repo_root = ?1 AND f.commit_sha = ?2 AND h.side = '+'",
         )?;
         let mut avail_stmt = conn.prepare(
             "SELECT MAX(hol.count) AS avail
              FROM fact_session_code_change co
-             JOIN fact_session_code_change_line_hashes hol ON hol.code_change_id = co.id
+             CROSS JOIN fact_session_code_change_line_hashes hol ON hol.code_change_id = co.id
              WHERE co.repo_root = ?1
                AND co.rel_path = ?2
                AND hol.side = '+'
