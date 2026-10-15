@@ -10,7 +10,9 @@ pub fn tool_category(tool_name: &str, target: Option<&str>) -> &'static str {
         return "mcp";
     }
     match name.as_str() {
-        "read" | "read_file" | "view" | "notebookread" | "cat" | "read_file_v2" => "read",
+        "read" | "read_file" | "view" | "notebookread" | "cat" | "read_file_v2" | "view_image" => {
+            "read"
+        }
         "grep" | "glob" | "ls" | "list_dir" | "find" | "search" | "codebase_search"
         | "grep_search" | "file_search" | "list" | "toolsearch" => "search",
         "edit" | "multiedit" | "write" | "notebookedit" | "apply_patch" | "edit_file"
@@ -49,6 +51,7 @@ pub fn is_ask_tool(tool_name: &str) -> bool {
         "askuserquestion"
             | "ask_user_question"
             | "request_user_input"
+            | "request_user_input_async"
             | "ask_followup_question"
             | "askfollowupquestion"
             | "question"
@@ -332,6 +335,8 @@ mod tests {
         assert_eq!(tool_category("mcp__github__get_file", None), "mcp");
         assert_eq!(tool_category("Task", None), "agent");
         assert_eq!(tool_category("apply_patch", None), "edit");
+        assert_eq!(tool_category("view_image", None), "read");
+        assert_eq!(tool_category("request_user_input_async", None), "ask");
     }
 
     #[test]
