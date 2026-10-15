@@ -105,7 +105,7 @@ mod tests {
         assert_eq!(
             resolved.repo.as_deref(),
             Some(
-                std::fs::canonicalize(&repo_root)?
+                crate::path_utils::canonicalize(&repo_root)?
                     .to_string_lossy()
                     .as_ref()
             )

@@ -1425,8 +1425,10 @@ fn shared_repo_relative_components(repo_root: &str, left: &str, right: &str) -> 
 fn normalize_repo_candidate_path(repo_root: &str, abs_path: &str) -> String {
     let repo_root = Path::new(repo_root);
     let abs_path_buf = PathBuf::from(abs_path);
+    // Push components so the separators match paths from `read_dir` on Windows
+    // (`rel_path` always uses `/`).
     to_rel_path(Some(repo_root), &abs_path_buf)
-        .map(|rel_path| path_to_string(&repo_root.join(rel_path)))
+        .map(|rel_path| path_to_string(&repo_root.join(rel_path.split('/').collect::<PathBuf>())))
         .unwrap_or_else(|| abs_path.to_string())
 }
 

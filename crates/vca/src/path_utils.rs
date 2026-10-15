@@ -96,12 +96,31 @@ pub fn to_rel_path(repo_root: Option<&Path>, abs_path: &Path) -> Option<String> 
         return Some(normalize_rel_path(rel));
     }
 
-    let normalized_root = std::fs::canonicalize(root)
+    let normalized_root = canonicalize(root)
         .ok()
         .unwrap_or_else(|| root.to_path_buf());
-    let normalized_path = std::fs::canonicalize(abs_path).ok()?;
+    let normalized_path = canonicalize(abs_path).ok()?;
     let rel = normalized_path.strip_prefix(&normalized_root).ok()?;
     Some(normalize_rel_path(rel))
+}
+
+/// `std::fs::canonicalize` without the Windows verbatim prefix (`\\?\C:\…`,
+/// `\\?\UNC\server\…`), which git and every other tool leave out; stored repo
+/// roots would otherwise never match a path typed by the user.
+pub fn canonicalize(path: &Path) -> std::io::Result<PathBuf> {
+    std::fs::canonicalize(path).map(strip_verbatim_prefix)
+}
+
+fn strip_verbatim_prefix(path: PathBuf) -> PathBuf {
+    let text = path.to_string_lossy();
+    let stripped = if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else if let Some(rest) = text.strip_prefix(r"\\?\") {
+        rest.to_string()
+    } else {
+        return path;
+    };
+    PathBuf::from(stripped)
 }
 
 pub fn path_to_string(path: &Path) -> String {
@@ -218,7 +237,7 @@ fn detect_git_top_level(query_dir: &Path) -> Option<PathBuf> {
     }
 
     let root_path = PathBuf::from(root);
-    std::fs::canonicalize(&root_path).ok().or(Some(root_path))
+    canonicalize(&root_path).ok().or(Some(root_path))
 }
 
 #[cfg(test)]
@@ -240,6 +259,20 @@ mod tests {
     use super::*;
     use anyhow::Result;
     use tempfile::tempdir;
+
+    #[test]
+    fn strips_windows_verbatim_prefixes() {
+        let strip = |p: &str| strip_verbatim_prefix(PathBuf::from(p));
+        assert_eq!(strip(r"\\?\C:\Work\repo"), PathBuf::from(r"C:\Work\repo"));
+        assert_eq!(
+            strip(r"\\?\UNC\server\share\repo"),
+            PathBuf::from(r"\\server\share\repo")
+        );
+        assert_eq!(strip("/home/me/repo"), PathBuf::from("/home/me/repo"));
+        let dir = tempdir().unwrap();
+        let canonical = canonicalize(dir.path()).unwrap();
+        assert!(!canonical.to_string_lossy().starts_with(r"\\?\"));
+    }
 
     fn git(args: &[&str], cwd: &Path) -> Result<()> {
         let status = Command::new("git").current_dir(cwd).args(args).status()?;
@@ -270,7 +303,7 @@ mod tests {
 
         let file_path = repo_root.join("profile_app/src/app/page.tsx");
         let detected = detect_repo_root(&file_path).expect("git repo should be detected");
-        assert_eq!(detected, std::fs::canonicalize(&repo_root)?);
+        assert_eq!(detected, canonicalize(&repo_root)?);
         assert_eq!(
             to_rel_path(Some(&detected), &file_path).as_deref(),
             Some("profile_app/src/app/page.tsx")
@@ -355,7 +388,7 @@ mod tests {
         let file_path = repo_root.join("src").join("lib.rs");
         let detected = detect_repo_root(&file_path).expect("git repo should be detected");
 
-        assert_eq!(detected, std::fs::canonicalize(&repo_root)?);
+        assert_eq!(detected, canonicalize(&repo_root)?);
         assert_eq!(
             to_rel_path(Some(&detected), &file_path).as_deref(),
             Some("src/lib.rs")
