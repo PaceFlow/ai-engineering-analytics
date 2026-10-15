@@ -184,13 +184,30 @@ impl From<OverrideEntry> for PriceEntry {
 }
 
 /// Providers whose bare model names may serve as a family fallback.
-const FAMILY_PROVIDERS: [&str; 6] = [
+const FAMILY_PROVIDERS: [&str; 7] = [
     "anthropic",
     "openai",
     "gemini",
+    "vertex_ai-language-models",
     "xai",
     "deepseek",
     "mistral",
+];
+
+/// LiteLLM key prefixes of model makers' own APIs, tried for bare names that
+/// LiteLLM lists only provider-qualified (`xai/grok-4.5`, `zai/glm-5.2`).
+/// Resellers (aihubmix, azure_ai, tencent…) are never used.
+const FIRST_PARTY_HOSTS: [&str; 10] = [
+    "xai",
+    "gemini",
+    "deepseek",
+    "moonshot",
+    "zai",
+    "minimax",
+    "dashscope",
+    "xiaomi_mimo",
+    "mistral",
+    "meta",
 ];
 
 #[derive(Debug, Clone)]
@@ -291,9 +308,28 @@ impl PricingTable {
         if let Some(entry) = self.entries.get(&normalized) {
             return Some((entry, PriceMatch::Alias));
         }
+        // Router names (`z-ai/glm-5.3`, `~deepseek/deepseek-v4-flash-latest`,
+        // `deepseek/deepseek-v4-pro-0813`): drop the vendor path and moving-alias
+        // suffixes, then try the bare key and the maker's own provider key.
+        let bare = without_vendor_path(&normalized);
+        let undated = without_short_date(&bare);
+        for candidate in [Some(bare.as_str()), undated.as_deref()]
+            .into_iter()
+            .flatten()
+        {
+            if let Some(entry) = self.entries.get(candidate) {
+                return Some((entry, PriceMatch::Alias));
+            }
+            if let Some(entry) = FIRST_PARTY_HOSTS
+                .iter()
+                .find_map(|host| self.entries.get(&format!("{host}/{candidate}")))
+            {
+                return Some((entry, PriceMatch::Alias));
+            }
+        }
         self.family_keys
             .iter()
-            .find(|key| prefix_at_boundary(&normalized, key))
+            .find(|key| prefix_at_boundary(&bare, key))
             .and_then(|key| self.entries.get(key))
             .map(|entry| (entry, PriceMatch::Family))
     }
@@ -433,6 +469,22 @@ fn strip_prefixes(name: &str) -> String {
     name
 }
 
+/// The model part of a router name: after the last `/`, without `~` and `-latest`.
+fn without_vendor_path(name: &str) -> String {
+    let model = name
+        .rsplit('/')
+        .next()
+        .unwrap_or(name)
+        .trim_start_matches('~');
+    model.strip_suffix("-latest").unwrap_or(model).to_string()
+}
+
+/// `deepseek-v4-pro-0813` -> `deepseek-v4-pro` (a 4-digit release stamp).
+fn without_short_date(name: &str) -> Option<String> {
+    let (stem, stamp) = name.rsplit_once('-')?;
+    (stamp.len() == 4 && stamp.chars().all(|c| c.is_ascii_digit())).then(|| stem.to_string())
+}
+
 /// Lower-case, drop provider prefixes, date suffixes and context markers, and
 /// rewrite Cursor-style names (`claude-4.5-sonnet-thinking`) to API ids.
 pub fn normalize_model_name(model_name: &str) -> String {
@@ -512,6 +564,40 @@ mod tests {
             per_call: true,
             ..UsageForPricing::default()
         }
+    }
+
+    #[test]
+    fn resolves_router_names_through_bare_and_first_party_keys() {
+        let json = r#"{
+          "_vca_meta": {"fetched_at": "2026-10-13T08:00:00Z"},
+          "gpt-5": {"input_cost_per_token": 1e-6, "output_cost_per_token": 1e-5, "litellm_provider": "openai"},
+          "deepseek-v4-pro": {"input_cost_per_token": 5e-7, "output_cost_per_token": 2e-6, "litellm_provider": "deepseek"},
+          "gemini-2.5-pro": {"input_cost_per_token": 1.25e-6, "output_cost_per_token": 1e-5, "litellm_provider": "vertex_ai-language-models"},
+          "xai/grok-4.6": {"input_cost_per_token": 3e-6, "output_cost_per_token": 1.5e-5, "litellm_provider": "xai"},
+          "zai/glm-5.3": {"input_cost_per_token": 6e-7, "output_cost_per_token": 2.2e-6, "litellm_provider": "zai"},
+          "deepseek/deepseek-v4-flash": {"input_cost_per_token": 1e-7, "output_cost_per_token": 4e-7, "litellm_provider": "deepseek"},
+          "aihubmix/kimi-k3": {"input_cost_per_token": 1e-6, "output_cost_per_token": 4e-6, "litellm_provider": "aihubmix"}
+        }"#;
+        let table = PricingTable::from_litellm(json, "test").unwrap();
+        let found = |name: &str| table.lookup(name).map(|(e, m)| (e.id.clone(), m));
+        let alias = |id: &str| Some((id.to_string(), PriceMatch::Alias));
+        assert_eq!(found("x-ai/grok-4.6"), alias("xai/grok-4.6"));
+        assert_eq!(found("grok-4.6"), alias("xai/grok-4.6"));
+        assert_eq!(found("z-ai/glm-5.3"), alias("zai/glm-5.3"));
+        assert_eq!(
+            found("~deepseek/deepseek-v4-flash-latest"),
+            alias("deepseek/deepseek-v4-flash")
+        );
+        assert_eq!(
+            found("deepseek/deepseek-v4-pro-0813"),
+            alias("deepseek-v4-pro")
+        );
+        assert_eq!(
+            found("gemini-2.5-pro-preview-05-06"),
+            Some(("gemini-2.5-pro".into(), PriceMatch::Family))
+        );
+        assert_eq!(found("kimi-k3"), None, "resellers are not a price source");
+        assert_eq!(found("default"), None);
     }
 
     #[test]
