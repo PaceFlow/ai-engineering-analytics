@@ -3,15 +3,15 @@
 //!
 //! The snapshot is laid out as a fake home; a child `vca ingest` runs with every
 //! agent path, the data home and the price map pointed into a temporary copy.
-//! The repository comes from the git bundle, cloned to a temporary folder; the
-//! original repository path inside the copied sources is rewritten to it, so
-//! commit association and delivery numbers do not depend on the live checkout.
-//! Replays must run on the same OS family as the snapshot (paths are not
-//! translated between Windows and Unix).
+//! The repository is restored from the git bundle with its refs, HEAD and
+//! origin as they were. The copied sources are not edited (token estimates
+//! depend on their exact text); instead `VCA_REPLAY_REPOS` tells the child to
+//! run git and read repository files in the restored copy whenever a source
+//! names the original path. Replays must run on the same OS family as the
+//! snapshot (paths are not translated between Windows and Unix).
 
 use anyhow::{Context, Result, bail};
-use rusqlite::Connection;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 
 use super::{BUNDLE, EXPECTATIONS, Manifest, PRICES};
@@ -41,35 +41,15 @@ pub fn replay(dir: &Path, exe: &Path, keep: bool) -> Result<ReplayResult> {
         std::fs::copy(&cursor_state, cursor_dir.join("state.vscdb"))?;
     }
 
-    // Repository from the bundle, with the original path rewritten to it.
+    let mut repos = serde_json::Map::new();
     if let (Some(original), true) = (&manifest.repo_root, dir.join(BUNDLE).exists()) {
         let repo = work.join("repo");
-        let status = Command::new("git")
-            .args(["clone", "--quiet"])
-            .arg(dir.join(BUNDLE))
-            .arg(&repo)
-            .status()
-            .context("git is needed to restore the repository")?;
-        if !status.success() {
-            bail!("git clone of {} failed", dir.join(BUNDLE).display());
-        }
-        if let Some(head) = &manifest.repo_head {
-            let _ = Command::new("git")
-                .arg("-C")
-                .arg(&repo)
-                .args(["checkout", "--quiet", "--detach", head])
-                .status();
-        }
-        let canonical = crate::path_utils::canonicalize(&repo)?;
-        let pairs = path_variants(original, &canonical.to_string_lossy());
-        rewrite_tree(&home, &pairs)?;
-        if cursor_state.exists() {
-            rewrite_db(&cursor_dir.join("state.vscdb"), &pairs)?;
-        }
-        let opencode = home.join(".local/share/opencode/opencode.db");
-        if opencode.exists() {
-            rewrite_db(&opencode, &pairs)?;
-        }
+        restore_repo(&dir.join(BUNDLE), &repo, &manifest)?;
+        let restored = crate::path_utils::canonicalize(&repo)?;
+        repos.insert(
+            original.clone(),
+            serde_json::Value::String(restored.to_string_lossy().to_string()),
+        );
     }
 
     let vca_home = work.join("vca");
@@ -103,7 +83,11 @@ pub fn replay(dir: &Path, exe: &Path, keep: bool) -> Result<ReplayResult> {
             .env("LOCALAPPDATA", home.join("AppData").join("Local"))
             .env("XDG_CONFIG_HOME", home.join(".config"))
             .env("VCA_CURSOR_HISTORY_PATH", cursor_dir.join("History"))
-            .env("VCA_PRICING_OFFLINE", "1");
+            .env("VCA_PRICING_OFFLINE", "1")
+            .env(
+                crate::path_utils::REPLAY_REPOS_ENV,
+                serde_json::Value::Object(repos.clone()).to_string(),
+            );
         if cursor_state.exists() {
             command.env("VCA_CURSOR_STATE_PATH", cursor_dir.join("state.vscdb"));
         } else {
@@ -181,129 +165,48 @@ fn copy_dir(from: &Path, to: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Spellings of one path as it appears in transcripts, JSON and file URIs.
-pub fn path_variants(original: &str, replacement: &str) -> Vec<(String, String)> {
-    let trim = |s: &str| s.trim_end_matches(['/', '\\']).to_string();
-    let (from, to) = (trim(original), trim(replacement));
-    let forward = |s: &str| s.replace('\\', "/");
-    let json = |s: &str| s.replace('\\', "\\\\");
-    let lower_drive = |s: &str| {
-        let mut chars = s.chars();
-        match (chars.next(), chars.next()) {
-            (Some(d), Some(':')) => format!("{}:{}", d.to_ascii_lowercase(), chars.as_str()),
-            _ => s.to_string(),
+/// Recreate the repository as it was: every ref from the bundle, the same
+/// HEAD (branch or detached commit), origin's URL and default branch.
+fn restore_repo(bundle: &Path, repo: &Path, manifest: &Manifest) -> Result<()> {
+    let git = |args: &[&str]| -> Result<()> {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .output()
+            .context("git is needed to restore the repository")?;
+        if !out.status.success() {
+            bail!(
+                "git {} failed: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
         }
-    };
-    let uri = |s: &str| lower_drive(&forward(s)).replacen(':', "%3A", 1);
-    let mut pairs = vec![
-        (json(&from), json(&to)),
-        (from.clone(), to.clone()),
-        (forward(&from), forward(&to)),
-        (lower_drive(&from), lower_drive(&to)),
-        (lower_drive(&forward(&from)), lower_drive(&forward(&to))),
-        (json(&lower_drive(&from)), json(&lower_drive(&to))),
-        (uri(&from), uri(&to)),
-    ];
-    pairs.retain(|(a, _)| !a.is_empty());
-    pairs.dedup();
-    pairs
-}
-
-fn rewrite_text(text: &str, pairs: &[(String, String)]) -> String {
-    pairs.iter().fold(text.to_string(), |acc, (from, to)| {
-        acc.replace(from.as_str(), to)
-    })
-}
-
-fn rewrite_tree(dir: &Path, pairs: &[(String, String)]) -> Result<()> {
-    for entry in std::fs::read_dir(dir)?.flatten() {
-        let path: PathBuf = entry.path();
-        if path.is_dir() {
-            rewrite_tree(&path, pairs)?;
-        } else if matches!(
-            path.extension().and_then(|e| e.to_str()),
-            Some("jsonl" | "json")
-        ) {
-            let text = std::fs::read_to_string(&path)?;
-            let rewritten = rewrite_text(&text, pairs);
-            if rewritten != text {
-                std::fs::write(&path, rewritten)?;
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Rewrite the path in every text column of every table.
-fn rewrite_db(path: &Path, pairs: &[(String, String)]) -> Result<()> {
-    let conn = Connection::open(path)?;
-    let tables: Vec<String> = conn
-        .prepare(
-            "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
-        )?
-        .query_map([], |row| row.get(0))?
-        .collect::<rusqlite::Result<_>>()?;
-    for table in tables {
-        let cols: Vec<String> = conn
-            .prepare(&format!("PRAGMA table_info({table})"))?
-            .query_map([], |row| row.get::<_, String>(1))?
-            .collect::<rusqlite::Result<_>>()?;
-        for col in cols {
-            for (from, to) in pairs {
-                conn.execute(
-                    &format!(
-                        "UPDATE {table} SET {col} = replace(CAST({col} AS TEXT), ?1, ?2)
-                         WHERE typeof({col}) IN ('text', 'blob') AND instr(CAST({col} AS TEXT), ?1) > 0"
-                    ),
-                    [from, to],
-                )?;
-            }
-        }
-    }
-    Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn rewrites_windows_path_spellings() {
-        let pairs = path_variants(r"C:\Work\game", r"C:\Temp\r\repo");
-        let text = r#"{"cwd":"C:\\Work\\game","uri":"file:///c%3A/Work/game/src/a.rs","p":"C:/Work/game/x","raw":"C:\Work\game\y"}"#;
-        assert_eq!(
-            rewrite_text(text, &pairs),
-            r#"{"cwd":"C:\\Temp\\r\\repo","uri":"file:///c%3A/Temp/r/repo/src/a.rs","p":"C:/Temp/r/repo/x","raw":"C:\Temp\r\repo\y"}"#
-        );
-    }
-
-    #[test]
-    fn rewrites_unix_paths() {
-        let pairs = path_variants("/home/me/game/", "/tmp/r/repo");
-        assert_eq!(
-            rewrite_text(
-                r#"{"cwd":"/home/me/game","f":"/home/me/game/a.rs"}"#,
-                &pairs
-            ),
-            r#"{"cwd":"/tmp/r/repo","f":"/tmp/r/repo/a.rs"}"#
-        );
-    }
-
-    #[test]
-    fn rewrites_text_columns_in_sqlite() -> Result<()> {
-        let dir = tempfile::tempdir()?;
-        let path = dir.path().join("db.sqlite");
-        let conn = Connection::open(&path)?;
-        conn.execute_batch(
-            "CREATE TABLE session (id TEXT, directory TEXT, n INTEGER);
-             INSERT INTO session VALUES ('s1', '/home/me/game', 3);",
-        )?;
-        drop(conn);
-        rewrite_db(&path, &path_variants("/home/me/game", "/tmp/repo"))?;
-        let dir_now: String =
-            Connection::open(&path)?
-                .query_row("SELECT directory FROM session", [], |row| row.get(0))?;
-        assert_eq!(dir_now, "/tmp/repo");
         Ok(())
+    };
+    std::fs::create_dir_all(repo)?;
+    git(&["init", "--quiet"])?;
+    let bundle = bundle.to_string_lossy().to_string();
+    git(&[
+        "fetch",
+        "--quiet",
+        "--update-head-ok",
+        &bundle,
+        "+refs/*:refs/*",
+    ])?;
+    if let Some(url) = &manifest.repo_remote {
+        git(&["remote", "add", "origin", url])?;
     }
+    if let Some(target) = &manifest.repo_origin_head {
+        git(&["symbolic-ref", "refs/remotes/origin/HEAD", target])?;
+    }
+    match (&manifest.repo_head_ref, &manifest.repo_head) {
+        (Some(branch), _) => {
+            git(&["symbolic-ref", "HEAD", branch])?;
+            git(&["reset", "--quiet", "--hard"])?;
+        }
+        (None, Some(head)) => git(&["checkout", "--quiet", "--detach", head])?,
+        (None, None) => {}
+    }
+    Ok(())
 }

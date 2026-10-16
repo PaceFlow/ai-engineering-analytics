@@ -617,7 +617,7 @@ fn instruction_references(
 }
 
 fn extract_path_references(path: &str) -> Vec<(usize, String)> {
-    let Ok(text) = std::fs::read_to_string(path) else {
+    let Ok(text) = std::fs::read_to_string(crate::path_utils::on_disk_str(path)) else {
         return Vec::new();
     };
     let mut refs = Vec::new();

@@ -53,6 +53,14 @@ pub struct Manifest {
     /// The repository the session worked in, as recorded on the source machine.
     pub repo_root: Option<String>,
     pub repo_head: Option<String>,
+    /// HEAD's branch (`refs/heads/main`), when not detached.
+    #[serde(default)]
+    pub repo_head_ref: Option<String>,
+    #[serde(default)]
+    pub repo_remote: Option<String>,
+    /// What `refs/remotes/origin/HEAD` points to.
+    #[serde(default)]
+    pub repo_origin_head: Option<String>,
     /// Copied files, relative to the snapshot folder.
     pub files: Vec<ManifestFile>,
     #[serde(default)]

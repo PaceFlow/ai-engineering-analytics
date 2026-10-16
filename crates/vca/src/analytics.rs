@@ -1166,7 +1166,10 @@ pub fn refresh_commit_events(
     )?;
 
     for (repo_index, (repo_root, mut repo_commits)) in by_repo.into_iter().enumerate() {
-        if !Path::new(&repo_root).join(".git").exists() {
+        if !crate::path_utils::on_disk(Path::new(&repo_root))
+            .join(".git")
+            .exists()
+        {
             if verbose {
                 println!(
                     "  [{}/{}] {} skipped (not a git repo)",
@@ -3744,7 +3747,7 @@ fn resolve_mainline_ref(repo_root: &str) -> Result<Option<String>> {
 fn resolve_origin_head_ref(repo_root: &str) -> Result<Option<String>> {
     let output = Command::new("git")
         .arg("-C")
-        .arg(repo_root)
+        .arg(crate::path_utils::on_disk_str(repo_root))
         .arg("symbolic-ref")
         .arg("--quiet")
         .arg("refs/remotes/origin/HEAD")
@@ -3762,7 +3765,7 @@ fn resolve_origin_head_ref(repo_root: &str) -> Result<Option<String>> {
 fn git_ref_exists(repo_root: &str, reference: &str) -> Result<bool> {
     let status = Command::new("git")
         .arg("-C")
-        .arg(repo_root)
+        .arg(crate::path_utils::on_disk_str(repo_root))
         .arg("show-ref")
         .arg("--verify")
         .arg("--quiet")
@@ -4332,7 +4335,7 @@ fn run_git_capture(repo_root: &str, args: &[String]) -> Result<String> {
         .arg("-c")
         .arg("core.quotepath=false")
         .arg("-C")
-        .arg(repo_root)
+        .arg(crate::path_utils::on_disk_str(repo_root))
         .args(args)
         .output()?;
     if !output.status.success() {
