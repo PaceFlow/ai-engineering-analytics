@@ -23,6 +23,8 @@ vca cost
 vca tui
 ```
 
+Conversation analytics: `vca usage`, `vca quota`, `vca sessions`, `vca tasks`, `vca show`, `vca context` and `vca rework`. Optional, opt-in task splitting and labels: `vca classify`. See the [VCA guide](crates/vca/README.md#conversations-usage-quota-and-tasks).
+
 ## Automatic history discovery in 0.3.0
 
 Both commands use the same analytics database at `~/.vca/vca.db`. On the first data-using command, either executable automatically discovers and copies previous history from these locations:

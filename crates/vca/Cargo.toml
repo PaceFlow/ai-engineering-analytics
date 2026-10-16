@@ -11,7 +11,7 @@ description = "Vibe Coding Analytics: local-first analytics for agent-assisted e
 readme = "README.md"
 default-run = "vca"
 autobins = false
-include = ["/src/**", "/build.rs", "/Cargo.toml", "/Cargo.lock", "/README.md", "/USER_GUIDE.md", "/LICENSE"]
+include = ["/src/**", "/pricing/**", "/build.rs", "/Cargo.toml", "/Cargo.lock", "/README.md", "/USER_GUIDE.md", "/LICENSE"]
 
 [lib]
 name = "vca"

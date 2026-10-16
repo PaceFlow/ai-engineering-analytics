@@ -21,7 +21,7 @@ pub const VERSION: &str = concat!(
     env!("VCA_GIT_COMMIT_TIME"),
     ")"
 );
-const TOP_LEVEL_AFTER_HELP: &str = "Quick start:\n  vca ingest\n  vca session\n  vca delivery\n  vca quality\n  vca cost\n  vca tui\n\nOptional GitHub setup:\n  vca github token\n\nManual validation:\n  vca event-stream --stream session-base\n\nDiscover options:\n  vca <command> --help";
+const TOP_LEVEL_AFTER_HELP: &str = "Quick start:\n  vca ingest\n  vca tui\n  vca sessions\n  vca tasks\n  vca usage\n  vca quota\n  vca context\n  vca session\n  vca delivery\n  vca quality\n  vca cost\n\nOptional GitHub setup:\n  vca github token\n\nManual validation:\n  vca event-stream --stream session-base\n\nDiscover options:\n  vca <command> --help";
 
 #[derive(Parser)]
 #[command(
@@ -57,6 +57,445 @@ pub enum Commands {
     #[command(name = "tui")]
     /// Launch the interactive terminal dashboard
     Tui(TuiArgs),
+    /// Token usage and API-equivalent cost by tool, model, project, session or time
+    #[command(after_help = USAGE_AFTER_HELP)]
+    Usage(UsageArgs),
+    /// Subscription quota windows: observed percentages and token burn
+    #[command(after_help = QUOTA_AFTER_HELP)]
+    Quota(QuotaArgs),
+    /// Rank or group root sessions (subagents included) by cost, tokens or activity
+    #[command(after_help = SESSIONS_AFTER_HELP)]
+    Sessions(SessionsArgs),
+    /// Tasks inside sessions: time and cost to completion, by model and harness
+    #[command(after_help = TASKS_AFTER_HELP)]
+    Tasks(TasksArgs),
+    /// Show one session: tasks, agents, usage by model, context and commits
+    Show(ShowArgs),
+    /// Review one session in a local HTML page: timeline plus key numbers to approve or reject
+    #[command(after_help = REVIEW_AFTER_HELP)]
+    Review(ReviewArgs),
+    /// Reference corpus: sample real sessions, approve their numbers, snapshot and replay them
+    #[command(after_help = CORPUS_AFTER_HELP)]
+    Corpus(CorpusArgs),
+    /// What filled the context and what carrying it cost
+    #[command(after_help = CONTEXT_AFTER_HELP)]
+    Context(ContextArgs),
+    /// Later AI work that changed earlier AI lines, defect evidence and correction spend
+    #[command(after_help = REWORK_AFTER_HELP)]
+    Rework(ReworkArgs),
+    /// The team's 12 habits: how often each is followed and what that correlates with
+    #[command(after_help = HABITS_AFTER_HELP)]
+    Habits(HabitsArgs),
+    /// Work stages: cost by stage (explore, plan, implement, verify, review…), stage paths, session kinds
+    Stages(StagesArgs),
+    /// Model prices (LiteLLM's public price map): status, update, show a model
+    Pricing(PricingArgs),
+    /// Optional AI task splitting and labels via Jev on OpenRouter (opt-in, previewable)
+    #[command(after_help = CLASSIFY_AFTER_HELP)]
+    Classify(ClassifyArgs),
+}
+
+const REWORK_AFTER_HELP: &str = "Examples:\n  vca rework                          # spend split, suspected defects, relations\n  vca rework --kind defect_correction\n  vca rework --days 90 --here\n\nEvidence levels: L0 AI lines later changed · L1 later fix signal · L2 fix linked to a bug issue ·\nL3 classifier says defect correction · L4 confirmed by you. Correlation, not causation.";
+
+const HABITS_AFTER_HELP: &str = "Examples:\n  vca habits                       # adoption and outcomes for all 12 habits\n  vca habits --habit 7 --list      # tasks behind one habit, with evidence\n  vca habits --days 90 --here\n\nLabels come from local heuristics until you classify with Jev (`vca classify run`), which adds\nturn stages, request kinds and flags such as unrequested changes. Correlation, not causation.";
+
+const REVIEW_AFTER_HELP: &str = "Examples:\n  vca review 1a2b3c                         # writes review-<session>.html in the current directory\n  vca review claude:1a2b3c --out /tmp/r.html\n  vca review --check expectations.json         # exit 1 if an approved number changed\n\nThe page is a local file with the whole transcript; it is never uploaded. Mark each number ✓ or ✗,\nthen Export to get expectations JSON that `--check` (and the test suite) asserts.";
+
+const CORPUS_AFTER_HELP: &str = "Examples:\n  vca corpus review --project nothing-phone --project WarGames   # sample, review, save\n  vca corpus review --per 3 --seed 7\n  vca corpus list\n  vca corpus check                     # replay every snapshot and compare\n  vca corpus check claude-7956ac77      # one snapshot\n\nSnapshots go to ~/.vca/corpus/<provider>-<id>/: the session's source files (for Cursor and\nOpenCode only that session's rows), a git bundle of its repository, the price map and the\napproved numbers. Nothing is uploaded.";
+
+#[derive(Args, Debug, Clone)]
+pub struct CorpusArgs {
+    #[command(subcommand)]
+    pub command: CorpusCommands,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum CorpusCommands {
+    /// Open the local review app: sampled sessions, review pages, "Save as reference"
+    Review(CorpusReviewArgs),
+    /// Snapshot one session with an expectations file (what the app's "Save as reference" does)
+    Save(CorpusSaveArgs),
+    /// List saved snapshots
+    List,
+    /// Rebuild each snapshot's numbers from its files alone and compare with the approved ones
+    Check(CorpusCheckArgs),
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct CorpusReviewArgs {
+    /// Only sessions whose repository path contains this (case-insensitive); repeatable
+    #[arg(long = "project")]
+    pub projects: Vec<String>,
+    /// Tool filter (claude, codex, cursor, opencode); repeatable
+    #[arg(long = "provider")]
+    pub providers: Vec<String>,
+    /// Sessions sampled per project and tool
+    #[arg(long, default_value_t = 2)]
+    pub per: usize,
+    /// Sampling seed; the same seed gives the same picks
+    #[arg(long, default_value_t = 1)]
+    pub seed: u64,
+    /// Skip sessions with fewer turns
+    #[arg(long, default_value_t = 2)]
+    pub min_turns: i64,
+    /// Port on 127.0.0.1 (0 picks a free one)
+    #[arg(long, default_value_t = 0)]
+    pub port: u16,
+    /// Do not open a browser
+    #[arg(long)]
+    pub no_open: bool,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct CorpusSaveArgs {
+    /// Session id, id prefix, or provider:id
+    pub session: String,
+    /// Expectations JSON (from the review page's Export)
+    #[arg(long)]
+    pub expectations: std::path::PathBuf,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct CorpusCheckArgs {
+    /// Snapshot folder names or paths (default: all)
+    pub snapshots: Vec<String>,
+    /// Keep each replay's temporary folder for inspection
+    #[arg(long)]
+    pub keep: bool,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct ReviewArgs {
+    /// Session id, id prefix, or provider:id (not needed with --check)
+    #[arg(required_unless_present = "check")]
+    pub session: Option<String>,
+    /// Where to write the HTML page (default review-<provider>-<id>.html)
+    #[arg(long)]
+    pub out: Option<std::path::PathBuf>,
+    /// Compare approved numbers in an expectations file instead of writing the page
+    #[arg(long, conflicts_with_all = ["out", "json"])]
+    pub check: Option<std::path::PathBuf>,
+    /// Print the review data as JSON instead of writing the page
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct HabitsArgs {
+    #[command(flatten)]
+    pub filters: InsightFilterArgs,
+    /// One habit (number or id), e.g. 7 or 07_tests_can_fail
+    #[arg(long)]
+    pub habit: Option<String>,
+    /// List the tasks behind the habit (needs --habit)
+    #[arg(long, requires = "habit")]
+    pub list: bool,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct StagesArgs {
+    #[command(flatten)]
+    pub filters: InsightFilterArgs,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct PricingArgs {
+    #[command(subcommand)]
+    pub command: Option<PricingCommands>,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum PricingCommands {
+    /// Where prices come from and when they were fetched (default)
+    Status,
+    /// Download the latest LiteLLM price map now
+    Update,
+    /// Show how a model name resolves and its rates per million tokens
+    Show {
+        model: String,
+        /// Prompt size (input + cache tokens) of one request, to show tier rates
+        #[arg(long, default_value_t = 0)]
+        prompt_tokens: i64,
+    },
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct ReworkArgs {
+    #[command(flatten)]
+    pub filters: InsightFilterArgs,
+    /// Only relations with this rework kind (defect_correction, requirement_change, refinement, …)
+    #[arg(long)]
+    pub kind: Option<String>,
+}
+
+const CLASSIFY_AFTER_HELP: &str = "Examples:\n  vca classify plan --days 7                 # what would be sent, estimated cost\n  vca classify preview <session> --pass segment\n  vca classify key set                       # or export OPENROUTER_API_KEY\n  vca classify run --days 7 --max-usd 0.05 --yes\n  vca classify set <session> --task 0 intent bug_fix\n  vca classify set-turn <session> 5 1        # move turn 5 to task 1\n  vca classify eval\n\nNothing is sent unless you run `classify run` and confirm. Without it, each session is one task\nand labels come from local heuristics (marked h).";
+
+#[derive(Args, Debug, Clone)]
+pub struct ClassifyArgs {
+    #[command(subcommand)]
+    pub command: ClassifyCommands,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct ClassifySelectArgs {
+    #[command(flatten)]
+    pub filters: InsightFilterArgs,
+    /// Specific sessions (id, prefix or provider:id); repeatable
+    #[arg(long)]
+    pub session: Vec<String>,
+    /// Content level: evidence_only | user_text | conversation | full
+    #[arg(long)]
+    pub level: Option<String>,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum ClassifyCommands {
+    /// Count units, tokens and cost a run would send (sends nothing)
+    Plan(ClassifySelectArgs),
+    /// Print the exact request one unit would send
+    Preview {
+        /// Session id, prefix or provider:id
+        session: String,
+        /// segment | feedback | labels | completion
+        #[arg(long, default_value = "labels")]
+        pass: String,
+        /// Turn (segment, feedback) or task (labels, completion) index
+        #[arg(long)]
+        unit: Option<i64>,
+        /// Content level override
+        #[arg(long)]
+        level: Option<String>,
+    },
+    /// Send the selection to the classifier
+    Run {
+        #[command(flatten)]
+        select: ClassifySelectArgs,
+        /// Stop before spending more than this (USD)
+        #[arg(long, default_value_t = 0.50)]
+        max_usd: f64,
+        /// Comma list: segment, feedback, labels, completion, rework, all
+        #[arg(long, default_value = "all")]
+        passes: String,
+        /// Do not ask for confirmation
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Settings, key source, spend and label coverage
+    Status,
+    /// Manage the OpenRouter API key
+    Key {
+        #[command(subcommand)]
+        command: ClassifyKeyCommands,
+    },
+    /// Change classifier settings
+    Config {
+        /// Default content level
+        #[arg(long)]
+        level: Option<String>,
+        /// Monthly classifier budget (USD)
+        #[arg(long)]
+        monthly_budget: Option<f64>,
+        /// Only send these projects (glob on repo root); repeatable
+        #[arg(long)]
+        allow_project: Vec<String>,
+        /// Never send these projects (glob on repo root); repeatable
+        #[arg(long)]
+        deny_project: Vec<String>,
+        /// Clear allow and deny lists before adding
+        #[arg(long)]
+        reset_projects: bool,
+    },
+    /// Override a label (wins over classifier and heuristic labels)
+    Set {
+        session: String,
+        /// Task index (task questions)
+        #[arg(long, conflicts_with = "turn")]
+        task: Option<i64>,
+        /// Turn index (exchange questions such as feedback)
+        #[arg(long)]
+        turn: Option<i64>,
+        /// Question id, e.g. intent, outcome, feedback, p_repeated_failure
+        question: String,
+        label: String,
+        #[arg(long)]
+        note: Option<String>,
+    },
+    /// Move a user turn (and the turns after it, until the next assignment) to a task
+    SetTurn {
+        session: String,
+        turn: i64,
+        task: i64,
+    },
+    /// Set the turn where a task was completed (`none` = not completed)
+    SetCompletion {
+        session: String,
+        task: i64,
+        turn: String,
+    },
+    /// Remove all manual overrides for a session
+    ClearOverrides { session: String },
+    /// Accuracy of classifier and heuristic labels against your overrides and gold labels
+    Eval {
+        #[arg(long)]
+        question: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum ClassifyKeyCommands {
+    /// Save a key (reads stdin when omitted)
+    Set { key: Option<String> },
+    /// Delete the saved key
+    Delete,
+}
+
+const USAGE_AFTER_HELP: &str = "Examples:\n  vca usage                       # by tool, last 30 days\n  vca usage --group-by model\n  vca usage --group-by session --limit 20\n  vca usage --group-by hour --days 2\n\nEvery usage event is counted once, so groups add up to the total. Costs are API list-price estimates.";
+const QUOTA_AFTER_HELP: &str = "Examples:\n  vca quota\n  vca quota --provider codex --days 7\n  vca quota mark claude --kind limit_hit          # record that you hit a limit now\n  vca quota mark claude --at 2026-10-03T15:47:00Z --kind limit_hit\n\nCodex logs quota percentages; other tools only show token burn per window.";
+const SESSIONS_AFTER_HELP: &str = "Examples:\n  vca sessions                    # most expensive first\n  vca sessions --sort tokens\n  vca sessions --group-by cost    # cost bands; also tokens, model, tool, project, intent, outcome, week\n  vca sessions --provider claude --search parser";
+const TASKS_AFTER_HELP: &str = "Examples:\n  vca tasks                                   # most expensive tasks\n  vca tasks --sort time --completed-only\n  vca tasks --group-by model --group-by tool --intent feature\n\nWithout the optional classifier every session is one task.";
+const CONTEXT_AFTER_HELP: &str = "Examples:\n  vca context                     # by kind (instructions, tool results, baseline, ...)\n  vca context --group-by dir      # which directories cost the most to keep in context\n  vca context --group-by instruction\n  vca context --session 93cba0e8 --group-by target";
+
+#[derive(Args, Debug, Clone)]
+pub struct InsightFilterArgs {
+    /// Only include the last N days (0 = all time)
+    #[arg(long, default_value_t = 30)]
+    pub days: u32,
+    /// Start date (YYYY-MM-DD), overrides --days
+    #[arg(long)]
+    pub from: Option<String>,
+    /// End date (YYYY-MM-DD)
+    #[arg(long)]
+    pub to: Option<String>,
+    /// Tool filter (claude, codex, cursor, opencode); repeatable
+    #[arg(long)]
+    pub provider: Vec<String>,
+    /// Model substring filter
+    #[arg(long)]
+    pub model: Option<String>,
+    /// Repository root filter
+    #[arg(long)]
+    pub repo: Option<String>,
+    /// Limit to the git repository of the current directory
+    #[arg(long)]
+    pub here: bool,
+    /// Text search in titles, first requests, branches and ids
+    #[arg(long)]
+    pub search: Option<String>,
+    /// Intent label filter (e.g. feature, bug_fix, research_explain)
+    #[arg(long)]
+    pub intent: Option<String>,
+    /// Outcome label filter (e.g. completed_verified, stalled)
+    #[arg(long)]
+    pub outcome: Option<String>,
+    /// Minimum API-equivalent cost
+    #[arg(long)]
+    pub min_cost: Option<f64>,
+    /// Max rows
+    #[arg(long, default_value_t = 30)]
+    pub limit: usize,
+    /// Print JSON instead of a table
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct UsageArgs {
+    #[command(flatten)]
+    pub filters: InsightFilterArgs,
+    /// tool | model | project | session | agent | day | hour
+    #[arg(long, default_value = "tool")]
+    pub group_by: String,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct QuotaArgs {
+    #[command(subcommand)]
+    pub command: Option<QuotaCommands>,
+    #[command(flatten)]
+    pub filters: InsightFilterArgs,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum QuotaCommands {
+    /// Record a quota observation (e.g. you hit a limit)
+    Mark {
+        /// Tool the observation applies to (claude, cursor, codex, opencode)
+        provider: String,
+        /// When it happened (RFC 3339); defaults to now
+        #[arg(long)]
+        at: Option<String>,
+        /// limit_hit | reset | plan_change | note
+        #[arg(long, default_value = "limit_hit")]
+        kind: String,
+        /// Free-text note
+        #[arg(long)]
+        note: Option<String>,
+    },
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct SessionsArgs {
+    #[command(flatten)]
+    pub filters: InsightFilterArgs,
+    /// cost | tokens | fresh | cache | started | turns | failures | agents
+    #[arg(long, default_value = "cost")]
+    pub sort: String,
+    /// Group instead of listing: cost | tokens | model | tool | project | intent | outcome | branch | week | day
+    #[arg(long)]
+    pub group_by: Option<String>,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct TasksArgs {
+    #[command(flatten)]
+    pub filters: InsightFilterArgs,
+    /// cost | cost-to-complete | tokens | time | wall | started | attempts | failures
+    #[arg(long, default_value = "cost")]
+    pub sort: String,
+    /// Group by one or more dimensions (model, tool, intent, project, cost, tokens, week)
+    #[arg(long)]
+    pub group_by: Vec<String>,
+    /// Only tasks with an observed completion
+    #[arg(long)]
+    pub completed_only: bool,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct ShowArgs {
+    /// Session id, id prefix, or provider:id
+    pub session: String,
+    #[arg(long)]
+    pub tasks: bool,
+    #[arg(long)]
+    pub agents: bool,
+    #[arg(long)]
+    pub usage: bool,
+    #[arg(long)]
+    pub context: bool,
+    #[arg(long)]
+    pub delivery: bool,
+    /// Turn-by-turn timeline
+    #[arg(long)]
+    pub turns: bool,
+    /// Rows per section
+    #[arg(long, default_value_t = 15)]
+    pub limit: usize,
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct ContextArgs {
+    #[command(flatten)]
+    pub filters: InsightFilterArgs,
+    /// kind | tool | dir | mcp | instruction | purpose | target
+    #[arg(long, default_value = "kind")]
+    pub group_by: String,
+    /// Restrict to one session (id, prefix or provider:id)
+    #[arg(long)]
+    pub session: Option<String>,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -71,13 +510,22 @@ pub struct IngestArgs {
     /// (GitHub token) are not touched.
     #[arg(long)]
     pub fresh: bool,
+    /// Do not download LiteLLM model prices; use the cached or bundled copy
+    #[arg(long)]
+    pub offline_pricing: bool,
 }
 
 #[derive(Args, Debug, Clone)]
 pub struct TuiArgs {
-    /// Show results across all tracked projects instead of defaulting to the current repo
+    /// Show results across all tracked projects (default for the explorer; the classic dashboard scopes to the current repo)
     #[arg(long)]
     pub all_projects: bool,
+    /// Limit the explorer to the git repository of the current directory
+    #[arg(long)]
+    pub here: bool,
+    /// Open the previous 4-tab metrics dashboard instead of the explorer
+    #[arg(long)]
+    pub classic: bool,
     /// Max number of grouped rows to display
     #[arg(long, default_value_t = 50)]
     pub limit: usize,

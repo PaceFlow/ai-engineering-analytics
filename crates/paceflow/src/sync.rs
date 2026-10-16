@@ -1287,6 +1287,40 @@ mod tests {
     }
 
     #[test]
+    fn collect_sync_events_runs_on_v2_schema_with_session_store_data() -> Result<()> {
+        use vca::db::session_store::{SessionRecord, UsageRecord, store_session_record};
+        let conn = open_sync_test_db()?;
+        let mut record = SessionRecord::new("claude", "sync-v2");
+        record.started_at = Some("2026-10-01T10:00:00Z".into());
+        record.ended_at = Some("2026-10-01T11:00:00Z".into());
+        let mut usage = UsageRecord::new("msg-1");
+        usage.ts = Some("2026-10-01T10:05:00Z".into());
+        usage.model = Some("claude-sonnet-4-5".into());
+        usage.input_tokens = 1_000;
+        usage.output_tokens = 200;
+        record.usage = vec![usage];
+        store_session_record(&conn, &record)?;
+        vca::db::session_store::refresh_session_roots(&conn)?;
+        vca::analytics::refresh_session_events(&conn)?;
+        vca::insights::refresh(&conn)?;
+        // Sync only sends events with a repository; give the session one.
+        conn.execute(
+            "UPDATE event_session_cost SET repo_root = '/tmp/repo', repo_key = 'git:example/repo'",
+            [],
+        )?;
+
+        let events = collect_sync_events(&conn, &SyncScope { repo_root: None })?;
+        let cost = events
+            .iter()
+            .map(|event| event.to_remote_event())
+            .find(|event| event.event_type == "event_session_cost")
+            .expect("session cost event synced");
+        assert_eq!(cost.payload["session_id"], "sync-v2", "{:?}", cost.payload);
+        assert_eq!(cost.payload["total_tokens"], 1_200, "{:?}", cost.payload);
+        Ok(())
+    }
+
+    #[test]
     fn collect_sync_events_builds_expected_keys_for_all_event_tables() -> Result<()> {
         let conn = open_sync_test_db()?;
         let repo_root = "/tmp/repo";

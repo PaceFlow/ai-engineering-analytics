@@ -20,6 +20,21 @@ Analytics materializes normalized `event_*` tables and creates reporting views. 
 
 Schema initialization creates tables, upgrades missing columns, and then creates dependent indexes. Migrated databases are integrity-checked and their reporting views validated before replacing the canonical destination.
 
+## Session store and insights
+
+Providers build one normalized `SessionRecord` per session (`db/session_store.rs`): messages, per-call usage, tool calls with exit codes, events (compaction, clear, API errors), context injections and rate-limit snapshots. Records are stored by natural keys inside a transaction, and a per-source fingerprint (`session_source_state`) re-parses a session whenever its file changes. Sessions whose source disappears keep their facts. Schema version 2 adds these tables and columns additively; one-time data fixes are recorded in `schema_migrations`.
+
+`insights/` rebuilds deterministic derived tables after each ingest:
+
+- `structure.rs`: turns, tasks and attempts. It allocates every usage event to one turn and task, times tasks, and detects loops. Task boundaries come from `task_turn_assignment` and completion from `task_completion_mark` (overrides first, then classifier answers). Without either, each session is one task completed by commit or validation evidence.
+- `context.rs`: the context ledger (API calls, context items, write/carry cost, cache rebuilds, instruction references).
+- `quota.rs`: observed and estimated quota windows, with each observed rise allocated to the usage that preceded it.
+- `relations.rs`: task relations where later AI work removed earlier AI lines, and same-branch follow-ups.
+
+`explore/` holds the typed queries (usage, sessions, tasks, groups, quota, context, delivery ladder, rework, practices, compare). The CLI commands and the TUI use them, the TUI through a background loader thread.
+
+`classify/` holds heuristic labels and the optional Jev classifier. The classifier consists of question definitions, state builders with redaction and size limits, a `DecisionClient` trait (OpenRouter implementation plus a scripted test client), and run orchestration with caching, budgets and overrides. Results live in `classification_result` and overrides in `classification_override`, and `view_label_effective` picks override > classifier > heuristic.
+
 ## Backend integration and releases
 
 Paceflow stores authentication, schedule files, and logs separately under `.paceflow`. Its sync commands read shared event streams and record upload cursors in the shared database. Its hooks and schedules continue invoking `paceflow`.

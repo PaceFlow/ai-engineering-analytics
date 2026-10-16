@@ -56,7 +56,7 @@ struct LifecycleSummarySnapshot {
 impl TestEnv {
     fn new_live_fixture() -> anyhow::Result<Self> {
         let tempdir = TempDir::new()?;
-        let home = tempdir.path().to_path_buf();
+        let home = padded_home(tempdir.path())?;
         let work_dir = home.join("work");
         let paceflow_repo = work_dir.join("fixture-paceflow");
         let cursor_dir = work_dir.join("fixture-cursor");
@@ -69,18 +69,18 @@ impl TestEnv {
             &home,
             &["__REPO_PACEFLOW__", "__REPO_CURSOR__", "__HOME__"],
             &[
-                &paceflow_repo.to_string_lossy(),
-                &cursor_dir.to_string_lossy(),
-                &home.to_string_lossy(),
+                &fixture_path(&paceflow_repo.to_string_lossy()),
+                &fixture_path(&cursor_dir.to_string_lossy()),
+                &fixture_path(&home.to_string_lossy()),
             ],
         )?;
         copy_claude_sessions(
             &home,
             &["__REPO_PACEFLOW__", "__REPO_CURSOR__", "__HOME__"],
             &[
-                &paceflow_repo.to_string_lossy(),
-                &cursor_dir.to_string_lossy(),
-                &home.to_string_lossy(),
+                &fixture_path(&paceflow_repo.to_string_lossy()),
+                &fixture_path(&cursor_dir.to_string_lossy()),
+                &fixture_path(&home.to_string_lossy()),
             ],
         )?;
         install_cursor_fixture(&home, &paceflow_repo, &cursor_dir)?;
@@ -116,18 +116,7 @@ impl TestEnv {
     }
 
     fn run_paceflow(&self, args: &[&str]) -> anyhow::Result<String> {
-        let output = Command::cargo_bin("vca")?
-            .args(args)
-            .current_dir(&self.home)
-            .env("VCA_HOME", &self.home)
-            .env_remove("PACEFLOW_GITHUB_TOKEN")
-            .env("HOME", &self.home)
-            .env("USERPROFILE", &self.home)
-            .env_remove("HOMEDRIVE")
-            .env_remove("HOMEPATH")
-            .env_remove("XDG_CONFIG_HOME")
-            .env_remove("VCA_GITHUB_TOKEN")
-            .output()?;
+        let output = self.run_paceflow_output(args)?;
 
         if !output.status.success() {
             anyhow::bail!(
@@ -139,6 +128,23 @@ impl TestEnv {
         }
 
         Ok(String::from_utf8(output.stdout)?)
+    }
+
+    fn run_paceflow_output(&self, args: &[&str]) -> anyhow::Result<std::process::Output> {
+        Ok(Command::cargo_bin("vca")?
+            .args(args)
+            .current_dir(&self.home)
+            .env("VCA_HOME", &self.home)
+            .env("VCA_PRICING_OFFLINE", "1")
+            .env_remove("PACEFLOW_GITHUB_TOKEN")
+            .env("HOME", &self.home)
+            .env("USERPROFILE", &self.home)
+            .env_remove("HOMEDRIVE")
+            .env_remove("HOMEPATH")
+            .env_remove("XDG_CONFIG_HOME")
+            .env_remove("CODEX_HOME")
+            .env_remove("VCA_GITHUB_TOKEN")
+            .output()?)
     }
 
     fn ingest(&self) -> anyhow::Result<()> {
@@ -810,6 +816,32 @@ fn event_stream_matches_snapshots() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Fixture home path with the same length on every OS (temp roots differ:
+/// `/tmp/.tmpX`, `/var/folders/…/T/.tmpX`, `C:\\Users\\…\\Temp\\.tmpX`), so
+/// text-length based estimates such as context token sizes do not depend on
+/// where the test runs.
+const FIXTURE_HOME_LEN: usize = 110;
+
+fn padded_home(root: &Path) -> anyhow::Result<PathBuf> {
+    let root_len = root.to_string_lossy().chars().count();
+    anyhow::ensure!(
+        root_len + 2 <= FIXTURE_HOME_LEN,
+        "temp dir {} is too long for the fixture home",
+        root.display()
+    );
+    let home = root.join("h".repeat(FIXTURE_HOME_LEN - root_len - 1));
+    fs::create_dir_all(&home)?;
+    Ok(home)
+}
+
+/// A path as written into fixture JSON. Forward slashes on every OS (Windows
+/// accepts them), so serialized tool inputs are the same length everywhere
+/// and token estimates do not depend on backslash escaping.
+fn fixture_path(text: &str) -> String {
+    let quoted = serde_json::to_string(&text.replace('\\', "/")).expect("string serializes");
+    quoted[1..quoted.len() - 1].to_string()
+}
+
 fn path_variants(path: &Path) -> Vec<String> {
     let mut variants = Vec::new();
     push_path_variant(&mut variants, &path.to_string_lossy());
@@ -824,6 +856,8 @@ fn push_path_variant(variants: &mut Vec<String>, path: &str) {
         path.to_string(),
         path.replace('\\', "/"),
         path.replace('/', "\\"),
+        // As it appears inside JSON text on Windows.
+        path.replace('\\', "\\\\"),
     ] {
         if !candidate.is_empty() && !variants.contains(&candidate) {
             variants.push(candidate);
@@ -1253,9 +1287,9 @@ fn rewrite_cursor_db(
              '__HOME__', ?3
          )",
         (
-            paceflow_repo.to_string_lossy().to_string(),
-            cursor_dir.to_string_lossy().to_string(),
-            home.to_string_lossy().to_string(),
+            fixture_path(&paceflow_repo.to_string_lossy()),
+            fixture_path(&cursor_dir.to_string_lossy()),
+            fixture_path(&home.to_string_lossy()),
         ),
     )?;
     Ok(())
@@ -1366,4 +1400,218 @@ fn first_token(value: &str) -> anyhow::Result<&str> {
         .split_whitespace()
         .next()
         .ok_or_else(|| anyhow::anyhow!("missing token in value {}", value))
+}
+
+#[test]
+fn insight_commands_match_snapshots() -> anyhow::Result<()> {
+    let env = TestEnv::new_live_fixture()?;
+    env.ingest()?;
+
+    let cases: [(&str, &[&str]); 11] = [
+        ("insights_usage_by_tool", &["usage", "--days", "0"]),
+        (
+            "insights_usage_by_model",
+            &["usage", "--days", "0", "--group-by", "model"],
+        ),
+        ("insights_sessions", &["sessions", "--days", "0"]),
+        (
+            "insights_sessions_by_cost_band",
+            &["sessions", "--days", "0", "--group-by", "cost"],
+        ),
+        ("insights_tasks", &["tasks", "--days", "0"]),
+        ("insights_quota", &["quota", "--days", "0"]),
+        ("insights_context_by_kind", &["context", "--days", "0"]),
+        ("insights_rework", &["rework", "--days", "0"]),
+        (
+            "insights_classify_plan",
+            &["classify", "plan", "--days", "0"],
+        ),
+        ("insights_habits", &["habits", "--days", "0"]),
+        ("insights_stages", &["stages", "--days", "0"]),
+    ];
+    for (name, args) in cases {
+        let output = env.normalize_output(env.run_paceflow(args)?);
+        insta::assert_snapshot!(name, output);
+    }
+    Ok(())
+}
+
+#[test]
+fn review_numbers_match_snapshot_and_check_round_trips() -> anyhow::Result<()> {
+    let env = TestEnv::new_live_fixture()?;
+    env.ingest()?;
+    let session = "codex:019cd678-8f72-7b43-a07f-d49cdbbb81c9";
+    let data: serde_json::Value =
+        serde_json::from_str(&env.run_paceflow(&["review", session, "--json"])?)?;
+    let stats: std::collections::BTreeMap<String, serde_json::Value> = data["stats"]
+        .as_array()
+        .expect("stats array")
+        .iter()
+        .map(|stat| {
+            (
+                stat["id"].as_str().unwrap_or("").to_string(),
+                stat["value"].clone(),
+            )
+        })
+        .collect();
+    insta::assert_yaml_snapshot!("review_codex_session_numbers", stats);
+
+    // Every number is backed by timeline entries that exist.
+    let entries = data["timeline"].as_array().expect("timeline").len() as u64;
+    for stat in data["stats"].as_array().expect("stats") {
+        for id in stat["entries"].as_array().expect("entries") {
+            assert!(id.as_u64().expect("entry id") < entries, "{stat}");
+        }
+    }
+
+    let write = |approved: &std::collections::BTreeMap<String, serde_json::Value>| {
+        let path = env.home.join("expectations.json");
+        let body = serde_json::json!({ "session": session, "approved": approved });
+        fs::write(&path, serde_json::to_string_pretty(&body)?)?;
+        anyhow::Ok(path)
+    };
+    let path = write(&stats)?;
+    let ok = env.run_paceflow(&["review", "--check", path.to_str().expect("utf-8")])?;
+    assert!(ok.contains("all"), "{ok}");
+
+    let mut changed = stats.clone();
+    changed.insert("cost.total_usd".into(), serde_json::json!(1.0));
+    changed.insert("no.such.number".into(), serde_json::json!(3));
+    let path = write(&changed)?;
+    let output = env.run_paceflow_output(&["review", "--check", path.to_str().expect("utf-8")])?;
+    assert!(!output.status.success());
+    let stdout = String::from_utf8(output.stdout)?;
+    assert!(
+        stdout.contains("✗ cost.total_usd: approved 1.0"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("✗ no.such.number: approved 3 · now (no longer produced)"),
+        "{stdout}"
+    );
+    Ok(())
+}
+
+/// Save a session into the reference corpus, then rebuild its numbers from the
+/// snapshot alone (original transcript deleted) and compare.
+#[test]
+fn corpus_snapshot_replays_without_the_original_sources() -> anyhow::Result<()> {
+    let env = TestEnv::new_live_fixture()?;
+    env.ingest()?;
+    let session = "codex:019cd678-8f72-7b43-a07f-d49cdbbb81c9";
+    let data: serde_json::Value =
+        serde_json::from_str(&env.run_paceflow(&["review", session, "--json"])?)?;
+    let approved: serde_json::Map<String, serde_json::Value> = data["stats"]
+        .as_array()
+        .expect("stats array")
+        .iter()
+        .map(|stat| {
+            (
+                stat["id"].as_str().unwrap_or("").to_string(),
+                stat["value"].clone(),
+            )
+        })
+        .collect();
+    let expectations = env.home.join("expectations.json");
+    fs::write(
+        &expectations,
+        serde_json::to_string_pretty(
+            &serde_json::json!({ "session": session, "approved": approved }),
+        )?,
+    )?;
+    let saved = env.run_paceflow(&[
+        "corpus",
+        "save",
+        session,
+        "--expectations",
+        expectations.to_str().expect("utf-8"),
+    ])?;
+    assert!(saved.contains("Saved codex:019cd678"), "{saved}");
+    let snapshot = env
+        .home
+        .join(".vca/corpus/codex-019cd678-8f72-7b43-a07f-d49cdbbb81c9");
+    let manifest: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(snapshot.join("manifest.json"))?)?;
+    let copied: Vec<&str> = manifest["files"]
+        .as_array()
+        .expect("files")
+        .iter()
+        .filter_map(|f| f["path"].as_str())
+        .collect();
+    assert!(
+        copied
+            .iter()
+            .any(|p| p.starts_with("home/.codex/sessions/") && p.ends_with(".jsonl")),
+        "{copied:?}"
+    );
+
+    // The replay must not read the original rollout.
+    for source in manifest["files"].as_array().expect("files") {
+        let original = PathBuf::from(source["source"].as_str().unwrap_or(""));
+        if original.extension().is_some_and(|e| e == "jsonl") {
+            fs::remove_file(&original)?;
+        }
+    }
+    let ok = env.run_paceflow(&["corpus", "check"])?;
+    assert!(ok.contains("✓ codex:019cd678"), "{ok}");
+    assert!(ok.contains("all 1 snapshots match"), "{ok}");
+
+    // A changed approved number is reported.
+    let mut tampered: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(snapshot.join("expectations.json"))?)?;
+    tampered["approved"]["cost.total_usd"] = serde_json::json!(1.0);
+    fs::write(snapshot.join("expectations.json"), tampered.to_string())?;
+    let output = env.run_paceflow_output(&["corpus", "check"])?;
+    assert!(!output.status.success());
+    let stdout = String::from_utf8(output.stdout)?;
+    assert!(
+        stdout.contains("✗ cost.total_usd: approved 1.0"),
+        "{stdout}"
+    );
+    Ok(())
+}
+
+#[test]
+fn usage_groups_are_additive() -> anyhow::Result<()> {
+    let env = TestEnv::new_live_fixture()?;
+    env.ingest()?;
+    let total = |group: &str| -> anyhow::Result<(f64, i64)> {
+        let json = env.run_paceflow(&[
+            "usage",
+            "--days",
+            "0",
+            "--json",
+            "--limit",
+            "1000",
+            "--group-by",
+            group,
+        ])?;
+        let rows: Vec<serde_json::Value> = serde_json::from_str(&json)?;
+        Ok((
+            rows.iter().filter_map(|row| row["cost"].as_f64()).sum(),
+            rows.iter().filter_map(|row| row["tokens"].as_i64()).sum(),
+        ))
+    };
+    let (tool_cost, tool_tokens) = total("tool")?;
+    for group in ["model", "session", "day", "agent"] {
+        let (cost, tokens) = total(group)?;
+        assert_eq!(tokens, tool_tokens, "token totals differ for {group}");
+        assert!(
+            (cost - tool_cost).abs() < 1e-6,
+            "cost totals differ for {group}"
+        );
+    }
+    assert!(tool_tokens > 0);
+    Ok(())
+}
+
+#[test]
+fn second_ingest_keeps_insight_tables_stable() -> anyhow::Result<()> {
+    let env = TestEnv::new_live_fixture()?;
+    env.ingest()?;
+    let before = env.run_paceflow(&["tasks", "--days", "0", "--json"])?;
+    env.ingest()?;
+    let after = env.run_paceflow(&["tasks", "--days", "0", "--json"])?;
+    assert_eq!(before, after);
+    Ok(())
 }
