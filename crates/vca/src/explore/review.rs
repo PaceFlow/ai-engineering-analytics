@@ -566,7 +566,7 @@ fn stats(conn: &Connection, detail: &SessionDetail, timeline: &[Entry]) -> Resul
     st.add(
         "tokens.fresh",
         "Cost & tokens",
-        "Fresh tokens (uncached input + output)",
+        "Fresh tokens (uncached input + cache write + output)",
         json!(sum("fresh")),
         all_calls.clone(),
     );
