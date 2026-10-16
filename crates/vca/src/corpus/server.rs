@@ -253,20 +253,32 @@ impl State {
                     ));
                 }
                 let conn = crate::db::open()?;
-                let saved =
-                    super::snapshot::save(&conn, &self.root, provider, session, &expectations)?;
+                println!("saving {provider}:{session} and replaying its project…");
+                let exe = std::env::current_exe()?;
+                let saved = super::save_reviewed(
+                    &conn,
+                    &self.root,
+                    &exe,
+                    provider,
+                    session,
+                    &expectations,
+                )?;
                 println!(
                     "saved {provider}:{session} → {} ({} files, {} approved)",
                     saved.dir.display(),
                     saved.files,
-                    expectations.approved.len()
+                    saved.approved
                 );
+                for warning in &saved.warnings {
+                    println!("  note: {warning}");
+                }
                 Ok(Response::json(
                     200,
                     &json!({
                         "dir": saved.dir,
                         "files": saved.files,
                         "bytes": saved.bytes,
+                        "approved": saved.approved,
                         "warnings": saved.warnings,
                     }),
                 ))

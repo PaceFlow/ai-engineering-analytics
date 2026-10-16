@@ -272,7 +272,8 @@ button.primary { background: var(--accent); border-color: var(--accent); color: 
         const was = r.state && !sameValue(r.value, s.value) ? JSON.stringify(r.value) : (s.id in previous ? JSON.stringify(previous[s.id]) : null);
         out.push('<div class="stat ' + st + (r.note ? ' has-note' : '') + (selected === s.id ? ' active' : '') + '" data-id="' + esc(s.id) + '">' +
           '<div class="row"><span class="label" title="' + esc(s.id) + '">' + esc(s.label) +
-          (s.entries.length ? ' <small>(' + s.entries.length + ')</small>' : '') + '</span>' +
+          (s.entries.length ? ' <small>(' + s.entries.length + ')</small>' : '') +
+          (s.cross_session ? ' <span class="badge" title="Depends on the project\'s other sessions too. Saving takes its value from a replay of all saved sessions of this project.">project</span>' : '') + '</span>' +
           '<span class="val">' + esc(s.display) + '</span>' +
           '<span class="vote"><button class="ok' + (r.state === 'ok' ? ' on' : '') + '" title="Looks right">✓</button>' +
           '<button class="no' + (r.state === 'no' ? ' on' : '') + '" title="Wrong">✗</button></span></div>' +
@@ -350,10 +351,15 @@ button.primary { background: var(--accent); border-color: var(--accent); color: 
       const open = DATA.stats.length - n - bad;
       if (!n && !confirm('No numbers are approved yet. Save the snapshot anyway?')) return;
       if (open && !confirm(open + ' numbers are not reviewed and will not be checked. Save?')) return;
-      btn.disabled = true; state.textContent = 'saving…';
+      btn.disabled = true; state.textContent = 'saving and replaying the project (a minute or two)…';
       fetch(CORPUS.save, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(x) })
         .then((r) => r.json().then((j) => ({ ok: r.ok, j })))
-        .then(({ ok, j }) => { state.textContent = ok ? 'saved → ' + j.dir + (j.warnings && j.warnings.length ? ' (' + j.warnings.join('; ') + ')' : '') : 'failed: ' + j.error; })
+        .then(({ ok, j }) => {
+          if (!ok) { state.textContent = 'failed: ' + j.error; return; }
+          state.textContent = 'saved ' + j.approved + ' numbers → ' + j.dir + (j.warnings && j.warnings.length ? ' · ' + j.warnings.length + ' notes' : '');
+          state.title = (j.warnings || []).join('\n');
+          if (j.warnings && j.warnings.length) alert('Saved, with notes:\n\n' + j.warnings.join('\n'));
+        })
         .catch((e) => { state.textContent = 'failed: ' + e; })
         .finally(() => { btn.disabled = false; });
     };

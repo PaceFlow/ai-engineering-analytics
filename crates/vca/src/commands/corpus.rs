@@ -36,13 +36,15 @@ fn save(args: CorpusSaveArgs) -> Result<()> {
         );
     }
     let root = corpus::corpus_dir()?;
-    let saved = corpus::snapshot::save(&conn, &root, &provider, &session, &expectations)?;
+    println!("Saving {provider}:{session} and replaying its project…");
+    let exe = std::env::current_exe()?;
+    let saved = corpus::save_reviewed(&conn, &root, &exe, &provider, &session, &expectations)?;
     println!(
         "Saved {provider}:{session} → {} ({} files, {} KB, {} approved numbers)",
         saved.dir.display(),
         saved.files,
         saved.bytes / 1024,
-        expectations.approved.len()
+        saved.approved
     );
     for warning in &saved.warnings {
         println!("  note: {warning}");
@@ -78,52 +80,76 @@ fn list() -> Result<()> {
 
 fn check(args: CorpusCheckArgs) -> Result<()> {
     let root = corpus::corpus_dir()?;
-    let dirs: Vec<PathBuf> = if args.snapshots.is_empty() {
-        corpus::list(&root)?.into_iter().map(|s| s.dir).collect()
-    } else {
-        args.snapshots
-            .iter()
-            .map(|name| {
-                let path = PathBuf::from(name);
-                if path.is_dir() { path } else { root.join(name) }
-            })
-            .collect()
-    };
-    if dirs.is_empty() {
+    let all = corpus::list(&root)?;
+    if all.is_empty() {
         bail!("no snapshots in {}", root.display());
     }
+    // Named snapshots still replay with their whole project; only they are reported.
+    let wanted = |dir: &std::path::Path| {
+        args.snapshots.is_empty()
+            || args.snapshots.iter().any(|name| {
+                let path = PathBuf::from(name);
+                dir.file_name() == path.file_name() || dir == path
+            })
+    };
+    let groups: Vec<_> = replay::groups(all)
+        .into_iter()
+        .filter(|g| g.snapshots.iter().any(|s| wanted(&s.dir)))
+        .collect();
+    if groups.is_empty() {
+        bail!("no snapshot matches {:?}", args.snapshots);
+    }
     let exe = std::env::current_exe()?;
-    let mut failed = 0usize;
-    for dir in &dirs {
-        match replay::replay(dir, &exe, args.keep) {
-            Ok(result) => {
-                println!(
-                    "{} {} ({} approved numbers)",
-                    if result.passed { "✓" } else { "✗" },
-                    result.key,
-                    result.approved
-                );
-                if !result.passed {
-                    failed += 1;
-                }
-                if !result.passed || args.keep {
-                    for line in &result.report {
-                        println!("    {line}");
+    let prices = Some(root.join(corpus::PRICES)).filter(|p| p.exists());
+    let (mut checked, mut failed) = (0usize, 0usize);
+    for group in &groups {
+        let label = group.repo_root.as_deref().map(crate::explore::short_repo);
+        match replay::check_group(group, &exe, prices.as_deref(), args.keep) {
+            Ok(results) => {
+                for result in results.iter().filter(|r| {
+                    group
+                        .snapshots
+                        .iter()
+                        .any(|s| s.manifest.key == r.key && wanted(&s.dir))
+                }) {
+                    checked += 1;
+                    println!(
+                        "{} {} ({} approved numbers{})",
+                        if result.passed { "✓" } else { "✗" },
+                        result.key,
+                        result.approved,
+                        label
+                            .as_deref()
+                            .map(|l| format!(
+                                ", replayed with {} {l} sessions",
+                                group.snapshots.len()
+                            ))
+                            .unwrap_or_default()
+                    );
+                    if !result.passed {
+                        failed += 1;
+                    }
+                    if !result.passed || args.keep {
+                        for line in &result.report {
+                            println!("    {line}");
+                        }
                     }
                 }
             }
             Err(error) => {
-                failed += 1;
-                println!("✗ {}: {error:#}", dir.display());
+                let n = group.snapshots.iter().filter(|s| wanted(&s.dir)).count();
+                checked += n;
+                failed += n;
+                println!(
+                    "✗ {}: {error:#}",
+                    label.unwrap_or_else(|| group.snapshots[0].manifest.key.clone())
+                );
             }
         }
     }
     if failed > 0 {
-        bail!(
-            "{failed} of {} snapshots differ from their approved numbers",
-            dirs.len()
-        );
+        bail!("{failed} of {checked} snapshots differ from their approved numbers");
     }
-    println!("all {} snapshots match", dirs.len());
+    println!("all {checked} snapshots match");
     Ok(())
 }
