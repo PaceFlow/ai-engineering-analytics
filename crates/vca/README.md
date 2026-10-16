@@ -202,7 +202,7 @@ vca corpus check                                               # replay all snap
 - `litellm_prices.json`, the price map in use, so costs replay to the cent;
 - `expectations.json` (approved and rejected numbers) and `manifest.json` (files with md5s, source paths, repository HEAD, vca version).
 
-`vca corpus check` replays each snapshot from those files alone: it lays them out as a temporary home, clones the bundle, rewrites the original repository path inside the copied sources, runs `vca ingest --offline-pricing` there and then `vca review --check`. Replays must run on the same OS family as the snapshot. Cursor's `History` folder (local file versions) is not copied. Snapshots contain full transcripts; they never leave the machine unless you pack and move them yourself.
+`vca corpus check` replays each snapshot from those files alone: it lays them out as a temporary home, restores the repository from the bundle (refs, HEAD, origin as they were), runs `vca ingest --offline-pricing` there and then `vca review --check`. The copied sources are not edited, since token estimates depend on their exact text; `VCA_REPLAY_REPOS` points git and repository file access for the original path at the restored copy. Replays must run on the same OS family as the snapshot. Numbers that depend on other sessions (rework relations, the corrections habit, commits shared with other sessions) only replay if those sessions are in the corpus too. Cursor's `History` folder (local file versions) is not copied. Snapshots contain full transcripts; they never leave the machine unless you pack and move them yourself.
 
 ## Provider Assumptions
 
