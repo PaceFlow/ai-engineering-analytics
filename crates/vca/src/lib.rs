@@ -3,6 +3,7 @@ pub mod change_intel;
 pub mod classify;
 pub mod cli;
 pub mod commands;
+pub mod corpus;
 pub mod cost;
 pub mod cursor_paths;
 pub mod db;

@@ -79,6 +79,14 @@ h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: v
 .stat.rejected .note, .stat.has-note .note { display: block; }
 .stat .was { font-size: 12px; color: var(--warn); margin-top: 2px; }
 .stat.active { background: var(--accent-soft); border-radius: 6px; padding-left: 6px; padding-right: 6px; }
+.files { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+.files td, .files th { border-top: 1px solid var(--line); padding: 3px 4px; text-align: right; font-variant-numeric: tabular-nums; }
+.files th { color: var(--muted); font-weight: 500; font-size: 11.5px; }
+.files td.path { text-align: left; font: 12px var(--mono); overflow-wrap: anywhere; cursor: pointer; }
+.files td.path:hover { color: var(--accent); }
+.files .add { color: var(--ok); } .files .del { color: var(--bad); }
+button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+.saved { color: var(--ok); font-size: 12.5px; }
 .empty { color: var(--muted); padding: 30px 0; text-align: center; }
 .hint { color: var(--muted); font-size: 12px; margin: 6px 0 0; }
 </style>
@@ -95,17 +103,25 @@ h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: v
     <span class="progress" id="progress"></span>
     <label class="btn" title="Load an earlier expectations file">Import<input type="file" id="import" accept=".json" hidden></label>
     <button id="export" title="Download approved and rejected numbers">Export expectations</button>
+    <button id="saveref" class="primary" hidden title="Snapshot this session's source files with the approved numbers into the reference corpus">Save as reference</button>
+    <span id="savestate" class="saved"></span>
+    <a id="back" class="btn" hidden href="/">← sessions</a>
   </div>
 </header>
 <main>
   <section id="timeline"></section>
   <aside>
     <p class="hint">Click a number's label to highlight the timeline entries behind it. Mark each ✓ or ✗; a ✗ asks for a note on what is wrong.</p>
+    <details id="filesbox"><summary><h2 style="display:inline">Files changed</h2> <small id="filecount"></small></summary>
+      <p class="hint">Session: lines from the tool's own edit records (what “lines changed” counts). Delivery: lines extracted for commit matching. Click a path to find its tool calls.</p>
+      <table class="files" id="files"></table>
+    </details>
     <div class="chips" id="statfilter"></div>
     <div id="stats"></div>
   </aside>
 </main>
 <script id="data" type="application/json">/*__REVIEW_DATA__*/null</script>
+<script id="corpus" type="application/json">/*__CORPUS__*/null</script>
 <script>
 (function () {
   const DATA = JSON.parse(document.getElementById('data').textContent);
@@ -298,14 +314,53 @@ h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: v
     r.note = ev.target.value; review[id] = r; save(); renderStats();
   });
 
-  document.getElementById('export').onclick = () => {
+  // ── Files changed ──
+  const files = DATA.files || [];
+  document.getElementById('filecount').textContent = files.length ? '(' + files.length + ')' : '(none recorded)';
+  document.getElementById('files').innerHTML = files.length ? '<tr><th style="text-align:left">path</th><th>edits</th><th>session +/−</th><th>delivery +/−</th></tr>' +
+    files.map((f, i) => '<tr><td class="path" data-i="' + i + '" title="' + esc(f.path) + '">' + esc(f.rel_path || f.path) + '</td><td>' + num(f.edits) +
+      '</td><td><span class="add">+' + num(f.session_added) + '</span> <span class="del">−' + num(f.session_removed) +
+      '</span></td><td><span class="add">+' + num(f.delivery_added) + '</span> <span class="del">−' + num(f.delivery_removed) + '</span></td></tr>').join('') : '';
+  document.getElementById('files').addEventListener('click', (ev) => {
+    const cell = ev.target.closest('td.path'); if (!cell) return;
+    const f = files[Number(cell.dataset.i)];
+    const name = (f.rel_path || f.path).replace(/\\/g, '/').split('/').pop().toLowerCase();
+    const q = document.getElementById('q'); q.value = name; query = name; renderTimeline();
+  });
+
+  function expectations() {
     const approved = {}, rejected = {};
     for (const s of DATA.stats) {
       const r = review[s.id]; if (!r || !sameValue(r.value, s.value)) continue;
       if (r.state === 'ok') approved[s.id] = s.value;
       if (r.state === 'no') rejected[s.id] = { value: s.value, note: r.note || '' };
     }
-    const body = JSON.stringify({ session: DATA.key, pricing: DATA.pricing, approved, rejected }, null, 2) + '\n';
+    return { session: DATA.key, pricing: DATA.pricing, approved, rejected };
+  }
+
+  // Served by `vca corpus review`: save straight into the reference corpus.
+  const CORPUS = JSON.parse(document.getElementById('corpus').textContent);
+  if (CORPUS) {
+    const btn = document.getElementById('saveref'), state = document.getElementById('savestate');
+    btn.hidden = false; document.getElementById('back').hidden = false;
+    if (CORPUS.saved_at) state.textContent = 'saved ' + CORPUS.saved_at.slice(0, 16).replace('T', ' ');
+    btn.onclick = () => {
+      const x = expectations();
+      const n = Object.keys(x.approved).length, bad = Object.keys(x.rejected).length;
+      const open = DATA.stats.length - n - bad;
+      if (!n && !confirm('No numbers are approved yet. Save the snapshot anyway?')) return;
+      if (open && !confirm(open + ' numbers are not reviewed and will not be checked. Save?')) return;
+      btn.disabled = true; state.textContent = 'saving…';
+      fetch(CORPUS.save, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(x) })
+        .then((r) => r.json().then((j) => ({ ok: r.ok, j })))
+        .then(({ ok, j }) => { state.textContent = ok ? 'saved → ' + j.dir + (j.warnings && j.warnings.length ? ' (' + j.warnings.join('; ') + ')' : '') : 'failed: ' + j.error; })
+        .catch((e) => { state.textContent = 'failed: ' + e; })
+        .finally(() => { btn.disabled = false; });
+    };
+  }
+
+  document.getElementById('export').onclick = () => {
+    const body = JSON.stringify(expectations(), null, 2) + '\n';
     const a = document.createElement('a');
     a.href = URL.createObjectURL(new Blob([body], { type: 'application/json' }));
     a.download = 'expectations-' + DATA.key.replace(/[^a-z0-9]+/gi, '-').slice(0, 60) + '.json';

@@ -48,6 +48,25 @@ pub struct ReviewData {
     pub turns: Vec<TurnMark>,
     pub timeline: Vec<Entry>,
     pub stats: Vec<Stat>,
+    /// Files the session (subagents included) changed, one row per path.
+    pub files: Vec<FileTouch>,
+}
+
+/// Lines one session changed in one file. `session` counts come from the
+/// provider's edit records (what `lines_changed` uses); `delivery` counts from
+/// the change extraction that commit attribution matches against.
+#[derive(Debug, Clone, Serialize, PartialEq, Default)]
+pub struct FileTouch {
+    pub path: String,
+    pub rel_path: Option<String>,
+    pub repo_root: Option<String>,
+    pub edits: i64,
+    pub session_added: i64,
+    pub session_removed: i64,
+    pub delivery_added: i64,
+    pub delivery_removed: i64,
+    pub first_ts: Option<String>,
+    pub last_ts: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -94,6 +113,7 @@ pub fn review(conn: &Connection, provider: &str, session_id: &str) -> Result<Opt
     let agents = agent_ids(conn, provider, session_id)?;
     let timeline = timeline(conn, provider, session_id, &agents, &turns)?;
     let stats = stats(conn, &detail, &timeline)?;
+    let files = file_touches(conn, provider, &agents)?;
     Ok(Some(ReviewData {
         key: format!("{provider}:{session_id}"),
         pricing: crate::cost::pricing::pricing_version(),
@@ -101,7 +121,71 @@ pub fn review(conn: &Connection, provider: &str, session_id: &str) -> Result<Opt
         turns,
         timeline,
         stats,
+        files,
     }))
+}
+
+fn file_touches(conn: &Connection, provider: &str, sessions: &[String]) -> Result<Vec<FileTouch>> {
+    let mut stmt = conn.prepare(
+        "SELECT COALESCE(abs_path, rel_path, '(unknown)'), rel_path, repo_root, source_kind,
+                lines_added, lines_removed, change_ts
+         FROM fact_session_code_change
+         WHERE provider = ?1 AND session_id = ?2",
+    )?;
+    let mut by_path: BTreeMap<String, FileTouch> = BTreeMap::new();
+    for session in sessions {
+        let rows = stmt.query_map(rusqlite::params![provider, session], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, Option<String>>(6)?,
+            ))
+        })?;
+        for row in rows {
+            let (path, rel_path, repo_root, kind, added, removed, ts) = row?;
+            let touch = by_path.entry(path.clone()).or_insert_with(|| FileTouch {
+                path,
+                ..FileTouch::default()
+            });
+            touch.rel_path = touch.rel_path.take().or(rel_path);
+            touch.repo_root = touch.repo_root.take().or(repo_root);
+            if kind == "accepted_change" {
+                touch.edits += 1;
+                touch.session_added += added;
+                touch.session_removed += removed;
+            } else {
+                touch.delivery_added += added;
+                touch.delivery_removed += removed;
+            }
+            if let Some(ts) = ts {
+                if touch
+                    .first_ts
+                    .as_deref()
+                    .is_none_or(|first| ts.as_str() < first)
+                {
+                    touch.first_ts = Some(ts.clone());
+                }
+                if touch
+                    .last_ts
+                    .as_deref()
+                    .is_none_or(|last| ts.as_str() > last)
+                {
+                    touch.last_ts = Some(ts);
+                }
+            }
+        }
+    }
+    let mut files: Vec<FileTouch> = by_path.into_values().collect();
+    files.sort_by(|a, b| {
+        (b.session_added + b.session_removed + b.delivery_added + b.delivery_removed)
+            .cmp(&(a.session_added + a.session_removed + a.delivery_added + a.delivery_removed))
+            .then_with(|| a.path.cmp(&b.path))
+    });
+    Ok(files)
 }
 
 /// Compares approved values with what vca derives now.
@@ -963,6 +1047,15 @@ const TEMPLATE: &str = include_str!("review.html");
 /// The self-contained review page. `<` is escaped so the JSON cannot end the script tag.
 pub fn render_html(data: &ReviewData) -> Result<String> {
     Ok(embed(&serde_json::to_string(data)?))
+}
+
+/// The page served by the corpus review app: `corpus` carries the save URL
+/// (and when the session was last saved), which turns on "Save as reference".
+pub fn render_html_for_corpus(data: &ReviewData, corpus: &Value) -> Result<String> {
+    Ok(embed(&serde_json::to_string(data)?).replace(
+        "/*__CORPUS__*/null",
+        &serde_json::to_string(corpus)?.replace('<', "\\u003c"),
+    ))
 }
 
 fn embed(json: &str) -> String {
