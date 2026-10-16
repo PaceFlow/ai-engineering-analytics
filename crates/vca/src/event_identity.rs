@@ -6,7 +6,7 @@ use std::sync::{Mutex, OnceLock};
 fn run_git_capture(repo_root: Option<&str>, args: &[&str]) -> Option<String> {
     let mut cmd = Command::new("git");
     if let Some(repo_root) = repo_root {
-        cmd.arg("-C").arg(repo_root);
+        cmd.arg("-C").arg(crate::path_utils::on_disk_str(repo_root));
     }
     let output = cmd.args(args).output().ok()?;
     if !output.status.success() {

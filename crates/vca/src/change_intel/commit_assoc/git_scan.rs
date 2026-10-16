@@ -22,7 +22,7 @@ struct WorkingFileDiff {
 pub fn validate_git_repo(repo_root: &str) -> Result<Option<String>> {
     let output = Command::new("git")
         .arg("-C")
-        .arg(repo_root)
+        .arg(crate::path_utils::on_disk_str(repo_root))
         .arg("rev-parse")
         .arg("--show-toplevel")
         .output()?;
@@ -36,6 +36,10 @@ pub fn validate_git_repo(repo_root: &str) -> Result<Option<String>> {
         return Ok(None);
     }
 
+    let mapped = crate::path_utils::from_disk(std::path::Path::new(&top));
+    if mapped.as_os_str() != std::ffi::OsStr::new(&top) {
+        return Ok(Some(mapped.to_string_lossy().to_string()));
+    }
     Ok(Some(top))
 }
 
@@ -120,7 +124,7 @@ pub fn list_first_parent_commits(repo_root: &str, ref_name: &str) -> Result<Vec<
 pub fn merge_base(repo_root: &str, left: &str, right: &str) -> Result<Option<String>> {
     let output = Command::new("git")
         .arg("-C")
-        .arg(repo_root)
+        .arg(crate::path_utils::on_disk_str(repo_root))
         .arg("merge-base")
         .arg(left)
         .arg(right)
@@ -258,7 +262,7 @@ fn run_git_capture(repo_root: &str, args: &[String]) -> Result<String> {
         .arg("-c")
         .arg("core.quotepath=false")
         .arg("-C")
-        .arg(repo_root)
+        .arg(crate::path_utils::on_disk_str(repo_root))
         .args(args)
         .output()?;
 

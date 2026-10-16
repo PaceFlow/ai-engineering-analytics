@@ -79,16 +79,17 @@ pub fn save(
             },
         )
         .unwrap_or((None, None));
-    let repo_head = match repo_root.as_deref() {
+    let repo = match repo_root.as_deref() {
         Some(repo) => bundle_repo(Path::new(repo), &staging, &mut warnings),
         None => {
             warnings.push("no git repository: delivery numbers cannot be replayed".into());
             None
         }
     };
-    if repo_head.is_some() {
+    if repo.is_some() {
         record(&staging, BUNDLE, "git bundle", &mut files)?;
     }
+    let repo = repo.unwrap_or_default();
 
     match crate::cost::litellm::cache_path() {
         Ok(prices) if prices.exists() => {
@@ -113,7 +114,10 @@ pub fn save(
         vca_version: crate::cli::VERSION.to_string(),
         pricing: crate::cost::pricing::pricing_version(),
         repo_root,
-        repo_head,
+        repo_head: repo.head,
+        repo_head_ref: repo.head_ref,
+        repo_remote: repo.remote,
+        repo_origin_head: repo.origin_head,
         files: files.clone(),
         warnings: warnings.clone(),
     };
@@ -284,6 +288,9 @@ fn create_like(source: &Connection, dest: &Path, tables: &[&str]) -> Result<Conn
         std::fs::create_dir_all(parent)?;
     }
     let out = Connection::open(dest)?;
+    // Rows are copied table by table; the source schema's foreign keys
+    // (OpenCode: session -> project, part -> message) would reject that order.
+    out.execute_batch("PRAGMA foreign_keys = OFF;")?;
     for table in tables {
         let sql: Option<String> = source
             .query_row(
@@ -433,8 +440,17 @@ fn copy_cursor(
     Ok(())
 }
 
-/// `git bundle` of the whole repository; returns HEAD.
-fn bundle_repo(repo: &Path, staging: &Path, warnings: &mut Vec<String>) -> Option<String> {
+#[derive(Debug, Default)]
+struct RepoInfo {
+    head: Option<String>,
+    head_ref: Option<String>,
+    remote: Option<String>,
+    origin_head: Option<String>,
+}
+
+/// `git bundle` of the whole repository, plus what the replay needs to put
+/// HEAD and origin back as they were.
+fn bundle_repo(repo: &Path, staging: &Path, warnings: &mut Vec<String>) -> Option<RepoInfo> {
     if !repo.join(".git").exists() {
         warnings.push(format!(
             "{} is not a git checkout; no bundle",
@@ -442,10 +458,24 @@ fn bundle_repo(repo: &Path, staging: &Path, warnings: &mut Vec<String>) -> Optio
         ));
         return None;
     }
-    let git = |args: &[&str]| Command::new("git").arg("-C").arg(repo).args(args).output();
-    let head = git(&["rev-parse", "HEAD"])
-        .ok()
-        .filter(|o| o.status.success())?;
+    let read = |args: &[&str]| {
+        Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .filter(|s| !s.is_empty())
+    };
+    let info = RepoInfo {
+        head: read(&["rev-parse", "HEAD"]),
+        head_ref: read(&["symbolic-ref", "--quiet", "HEAD"]),
+        remote: read(&["remote", "get-url", "origin"]),
+        origin_head: read(&["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"]),
+    };
+    info.head.as_ref()?;
     let bundle = staging.join(BUNDLE);
     match Command::new("git")
         .arg("-C")
@@ -455,9 +485,7 @@ fn bundle_repo(repo: &Path, staging: &Path, warnings: &mut Vec<String>) -> Optio
         .args(["--all"])
         .output()
     {
-        Ok(out) if out.status.success() => {
-            Some(String::from_utf8_lossy(&head.stdout).trim().to_string())
-        }
+        Ok(out) if out.status.success() => Some(info),
         Ok(out) => {
             warnings.push(format!(
                 "git bundle failed: {}",

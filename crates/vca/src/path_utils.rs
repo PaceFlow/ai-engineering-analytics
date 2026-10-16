@@ -96,10 +96,10 @@ pub fn to_rel_path(repo_root: Option<&Path>, abs_path: &Path) -> Option<String> 
         return Some(normalize_rel_path(rel));
     }
 
-    let normalized_root = canonicalize(root)
+    let normalized_root = canonicalize(&on_disk(root))
         .ok()
         .unwrap_or_else(|| root.to_path_buf());
-    let normalized_path = canonicalize(abs_path).ok()?;
+    let normalized_path = canonicalize(&on_disk(abs_path)).ok()?;
     let rel = normalized_path.strip_prefix(&normalized_root).ok()?;
     Some(normalize_rel_path(rel))
 }
@@ -191,12 +191,85 @@ fn normalize_rel_path(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
 }
 
+/// Set only by `vca corpus check`: a JSON object mapping a repository's
+/// original root to where its copy was restored. Session sources keep the
+/// original paths byte for byte (token estimates depend on their length);
+/// only disk and git access is redirected.
+pub const REPLAY_REPOS_ENV: &str = "VCA_REPLAY_REPOS";
+
+fn replay_repos() -> &'static [(String, String)] {
+    static MAP: OnceLock<Vec<(String, String)>> = OnceLock::new();
+    MAP.get_or_init(|| {
+        std::env::var(REPLAY_REPOS_ENV)
+            .ok()
+            .and_then(|text| serde_json::from_str::<HashMap<String, String>>(&text).ok())
+            .map(|map| map.into_iter().collect())
+            .unwrap_or_default()
+    })
+}
+
+/// `path` with `from` replaced by `to` when it starts with `from` at a path
+/// boundary, comparing `/` and `\` alike (and case-insensitively on Windows).
+fn swap_prefix(path: &str, from: &str, to: &str) -> Option<String> {
+    let norm = |s: &str| {
+        let s = s.replace('\\', "/");
+        if cfg!(windows) {
+            s.to_ascii_lowercase()
+        } else {
+            s
+        }
+    };
+    let from = from.trim_end_matches(['/', '\\']);
+    let (path_n, from_n) = (norm(path), norm(from));
+    let rest = path_n.strip_prefix(&from_n)?;
+    if !(rest.is_empty() || rest.starts_with('/')) {
+        return None;
+    }
+    // Normalizing replaces ASCII characters one for one, so byte offsets hold.
+    Some(format!(
+        "{}{}",
+        to.trim_end_matches(['/', '\\']),
+        &path[from.len()..]
+    ))
+}
+
+fn map_with(pairs: &[(String, String)], path: &str, to_disk: bool) -> Option<String> {
+    pairs.iter().find_map(|(original, copy)| {
+        if to_disk {
+            swap_prefix(path, original, copy)
+        } else {
+            swap_prefix(path, copy, original)
+        }
+    })
+}
+
+/// Where a recorded path is on this machine (the restored copy during a replay).
+pub fn on_disk(path: &Path) -> PathBuf {
+    match map_with(replay_repos(), &path.to_string_lossy(), true) {
+        Some(mapped) => PathBuf::from(mapped),
+        None => path.to_path_buf(),
+    }
+}
+
+pub fn on_disk_str(path: &str) -> String {
+    map_with(replay_repos(), path, true).unwrap_or_else(|| path.to_string())
+}
+
+/// The recorded path for a path found on disk (inverse of `on_disk`).
+pub fn from_disk(path: &Path) -> PathBuf {
+    match map_with(replay_repos(), &path.to_string_lossy(), false) {
+        Some(mapped) => PathBuf::from(mapped),
+        None => path.to_path_buf(),
+    }
+}
+
 fn path_query_dir(abs_path: &Path) -> PathBuf {
-    if abs_path.is_dir() {
+    let disk = on_disk(abs_path);
+    if disk.is_dir() {
         return abs_path.to_path_buf();
     }
 
-    if abs_path.is_file() || abs_path.extension().is_some() {
+    if disk.is_file() || abs_path.extension().is_some() {
         return abs_path.parent().unwrap_or(abs_path).to_path_buf();
     }
 
@@ -218,7 +291,7 @@ fn nearest_existing_dir(path: &Path) -> Option<PathBuf> {
 }
 
 fn detect_git_top_level(query_dir: &Path) -> Option<PathBuf> {
-    let existing_dir = nearest_existing_dir(query_dir)?;
+    let existing_dir = nearest_existing_dir(&on_disk(query_dir))?;
     let output = Command::new("git")
         .arg("-C")
         .arg(&existing_dir)
@@ -237,7 +310,7 @@ fn detect_git_top_level(query_dir: &Path) -> Option<PathBuf> {
     }
 
     let root_path = PathBuf::from(root);
-    canonicalize(&root_path).ok().or(Some(root_path))
+    Some(from_disk(&canonicalize(&root_path).unwrap_or(root_path)))
 }
 
 #[cfg(test)]
@@ -259,6 +332,29 @@ mod tests {
     use super::*;
     use anyhow::Result;
     use tempfile::tempdir;
+
+    #[test]
+    fn replay_map_swaps_repo_prefixes_both_ways() {
+        let pairs = vec![("/home/me/game".to_string(), "/tmp/r/repo".to_string())];
+        assert_eq!(
+            map_with(&pairs, "/home/me/game/src/a.rs", true).as_deref(),
+            Some("/tmp/r/repo/src/a.rs")
+        );
+        assert_eq!(
+            map_with(&pairs, "/home/me/game", true).as_deref(),
+            Some("/tmp/r/repo")
+        );
+        assert_eq!(map_with(&pairs, "/home/me/gamer/x", true), None, "boundary");
+        assert_eq!(
+            map_with(&pairs, "/tmp/r/repo/src", false).as_deref(),
+            Some("/home/me/game/src")
+        );
+        let win = vec![(r"C:\Work\game".to_string(), r"D:\t\repo".to_string())];
+        assert_eq!(
+            map_with(&win, "C:/Work/game/a.rs", true).as_deref(),
+            Some(r"D:\t\repo/a.rs")
+        );
+    }
 
     #[test]
     fn strips_windows_verbatim_prefixes() {

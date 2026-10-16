@@ -1149,7 +1149,10 @@ fn load_repo_content_index<'a>(
 
 fn build_repo_content_index(repo_root: &str) -> std::result::Result<RepoContentIndex, String> {
     let mut index = RepoContentIndex::default();
-    index_repo_content_dir(Path::new(repo_root), &mut index)?;
+    index_repo_content_dir(
+        &crate::path_utils::on_disk(Path::new(repo_root)),
+        &mut index,
+    )?;
     Ok(index)
 }
 
@@ -1208,7 +1211,7 @@ fn index_repo_content_dir(
             continue;
         }
 
-        let abs_path = path_to_string(&path);
+        let abs_path = path_to_string(&crate::path_utils::from_disk(&path));
         for (line_hash, count) in file_hashes {
             index
                 .line_hash_hits
