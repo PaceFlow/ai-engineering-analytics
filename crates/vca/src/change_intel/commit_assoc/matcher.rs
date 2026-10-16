@@ -13,6 +13,9 @@ const FALLBACK_MIN_MATCHED_LINES: i64 = 10;
 const FALLBACK_WINNER_MARGIN: f64 = 0.20;
 const HUMAN_PROVIDER: &str = "human";
 const HUMAN_SESSION_ID: &str = "__human__";
+/// A commit can only contain work from sessions that had started by then;
+/// this allows for clock differences between the agent and git.
+const SESSION_START_SLACK_MS: i64 = 60 * 60 * 1000;
 
 type SessionAvailabilityKey = (String, LineSide, String);
 type AliasCandidateKey = (LineSide, String);
@@ -50,6 +53,8 @@ struct SessionAvailability {
     provider: String,
     session_id: String,
     avail: i64,
+    /// Session start (epoch ms), when known.
+    started_ms: Option<i64>,
 }
 
 #[derive(Debug, Default)]
@@ -104,6 +109,7 @@ pub fn compute_commit_attribution(
         .sum();
     let commit_total = total_added + total_removed;
     let files = build_commit_files(commit);
+    let commit_ms = parse_ms(&commit.commit_time);
 
     let mut matched_added = 0i64;
     let mut matched_removed = 0i64;
@@ -111,7 +117,8 @@ pub fn compute_commit_attribution(
     let mut session_matched: HashMap<(String, String), f64> = HashMap::new();
 
     for file in files {
-        let strict_match = evaluate_file_match_for_path(preload, &file.rel_path, &file.rows);
+        let strict_match =
+            evaluate_file_match_for_path(preload, &file.rel_path, &file.rows, commit_ms);
         let strict_ratio = if file.total_lines > 0 {
             strict_match.matched_total() as f64 / file.total_lines as f64
         } else {
@@ -122,7 +129,8 @@ pub fn compute_commit_attribution(
             if let Some(alias_path) =
                 choose_fallback_alias_path(preload, &file.rel_path, &file.rows, file.total_lines)
             {
-                let alias_match = evaluate_file_match_for_path(preload, &alias_path, &file.rows);
+                let alias_match =
+                    evaluate_file_match_for_path(preload, &alias_path, &file.rows, commit_ms);
                 if alias_match.matched_total() > strict_match.matched_total() {
                     alias_match
                 } else {
@@ -227,15 +235,30 @@ fn build_commit_files(commit: &GitCommitDiff) -> Vec<FileCommitRows> {
     files
 }
 
+fn parse_ms(ts: &str) -> Option<i64> {
+    chrono::DateTime::parse_from_rfc3339(ts.trim())
+        .ok()
+        .map(|dt| dt.timestamp_millis())
+}
+
 fn evaluate_file_match_for_path(
     preload: &RepoMatchPreload,
     target_path: &str,
     rows: &[CommitHashRow],
+    commit_ms: Option<i64>,
 ) -> PathMatch {
     let mut out = PathMatch::default();
+    let started_in_time = |a: &&SessionAvailability| match (a.started_ms, commit_ms) {
+        (Some(started), Some(commit)) => started <= commit + SESSION_START_SLACK_MS,
+        _ => true,
+    };
 
     for row in rows {
-        let avail = preload.session_availability_for(target_path, row.side, &row.line_hash);
+        let avail: Vec<&SessionAvailability> = preload
+            .session_availability_for(target_path, row.side, &row.line_hash)
+            .iter()
+            .filter(started_in_time)
+            .collect();
         if avail.is_empty() {
             continue;
         }
@@ -348,9 +371,11 @@ fn load_session_availability_map(
     repo_root: &str,
 ) -> Result<HashMap<SessionAvailabilityKey, Vec<SessionAvailability>>> {
     let mut stmt = conn.prepare(
-        "SELECT co.rel_path, hol.side, hol.line_hash, co.provider, co.session_id, MAX(hol.count) AS avail
+        "SELECT co.rel_path, hol.side, hol.line_hash, co.provider, co.session_id, MAX(hol.count) AS avail,
+                MIN(ms.started_at)
          FROM fact_session_code_change co
-         JOIN fact_session_code_change_line_hashes hol ON hol.code_change_id = co.id
+         CROSS JOIN fact_session_code_change_line_hashes hol ON hol.code_change_id = co.id
+         LEFT JOIN metadata_sessions ms ON ms.provider = co.provider AND ms.session_id = co.session_id
          WHERE co.repo_root = ?1
            AND co.rel_path IS NOT NULL
          GROUP BY co.rel_path, hol.side, hol.line_hash, co.provider, co.session_id",
@@ -365,6 +390,10 @@ fn load_session_availability_map(
                 provider: row.get::<_, String>(3)?,
                 session_id: row.get::<_, String>(4)?,
                 avail: row.get::<_, i64>(5)?,
+                started_ms: row
+                    .get::<_, Option<String>>(6)?
+                    .as_deref()
+                    .and_then(parse_ms),
             },
         ))
     })?;
@@ -472,6 +501,31 @@ mod tests {
     }
 
     #[test]
+    fn sessions_that_started_after_the_commit_get_no_credit() -> Result<()> {
+        let commit = sample_commit();
+        let commit_ms = parse_ms(&commit.commit_time).expect("sample commit time");
+        let mut preload = RepoMatchPreload::default();
+        let session = |id: &str, started_ms: i64| SessionAvailability {
+            provider: "claude".to_string(),
+            session_id: id.to_string(),
+            avail: 4,
+            started_ms: Some(started_ms),
+        };
+        preload.session_availability.insert(
+            ("src/lib.rs".to_string(), LineSide::Added, "h1".to_string()),
+            vec![
+                session("before", commit_ms - 3_600_000),
+                session("within_slack", commit_ms + 30 * 60_000),
+                session("days_later", commit_ms + 8 * 86_400_000),
+            ],
+        );
+        let (_, rows) = compute_commit_attribution(&commit, &preload)?;
+        let ids: Vec<&str> = rows.iter().map(|r| r.session_id.as_str()).collect();
+        assert_eq!(ids, ["before", "within_slack"]);
+        Ok(())
+    }
+
+    #[test]
     fn partially_matched_commit_does_not_get_human_remainder() -> Result<()> {
         let commit = sample_commit();
         let mut preload = RepoMatchPreload::default();
@@ -481,6 +535,7 @@ mod tests {
                 provider: "codex".to_string(),
                 session_id: "s1".to_string(),
                 avail: 4,
+                started_ms: None,
             }],
         );
 
@@ -543,6 +598,7 @@ mod tests {
                 provider: "codex".to_string(),
                 session_id: "s1".to_string(),
                 avail: 50,
+                started_ms: None,
             }],
         );
 
