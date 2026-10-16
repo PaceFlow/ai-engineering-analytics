@@ -74,6 +74,9 @@ pub enum Commands {
     /// Review one session in a local HTML page: timeline plus key numbers to approve or reject
     #[command(after_help = REVIEW_AFTER_HELP)]
     Review(ReviewArgs),
+    /// Reference corpus: sample real sessions, approve their numbers, snapshot and replay them
+    #[command(after_help = CORPUS_AFTER_HELP)]
+    Corpus(CorpusArgs),
     /// What filled the context and what carrying it cost
     #[command(after_help = CONTEXT_AFTER_HELP)]
     Context(ContextArgs),
@@ -97,6 +100,69 @@ const REWORK_AFTER_HELP: &str = "Examples:\n  vca rework                        
 const HABITS_AFTER_HELP: &str = "Examples:\n  vca habits                       # adoption and outcomes for all 12 habits\n  vca habits --habit 7 --list      # tasks behind one habit, with evidence\n  vca habits --days 90 --here\n\nLabels come from local heuristics until you classify with Jev (`vca classify run`), which adds\nturn stages, request kinds and flags such as unrequested changes. Correlation, not causation.";
 
 const REVIEW_AFTER_HELP: &str = "Examples:\n  vca review 1a2b3c                         # writes review-<session>.html in the current directory\n  vca review claude:1a2b3c --out /tmp/r.html\n  vca review --check expectations.json         # exit 1 if an approved number changed\n\nThe page is a local file with the whole transcript; it is never uploaded. Mark each number ✓ or ✗,\nthen Export to get expectations JSON that `--check` (and the test suite) asserts.";
+
+const CORPUS_AFTER_HELP: &str = "Examples:\n  vca corpus review --project nothing-phone --project WarGames   # sample, review, save\n  vca corpus review --per 3 --seed 7\n  vca corpus list\n  vca corpus check                     # replay every snapshot and compare\n  vca corpus check claude-7956ac77      # one snapshot\n\nSnapshots go to ~/.vca/corpus/<provider>-<id>/: the session's source files (for Cursor and\nOpenCode only that session's rows), a git bundle of its repository, the price map and the\napproved numbers. Nothing is uploaded.";
+
+#[derive(Args, Debug, Clone)]
+pub struct CorpusArgs {
+    #[command(subcommand)]
+    pub command: CorpusCommands,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum CorpusCommands {
+    /// Open the local review app: sampled sessions, review pages, "Save as reference"
+    Review(CorpusReviewArgs),
+    /// Snapshot one session with an expectations file (what the app's "Save as reference" does)
+    Save(CorpusSaveArgs),
+    /// List saved snapshots
+    List,
+    /// Rebuild each snapshot's numbers from its files alone and compare with the approved ones
+    Check(CorpusCheckArgs),
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct CorpusReviewArgs {
+    /// Only sessions whose repository path contains this (case-insensitive); repeatable
+    #[arg(long = "project")]
+    pub projects: Vec<String>,
+    /// Tool filter (claude, codex, cursor, opencode); repeatable
+    #[arg(long = "provider")]
+    pub providers: Vec<String>,
+    /// Sessions sampled per project and tool
+    #[arg(long, default_value_t = 2)]
+    pub per: usize,
+    /// Sampling seed; the same seed gives the same picks
+    #[arg(long, default_value_t = 1)]
+    pub seed: u64,
+    /// Skip sessions with fewer turns
+    #[arg(long, default_value_t = 2)]
+    pub min_turns: i64,
+    /// Port on 127.0.0.1 (0 picks a free one)
+    #[arg(long, default_value_t = 0)]
+    pub port: u16,
+    /// Do not open a browser
+    #[arg(long)]
+    pub no_open: bool,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct CorpusSaveArgs {
+    /// Session id, id prefix, or provider:id
+    pub session: String,
+    /// Expectations JSON (from the review page's Export)
+    #[arg(long)]
+    pub expectations: std::path::PathBuf,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct CorpusCheckArgs {
+    /// Snapshot folder names or paths (default: all)
+    pub snapshots: Vec<String>,
+    /// Keep each replay's temporary folder for inspection
+    #[arg(long)]
+    pub keep: bool,
+}
 
 #[derive(Args, Debug, Clone)]
 pub struct ReviewArgs {

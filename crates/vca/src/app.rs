@@ -73,6 +73,7 @@ pub fn run(
         Commands::Tasks(args) => commands::insights::run_tasks(args, context),
         Commands::Show(args) => commands::insights::run_show(args, context),
         Commands::Review(args) => commands::insights::run_review(args, context),
+        Commands::Corpus(args) => commands::corpus::run(args),
         Commands::Context(args) => commands::insights::run_context(args, context),
         Commands::Rework(args) => commands::insights::run_rework(args, context),
         Commands::Habits(args) => commands::insights::run_habits(args, context),
