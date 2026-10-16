@@ -38,6 +38,17 @@ pub struct Stat {
     pub display: String,
     /// Timeline entries that back the number.
     pub entries: Vec<usize>,
+    /// Depends on other sessions too (commit sharing, rework); a corpus
+    /// replays it together with the project's other saved sessions.
+    pub cross_session: bool,
+}
+
+/// Numbers that depend on other sessions, not only on this one's sources.
+pub fn is_cross_session(id: &str) -> bool {
+    matches!(
+        id,
+        "delivery.commits" | "delivery.ai_lines" | "delivery.rework_relations"
+    ) || id.ends_with(".habit.12_rules_from_corrections")
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -201,7 +212,12 @@ pub fn check(conn: &Connection, expected: &Expectations) -> Result<Vec<Mismatch>
         .iter()
         .map(|stat| (stat.id.as_str(), &stat.value))
         .collect();
-    Ok(expected
+    Ok(compare(expected, &actual))
+}
+
+/// Approved numbers that differ from `actual` (or are no longer produced).
+pub fn compare(expected: &Expectations, actual: &HashMap<&str, &Value>) -> Vec<Mismatch> {
+    expected
         .approved
         .iter()
         .filter_map(|(id, value)| match actual.get(id.as_str()) {
@@ -212,11 +228,11 @@ pub fn check(conn: &Connection, expected: &Expectations) -> Result<Vec<Mismatch>
                 actual: now.map(|v| (*v).clone()),
             }),
         })
-        .collect())
+        .collect()
 }
 
 /// Equal, with numbers compared to six decimals.
-fn same(a: &Value, b: &Value) -> bool {
+pub fn same(a: &Value, b: &Value) -> bool {
     match (a, b) {
         (Value::Number(x), Value::Number(y)) => {
             let (x, y) = (
@@ -583,6 +599,7 @@ impl Stats<'_> {
             value,
             display,
             entries,
+            cross_session: is_cross_session(id),
         });
     }
 

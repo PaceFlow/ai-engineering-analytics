@@ -117,6 +117,117 @@ pub fn list(root: &Path) -> Result<Vec<SavedSnapshot>> {
     Ok(out)
 }
 
+/// The corpus' price map: pinned on the first save so costs replay the same
+/// way for every snapshot, whatever LiteLLM publishes later.
+pub fn pinned_prices(root: &Path) -> Result<Option<PathBuf>> {
+    let pinned = root.join(PRICES);
+    if !pinned.exists() {
+        let cache = crate::cost::litellm::cache_path()?;
+        if !cache.exists() {
+            return Ok(None);
+        }
+        std::fs::create_dir_all(root)?;
+        std::fs::copy(cache, &pinned)?;
+    }
+    Ok(Some(pinned))
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SaveOutcome {
+    pub dir: PathBuf,
+    pub files: usize,
+    pub bytes: u64,
+    pub approved: usize,
+    pub warnings: Vec<String>,
+}
+
+/// Save a reviewed session and settle its approved values against a replay of
+/// all saved sessions of the same repository.
+///
+/// The reviewer judged the numbers in the live view; the stored values come
+/// from the replay, so the corpus checks what it can actually reproduce. A
+/// single-session number whose replay differs from what was reviewed is kept
+/// at the replay value with a warning (that difference is worth a look). Other
+/// saved sessions of the project get their cross-session numbers refreshed,
+/// since the set of sessions they depend on changed.
+pub fn save_reviewed(
+    conn: &rusqlite::Connection,
+    root: &Path,
+    exe: &Path,
+    provider: &str,
+    session_id: &str,
+    reviewed: &crate::explore::review::Expectations,
+) -> Result<SaveOutcome> {
+    use crate::explore::review::{is_cross_session, same};
+
+    let prices = pinned_prices(root)?;
+    let saved = snapshot::save(conn, root, provider, session_id, reviewed)?;
+    let mut warnings = saved.warnings.clone();
+    let key = format!("{provider}:{session_id}");
+    let group = replay::groups(list(root)?)
+        .into_iter()
+        .find(|g| g.snapshots.iter().any(|s| s.manifest.key == key))
+        .ok_or_else(|| anyhow::anyhow!("saved snapshot not found in {}", root.display()))?;
+    let replay = replay::GroupReplay::build(&group, exe, prices.as_deref())?;
+
+    let mut approved_count = 0;
+    for snapshot in &group.snapshots {
+        let stats = replay.stats(&snapshot.manifest.key)?;
+        let path = snapshot.dir.join(EXPECTATIONS);
+        if snapshot.manifest.key == key {
+            let mut settled = reviewed.clone();
+            settled.approved.clear();
+            for (id, live) in &reviewed.approved {
+                match stats.get(id) {
+                    Some(replayed) => {
+                        if !is_cross_session(id) && !same(live, replayed) {
+                            warnings.push(format!("{id}: reviewed {live}, replay {replayed}"));
+                        }
+                        settled.approved.insert(id.clone(), replayed.clone());
+                    }
+                    None => warnings.push(format!("{id}: not produced in the replay; dropped")),
+                }
+            }
+            approved_count = settled.approved.len();
+            std::fs::write(&path, serde_json::to_string_pretty(&settled)? + "\n")?;
+        } else {
+            let mut other = replay::read_expectations(&snapshot.dir)?;
+            let mut changed = false;
+            for (id, value) in other.approved.iter_mut() {
+                let Some(replayed) = stats.get(id) else {
+                    continue;
+                };
+                if same(value, replayed) {
+                    continue;
+                }
+                if is_cross_session(id) {
+                    warnings.push(format!(
+                        "{}: {id} {value} → {replayed} (project changed)",
+                        snapshot.manifest.key
+                    ));
+                    *value = replayed.clone();
+                    changed = true;
+                } else {
+                    warnings.push(format!(
+                        "{}: {id} no longer replays as approved ({value} → {replayed}); left as is",
+                        snapshot.manifest.key
+                    ));
+                }
+            }
+            if changed {
+                std::fs::write(&path, serde_json::to_string_pretty(&other)? + "\n")?;
+            }
+        }
+    }
+    Ok(SaveOutcome {
+        dir: saved.dir,
+        files: saved.files,
+        bytes: saved.bytes,
+        approved: approved_count,
+        warnings,
+    })
+}
+
 /// Stable pseudo-random order for sampling: the same seed gives the same picks.
 pub fn sample_rank(seed: u64, key: &str) -> String {
     format!("{:x}", md5::compute(format!("{seed}:{key}")))
