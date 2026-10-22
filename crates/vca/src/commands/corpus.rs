@@ -19,6 +19,7 @@ pub fn run(args: CorpusArgs) -> Result<()> {
         ),
         CorpusCommands::Save(args) => save(args),
         CorpusCommands::List => list(),
+        CorpusCommands::Wrong => wrong(),
         CorpusCommands::Check(args) => check(args),
     }
 }
@@ -48,6 +49,30 @@ fn save(args: CorpusSaveArgs) -> Result<()> {
     );
     for warning in &saved.warnings {
         println!("  note: {warning}");
+    }
+    Ok(())
+}
+
+fn wrong() -> Result<()> {
+    let root = corpus::corpus_dir()?;
+    let mut total = 0usize;
+    for snapshot in corpus::list(&root)? {
+        let expected = replay::read_expectations(&snapshot.dir)?;
+        if expected.rejected.is_empty() {
+            continue;
+        }
+        println!(
+            "{}  {}",
+            expected.session,
+            snapshot.manifest.title.as_deref().unwrap_or("")
+        );
+        for (id, rejected) in &expected.rejected {
+            total += 1;
+            println!("  ✗ {id} = {}  — {}", rejected.value, rejected.note);
+        }
+    }
+    if total == 0 {
+        println!("Nothing is marked wrong in {}.", root.display());
     }
     Ok(())
 }

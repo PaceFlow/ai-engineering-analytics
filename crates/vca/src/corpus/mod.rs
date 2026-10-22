@@ -188,12 +188,20 @@ pub fn save_reviewed(
                     None => warnings.push(format!("{id}: not produced in the replay; dropped")),
                 }
             }
+            // Everything nobody judged is recorded too, so a change still shows up.
+            settled.locked = stats
+                .iter()
+                .filter(|(id, _)| {
+                    !settled.approved.contains_key(*id) && !settled.rejected.contains_key(*id)
+                })
+                .map(|(id, value)| (id.clone(), value.clone()))
+                .collect();
             approved_count = settled.approved.len();
             std::fs::write(&path, serde_json::to_string_pretty(&settled)? + "\n")?;
         } else {
             let mut other = replay::read_expectations(&snapshot.dir)?;
             let mut changed = false;
-            for (id, value) in other.approved.iter_mut() {
+            for (id, value) in other.approved.iter_mut().chain(other.locked.iter_mut()) {
                 let Some(replayed) = stats.get(id) else {
                     continue;
                 };

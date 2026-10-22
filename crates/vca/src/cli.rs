@@ -101,7 +101,7 @@ const HABITS_AFTER_HELP: &str = "Examples:\n  vca habits                       #
 
 const REVIEW_AFTER_HELP: &str = "Examples:\n  vca review 1a2b3c                         # writes review-<session>.html in the current directory\n  vca review claude:1a2b3c --out /tmp/r.html\n  vca review --check expectations.json         # exit 1 if an approved number changed\n\nThe page is a local file with the whole transcript; it is never uploaded. Mark each number ✓ or ✗,\nthen Export to get expectations JSON that `--check` (and the test suite) asserts.";
 
-const CORPUS_AFTER_HELP: &str = "Examples:\n  vca corpus review --project nothing-phone --project WarGames   # sample, review, save\n  vca corpus review --per 3 --seed 7\n  vca corpus list\n  vca corpus check                     # replay every snapshot and compare\n  vca corpus check claude-7956ac77      # one snapshot\n\nSnapshots go to ~/.vca/corpus/<provider>-<id>/: the session's source files (for Cursor and\nOpenCode only that session's rows), a git bundle of its repository, the price map and the\napproved numbers. Nothing is uploaded.";
+const CORPUS_AFTER_HELP: &str = "Examples:\n  vca corpus review --project nothing-phone --project WarGames   # sample, review, save\n  vca corpus review --per 3 --seed 7\n  vca corpus list\n  vca corpus wrong                     # every number marked ✗, with your notes\n  vca corpus check                     # replay every snapshot and compare\n  vca corpus check claude-7956ac77      # one snapshot\n\nSnapshots go to ~/.vca/corpus/<provider>-<id>/: the session's source files (for Cursor and\nOpenCode only that session's rows), a git bundle of its repository, the price map and the\napproved numbers. Nothing is uploaded.";
 
 #[derive(Args, Debug, Clone)]
 pub struct CorpusArgs {
@@ -117,6 +117,8 @@ pub enum CorpusCommands {
     Save(CorpusSaveArgs),
     /// List saved snapshots
     List,
+    /// Every number marked ✗ in the corpus, with the reviewer's note
+    Wrong,
     /// Rebuild each snapshot's numbers from its files alone and compare with the approved ones
     Check(CorpusCheckArgs),
 }

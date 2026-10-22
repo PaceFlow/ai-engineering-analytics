@@ -11,6 +11,7 @@ pub mod format;
 pub mod habits;
 pub mod practices;
 pub mod review;
+pub mod review_checks;
 pub mod rework;
 pub mod stages;
 

@@ -221,14 +221,8 @@ pub fn check_group(
         let stats = replay.stats(&snapshot.manifest.key)?;
         let actual: HashMap<&str, &Value> = stats.iter().map(|(k, v)| (k.as_str(), v)).collect();
         let report = review::compare(&expected, &actual)
-            .into_iter()
-            .map(|m| {
-                let now = m
-                    .actual
-                    .as_ref()
-                    .map_or_else(|| "(no longer produced)".to_string(), Value::to_string);
-                format!("✗ {}: approved {} · now {}", m.id, m.expected, now)
-            })
+            .iter()
+            .map(review::Mismatch::line)
             .collect::<Vec<_>>();
         results.push(ReplayResult {
             key: snapshot.manifest.key.clone(),
