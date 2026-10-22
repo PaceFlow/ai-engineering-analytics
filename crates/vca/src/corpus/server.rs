@@ -126,7 +126,12 @@ pub fn serve(port: u16, opts: SampleOptions, open_browser: bool) -> Result<()> {
     if open_browser {
         open_url(&origin);
     }
-    let mut state = State { root, opts, origin };
+    let mut state = State {
+        root,
+        opts,
+        origin,
+        order: Vec::new(),
+    };
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
         if let Err(error) = state.handle(stream) {
@@ -140,6 +145,49 @@ struct State {
     root: PathBuf,
     opts: SampleOptions,
     origin: String,
+    /// The sampled sessions in list order (provider, session id), for "Save & next".
+    order: Vec<(String, String)>,
+}
+
+impl State {
+    fn resample(&mut self, conn: &Connection) -> Result<Vec<Candidate>> {
+        let candidates = sample(conn, &self.root, &self.opts)?;
+        self.order = candidates
+            .iter()
+            .map(|c| (c.provider.clone(), c.session_id.clone()))
+            .collect();
+        Ok(candidates)
+    }
+
+    /// The next sampled session after this one that is not saved yet.
+    fn next_after(&self, provider: &str, session: &str) -> Option<String> {
+        let at = self
+            .order
+            .iter()
+            .position(|(p, s)| p == provider && s == session)
+            .map_or(0, |i| i + 1);
+        self.order
+            .iter()
+            .cycle()
+            .skip(at)
+            .take(self.order.len())
+            .find(|(p, s)| {
+                !(p == provider && s == session)
+                    && !self
+                        .root
+                        .join(super::snapshot_name(p, s))
+                        .join(super::MANIFEST)
+                        .exists()
+            })
+            .map(|(p, s)| review_url(p, s))
+    }
+}
+
+fn review_url(provider: &str, session: &str) -> String {
+    format!(
+        "/review/{provider}/{}",
+        percent_encoding::utf8_percent_encode(session, percent_encoding::NON_ALPHANUMERIC)
+    )
 }
 
 struct Request {
@@ -183,7 +231,7 @@ impl State {
                     self.opts.per_group = per;
                 }
                 let conn = crate::db::open()?;
-                let candidates = sample(&conn, &self.root, &self.opts)?;
+                let candidates = self.resample(&conn)?;
                 let data = json!({
                     "corpus": self.root,
                     "seed": self.opts.seed,
@@ -216,9 +264,13 @@ impl State {
                 };
                 let dir = self.root.join(super::snapshot_name(provider, session));
                 let saved_at = super::read_manifest(&dir).ok().map(|m| m.created_at);
+                if self.order.is_empty() {
+                    self.resample(&conn)?;
+                }
                 let corpus = json!({
                     "save": format!("/api/save/{provider}/{}",
                         percent_encoding::utf8_percent_encode(session, percent_encoding::NON_ALPHANUMERIC)),
+                    "next": self.next_after(provider, session),
                     "saved_at": saved_at,
                 });
                 Ok(Response::html(explore::review::render_html_for_corpus(

@@ -983,23 +983,20 @@ pub fn run_review(args: ReviewArgs, _context: AppContext) -> Result<()> {
         let mismatches = explore::review::check(&conn, &expected)?;
         if mismatches.is_empty() {
             println!(
-                "{}: all {} approved numbers match",
+                "{}: all {} approved and {} recorded numbers match",
                 expected.session,
-                expected.approved.len()
+                expected.approved.len(),
+                expected.locked.len()
             );
             return Ok(());
         }
         for m in &mismatches {
-            let actual = m
-                .actual
-                .as_ref()
-                .map_or_else(|| "(no longer produced)".to_string(), |v| v.to_string());
-            println!("✗ {}: approved {} · now {}", m.id, m.expected, actual);
+            println!("{}", m.line());
         }
         bail!(
-            "{} of {} approved numbers changed",
+            "{} of {} recorded numbers changed",
             mismatches.len(),
-            expected.approved.len()
+            expected.approved.len() + expected.locked.len()
         );
     }
     let input = args.session.as_deref().unwrap_or_default();

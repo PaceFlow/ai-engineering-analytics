@@ -41,6 +41,8 @@ pub struct Stat {
     /// Depends on other sessions too (commit sharing, rework); a corpus
     /// replays it together with the project's other saved sessions.
     pub cross_session: bool,
+    /// What the number means, in plain words.
+    pub help: String,
 }
 
 /// Numbers that depend on other sessions, not only on this one's sources.
@@ -61,6 +63,8 @@ pub struct ReviewData {
     pub stats: Vec<Stat>,
     /// Files the session (subagents included) changed, one row per path.
     pub files: Vec<FileTouch>,
+    /// The short list a person can verify by reading the session.
+    pub checks: Vec<super::review_checks::Check>,
 }
 
 /// Lines one session changed in one file. `session` counts come from the
@@ -99,6 +103,9 @@ pub struct Expectations {
     pub approved: BTreeMap<String, Value>,
     #[serde(default)]
     pub rejected: BTreeMap<String, Rejected>,
+    /// Numbers nobody reviewed, recorded so a change still shows up.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub locked: BTreeMap<String, Value>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -114,6 +121,8 @@ pub struct Mismatch {
     pub expected: Value,
     /// `None` when vca no longer produces the number.
     pub actual: Option<Value>,
+    /// Approved by a reviewer (false: locked without review).
+    pub reviewed: bool,
 }
 
 pub fn review(conn: &Connection, provider: &str, session_id: &str) -> Result<Option<ReviewData>> {
@@ -125,6 +134,7 @@ pub fn review(conn: &Connection, provider: &str, session_id: &str) -> Result<Opt
     let timeline = timeline(conn, provider, session_id, &agents, &turns)?;
     let stats = stats(conn, &detail, &timeline)?;
     let files = file_touches(conn, provider, &agents)?;
+    let checks = super::review_checks::checks(&detail, &stats, &files);
     Ok(Some(ReviewData {
         key: format!("{provider}:{session_id}"),
         pricing: crate::cost::pricing::pricing_version(),
@@ -133,6 +143,7 @@ pub fn review(conn: &Connection, provider: &str, session_id: &str) -> Result<Opt
         timeline,
         stats,
         files,
+        checks,
     }))
 }
 
@@ -217,18 +228,36 @@ pub fn check(conn: &Connection, expected: &Expectations) -> Result<Vec<Mismatch>
 
 /// Approved numbers that differ from `actual` (or are no longer produced).
 pub fn compare(expected: &Expectations, actual: &HashMap<&str, &Value>) -> Vec<Mismatch> {
-    expected
-        .approved
-        .iter()
-        .filter_map(|(id, value)| match actual.get(id.as_str()) {
+    let approved = expected.approved.iter().map(|(id, v)| (id, v, true));
+    let locked = expected.locked.iter().map(|(id, v)| (id, v, false));
+    approved
+        .chain(locked)
+        .filter_map(|(id, value, reviewed)| match actual.get(id.as_str()) {
             Some(now) if same(value, now) => None,
             now => Some(Mismatch {
                 id: id.clone(),
                 expected: value.clone(),
                 actual: now.map(|v| (*v).clone()),
+                reviewed,
             }),
         })
         .collect()
+}
+
+impl Mismatch {
+    /// `✗ id: approved X · now Y` (locked numbers say "recorded").
+    pub fn line(&self) -> String {
+        let now = self
+            .actual
+            .as_ref()
+            .map_or_else(|| "(no longer produced)".to_string(), Value::to_string);
+        let what = if self.reviewed {
+            "approved"
+        } else {
+            "recorded (unreviewed)"
+        };
+        format!("✗ {}: {what} {} · now {now}", self.id, self.expected)
+    }
 }
 
 /// Equal, with numbers compared to six decimals.
@@ -600,6 +629,7 @@ impl Stats<'_> {
             display,
             entries,
             cross_session: is_cross_session(id),
+            help: super::review_checks::help(id),
         });
     }
 

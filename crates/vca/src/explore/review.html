@@ -86,6 +86,24 @@ h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: v
 .files td.path:hover { color: var(--accent); }
 .files .add { color: var(--ok); } .files .del { color: var(--bad); }
 button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+.tabs { display: flex; gap: 4px; margin: 4px 0 8px; position: sticky; top: 0; background: var(--panel); padding: 4px 0; z-index: 2; }
+.tabs button { flex: 1; }
+.check { border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; margin: 10px 0; }
+.check.ok { border-color: var(--ok); background: var(--ok-soft); }
+.check.no { border-color: var(--bad); background: var(--bad-soft); }
+.check.skip { opacity: .65; }
+.check .ctitle { font: 600 11px var(--sans); text-transform: uppercase; letter-spacing: .05em; color: var(--muted); }
+.check .statement { font-size: 15px; margin: 4px 0 6px; }
+.check ul { margin: 4px 0 6px 18px; padding: 0; font: 12px var(--mono); max-height: 220px; overflow: auto; }
+.check .why { font-size: 12.5px; color: var(--muted); margin: 4px 0; }
+.check .why p { margin: 4px 0; }
+.check .answer { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+.check .answer .ok.on { background: var(--ok-soft); border-color: var(--ok); color: var(--ok); }
+.check .answer .no.on { background: var(--bad-soft); border-color: var(--bad); color: var(--bad); }
+.check .answer .skip.on { border-color: var(--muted); }
+.check .note { width: 100%; margin-top: 6px; display: none; }
+.check.no .note { display: block; }
+.stat .help { display: block; color: var(--muted); font-size: 11.5px; margin-top: 1px; }
 .saved { color: var(--ok); font-size: 12.5px; }
 .empty { color: var(--muted); padding: 30px 0; text-align: center; }
 .hint { color: var(--muted); font-size: 12px; margin: 6px 0 0; }
@@ -103,7 +121,8 @@ button.primary { background: var(--accent); border-color: var(--accent); color: 
     <span class="progress" id="progress"></span>
     <label class="btn" title="Load an earlier expectations file">Import<input type="file" id="import" accept=".json" hidden></label>
     <button id="export" title="Download approved and rejected numbers">Export expectations</button>
-    <button id="saveref" class="primary" hidden title="Snapshot this session's source files with the approved numbers into the reference corpus">Save as reference</button>
+    <button id="saveref" class="primary" hidden title="Save this session and your answers into the reference corpus">Save session</button>
+    <button id="savenext" class="primary" hidden title="Save, then open the next session to review">Save &amp; next →</button>
     <span id="savestate" class="saved"></span>
     <a id="back" class="btn" hidden href="/">← sessions</a>
   </div>
@@ -111,13 +130,20 @@ button.primary { background: var(--accent); border-color: var(--accent); color: 
 <main>
   <section id="timeline"></section>
   <aside>
-    <p class="hint">Click a number's label to highlight the timeline entries behind it. Mark each ✓ or ✗; a ✗ asks for a note on what is wrong.</p>
+    <div class="tabs"><button id="tab-checks" class="on">Checklist</button><button id="tab-all">All numbers</button></div>
+    <section id="checkpane">
+      <p class="hint">Each card says what vca concluded about this session. Check it against the timeline (<b>Show me</b> highlights the evidence) and answer ✓ or ✗. Skip anything you can't judge — every number is still recorded, marked as unreviewed.</p>
+      <div id="checks"></div>
+    </section>
+    <section id="allpane" hidden>
+    <p class="hint">Everything vca records for this session. You don't need to go through these: the checklist covers what a person can verify, and the rest is recorded automatically. Click a label to highlight its evidence.</p>
     <details id="filesbox"><summary><h2 style="display:inline">Files changed</h2> <small id="filecount"></small></summary>
       <p class="hint">Session: lines from the tool's own edit records (what “lines changed” counts). Delivery: lines extracted for commit matching. Click a path to find its tool calls.</p>
       <table class="files" id="files"></table>
     </details>
     <div class="chips" id="statfilter"></div>
     <div id="stats"></div>
+    </section>
   </aside>
 </main>
 <script id="data" type="application/json">/*__REVIEW_DATA__*/null</script>
@@ -273,7 +299,8 @@ button.primary { background: var(--accent); border-color: var(--accent); color: 
         out.push('<div class="stat ' + st + (r.note ? ' has-note' : '') + (selected === s.id ? ' active' : '') + '" data-id="' + esc(s.id) + '">' +
           '<div class="row"><span class="label" title="' + esc(s.id) + '">' + esc(s.label) +
           (s.entries.length ? ' <small>(' + s.entries.length + ')</small>' : '') +
-          (s.cross_session ? ' <span class="badge" title="Depends on the project\'s other sessions too. Saving takes its value from a replay of all saved sessions of this project.">project</span>' : '') + '</span>' +
+          (s.cross_session ? ' <span class="badge" title="Depends on the project\'s other sessions too. Saving takes its value from a replay of all saved sessions of this project.">project</span>' : '') +
+          (s.help ? '<small class="help">' + esc(s.help) + '</small>' : '') + '</span>' +
           '<span class="val">' + esc(s.display) + '</span>' +
           '<span class="vote"><button class="ok' + (r.state === 'ok' ? ' on' : '') + '" title="Looks right">✓</button>' +
           '<button class="no' + (r.state === 'no' ? ' on' : '') + '" title="Wrong">✗</button></span></div>' +
@@ -282,9 +309,6 @@ button.primary { background: var(--accent); border-color: var(--accent); color: 
       }
     }
     document.getElementById('stats').innerHTML = out.join('') || '<p class="empty">No numbers in this view.</p>';
-    const done = DATA.stats.filter((s) => ['approved', 'rejected'].includes(stateOf(s))).length;
-    const bad = DATA.stats.filter((s) => stateOf(s) === 'rejected').length;
-    document.getElementById('progress').textContent = done + ' / ' + DATA.stats.length + ' reviewed · ' + bad + ' wrong';
   }
   const statById = new Map(DATA.stats.map((s) => [s.id, s]));
   document.getElementById('stats').addEventListener('click', (ev) => {
@@ -329,12 +353,83 @@ button.primary { background: var(--accent); border-color: var(--accent); color: 
     const q = document.getElementById('q'); q.value = name; query = name; renderTimeline();
   });
 
+  // ── Checklist ──
+  const CHECKS = DATA.checks || [];
+  const CSTORE = STORE + ':checks';
+  let answers = {};  // check id -> {state: 'ok'|'no'|'skip', note}
+  try { answers = JSON.parse(localStorage.getItem(CSTORE) || '{}') || {}; } catch (e) { answers = {}; }
+  const saveAnswers = () => { try { localStorage.setItem(CSTORE, JSON.stringify(answers)); } catch (e) {} };
+  function renderChecks() {
+    const out = CHECKS.map((c) => {
+      const a = answers[c.id] || {};
+      const items = c.items.length ? '<ul>' + c.items.map((i) => '<li>' + esc(i) + '</li>').join('') + '</ul>' : '';
+      return '<div class="check ' + (a.state || '') + '" data-id="' + esc(c.id) + '">' +
+        '<div class="ctitle">' + esc(c.title) + '</div>' +
+        '<div class="statement">' + esc(c.statement) + '</div>' + items +
+        '<details class="why"><summary>What this means · how to check</summary><p>' + esc(c.explain) + '</p><p><b>Check:</b> ' + esc(c.how) + '</p></details>' +
+        '<div class="answer">' +
+        (c.entries.length ? '<button class="show" title="Highlight the evidence in the timeline">Show me (' + c.entries.length + ')</button>' : '') +
+        '<button class="ok' + (a.state === 'ok' ? ' on' : '') + '">✓ Right</button>' +
+        '<button class="no' + (a.state === 'no' ? ' on' : '') + '">✗ Wrong</button>' +
+        '<button class="skip' + (a.state === 'skip' ? ' on' : '') + '" title="Can\'t tell; it is recorded as unreviewed">Skip</button></div>' +
+        '<input type="text" class="note" placeholder="What is wrong? What should it be?" value="' + esc(a.note || '') + '"></div>';
+    });
+    document.getElementById('checks').innerHTML = out.join('') || '<p class="empty">No checks for this session.</p>';
+    const done = CHECKS.filter((c) => answers[c.id] && answers[c.id].state).length;
+    const bad = CHECKS.filter((c) => answers[c.id] && answers[c.id].state === 'no').length;
+    document.getElementById('progress').textContent = done + ' of ' + CHECKS.length + ' answered' + (bad ? ' · ' + bad + ' wrong' : '');
+  }
+  const checkById = new Map(CHECKS.map((c) => [c.id, c]));
+  document.getElementById('checks').addEventListener('click', (ev) => {
+    const box = ev.target.closest('.check'); if (!box) return;
+    const c = checkById.get(box.dataset.id);
+    const btn = ev.target.closest('.answer button'); if (!btn) return;
+    if (btn.classList.contains('show')) {
+      const same = selected === 'check:' + c.id;
+      selected = same ? null : 'check:' + c.id;
+      highlighted = new Set(same ? [] : c.entries);
+      onlyHl = !same; document.getElementById('onlyhl').classList.toggle('on', onlyHl);
+      renderTimeline();
+      const first = document.querySelector('.e.hl'); if (first) first.scrollIntoView({ block: 'center', behavior: 'smooth' });
+      return;
+    }
+    const want = btn.classList.contains('ok') ? 'ok' : btn.classList.contains('no') ? 'no' : 'skip';
+    const a = answers[c.id] || {};
+    if (a.state === want) delete answers[c.id]; else answers[c.id] = { state: want, note: a.note || '' };
+    saveAnswers(); renderChecks();
+    if (want === 'no') { const n = document.querySelector('.check[data-id="' + CSS.escape(c.id) + '"] .note'); if (n) n.focus(); }
+  });
+  document.getElementById('checks').addEventListener('change', (ev) => {
+    if (!ev.target.classList.contains('note')) return;
+    const id = ev.target.closest('.check').dataset.id;
+    answers[id] = Object.assign(answers[id] || { state: 'no' }, { note: ev.target.value }); saveAnswers();
+  });
+  const tabs = { checks: document.getElementById('tab-checks'), all: document.getElementById('tab-all') };
+  const showTab = (name) => {
+    tabs.checks.classList.toggle('on', name === 'checks'); tabs.all.classList.toggle('on', name === 'all');
+    document.getElementById('checkpane').hidden = name !== 'checks';
+    document.getElementById('allpane').hidden = name !== 'all';
+  };
+  tabs.checks.onclick = () => showTab('checks');
+  tabs.all.onclick = () => showTab('all');
+  tabs.all.textContent = 'All numbers (' + DATA.stats.length + ')';
+
+  // Checklist answers approve or reject the numbers they cover; a vote on a
+  // single number in "All numbers" overrides that.
   function expectations() {
     const approved = {}, rejected = {};
+    for (const c of CHECKS) {
+      const a = answers[c.id]; if (!a || a.state === 'skip') continue;
+      for (const id of c.stats) {
+        const s = statById.get(id); if (!s) continue;
+        if (a.state === 'ok') approved[id] = s.value;
+        if (a.state === 'no') rejected[id] = { value: s.value, note: c.title + ': ' + (a.note || '') };
+      }
+    }
     for (const s of DATA.stats) {
       const r = review[s.id]; if (!r || !sameValue(r.value, s.value)) continue;
-      if (r.state === 'ok') approved[s.id] = s.value;
-      if (r.state === 'no') rejected[s.id] = { value: s.value, note: r.note || '' };
+      if (r.state === 'ok') { approved[s.id] = s.value; delete rejected[s.id]; }
+      if (r.state === 'no') { rejected[s.id] = { value: s.value, note: r.note || '' }; delete approved[s.id]; }
     }
     return { session: DATA.key, pricing: DATA.pricing, approved, rejected };
   }
@@ -342,27 +437,31 @@ button.primary { background: var(--accent); border-color: var(--accent); color: 
   // Served by `vca corpus review`: save straight into the reference corpus.
   const CORPUS = JSON.parse(document.getElementById('corpus').textContent);
   if (CORPUS) {
-    const btn = document.getElementById('saveref'), state = document.getElementById('savestate');
+    const btn = document.getElementById('saveref'), next = document.getElementById('savenext');
+    const state = document.getElementById('savestate');
     btn.hidden = false; document.getElementById('back').hidden = false;
+    next.hidden = !CORPUS.next;
     if (CORPUS.saved_at) state.textContent = 'saved ' + CORPUS.saved_at.slice(0, 16).replace('T', ' ');
-    btn.onclick = () => {
-      const x = expectations();
-      const n = Object.keys(x.approved).length, bad = Object.keys(x.rejected).length;
-      const open = DATA.stats.length - n - bad;
-      if (!n && !confirm('No numbers are approved yet. Save the snapshot anyway?')) return;
-      if (open && !confirm(open + ' numbers are not reviewed and will not be checked. Save?')) return;
-      btn.disabled = true; state.textContent = 'saving and replaying the project (a minute or two)…';
-      fetch(CORPUS.save, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(x) })
+    const doSave = (then) => {
+      const open = CHECKS.filter((c) => !answers[c.id] || !answers[c.id].state).length;
+      if (open && !confirm(open + ' of ' + CHECKS.length + ' checks are unanswered. They are saved as unreviewed. Save now?')) return;
+      btn.disabled = next.disabled = true; state.textContent = 'saving and replaying the project (a minute or two)…';
+      fetch(CORPUS.save, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(expectations()) })
         .then((r) => r.json().then((j) => ({ ok: r.ok, j })))
         .then(({ ok, j }) => {
           if (!ok) { state.textContent = 'failed: ' + j.error; return; }
-          state.textContent = 'saved ' + j.approved + ' numbers → ' + j.dir + (j.warnings && j.warnings.length ? ' · ' + j.warnings.length + ' notes' : '');
-          state.title = (j.warnings || []).join('\n');
-          if (j.warnings && j.warnings.length) alert('Saved, with notes:\n\n' + j.warnings.join('\n'));
+          state.textContent = 'saved · ' + j.approved + ' numbers checked by you' + (j.warnings && j.warnings.length ? ' · ' + j.warnings.length + ' notes' : '');
+          const NL = String.fromCharCode(10);
+          state.title = (j.warnings || []).join(NL);
+          const notes = (j.warnings || []).filter((w) => !w.startsWith('Cursor History') && !w.includes('OpenCode sessions'));
+          if (notes.length) alert('Saved, with notes:' + NL + NL + notes.join(NL));
+          if (then) location.href = then;
         })
         .catch((e) => { state.textContent = 'failed: ' + e; })
-        .finally(() => { btn.disabled = false; });
+        .finally(() => { btn.disabled = next.disabled = false; });
     };
+    btn.onclick = () => doSave(null);
+    next.onclick = () => doSave(CORPUS.next);
   }
 
   document.getElementById('export').onclick = () => {
@@ -392,6 +491,7 @@ button.primary { background: var(--accent); border-color: var(--accent); color: 
 
   renderTimeline();
   renderStats();
+  renderChecks();
 })();
 </script>
 </body>
