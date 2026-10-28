@@ -81,6 +81,16 @@ impl std::fmt::Display for ClientError {
 
 pub trait DecisionClient {
     fn decide(&self, request: &DecisionRequest) -> Result<DecisionResponse, ClientError>;
+    /// The coordinator invokes the callback as each response arrives; it owns SQLite and budgets.
+    fn decide_many(
+        &self,
+        requests: &[DecisionRequest],
+        callback: &mut dyn FnMut(usize, Result<DecisionResponse, ClientError>),
+    ) {
+        for (index, request) in requests.iter().enumerate() {
+            callback(index, self.decide(request));
+        }
+    }
 }
 
 /// Parse the `answers` and `usage` of a Decisions response.
@@ -220,38 +230,50 @@ impl OpenRouterClient {
         })
     }
 
-    fn post(&self, body: &Value) -> Result<(u16, Option<u64>, String), String> {
-        self.runtime.block_on(async {
-            let response = self
-                .http
-                .post(&self.endpoint)
-                .bearer_auth(&self.key)
-                .header("X-Title", "AI Engineering Analytics")
-                .json(body)
-                .send()
-                .await
-                .map_err(|err| err.to_string())?;
-            let status = response.status().as_u16();
-            let retry_after = response
-                .headers()
-                .get("retry-after")
-                .and_then(|value| value.to_str().ok())
-                .and_then(|value| value.trim().parse::<u64>().ok());
-            let text = response.text().await.map_err(|err| err.to_string())?;
-            Ok((status, retry_after, text))
-        })
+    fn transport(&self) -> Transport {
+        Transport {
+            endpoint: self.endpoint.clone(),
+            key: self.key.clone(),
+            http: self.http.clone(),
+            base_delay: self.base_delay,
+        }
     }
 }
-
-impl DecisionClient for OpenRouterClient {
-    fn decide(&self, request: &DecisionRequest) -> Result<DecisionResponse, ClientError> {
+#[derive(Clone)]
+struct Transport {
+    endpoint: String,
+    key: String,
+    http: reqwest::Client,
+    base_delay: Duration,
+}
+impl Transport {
+    async fn post(&self, body: &Value) -> Result<(u16, Option<u64>, String), String> {
+        let response = self
+            .http
+            .post(&self.endpoint)
+            .bearer_auth(&self.key)
+            .header("X-Title", "AI Engineering Analytics")
+            .json(body)
+            .send()
+            .await
+            .map_err(|err| err.to_string())?;
+        let status = response.status().as_u16();
+        let retry_after = response
+            .headers()
+            .get("retry-after")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.trim().parse::<u64>().ok());
+        let text = response.text().await.map_err(|err| err.to_string())?;
+        Ok((status, retry_after, text))
+    }
+    async fn decide(&self, request: &DecisionRequest) -> Result<DecisionResponse, ClientError> {
         let body = request.body();
         let mut attempts = 0u32;
         let mut rate_limited = 0u32;
         let mut transient = 0u32;
         loop {
             attempts += 1;
-            let (status, retry_after, message) = match self.post(&body) {
+            let (status, retry_after, message) = match self.post(&body).await {
                 Ok((status, retry_after, text)) => {
                     if status == 200 {
                         return match serde_json::from_str::<Value>(&text) {
@@ -289,19 +311,61 @@ impl DecisionClient for OpenRouterClient {
                         .map(|seconds| Duration::from_secs(seconds).min(Duration::from_secs(60)))
                         .unwrap_or(backoff)
                         .min(self.base_delay * 32);
-                    std::thread::sleep(wait);
+                    tokio::time::sleep(wait).await;
                 }
                 None | Some(500..=599) => {
                     transient += 1;
                     if transient > 3 {
                         return Err(fail(ErrorKind::Transient));
                     }
-                    std::thread::sleep(self.base_delay * transient);
+                    tokio::time::sleep(self.base_delay * transient).await;
                 }
                 Some(413) => return Err(fail(ErrorKind::TooLarge)),
                 Some(401 | 403) => return Err(fail(ErrorKind::Auth)),
                 Some(402) => return Err(fail(ErrorKind::Credits)),
                 Some(_) => return Err(fail(ErrorKind::InvalidRequest)),
+            }
+        }
+    }
+}
+impl DecisionClient for OpenRouterClient {
+    fn decide(&self, request: &DecisionRequest) -> Result<DecisionResponse, ClientError> {
+        self.runtime.block_on(self.transport().decide(request))
+    }
+    fn decide_many(
+        &self,
+        requests: &[DecisionRequest],
+        callback: &mut dyn FnMut(usize, Result<DecisionResponse, ClientError>),
+    ) {
+        let mut tasks = tokio::task::JoinSet::new();
+        let mut completed = std::collections::BTreeSet::new();
+        {
+            let _runtime = self.runtime.enter();
+            for (index, request) in requests.iter().cloned().enumerate() {
+                let transport = self.transport();
+                tasks.spawn(async move { (index, transport.decide(&request).await) });
+            }
+        }
+        while let Some(result) = self.runtime.block_on(tasks.join_next()) {
+            match result {
+                Ok((index, response)) => {
+                    completed.insert(index);
+                    callback(index, response);
+                }
+                Err(_) => {
+                    if let Some(index) = (0..requests.len()).find(|i| !completed.contains(i)) {
+                        completed.insert(index);
+                        callback(
+                            index,
+                            Err(ClientError {
+                                kind: ErrorKind::Transient,
+                                status: None,
+                                message: "Classifier request worker failed".into(),
+                                attempts: 1,
+                            }),
+                        );
+                    }
+                }
             }
         }
     }
@@ -448,6 +512,60 @@ mod tests {
             questions,
             provider: ProviderPrefs::default(),
         }
+    }
+
+    #[test]
+    fn concurrent_batch_dispatches_four_before_any_response() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let endpoint = format!("http://{}/decisions", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let mut streams = Vec::new();
+            while streams.len() < 4 && std::time::Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((stream, _)) => streams.push(stream),
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5))
+                    }
+                    Err(e) => panic!("{e}"),
+                }
+            }
+            let n = streams.len();
+            for stream in streams {
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut reader = BufReader::new(stream);
+                let mut length = 0;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" || line.is_empty() {
+                        break;
+                    }
+                    if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        length = v.trim().parse().unwrap();
+                    }
+                }
+                let mut body = vec![0; length];
+                reader.read_exact(&mut body).unwrap();
+                let response = r#"{"answers":{},"usage":{"cost":0.01}}"#;
+                write!(reader.into_inner(),"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",response.len()).unwrap();
+            }
+            n
+        });
+        let client = OpenRouterClient::new(&endpoint, "test-only").unwrap();
+        let mut received = Vec::new();
+        client.decide_many(&vec![request(); 4], &mut |index, result| {
+            received.push((index, result.unwrap().cost_usd))
+        });
+        assert_eq!(server.join().unwrap(), 4);
+        received.sort_by_key(|v| v.0);
+        assert_eq!(
+            received,
+            (0..4).map(|i| (i, Some(0.01))).collect::<Vec<_>>()
+        );
     }
 
     #[test]

@@ -164,6 +164,12 @@ pub fn explain(app: &App) -> Option<(String, Vec<String>)> {
         }
         (Screen::Detail { tab, .. }, Data::Detail(Some(detail))) => {
             match tab {
+                DetailTab::Overview => {
+                    title = "Session overview".into();
+                    lines.push("Context sources count captured characters by origin. Repeated characters estimate material carried into later requests; they are not native token usage.".into());
+                    lines.push("Tool calls are grouped by the provider-normalized tool category. Skill calls, listings, injections, and file loads are separate observations.".into());
+                    lines.push("Use the Context and Skills tabs for request-level origins, capture completeness, skill outcomes, and downstream usage.".into());
+                }
                 DetailTab::Conversation => {
                     let turn = detail.turns.get(i)?;
                     title = format!("Turn {}", turn.turn_index);
@@ -250,31 +256,99 @@ pub fn explain(app: &App) -> Option<(String, Vec<String>)> {
                     lines.push(COST_NOTE.into());
                 }
                 DetailTab::Context => {
-                    let item = detail.context_items.get(i)?;
-                    title = format!("Context item {}", item.item_key);
+                    let call = detail.calls.get(i)?;
+                    title = format!("Request {} context", call.call_index);
                     lines.push(format!(
-                        "{} · {}",
-                        item.kind,
-                        item.target.clone().unwrap_or_default()
+                        "Observed input {} · cached {} · output {} · reported spend {}",
+                        fmt::tokens(call.fresh_tokens),
+                        fmt::tokens(call.cached_tokens),
+                        fmt::tokens(call.output_tokens),
+                        fmt::usd(call.reported_cost)
                     ));
                     lines.push(format!(
-                        "~{} tokens entered at call {} and were carried through {} later calls",
-                        fmt::tokens(item.tokens),
-                        item.entered_call,
-                        item.carried_calls
+                        "Estimated new {} · carried {} · event {}",
+                        fmt::tokens(call.new_tokens),
+                        fmt::tokens(call.carried_tokens),
+                        call.cache_event
                     ));
                     lines.push(format!(
-                        "Write {} + carry {} + rebuild {} = {}",
-                        fmt::usd(item.write_usd),
-                        fmt::usd(item.carry_usd),
-                        fmt::usd(item.rebuild_usd),
-                        fmt::usd(item.total_usd)
+                        "Capture completeness: {}",
+                        call.capture_completeness
+                    ));
+                    if i > 0
+                        && call.task_index != detail.calls[i - 1].task_index
+                        && call.carried_tokens > 0
+                    {
+                        lines.push(format!(
+                            "Context carried into task {:?} from an earlier task in this session.",
+                            call.task_index
+                        ));
+                    }
+                    for item in detail
+                        .context_items
+                        .iter()
+                        .filter(|item| item.entered_call == call.call_index)
+                    {
+                        lines.push(format!(
+                            "{} · {} · {} chars · ~{} tokens",
+                            item.kind,
+                            item.target.as_deref().unwrap_or("(unknown source)"),
+                            item.chars,
+                            fmt::tokens(item.tokens)
+                        ));
+                        lines.push(format!("  source {} via {} · last request {:?} · repeated chars {} · capture {} · {} {}",
+                            item.content_source.as_deref().unwrap_or("unknown"),
+                            item.delivery_path.as_deref().unwrap_or("unknown"),
+                            item.last_request, item.repeated_chars.unwrap_or(0),
+                            item.completeness.as_deref().unwrap_or("unknown"),
+                            item.fingerprint_kind.as_deref().unwrap_or("origin"),
+                            item.fingerprint.as_deref().unwrap_or("")));
+                    }
+                    lines.push("Source attribution is incomplete when the harness did not capture request content.".into());
+                }
+                DetailTab::Skills => {
+                    let skill = detail.skills.get(i)?;
+                    title = format!("Skill {}", skill.skill_id);
+                    lines.push(format!(
+                        "{} · {} · task {:?} · outcome {}",
+                        skill.kind, skill.status, skill.task_index, skill.outcome
                     ));
                     lines.push(format!(
-                        "Purpose: {} · instruction reference: {}",
-                        item.purpose.as_deref().unwrap_or("n/a"),
-                        item.instruction_ref.as_deref().unwrap_or("none")
+                        "Situation: {} · {} · {}",
+                        skill.task_intent.as_deref().unwrap_or("task unknown"),
+                        skill.agent_role.as_deref().unwrap_or("role unknown"),
+                        skill.work_stage.as_deref().unwrap_or("stage unknown")
                     ));
+                    lines.push(format!(
+                        "Loaded body: {} chars · ~{} tokens · carried {} calls",
+                        skill.body_chars,
+                        fmt::tokens(skill.body_est_tokens),
+                        skill.carried_calls
+                    ));
+                    lines.push(format!(
+                        "Version: {}{}",
+                        skill.version_status,
+                        skill
+                            .current_file_fingerprint
+                            .as_deref()
+                            .map(|hash| format!(" · {hash}"))
+                            .unwrap_or_default()
+                    ));
+                    lines.push(format!("Follow-through: {}", skill.follow_through));
+                    for (label, usage) in [
+                        ("task", &skill.task),
+                        ("session", &skill.session),
+                        ("next skill", &skill.next_skill),
+                    ] {
+                        lines.push(format!("Downstream to {label}: {} calls · {} input · {} cached · {} output · reported {} · API-equivalent {}{}",
+                            usage.calls, fmt::tokens(usage.input_tokens), fmt::tokens(usage.cached_tokens),
+                            fmt::tokens(usage.output_tokens), fmt::usd(usage.reported_cost_usd),
+                            fmt::usd(usage.api_equiv_usd), if usage.incomplete { " · incomplete" } else { "" }));
+                    }
+                    lines.push(
+                        "Downstream windows overlap and do not isolate the skill's causal cost."
+                            .into(),
+                    );
                     lines.push("Size is estimated from characters and calibrated to observed context growth.".into());
                     lines.push("Instruction references are path matches with AGENTS.md / CLAUDE.md lines, not proof of cause.".into());
                 }
@@ -295,6 +369,31 @@ pub fn explain(app: &App) -> Option<(String, Vec<String>)> {
                         "Later fix signal ({signal}): a later fix-like commit or bug issue touched these AI-written lines. Evidence, not proof of a defect."
                     ));
                     }
+                }
+                DetailTab::TurnContext => {
+                    let turn = detail.turn_context.get(i)?;
+                    title = format!("Turn {} context", turn.turn_index);
+                    lines.push(format!(
+                        "{} requests · {} tools · {} since preceding user message",
+                        turn.model_requests,
+                        turn.tool_calls,
+                        fmt::minutes(turn.since_previous_minutes)
+                    ));
+                    lines.push(format!(
+                        "Native first/last input: {} → {}",
+                        turn.first_context_tokens
+                            .map(fmt::tokens)
+                            .unwrap_or_else(|| "unavailable".into()),
+                        turn.last_context_tokens
+                            .map(fmt::tokens)
+                            .unwrap_or_else(|| "unavailable".into())
+                    ));
+                    lines.push(format!(
+                        "Captured before first request: {} chars (~{} tokens); newly observed: {} chars (~{} tokens)",
+                        fmt::tokens(turn.prior_captured_chars), fmt::tokens(turn.prior_est_tokens),
+                        fmt::tokens(turn.new_captured_chars), fmt::tokens(turn.new_est_tokens)
+                    ));
+                    lines.push("User messages mark coding-agent turns. They can suggest session reuse but do not prove a separate external run. Captured material is not the exact provider prompt.".into());
                 }
             }
         }
@@ -412,6 +511,43 @@ pub fn explain(app: &App) -> Option<(String, Vec<String>)> {
                 row.purpose.as_deref().unwrap_or("n/a")
             ));
             lines.push("Enter opens the session's Context tab.".into());
+        }
+        (_, Data::Skills(rows)) => {
+            let row = rows.get(i)?;
+            title = format!("Skill {}", row.skill_id);
+            lines.push(format!(
+                "{} calls in {} sessions ({:.2} calls per invoking session)",
+                row.calls, row.sessions, row.calls_per_session
+            ));
+            lines.push(format!(
+                "{} successful · {} failed · {} unknown · {} file loads · {} direct injections · {} listings",
+                row.successful, row.failed, row.unknown_calls, row.loaded, row.injected, row.listed
+            ));
+            lines.push(format!("{} distinct linked tasks · {} with commit or passing validation · {} validation failures",
+                row.distinct_tasks, row.verified_tasks, row.validation_failures));
+            lines.push(format!(
+                "API-equivalent cost per verified linked task: {}",
+                fmt::usd(row.cost_per_verified_usd)
+            ));
+            if let Some(eligible) = row.eligible_tasks {
+                lines.push(format!("Listed tasks matching the invoked tasks’ intent, role and stage: {eligible}. This is a descriptive selection."));
+                lines.push(format!(
+                    "With invocation: {} verified · API-equivalent cost per verified {}",
+                    row.eligible_invoked_verified_tasks.unwrap_or(0),
+                    fmt::usd(row.eligible_invoked_cost_per_verified_usd)
+                ));
+                lines.push(format!(
+                    "Without invocation: {} verified · API-equivalent cost per verified {}",
+                    row.uninvoked_verified_tasks.unwrap_or(0),
+                    fmt::usd(row.uninvoked_cost_per_verified_usd)
+                ));
+            } else {
+                lines.push("Matched listing cohort unavailable for this selection; relevance is not inferred from a listing.".into());
+            }
+            lines.push(
+                "Comparisons are observational and do not prove the skill caused an outcome."
+                    .into(),
+            );
         }
         (_, Data::Ladder(rows, _)) => {
             let row = rows.get(i)?;

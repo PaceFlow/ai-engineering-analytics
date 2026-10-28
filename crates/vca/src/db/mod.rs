@@ -78,9 +78,13 @@ pub(crate) fn tune_connection(conn: &Connection) -> Result<()> {
 }
 
 pub fn init_app_schema(conn: &Connection) -> Result<()> {
+    let previous: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
     init_metadata_schema(conn)?;
 
     init_change_intel_schema(conn)?;
+    if previous > 0 && previous < 4 {
+        crate::insights::refresh(conn)?;
+    }
     Ok(())
 }
 
@@ -928,7 +932,16 @@ fn upsert_metadata_session_with_model_internal(
     model_name: Option<&str>,
     store_unknown_if_missing: bool,
 ) -> Result<()> {
-    let repo_root = derive_repo_root(project_path, source_path);
+    let recorded_root: Option<String> = conn
+        .query_row(
+            "SELECT project_root FROM fact_session_project WHERE provider=?1 AND session_id=?2",
+            params![provider, session_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let repo_root = recorded_root
+        .map(|root| path_to_string(&crate::path_utils::on_disk(Path::new(&root))))
+        .or_else(|| derive_repo_root(project_path, source_path));
     let repository_id = if let Some(repo_root) = repo_root.as_deref() {
         upsert_metadata_repository(conn, repo_root)?
     } else {

@@ -526,6 +526,26 @@ fn process_auxiliary_record(record: &Value, timestamp: Option<&str>, state: &mut
             let Some(attachment_type) = attachment.get("type").and_then(Value::as_str) else {
                 return;
             };
+            if attachment_type == "skill_listing" {
+                let names = skill_listing_names(attachment);
+                if !names.is_empty() {
+                    let total = attachment.to_string().chars().count() as i64;
+                    let count = names.len() as i64;
+                    let share = total / count;
+                    let key = record_key(record)
+                        .unwrap_or_else(|| format!("att:{}", state.context_injections.len()));
+                    for (index, name) in names.into_iter().enumerate() {
+                        state.context_injections.push(ContextInjectionRecord {
+                            key: format!("{key}:skill:{index}"),
+                            ts: timestamp.map(ToOwned::to_owned),
+                            kind: "skill_listing".to_string(),
+                            source: Some(name),
+                            chars: share + if index == 0 { total % count } else { 0 },
+                        });
+                    }
+                    return;
+                }
+            }
             let (category, source, chars) = classify_attachment(attachment_type, attachment);
             let key = record_key(record)
                 .unwrap_or_else(|| format!("att:{}", state.context_injections.len()));
@@ -564,6 +584,32 @@ fn process_auxiliary_record(record: &Value, timestamp: Option<&str>, state: &mut
         }
         _ => {}
     }
+}
+
+fn skill_listing_names(attachment: &Value) -> Vec<String> {
+    ["skills", "items", "addedSkills", "addedNames"]
+        .iter()
+        .find_map(|key| attachment.get(key).and_then(Value::as_array))
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    let name = item.as_str().or_else(|| {
+                        item.get("name")
+                            .or_else(|| item.get("id"))
+                            .and_then(Value::as_str)
+                    })?;
+                    let name = name.trim();
+                    (!name.is_empty()
+                        && name.len() <= 96
+                        && name
+                            .chars()
+                            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_'))
+                    .then(|| name.to_string())
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn classify_attachment(
@@ -647,6 +693,7 @@ fn tool_target(tool_name: &str, input: &Value) -> Option<String> {
             .map(ToOwned::to_owned)
     };
     match tool_name {
+        "Skill" | "skill" => text("name").or_else(|| text("skill")),
         "Task" | "Agent" => text("description").or_else(|| text("subagent_type")),
         "Grep" | "Glob" => match (text("pattern"), text("path")) {
             (Some(pattern), Some(path)) => Some(format!("{path} :: {pattern}")),
@@ -1141,12 +1188,20 @@ fn update_time_bounds(
 mod tests {
     use super::{
         ClaudeMessageRole, discover_top_level_jsonl_files, parse_session_file,
-        should_ignore_user_text, structured_patch_summary,
+        should_ignore_user_text, skill_listing_names, structured_patch_summary,
     };
     use anyhow::Result;
     use serde_json::json;
     use std::fs;
     use tempfile::tempdir;
+
+    #[test]
+    fn listing_names_are_bounded_and_explicit() {
+        assert_eq!(
+            skill_listing_names(&json!({"skills": ["review", {"name": "test-run"}, "../unsafe"]})),
+            vec!["review", "test-run"]
+        );
+    }
 
     #[test]
     fn structured_patch_summary_counts_and_hashes_changes() {

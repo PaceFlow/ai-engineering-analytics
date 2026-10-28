@@ -91,8 +91,23 @@ pub fn run_for(verbose: bool, args: IngestArgs, context: crate::app::AppContext)
                     println!("  {} rows written", n);
                 }
                 grand_total += n;
+                db.execute(
+                    "DELETE FROM analytics_setting WHERE key=?1",
+                    [format!("source_error:{provider_name}")],
+                )?;
+                crate::insights::observation::scanned(
+                    &db,
+                    provider_name,
+                    provider_name == "opencode" && context.env("OPENCODE_DB_PATH").is_some(),
+                )?;
             }
-            Err(e) => println!("  error: {}", e),
+            Err(e) => {
+                db.execute(
+                    "INSERT OR REPLACE INTO analytics_setting(key,value) VALUES(?1,?2)",
+                    rusqlite::params![format!("source_error:{provider_name}"), format!("{e:#}")],
+                )?;
+                println!("  error: {}", e);
+            }
         }
 
         let change_result = {
@@ -233,6 +248,28 @@ pub fn run_for(verbose: bool, args: IngestArgs, context: crate::app::AppContext)
     crate::db::session_store::refresh_session_roots(&db)?;
     crate::insights::refresh(&db)?;
 
+    match crate::insights::setup::capture(&db, None, &[]) {
+        Ok(_) => {}
+        Err(error) => eprintln!("Setup history incomplete: {error}"),
+    }
+    match crate::delivery_sources::sync_for(&db, None, context) {
+        Ok(results) => {
+            for result in results {
+                if !result["error"].is_null() {
+                    eprintln!("PR/deployment source incomplete: {}", result);
+                }
+            }
+        }
+        Err(error) => eprintln!("PR/deployment collection pending: {error}"),
+    }
+    match crate::classify::automatic::after_ingest(&db) {
+        Ok(messages) => {
+            for message in messages {
+                println!("{message}");
+            }
+        }
+        Err(error) => eprintln!("Automatic classification pending: {error}"),
+    }
     progress.finish();
     report_accounting_correction(&db, accounting_before)?;
 

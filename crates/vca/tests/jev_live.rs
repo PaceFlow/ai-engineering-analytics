@@ -212,6 +212,8 @@ fn classify_run_labels_a_session_end_to_end() -> Result<()> {
         max_usd: 0.02,
         passes: Passes::ALL,
         dry_run: false,
+        dispatch_seconds: None,
+        job_id: None,
     };
     let session = SessionRef {
         provider: "claude".into(),

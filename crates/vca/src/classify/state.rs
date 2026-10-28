@@ -143,6 +143,7 @@ pub struct TurnFacts {
     pub tools: Vec<ToolFact>,
     pub idle_minutes_before: Option<f64>,
     pub events_before: Vec<String>,
+    pub runtime_outcomes: Vec<String>,
     pub files: Vec<String>,
 }
 
@@ -213,6 +214,7 @@ pub fn load_turns(conn: &Connection, provider: &str, session_id: &str) -> Result
                 ..TurnFacts::default()
             });
         } else if role == "assistant"
+            && !compaction
             && let Some(turn) = turns.last_mut()
         {
             if !turn.assistant.is_empty() {
@@ -269,17 +271,33 @@ pub fn load_turns(conn: &Connection, provider: &str, session_id: &str) -> Result
     }
 
     let mut stmt = conn.prepare(
-        "SELECT ts, kind FROM fact_session_event WHERE provider = ?1 AND session_id = ?2 ORDER BY event_index",
+        "SELECT ts, kind, detail FROM fact_session_event WHERE provider = ?1 AND session_id = ?2 ORDER BY event_index",
     )?;
     let events = stmt
         .query_map(params![provider, session_id], |row| {
-            Ok((row.get::<_, Option<String>>(0)?, row.get::<_, String>(1)?))
+            Ok((
+                row.get::<_, Option<String>>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    for (ts, kind) in events {
+    for (ts, kind, detail) in events {
         let Some(ts) = ts.as_deref().and_then(parse_ts) else {
             continue;
         };
+        if kind == "runtime_outcome" {
+            if let Some(value) = detail.filter(|s| {
+                ["succeeded", "failed", "cancelled", "interrupted"].contains(&s.as_str())
+            }) && let Some(turn) = turns
+                .iter_mut()
+                .rev()
+                .find(|t| t.ts.is_some_and(|start| start <= ts))
+            {
+                turn.runtime_outcomes.push(value);
+            }
+            continue;
+        }
         if let Some(next) = turns
             .iter_mut()
             .find(|turn| turn.ts.is_some_and(|start| start >= ts))
@@ -396,6 +414,8 @@ pub fn task_state(
         "commits_after_task": commits_after,
         "subagents": subagents,
         "compactions": compactions,
+        "runtime_outcomes": selected.iter().flat_map(|t|t.runtime_outcomes.iter()).collect::<Vec<_>>(),
+        "runtime_outcome_is_goal_completion": false,
     });
 
     let build = |level: Level,

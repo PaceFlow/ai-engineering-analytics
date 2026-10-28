@@ -27,6 +27,7 @@ pub fn run(args: ClassifyArgs, _context: AppContext) -> Result<()> {
     let conn = db::open()?;
     let config = ClassifierConfig::load()?;
     match args.command {
+        ClassifyCommands::Auto(args) => crate::commands::observe::run_auto(&conn, args),
         ClassifyCommands::Plan(select) => {
             let level = level_of(&select, &config)?;
             let sessions = select_sessions(&conn, &select)?;
@@ -59,7 +60,8 @@ pub fn run(args: ClassifyArgs, _context: AppContext) -> Result<()> {
             max_usd,
             passes,
             yes,
-        } => run_classifier(&conn, &config, &select, max_usd, &passes, yes),
+            resume,
+        } => run_classifier(&conn, &config, &select, max_usd, &passes, yes, resume),
         ClassifyCommands::Status => status(&conn, &config),
         ClassifyCommands::Key { command } => match command {
             ClassifyKeyCommands::Set { key } => {
@@ -270,6 +272,7 @@ fn run_classifier(
     max_usd: f64,
     passes: &str,
     yes: bool,
+    resume: Option<i64>,
 ) -> Result<()> {
     let level = level_of(select, config)?;
     let passes = Passes::parse(passes).ok_or_else(|| {
@@ -281,9 +284,26 @@ fn run_classifier(
             config::KEY_ENV
         );
     };
-    let sessions = select_sessions(conn, select)?;
+    let (sessions, options) = if let Some(id) = resume {
+        run::resume_job(conn, id, config)?
+    } else {
+        (
+            select_sessions(conn, select)?,
+            RunOptions {
+                level,
+                max_usd,
+                passes,
+                dry_run: false,
+                dispatch_seconds: None,
+                job_id: None,
+            },
+        )
+    };
+    let level = options.level;
+    let passes = options.passes;
+    let max_usd = options.max_usd;
     let month_spent = run::monthly_spend(conn)?;
-    let estimate = run::plan(conn, config, &sessions, level)?;
+    let estimate = run::plan_passes(conn, config, &sessions, level, passes)?;
     print_plan(&estimate, level, config, month_spent);
     println!("Run cap: {}\n", small_usd(max_usd));
     if !yes {
@@ -301,12 +321,6 @@ fn run_classifier(
         }
     }
     let client = OpenRouterClient::new(&config.endpoint, &key)?;
-    let options = RunOptions {
-        level,
-        max_usd,
-        passes,
-        dry_run: false,
-    };
     let summary = run::run(conn, &client, config, &sessions, &options)?;
     if select.filters.json {
         println!("{}", serde_json::to_string_pretty(&summary)?);
@@ -323,8 +337,11 @@ fn run_classifier(
         small_usd(summary.cost_usd)
     );
     println!(
-        "{} sessions split into several tasks · {} completion turns set",
-        summary.tasks_split, summary.completions
+        "{} sessions split · {} completion decisions processed · {} new completions · job {}",
+        summary.tasks_split,
+        summary.completion_decisions,
+        summary.new_completions,
+        summary.job_id.unwrap_or_default()
     );
     if let Some(reason) = &summary.stopped {
         println!("Stopped: {reason}. Remaining units stay unclassified; re-run to continue.");

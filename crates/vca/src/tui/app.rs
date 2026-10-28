@@ -23,36 +23,46 @@ pub type TaskKey = (String, String, i64);
 pub enum Unit {
     Sessions,
     Tasks,
+    WorkItems,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DetailTab {
+    Overview,
     Conversation,
     Tasks,
     Agents,
     Usage,
     Context,
+    Skills,
     Delivery,
+    TurnContext,
 }
 
 impl DetailTab {
-    pub const ALL: [DetailTab; 6] = [
+    pub const ALL: [DetailTab; 9] = [
+        Self::Overview,
         Self::Conversation,
         Self::Tasks,
         Self::Agents,
         Self::Usage,
         Self::Context,
+        Self::Skills,
         Self::Delivery,
+        Self::TurnContext,
     ];
 
     pub fn label(self) -> &'static str {
         match self {
+            Self::Overview => "Overview",
             Self::Conversation => "Conversation",
             Self::Tasks => "Tasks",
             Self::Agents => "Agents",
             Self::Usage => "Usage",
             Self::Context => "Context",
+            Self::Skills => "Skills",
             Self::Delivery => "Code & Delivery",
+            Self::TurnContext => "Turn Context",
         }
     }
 }
@@ -78,6 +88,19 @@ impl UsageTab {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Screen {
+    Trends {
+        tab: usize,
+        around: Option<i64>,
+    },
+    WorkItems {
+        ids: Vec<String>,
+    },
+    WorkDetail {
+        id: String,
+    },
+    WorkLinks {
+        id: Option<String>,
+    },
     Overview,
     List {
         unit: Unit,
@@ -103,6 +126,7 @@ pub enum Screen {
     ContextItems {
         group: Option<(ContextDim, String)>,
     },
+    Skills,
     Delivery,
     Practices,
     Compare {
@@ -113,6 +137,21 @@ pub enum Screen {
 impl Screen {
     pub fn title(&self) -> String {
         match self {
+            Self::Trends { tab, .. } => [
+                "Trends",
+                "Work mix",
+                "Period comparison",
+                "Setup changes",
+                "Daily work",
+            ][*tab % 5]
+                .into(),
+            Self::WorkItems { .. }
+            | Self::List {
+                unit: Unit::WorkItems,
+                ..
+            } => "Work items".into(),
+            Self::WorkDetail { .. } => "Work item".into(),
+            Self::WorkLinks { .. } => "Work relationships".into(),
             Self::Overview => "Overview".into(),
             Self::List {
                 unit: Unit::Sessions,
@@ -131,6 +170,7 @@ impl Screen {
                 group: Some((_, key)),
             } => format!("Items: {}", crate::explore::format::truncate(key, 24)),
             Self::ContextItems { group: None } => "Context items".into(),
+            Self::Skills => "Skills".into(),
             Self::Delivery => "Delivery & Rework".into(),
             Self::Practices => "Practices".into(),
             Self::Compare { keys } => format!("Compare ({})", keys.len()),
@@ -173,6 +213,10 @@ impl Frame {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Popup {
+    ObserveInput {
+        kind: String,
+        text: String,
+    },
     Help,
     Explain {
         title: String,
@@ -491,6 +535,22 @@ impl App {
     pub fn query_for(frame: &Frame) -> Query {
         let filters = frame.filters.clone();
         match &frame.screen {
+            Screen::Trends { tab: 4, .. } => Query::Daily(filters),
+            Screen::Trends { around, .. } => Query::Trends(filters, *around),
+            Screen::WorkItems { ids } => Query::WorkItems(
+                filters,
+                if ids.is_empty() {
+                    vec!["__empty__".into()]
+                } else {
+                    ids.clone()
+                },
+            ),
+            Screen::List {
+                unit: Unit::WorkItems,
+                ..
+            } => Query::WorkItems(filters, vec![]),
+            Screen::WorkDetail { id } => Query::WorkDetail(id.clone()),
+            Screen::WorkLinks { id } => Query::WorkLinks(filters, id.clone()),
             Screen::Overview => Query::Overview(filters),
             Screen::List {
                 unit: Unit::Sessions,
@@ -522,6 +582,7 @@ impl App {
             } => Query::ContextGroups(filters, ContextDim::ALL[*ctx_dim % ContextDim::ALL.len()]),
             Screen::Window { window } => Query::Contributors((**window).clone()),
             Screen::ContextItems { group } => Query::ContextItems(filters, group.clone()),
+            Screen::Skills => Query::Skills(filters),
             Screen::Delivery => Query::Ladder(filters),
             Screen::Practices => Query::Practices(filters),
             Screen::Compare { keys } => Query::Compare(keys.clone()),
@@ -581,22 +642,33 @@ impl App {
                 3 => o.outcomes.len(),
                 _ => o.top_sessions.len(),
             },
+            (Screen::Trends { tab: 4, .. }, Data::Daily(report)) => report.days.len(),
+            (Screen::Trends { tab, .. }, Data::Trends(report)) => {
+                super::trend_ui::row_count(report, *tab)
+            }
+            (_, Data::WorkItems(rows)) => rows.len(),
+            (_, Data::WorkDetail(Some(work))) => work.members.len(),
+            (_, Data::WorkLinks(rows)) => rows.len(),
             (_, Data::Sessions(rows)) => rows.len(),
             (_, Data::Tasks(rows)) => rows.len(),
             (_, Data::Groups(rows)) => rows.len(),
             (Screen::Detail { tab, .. }, Data::Detail(Some(detail))) => match tab {
+                DetailTab::Overview => 0,
                 DetailTab::Conversation => detail.turns.len(),
                 DetailTab::Tasks => detail.tasks.len() + detail.attempts.len(),
                 DetailTab::Agents => detail.agents.len(),
                 DetailTab::Usage => detail.models.len(),
-                DetailTab::Context => detail.context_items.len(),
+                DetailTab::Context => detail.calls.len(),
+                DetailTab::Skills => detail.skills.len(),
                 DetailTab::Delivery => detail.commits.len(),
+                DetailTab::TurnContext => detail.turn_context.len(),
             },
             (_, Data::Usage(buckets, _)) => usage_rows(buckets).len(),
             (_, Data::Windows(rows)) => rows.len(),
             (_, Data::Contributors(rows)) => rows.len(),
             (_, Data::ContextGroups(rows)) => rows.len(),
             (_, Data::ContextItems(rows)) => rows.len(),
+            (_, Data::Skills(rows)) => rows.len(),
             (_, Data::Ladder(rows, _)) => rows.len(),
             (_, Data::Practices(rows)) => rows.len(),
             (_, Data::Compare(columns)) => columns.first().map(|c| c.values.len()).unwrap_or(0),
@@ -648,6 +720,68 @@ impl App {
                         Some("Mark at least two rows with m, then press c or 7 to compare".into());
                 }
             }
+            KeyCode::Char('8') => self.top_level(Screen::Skills),
+            KeyCode::Char('9') => {
+                if self.time_preset == 1
+                    && self.frame().filters.from == date_from_days(30)
+                    && self.frame().filters.to.is_none()
+                {
+                    self.frame_mut().filters.from = None;
+                    self.time_preset = 3;
+                }
+                self.top_level(Screen::Trends {
+                    tab: 0,
+                    around: None,
+                });
+            }
+            KeyCode::Char('n') if matches!(self.frame().screen, Screen::Trends { .. }) => {
+                self.popup = Some(Popup::ObserveInput {
+                    kind: "milestone".into(),
+                    text: format!("{} | ", chrono::Local::now().format("%Y-%m-%d")),
+                });
+            }
+            KeyCode::Char('L') => {
+                let id = match &self.frame().screen {
+                    Screen::WorkDetail { id } => Some(id.clone()),
+                    _ => None,
+                };
+                self.push(Frame::new(
+                    Screen::WorkLinks { id },
+                    self.frame().filters.clone(),
+                ));
+            }
+            KeyCode::Char('l')
+                if matches!(
+                    self.frame().screen,
+                    Screen::WorkDetail { .. } | Screen::WorkLinks { .. }
+                ) =>
+            {
+                self.popup = Some(Popup::ObserveInput {
+                    kind: "link".into(),
+                    text: String::new(),
+                });
+            }
+            KeyCode::Char('a') | KeyCode::Char('d')
+                if matches!(self.frame().screen, Screen::WorkLinks { .. }) =>
+            {
+                if let Some(Data::WorkLinks(rows)) = &self.frame().data
+                    && let Some(row) = rows.get(self.frame().selected)
+                {
+                    self.act(Action::DecideWorkLink {
+                        id: row.id.clone(),
+                        accepted: key.code == KeyCode::Char('a'),
+                    });
+                }
+            }
+            KeyCode::Char('d') if matches!(self.frame().screen, Screen::WorkDetail { .. }) => {
+                if let Some(Data::WorkDetail(Some(work))) = &self.frame().data
+                    && let Some(member) = work.members.get(self.frame().selected)
+                {
+                    self.act(Action::DetachWork {
+                        id: member.id.clone(),
+                    });
+                }
+            }
             KeyCode::Char('H') => {
                 self.frames.truncate(1);
                 if self.frame().screen != Screen::Overview {
@@ -674,6 +808,17 @@ impl App {
             KeyCode::Char('g') => self.cycle_group(if shift { -1 } else { 1 }),
             KeyCode::Char('G') => self.cycle_group(-1),
             KeyCode::Char('b') => self.toggle_bucket(),
+            KeyCode::Char('w') => {
+                if matches!(
+                    self.frame().screen,
+                    Screen::Detail {
+                        tab: DetailTab::Skills,
+                        ..
+                    }
+                ) {
+                    self.frame_mut().panel = (self.frame().panel + 1) % 3;
+                }
+            }
             KeyCode::Char('t') => self.cycle_time(),
             KeyCode::Char('f') => {
                 self.popup = Some(Popup::Filters {
@@ -723,6 +868,12 @@ impl App {
         let cycle =
             |index: usize, len: usize| ((index as i64 + delta).rem_euclid(len as i64)) as usize;
         let reload = match &mut frame.screen {
+            Screen::Trends { tab, .. } => {
+                let was_daily = *tab == 4;
+                *tab = cycle(*tab, 5);
+                frame.selected = 0;
+                was_daily || *tab == 4
+            }
             Screen::Detail { tab, .. } => {
                 let index = DetailTab::ALL.iter().position(|t| t == tab).unwrap_or(0);
                 *tab = DetailTab::ALL[cycle(index, DetailTab::ALL.len())];
@@ -754,6 +905,7 @@ impl App {
             let len = match unit {
                 Unit::Sessions => SessionSort::ALL.len(),
                 Unit::Tasks => TaskSort::ALL.len(),
+                Unit::WorkItems => 1,
             };
             *sort = (*sort + 1) % len;
             self.load();
@@ -779,7 +931,8 @@ impl App {
         if let Screen::List { unit, sort } = &mut frame.screen {
             *unit = match unit {
                 Unit::Sessions => Unit::Tasks,
-                Unit::Tasks => Unit::Sessions,
+                Unit::Tasks => Unit::WorkItems,
+                Unit::WorkItems => Unit::Sessions,
             };
             *sort = 0;
             frame.selected = 0;
@@ -899,6 +1052,62 @@ impl App {
             return;
         };
         let next: Option<Frame> = match (&frame.screen, data) {
+            (Screen::Trends { tab: 4, .. }, Data::Daily(report)) => {
+                report.days.get(selected).map(|day| {
+                    Frame::new(
+                        Screen::WorkItems {
+                            ids: report
+                                .work_by_day
+                                .get(&day.date)
+                                .cloned()
+                                .unwrap_or_default(),
+                        },
+                        frame.filters.clone(),
+                    )
+                })
+            }
+            (Screen::Trends { tab, .. }, Data::Trends(report)) => {
+                if *tab == 3 {
+                    report.milestones.get(selected).map(|m| {
+                        Frame::new(
+                            Screen::Trends {
+                                tab: 2,
+                                around: Some(m.id),
+                            },
+                            frame.filters.clone(),
+                        )
+                    })
+                } else {
+                    Some(Frame::new(
+                        Screen::WorkItems {
+                            ids: super::trend_ui::contributors(report, *tab, selected),
+                        },
+                        frame.filters.clone(),
+                    ))
+                }
+            }
+            (_, Data::WorkItems(rows)) => rows.get(selected).map(|w| {
+                Frame::new(
+                    Screen::WorkDetail { id: w.id.clone() },
+                    frame.filters.clone(),
+                )
+            }),
+            (_, Data::WorkDetail(Some(w))) => w.members.get(selected).map(|m| {
+                detail_frame(
+                    &frame.filters,
+                    &m.task.provider,
+                    &m.task.session_id,
+                    Some(m.task.task_index),
+                )
+            }),
+            (_, Data::WorkLinks(rows)) => rows.get(selected).map(|r| {
+                Frame::new(
+                    Screen::WorkItems {
+                        ids: vec![r.from_id.clone(), r.to_id.clone()],
+                    },
+                    frame.filters.clone(),
+                )
+            }),
             (Screen::Overview, Data::Overview(o)) => match frame.panel {
                 0 => o.by_tool.get(selected).map(|row| {
                     self.child(
@@ -1344,6 +1553,33 @@ impl App {
     }
 
     pub fn explain(&mut self) {
+        let value = match &self.frame().data {
+            Some(Data::WorkDetail(Some(w))) => Some(
+                serde_json::json!({"completion":w.completions,"reopens":w.reopens,"relations":w.relations,"pull_requests":w.pull_requests,"members":w.members.iter().map(|m|(&m.id,&m.review_reason)).collect::<Vec<_>>() }),
+            ),
+            Some(Data::WorkLinks(rows)) => rows
+                .get(self.frame().selected)
+                .map(|r| serde_json::json!(r)),
+            Some(Data::Daily(r)) => Some(
+                serde_json::json!({"sources":r.sources,"warnings":r.warnings,"published_revision":r.published_revision,"coverage":r.days.iter().map(|d|(&d.date,&d.coverage)).collect::<Vec<_>>()}),
+            ),
+            Some(Data::Trends(r)) => Some(
+                serde_json::json!({"coverage":r.periods.iter().map(|p|(&p.from,&p.coverage)).collect::<Vec<_>>(),"classification_versions":r.classification_versions,"warnings":r.warnings}),
+            ),
+            _ => None,
+        };
+        if let Some(value) = value {
+            self.popup = Some(Popup::Explain {
+                title: "Measurement evidence".into(),
+                lines: serde_json::to_string_pretty(&value)
+                    .unwrap_or_default()
+                    .lines()
+                    .map(str::to_owned)
+                    .collect(),
+            });
+            return;
+        }
+
         if let Some((title, lines)) = super::explain::explain(self) {
             self.popup = Some(Popup::Explain { title, lines });
         }
@@ -1352,6 +1588,42 @@ impl App {
     fn on_popup_key(&mut self, key: KeyEvent) {
         let popup = self.popup.take().expect("popup present");
         match popup {
+            Popup::ObserveInput { kind, mut text } => match key.code {
+                KeyCode::Esc => {}
+                KeyCode::Backspace => {
+                    text.pop();
+                    self.popup = Some(Popup::ObserveInput { kind, text });
+                }
+                KeyCode::Char(ch) => {
+                    text.push(ch);
+                    self.popup = Some(Popup::ObserveInput { kind, text });
+                }
+                KeyCode::Enter => {
+                    if kind == "milestone" {
+                        if let Some((at, title)) = text.split_once('|') {
+                            self.act(Action::AddMilestone {
+                                title: title.trim().into(),
+                                at: at.trim().into(),
+                                repo: self.frame().filters.repo.clone(),
+                            });
+                        } else {
+                            self.message = Some("Use YYYY-MM-DD | title".into());
+                        }
+                    } else {
+                        let parts: Vec<_> = text.split_whitespace().collect();
+                        if parts.len() >= 2 {
+                            self.act(Action::LinkWork {
+                                from: parts[0].into(),
+                                to: parts[1].into(),
+                                kind: parts.get(2).copied().unwrap_or("continuation").into(),
+                            });
+                        } else {
+                            self.message=Some("Use FROM_MEMBER TO_MEMBER [continuation|reopens|corrects_previous_work]".into());
+                        }
+                    }
+                }
+                _ => self.popup = Some(Popup::ObserveInput { kind, text }),
+            },
             Popup::Edit {
                 target,
                 mut field,
@@ -1745,7 +2017,7 @@ pub fn detail_frame(filters: &Filters, provider: &str, session: &str, task: Opti
             tab: if task.is_some() {
                 DetailTab::Tasks
             } else {
-                DetailTab::Conversation
+                DetailTab::Overview
             },
             focus_task: task,
         },

@@ -408,11 +408,35 @@ fn parse_session(path: &PathBuf) -> Result<Option<SessionRecord>> {
                     ("message", "user") | ("message", "developer") => {
                         let text = content_text(&line.payload, "input_text");
                         if let Some(kind) = injected_context_kind(&text) {
+                            if kind == "skill_listing" {
+                                let names = listed_skill_ids(&text);
+                                if !names.is_empty() {
+                                    let total = text.chars().count() as i64;
+                                    let count = names.len() as i64;
+                                    for (index, name) in names.into_iter().enumerate() {
+                                        record.context_injections.push(ContextInjectionRecord {
+                                            key: format!("line:{line_no}:skill:{index}"),
+                                            ts: ts.clone(),
+                                            kind: "skill_listing".into(),
+                                            source: Some(name),
+                                            chars: total / count
+                                                + if index == 0 { total % count } else { 0 },
+                                        });
+                                    }
+                                    continue;
+                                }
+                            }
                             record.context_injections.push(ContextInjectionRecord {
                                 key: format!("line:{line_no}"),
                                 ts: ts.clone(),
                                 kind: kind.to_string(),
-                                source: (kind == "instructions").then(|| "AGENTS.md".to_string()),
+                                source: if kind == "instructions" {
+                                    Some("AGENTS.md".to_string())
+                                } else if kind == "skill_injection" {
+                                    injected_skill_id(&text)
+                                } else {
+                                    None
+                                },
                                 chars: text.chars().count() as i64,
                             });
                         } else if role == "developer" && !text.is_empty() {
@@ -505,7 +529,22 @@ fn parse_session(path: &PathBuf) -> Result<Option<SessionRecord>> {
                                 ts: ts.clone(),
                             });
                         }
-                        let target = command.clone().or_else(|| patch_target(&arguments));
+                        let target = if name
+                            .rsplit(['.', '_', ':'])
+                            .next()
+                            .is_some_and(|part| part.eq_ignore_ascii_case("skill"))
+                        {
+                            serde_json::from_str::<Value>(&arguments)
+                                .ok()
+                                .and_then(|args| {
+                                    args.get("name")
+                                        .or_else(|| args.get("skill"))
+                                        .and_then(Value::as_str)
+                                        .map(ToOwned::to_owned)
+                                })
+                        } else {
+                            command.clone().or_else(|| patch_target(&arguments))
+                        };
                         pending_calls.insert(
                             call_id.clone(),
                             PendingCall {
@@ -907,7 +946,11 @@ fn content_text(payload: &Value, item_type: &str) -> String {
 
 fn injected_context_kind(text: &str) -> Option<&'static str> {
     let trimmed = text.trim_start();
-    if trimmed.starts_with("<user_instructions>")
+    if trimmed.starts_with("<skill name=\"") || trimmed.starts_with("# Skill: ") {
+        Some("skill_injection")
+    } else if trimmed.starts_with("<skills_instructions>") || trimmed.starts_with("## Skills\n") {
+        Some("skill_listing")
+    } else if trimmed.starts_with("<user_instructions>")
         || trimmed.starts_with("# AGENTS.md")
         || trimmed.contains("AGENTS.md instructions")
     {
@@ -919,6 +962,43 @@ fn injected_context_kind(text: &str) -> Option<&'static str> {
     } else {
         None
     }
+}
+
+fn injected_skill_id(text: &str) -> Option<String> {
+    let trimmed = text.trim_start();
+    let candidate = trimmed
+        .strip_prefix("# Skill: ")
+        .map(|rest| rest.lines().next().unwrap_or(""))
+        .or_else(|| trimmed.strip_prefix("<skill name=\"")?.split('"').next())?;
+    let id = candidate.trim();
+    (!id.is_empty()
+        && id.len() <= 96
+        && id
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_'))
+    .then(|| id.to_string())
+}
+
+fn listed_skill_ids(text: &str) -> Vec<String> {
+    let Some(list) = text.split("### Available skills").nth(1) else {
+        return Vec::new();
+    };
+    list.lines()
+        .take_while(|line| !line.starts_with("### "))
+        .filter_map(|line| {
+            let entry = line.trim_start().strip_prefix("- ")?;
+            let id = entry
+                .split_once(": ")
+                .map(|(id, _)| id)
+                .unwrap_or_else(|| entry.split_whitespace().next().unwrap_or(""));
+            (!id.is_empty()
+                && id.len() <= 96
+                && id
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | ':' | '.')))
+            .then(|| id.to_string())
+        })
+        .collect()
 }
 
 fn tool_arguments(payload: &Value) -> String {
@@ -1156,6 +1236,12 @@ fn parse_unified_diff(diff: &str) -> Vec<(String, i64, i64)> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn skill_listing_extracts_only_named_entries() {
+        let text = "<skills_instructions>\n### Skill roots\n- r0 = /tmp\n### Available skills\n- review: Reviews code.\n- plugin:skill: Handles work.\n</skills_instructions>";
+        assert_eq!(listed_skill_ids(text), vec!["review", "plugin:skill"]);
+    }
 
     #[test]
     fn parses_codex_patch_counts() {

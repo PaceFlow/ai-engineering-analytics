@@ -103,6 +103,19 @@ pub fn save(
         staging.join(EXPECTATIONS),
         serde_json::to_string_pretty(expectations)? + "\n",
     )?;
+    super::observations::save(
+        conn,
+        &staging.join(super::observations::FILE),
+        provider,
+        session_id,
+        repo_root.as_deref(),
+    )?;
+    record(
+        &staging,
+        super::observations::FILE,
+        "persistent analytics inputs",
+        &mut files,
+    )?;
     let manifest = Manifest {
         format: 1,
         key: format!("{provider}:{session_id}"),
@@ -354,22 +367,47 @@ fn copy_opencode(
     warnings: &mut Vec<String>,
 ) -> Result<()> {
     let db_path = crate::providers::opencode::opencode_db_path()?;
-    let source = open_source(&db_path)?;
+    copy_opencode_from(&db_path, sessions, staging, files, warnings)
+}
+
+fn copy_opencode_from(
+    db_path: &Path,
+    sessions: &[SessionSource],
+    staging: &Path,
+    files: &mut Vec<ManifestFile>,
+    warnings: &mut Vec<String>,
+) -> Result<()> {
+    let source = open_source(db_path)?;
     let rel = Path::new("home/.local/share/opencode/opencode.db");
-    let tables = ["project", "session", "message", "part"];
+    let tables = [
+        "project",
+        "session",
+        "message",
+        "part",
+        "session_v2",
+        "session_message",
+    ];
     let dest = create_like(&source, &staging.join(rel), &tables)?;
     let ids: Vec<String> = sessions.iter().map(|s| s.session_id.clone()).collect();
-    let copied = copy_rows(&source, &dest, "session", "id = ?1", &ids)?;
+    let copied = copy_rows(&source, &dest, "session", "id = ?1", &ids)?
+        + copy_rows(&source, &dest, "session_v2", "id = ?1", &ids)?;
     if copied == 0 {
         bail!("session rows not found in {}", db_path.display());
     }
     copy_rows(&source, &dest, "message", "session_id = ?1", &ids)?;
     copy_rows(&source, &dest, "part", "session_id = ?1", &ids)?;
-    let projects: Vec<String> = {
-        let mut stmt = dest.prepare("SELECT DISTINCT project_id FROM session")?;
-        stmt.query_map([], |row| row.get(0))?
-            .collect::<rusqlite::Result<_>>()?
-    };
+    copy_rows(&source, &dest, "session_message", "session_id = ?1", &ids)?;
+    let mut projects = Vec::new();
+    for table in ["session", "session_v2"] {
+        if columns(&dest, table)?.is_empty() {
+            continue;
+        }
+        let mut stmt = dest.prepare(&format!("SELECT DISTINCT project_id FROM {table}"))?;
+        projects.extend(
+            stmt.query_map([], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?,
+        );
+    }
     copy_rows(&source, &dest, "project", "id = ?1", &projects)?;
     drop(dest);
     record(
@@ -503,6 +541,70 @@ fn bundle_repo(repo: &Path, staging: &Path, warnings: &mut Vec<String>) -> Optio
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn v2_only_opencode_snapshot_replays_selected_sessions_without_private_tables() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let src_path = dir.path().join("opencode.db");
+        let src = Connection::open(&src_path)?;
+        src.execute_batch("CREATE TABLE project(id TEXT PRIMARY KEY,worktree TEXT);
+            CREATE TABLE session_v2(id TEXT PRIMARY KEY,project_id TEXT,directory TEXT,time_created INTEGER,time_updated INTEGER);
+            CREATE TABLE session_message(id TEXT PRIMARY KEY,session_id TEXT,type TEXT,seq INTEGER,time_created INTEGER,time_updated INTEGER,data TEXT);
+            CREATE TABLE credential(secret TEXT);
+            INSERT INTO credential VALUES('must never be copied');
+            INSERT INTO project VALUES('p','/recorded/repository');
+            INSERT INTO session_v2 VALUES('s','p','/removed/worktree',1790848800000,1790848860000);
+            INSERT INTO session_v2 VALUES('other','p','/removed/other',1790848800000,1790848860000);")?;
+        src.execute(
+            "INSERT INTO session_message VALUES('u','s','user',0,1790848800000,1790848800000,?1)",
+            [serde_json::json!({"text":"Explain this behavior"}).to_string()],
+        )?;
+        src.execute("INSERT INTO session_message VALUES('a','s','assistant',1,1790848860000,1790848860000,?1)",[serde_json::json!({"model":{"id":"model"},"cost":0.01,"tokens":{"input":5,"output":2,"reasoning":1,"cache":{"read":3,"write":0}},"content":[{"type":"text","text":"Explanation"}]}).to_string()])?;
+        src.execute("INSERT INTO session_message VALUES('private','other','user',0,1790848800000,1790848800000,?1)",[serde_json::json!({"text":"unselected conversation"}).to_string()])?;
+        let staging = dir.path().join("snapshot");
+        copy_opencode_from(
+            &src_path,
+            &[SessionSource {
+                session_id: "s".into(),
+                source_path: Some(src_path.to_string_lossy().into_owned()),
+            }],
+            &staging,
+            &mut vec![],
+            &mut vec![],
+        )?;
+        let copied = staging.join("home/.local/share/opencode/opencode.db");
+        let snapshot = Connection::open(&copied)?;
+        assert_eq!(
+            snapshot.query_row("SELECT COUNT(*) FROM session_v2", [], |r| r
+                .get::<_, i64>(0))?,
+            1
+        );
+        assert_eq!(
+            snapshot.query_row("SELECT COUNT(*) FROM session_message", [], |r| r
+                .get::<_, i64>(0))?,
+            2
+        );
+        assert_eq!(
+            snapshot.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name='credential'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )?,
+            0
+        );
+        let analytics = Connection::open_in_memory()?;
+        crate::db::init_app_schema(&analytics)?;
+        crate::providers::opencode::ingest_planned_sessions(&analytics, &[copied], false, None)?;
+        assert_eq!(
+            analytics.query_row(
+                "SELECT SUM(total_tokens) FROM fact_session_usage",
+                [],
+                |r| r.get::<_, i64>(0)
+            )?,
+            11
+        );
+        Ok(())
+    }
 
     #[test]
     fn below_keeps_relative_layout_or_falls_back() {

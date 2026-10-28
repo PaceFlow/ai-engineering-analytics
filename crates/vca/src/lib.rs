@@ -22,3 +22,5 @@ pub mod test_support;
 
 pub mod app;
 pub mod data_home;
+
+pub mod delivery_sources;

@@ -10,6 +10,7 @@
 //! Snapshots live in `~/.vca/corpus/<provider>-<id>/` and never leave the
 //! machine unless packed and uploaded deliberately.
 
+pub mod observations;
 pub mod replay;
 pub mod server;
 pub mod snapshot;

@@ -54,6 +54,35 @@ fn print_json<T: serde::Serialize>(value: &T) -> Result<()> {
     Ok(())
 }
 
+fn session_detail_export(detail: &explore::SessionDetail) -> Result<serde_json::Value> {
+    let mut value = serde_json::to_value(detail)?;
+    redact_session_detail_json(&mut value);
+    Ok(value)
+}
+
+fn redact_session_detail_json(value: &mut serde_json::Value) {
+    if let Some(session) = value.get_mut("session").and_then(|v| v.as_object_mut()) {
+        session.remove("title");
+    }
+    for (section, fields) in [
+        ("tasks", &["title"][..]),
+        ("turns", &["user_text", "feedback"][..]),
+        ("agents", &["title"][..]),
+        ("events", &["detail"][..]),
+        ("attempts", &["error_signature"][..]),
+    ] {
+        if let Some(rows) = value.get_mut(section).and_then(|v| v.as_array_mut()) {
+            for row in rows {
+                if let Some(row) = row.as_object_mut() {
+                    for field in fields {
+                        row.remove(*field);
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn print_footer(filters: &Filters) {
     let chips = filters.chips();
     let scope = if chips.is_empty() {
@@ -633,9 +662,10 @@ pub fn run_show(args: ShowArgs, _context: AppContext) -> Result<()> {
         bail!("session {} not found", args.session);
     };
     if args.json {
-        return print_json(&detail);
+        return print_json(&session_detail_export(&detail)?);
     }
     let s = &detail.session;
+    let native_usage = detail.native_usage_available;
     println!(
         "{} · {} · {}",
         s.provider,
@@ -657,18 +687,90 @@ pub fn run_show(args: ShowArgs, _context: AppContext) -> Result<()> {
     );
     println!(
         "API-equiv {} (subagents {}) · fresh {} · cache read {} · models {}",
-        fmt::usd(s.cost),
+        fmt::usd(if native_usage { s.cost } else { None }),
         fmt::usd(s.subagent_cost),
-        fmt::tokens(s.fresh_tokens),
-        fmt::tokens(s.cache_read_tokens),
+        if native_usage {
+            fmt::tokens(s.fresh_tokens)
+        } else {
+            "—".into()
+        },
+        if native_usage {
+            fmt::tokens(s.cache_read_tokens)
+        } else {
+            "—".into()
+        },
         s.models
             .split(',')
             .map(short_model)
             .collect::<Vec<_>>()
             .join(", ")
     );
-    let all =
-        !(args.tasks || args.agents || args.usage || args.context || args.delivery || args.turns);
+    if !native_usage && !detail.calls.is_empty() {
+        println!(
+            "Native token usage and cost unavailable for this session; context sizes below are captured characters."
+        );
+    }
+    let all = !(args.tasks
+        || args.agents
+        || args.usage
+        || args.context
+        || args.delivery
+        || args.turns
+        || args.turn_context);
+
+    if args.turn_context {
+        println!("\nContext by user turn (coding-agent source; turns are not external runs)");
+        let rows: Vec<Vec<String>> = detail
+            .turn_context
+            .iter()
+            .take(args.limit)
+            .map(|turn| {
+                vec![
+                    turn.turn_index.to_string(),
+                    fmt::when(turn.started_at.as_deref()),
+                    turn.since_previous_minutes
+                        .map(|minutes| format!("{minutes:.0}m"))
+                        .unwrap_or_else(|| "—".into()),
+                    turn.model_requests.to_string(),
+                    turn.tool_calls.to_string(),
+                    turn.first_context_tokens
+                        .map(fmt::tokens)
+                        .unwrap_or_else(|| "—".into()),
+                    turn.last_context_tokens
+                        .map(fmt::tokens)
+                        .unwrap_or_else(|| "—".into()),
+                    fmt::tokens(turn.prior_captured_chars),
+                    fmt::tokens(turn.prior_est_tokens),
+                    fmt::tokens(turn.new_captured_chars),
+                    fmt::tokens(turn.new_est_tokens),
+                    turn.capture.clone(),
+                ]
+            })
+            .collect();
+        print!(
+            "{}",
+            fmt::table(
+                &[
+                    "Turn",
+                    "Started",
+                    ">Since",
+                    ">Req",
+                    ">Tools",
+                    ">First in",
+                    ">Last in",
+                    ">Prior chars",
+                    ">~Prior tok",
+                    ">New chars",
+                    ">~New tok",
+                    "Capture"
+                ],
+                &rows,
+            )
+        );
+        println!(
+            "Prior/new sizes cover captured material; token estimates use character ratios. Missing native input stays unknown."
+        );
+    }
 
     if all || args.tasks {
         println!("\nTasks");
@@ -743,8 +845,12 @@ pub fn run_show(args: ShowArgs, _context: AppContext) -> Result<()> {
                     a.agent_type.clone().unwrap_or_else(|| a.agent_kind.clone()),
                     fmt::truncate(a.title.as_deref().unwrap_or(""), 36),
                     a.turns.to_string(),
-                    fmt::tokens(a.fresh_tokens),
-                    fmt::usd(a.cost),
+                    if native_usage {
+                        fmt::tokens(a.fresh_tokens)
+                    } else {
+                        "—".into()
+                    },
+                    fmt::usd(if native_usage { a.cost } else { None }),
                     if a.background_tokens > 0 {
                         format!("{} background", fmt::tokens(a.background_tokens))
                     } else {
@@ -778,10 +884,22 @@ pub fn run_show(args: ShowArgs, _context: AppContext) -> Result<()> {
                 vec![
                     short_model(&m.model),
                     m.calls.to_string(),
-                    fmt::tokens(m.fresh_tokens),
-                    fmt::tokens(m.cache_read_tokens),
-                    fmt::tokens(m.output_tokens),
-                    fmt::usd(m.cost),
+                    if native_usage {
+                        fmt::tokens(m.fresh_tokens)
+                    } else {
+                        "—".into()
+                    },
+                    if native_usage {
+                        fmt::tokens(m.cache_read_tokens)
+                    } else {
+                        "—".into()
+                    },
+                    if native_usage {
+                        fmt::tokens(m.output_tokens)
+                    } else {
+                        "—".into()
+                    },
+                    fmt::usd(if native_usage { m.cost } else { None }),
                     format!(
                         "{}, pricing {}",
                         m.token_source,
@@ -816,15 +934,35 @@ pub fn run_show(args: ShowArgs, _context: AppContext) -> Result<()> {
             .unwrap_or(0);
         println!(
             "\nContext · peak {} tokens · {} calls · cache rebuilds {} ({} extra)",
-            fmt::tokens(peak),
+            if native_usage {
+                fmt::tokens(peak)
+            } else {
+                "—".into()
+            },
             detail.calls.len(),
             detail
                 .calls
                 .iter()
                 .filter(|c| c.cache_event == "rebuild")
                 .count(),
-            fmt::usd(Some(rebuilds))
+            if native_usage {
+                fmt::usd(Some(rebuilds))
+            } else {
+                "—".into()
+            }
         );
+        if !native_usage {
+            let captured: i64 = detail
+                .context_sources
+                .iter()
+                .map(|source| source.captured_chars)
+                .sum();
+            println!(
+                "Captured context: {} characters across {} items",
+                fmt::tokens(captured),
+                detail.context_items.len()
+            );
+        }
         let rows: Vec<Vec<String>> = detail
             .context_kinds
             .iter()
@@ -833,8 +971,16 @@ pub fn run_show(args: ShowArgs, _context: AppContext) -> Result<()> {
                 vec![
                     k.key.clone(),
                     k.items.to_string(),
-                    fmt::tokens(k.tokens),
-                    fmt::usd(k.total_usd),
+                    if native_usage {
+                        fmt::tokens(k.tokens)
+                    } else {
+                        "—".into()
+                    },
+                    if native_usage {
+                        fmt::usd(k.total_usd)
+                    } else {
+                        "—".into()
+                    },
                 ]
             })
             .collect();
@@ -851,12 +997,28 @@ pub fn run_show(args: ShowArgs, _context: AppContext) -> Result<()> {
                 vec![
                     i.tool_name.clone().unwrap_or_else(|| i.kind.clone()),
                     fmt::truncate(i.target.as_deref().unwrap_or(""), 50),
-                    fmt::tokens(i.tokens),
+                    if native_usage {
+                        fmt::tokens(i.tokens)
+                    } else {
+                        "—".into()
+                    },
                     format!("c{}", i.entered_call),
                     i.carried_calls.to_string(),
-                    fmt::usd(i.write_usd),
-                    fmt::usd(i.carry_usd.map(|c| c + i.rebuild_usd.unwrap_or(0.0))),
-                    fmt::usd(i.total_usd),
+                    if native_usage {
+                        fmt::usd(i.write_usd)
+                    } else {
+                        "—".into()
+                    },
+                    if native_usage {
+                        fmt::usd(i.carry_usd.map(|c| c + i.rebuild_usd.unwrap_or(0.0)))
+                    } else {
+                        "—".into()
+                    },
+                    if native_usage {
+                        fmt::usd(i.total_usd)
+                    } else {
+                        "—".into()
+                    },
                     i.purpose.clone().unwrap_or_default(),
                     i.instruction_ref.clone().unwrap_or_default(),
                 ]
@@ -1482,4 +1644,28 @@ pub fn run_stages(args: StagesArgs, _context: AppContext) -> Result<()> {
         "Stages are heuristic until classified (`vca classify run`); Jev = turns labelled by the classifier or you."
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod export_tests {
+    use super::redact_session_detail_json;
+
+    #[test]
+    fn session_export_omits_captured_text() {
+        let mut value = serde_json::json!({
+            "session": { "title": "SECRET_PROMPT", "turns": 1 },
+            "tasks": [{ "title": "SECRET_PROMPT", "turns": 1 }],
+            "turns": [{ "user_text": "SECRET_PROMPT", "feedback": "SECRET_OUTPUT", "tool_calls": 2 }],
+            "agents": [{ "title": "SECRET_PROMPT" }],
+            "events": [{ "detail": "SECRET_OUTPUT" }],
+            "attempts": [{ "error_signature": "SECRET_OUTPUT" }],
+            "turn_context": [{ "model_requests": 3 }]
+        });
+        redact_session_detail_json(&mut value);
+        let output = value.to_string();
+        assert!(!output.contains("SECRET_PROMPT"));
+        assert!(!output.contains("SECRET_OUTPUT"));
+        assert_eq!(value["turn_context"][0]["model_requests"], 3);
+        assert_eq!(value["turns"][0]["tool_calls"], 2);
+    }
 }

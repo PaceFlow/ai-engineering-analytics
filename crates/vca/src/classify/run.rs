@@ -8,7 +8,9 @@
 use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Map, Value, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use crate::classify::client::{
     Answer, DecisionClient, DecisionRequest, ErrorKind, answer_valid, band,
@@ -16,8 +18,9 @@ use crate::classify::client::{
 use crate::classify::config::ClassifierConfig;
 use crate::classify::heuristic::{task_unit_key, turn_unit_key};
 use crate::classify::questions::{
-    QUESTION_SET_VERSION, completion_question, exchange_questions, rework_question,
-    task_assignment_question, task_label_questions, turn_questions,
+    QUESTION_SET_VERSION, SKILL_QUESTION_VERSION, completion_question, exchange_questions,
+    rework_question, skill_follow_through_question, task_assignment_question, task_label_questions,
+    turn_questions,
 };
 use crate::classify::state::{
     BuiltState, Level, TurnFacts, assignment_state, estimate_tokens, exchange_state, head_tail,
@@ -41,6 +44,8 @@ pub struct Passes {
     pub completion: bool,
     pub rework: bool,
     pub stages: bool,
+    pub skills: bool,
+    pub prs: bool,
 }
 
 impl Passes {
@@ -51,6 +56,8 @@ impl Passes {
         completion: true,
         rework: true,
         stages: true,
+        skills: true,
+        prs: true,
     };
 
     pub fn parse(value: &str) -> Option<Self> {
@@ -61,6 +68,8 @@ impl Passes {
             completion: false,
             rework: false,
             stages: false,
+            skills: false,
+            prs: false,
         };
         for part in value.split(',').map(str::trim) {
             match part {
@@ -71,6 +80,8 @@ impl Passes {
                 "completion" => passes.completion = true,
                 "rework" | "relations" => passes.rework = true,
                 "stages" | "stage" => passes.stages = true,
+                "skills" => passes.skills = true,
+                "prs" => passes.prs = true,
                 _ => return None,
             }
         }
@@ -85,11 +96,14 @@ pub struct RunOptions {
     pub passes: Passes,
     /// Count units and tokens without sending anything.
     pub dry_run: bool,
+    pub dispatch_seconds: Option<u64>,
+    pub job_id: Option<i64>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
 pub struct RunSummary {
     pub run_id: Option<i64>,
+    pub job_id: Option<i64>,
     pub sessions: usize,
     pub excluded_projects: usize,
     pub units: BTreeMap<String, usize>,
@@ -106,6 +120,8 @@ pub struct RunSummary {
     pub budget_usd: f64,
     pub tasks_split: usize,
     pub completions: usize,
+    pub completion_decisions: usize,
+    pub new_completions: usize,
     pub stopped: Option<String>,
 }
 
@@ -123,6 +139,11 @@ struct Runner<'a> {
     run_id: Option<i64>,
     budget: f64,
     summary: RunSummary,
+    deadline: Option<Instant>,
+    prepaid: bool,
+    prefetched: BTreeSet<String>,
+    job_id: Option<i64>,
+    prefetched_tasks: BTreeSet<String>,
 }
 
 pub fn monthly_spend(conn: &Connection) -> Result<f64> {
@@ -141,13 +162,29 @@ pub fn plan(
     sessions: &[SessionRef],
     level: Level,
 ) -> Result<RunSummary> {
-    let options = RunOptions {
-        level,
-        max_usd: f64::INFINITY,
-        passes: Passes::ALL,
-        dry_run: true,
-    };
-    execute(conn, None, config, sessions, &options)
+    plan_passes(conn, config, sessions, level, Passes::ALL)
+}
+pub fn plan_passes(
+    conn: &Connection,
+    config: &ClassifierConfig,
+    sessions: &[SessionRef],
+    level: Level,
+    passes: Passes,
+) -> Result<RunSummary> {
+    execute(
+        conn,
+        None,
+        config,
+        sessions,
+        &RunOptions {
+            level,
+            max_usd: f64::INFINITY,
+            passes,
+            dry_run: true,
+            dispatch_seconds: None,
+            job_id: None,
+        },
+    )
 }
 
 pub fn run(
@@ -157,7 +194,46 @@ pub fn run(
     sessions: &[SessionRef],
     options: &RunOptions,
 ) -> Result<RunSummary> {
-    execute(conn, Some(client), config, sessions, options)
+    // Serialize all entry points, including TUI and automatic runs. SQLite is not
+    // held in a write transaction during network calls.
+    static RUN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = RUN_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let database: String = conn.query_row(
+        "SELECT file FROM pragma_database_list WHERE name='main'",
+        [],
+        |r| r.get(0),
+    )?;
+    let _file_lock = if database.is_empty() {
+        None
+    } else {
+        use fs2::FileExt;
+        let path = std::path::Path::new(&database).with_extension("classifier.lock");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(path)?;
+        file.try_lock_exclusive().map_err(|_| {
+            anyhow::anyhow!("Another classification run is active; retry after it finishes")
+        })?;
+        Some(file)
+    };
+    let before: i64 = conn.query_row(
+        "SELECT COALESCE(MAX(id),0) FROM classification_job",
+        [],
+        |r| r.get(0),
+    )?;
+    let result = execute(conn, Some(client), config, sessions, options);
+    if let Err(error) = &result {
+        if let Some(id) = options.job_id {
+            conn.execute("UPDATE classification_job SET state='pending',error=?2,updated_at=datetime('now') WHERE id=?1",params![id,error.to_string()])?;
+        } else {
+            conn.execute("UPDATE classification_job SET state='pending',error=?2,updated_at=datetime('now') WHERE id>?1 AND state='running'",params![before,error.to_string()])?;
+        }
+    }
+    result
 }
 
 fn execute(
@@ -167,13 +243,40 @@ fn execute(
     sessions: &[SessionRef],
     options: &RunOptions,
 ) -> Result<RunSummary> {
+    let remaining_job = options
+        .job_id
+        .map(|id| {
+            conn.query_row(
+                "SELECT max_usd-spent_usd FROM classification_job WHERE id=?1",
+                [id],
+                |r| r.get::<_, f64>(0),
+            )
+        })
+        .transpose()?
+        .unwrap_or(f64::INFINITY)
+        .max(0.0);
     let budget = if options.dry_run {
         f64::INFINITY
     } else {
         options
             .max_usd
+            .min(remaining_job)
             .min((config.monthly_budget_usd - monthly_spend(conn)?).max(0.0))
     };
+    let job_id = if options.dry_run {
+        None
+    } else if let Some(id) = options.job_id {
+        Some(id)
+    } else {
+        conn.execute("INSERT INTO classification_job(created_at,updated_at,state,passes,level,policy,max_usd) VALUES(datetime('now'),datetime('now'),'running',?1,?2,?3,?4)",params![options.passes.names(),options.level.as_str(),job_policy(config),options.max_usd])?;
+        Some(conn.last_insert_rowid())
+    };
+    if let Some(id) = job_id {
+        conn.execute("UPDATE classification_job SET state='running',updated_at=datetime('now'),error=NULL WHERE id=?1",[id])?;
+        for session in sessions {
+            conn.execute("INSERT OR IGNORE INTO classification_job_unit(job_id,provider,session_id,repo_root,fingerprint,state,pass) VALUES(?1,?2,?3,?4,?5,'pending','session')",params![id,session.provider,session.session_id,session.repo_root,session_fingerprint(conn,session)?])?;
+        }
+    }
     let mut runner = Runner {
         conn,
         client: if options.dry_run { None } else { client },
@@ -183,8 +286,16 @@ fn execute(
         budget,
         summary: RunSummary {
             budget_usd: budget,
+            job_id,
             ..RunSummary::default()
         },
+        deadline: options
+            .dispatch_seconds
+            .map(|s| Instant::now() + Duration::from_secs(s)),
+        prepaid: false,
+        prefetched: BTreeSet::new(),
+        prefetched_tasks: BTreeSet::new(),
+        job_id,
     };
     if !options.dry_run {
         conn.execute(
@@ -219,20 +330,62 @@ fn execute(
     if segment || options.passes.stages {
         let mut changed = false;
         for (session, turns) in &selected {
+            if runner.stopped() {
+                break;
+            }
             changed |= runner.segment_session(session, turns, segment, options.passes.stages)?;
         }
         if changed && !options.dry_run {
-            crate::insights::structure::refresh_session_structure(conn)?;
+            crate::insights::refresh_structure(conn)?;
         }
     }
     if options.passes.feedback && options.level > Level::EvidenceOnly {
         for (session, turns) in &selected {
+            if runner.stopped() {
+                break;
+            }
             runner.feedback_session(session, turns)?;
         }
     }
     if options.passes.labels || options.passes.completion {
+        if !options.dry_run && config.concurrency > 1 {
+            let mut units = Vec::new();
+            for (session, turns) in &selected {
+                let shared = Arc::new(turns.clone());
+                for task in load_tasks(conn, session)? {
+                    for (enabled, kind) in [
+                        (options.passes.labels, "task"),
+                        (options.passes.completion, "task_completion"),
+                    ] {
+                        if enabled {
+                            units.push(TaskUnit {
+                                kind,
+                                key: task_unit_key(
+                                    &session.provider,
+                                    &session.session_id,
+                                    task.index,
+                                ),
+                                task: task.clone(),
+                                turns: shared.clone(),
+                                repo: session.repo_root.clone(),
+                            });
+                        }
+                    }
+                }
+            }
+            runner.prefetch_tasks(&units)?;
+        }
         for (session, turns) in &selected {
             for task in load_tasks(conn, session)? {
+                if runner.stopped()
+                    && !runner.prefetched_tasks.contains(&task_unit_key(
+                        &session.provider,
+                        &session.session_id,
+                        task.index,
+                    ))
+                {
+                    continue;
+                }
                 if options.passes.labels {
                     runner.label_task(session, turns, &task)?;
                 }
@@ -243,6 +396,16 @@ fn execute(
         }
     }
 
+    if options.passes.prs {
+        runner.classify_prs(sessions)?;
+    }
+    if options.passes.skills {
+        for (session, turns) in &selected {
+            for task in load_tasks(conn, session)? {
+                runner.classify_skills(session, turns, &task)?;
+            }
+        }
+    }
     if options.passes.rework {
         let selected_keys: Vec<(String, String)> = selected
             .iter()
@@ -255,6 +418,10 @@ fn execute(
         }
     }
 
+    if options.passes.rework && !options.dry_run {
+        crate::insights::refresh(conn)?;
+        runner.classify_work_links(sessions)?;
+    }
     runner.summary.est_usd = config.estimate_usd(runner.summary.est_tokens);
     if let Some(run_id) = runner.run_id {
         let summary = &runner.summary;
@@ -283,7 +450,380 @@ fn execute(
             crate::insights::refresh(conn)?;
         }
     }
+    if let Some(id) = job_id {
+        let state = if runner.summary.stopped.is_none()
+            && runner.summary.failed == 0
+            && runner.summary.invalid_answers == 0
+        {
+            "completed"
+        } else {
+            "pending"
+        };
+        conn.execute("UPDATE classification_job SET state=?2,updated_at=datetime('now'),error=?3 WHERE id=?1",params![id,state,runner.summary.stopped])?;
+        if state == "completed" {
+            conn.execute("UPDATE classification_job_unit SET state='completed',error=NULL WHERE job_id=?1 AND pass='session'",[id])?;
+        }
+    }
     Ok(runner.summary)
+}
+
+impl Passes {
+    pub const CORE: Self = Self {
+        segment: true,
+        feedback: true,
+        labels: true,
+        completion: true,
+        rework: false,
+        stages: true,
+        skills: false,
+        prs: true,
+    };
+    pub fn names(self) -> String {
+        [
+            (self.segment, "segment"),
+            (self.feedback, "feedback"),
+            (self.labels, "labels"),
+            (self.completion, "completion"),
+            (self.stages, "stages"),
+            (self.rework, "rework"),
+            (self.skills, "skills"),
+            (self.prs, "prs"),
+        ]
+        .into_iter()
+        .filter_map(|(enabled, name)| enabled.then_some(name))
+        .collect::<Vec<_>>()
+        .join(",")
+    }
+}
+
+pub fn session_fingerprint(conn: &Connection, session: &SessionRef) -> Result<String> {
+    let mut material = String::new();
+    for sql in [
+        "SELECT COALESCE(m.message_key,'')||':'||COALESCE(m.message_ts,'')||':'||m.role||':'||m.content FROM fact_session_message m JOIN metadata_sessions s USING(provider,session_id) WHERE s.provider=?1 AND (s.root_session_id=?2 OR (s.root_session_id IS NULL AND s.session_id=?2)) ORDER BY m.session_id,m.message_index",
+        "SELECT t.call_key||':'||COALESCE(t.ts,'')||':'||t.tool_name||':'||COALESCE(t.target,'')||':'||t.status FROM fact_session_tool_call t JOIN metadata_sessions s USING(provider,session_id) WHERE s.provider=?1 AND (s.root_session_id=?2 OR (s.root_session_id IS NULL AND s.session_id=?2)) ORDER BY t.session_id,t.call_index",
+    ] {
+        for value in conn
+            .prepare(sql)?
+            .query_map(params![session.provider, session.session_id], |r| {
+                r.get::<_, String>(0)
+            })?
+        {
+            material.push_str(&value?);
+            material.push('\0');
+        }
+    }
+    Ok(format!("{:x}", md5::compute(material)))
+}
+
+pub fn job_policy(config: &ClassifierConfig) -> String {
+    format!(
+        "{}|{}|{}|{}|{}",
+        QUESTION_SET_VERSION,
+        SKILL_QUESTION_VERSION,
+        config.model,
+        config.endpoint,
+        config.level().as_str()
+    )
+}
+pub fn resume_job(
+    conn: &Connection,
+    id: i64,
+    config: &ClassifierConfig,
+) -> Result<(Vec<SessionRef>, RunOptions)> {
+    let (state,passes,level,policy,max,spent):(String,String,String,String,f64,f64)=conn.query_row("SELECT state,passes,level,policy,max_usd,spent_usd FROM classification_job WHERE id=?1",[id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?)))?;
+    anyhow::ensure!(
+        state != "completed",
+        "Classification job is already complete"
+    );
+    anyhow::ensure!(
+        policy == job_policy(config),
+        "Classifier policy changed; start a new run"
+    );
+    anyhow::ensure!(
+        spent < max,
+        "This job reached its spending cap; start an explicit new run to extend work"
+    );
+    let sessions=conn.prepare("SELECT provider,session_id,repo_root FROM classification_job_unit WHERE job_id=?1 AND pass='session' ORDER BY rowid")?.query_map([id],|r|Ok(SessionRef{provider:r.get(0)?,session_id:r.get(1)?,repo_root:r.get(2)?}))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok((
+        sessions,
+        RunOptions {
+            level: Level::parse(&level)
+                .ok_or_else(|| anyhow::anyhow!("Invalid saved content level"))?,
+            max_usd: max - spent,
+            passes: Passes::parse(&passes)
+                .ok_or_else(|| anyhow::anyhow!("Invalid saved passes"))?,
+            dry_run: false,
+            dispatch_seconds: None,
+            job_id: Some(id),
+        },
+    ))
+}
+
+struct ResponseTransaction<'a> {
+    conn: &'a Connection,
+    done: bool,
+}
+impl<'a> ResponseTransaction<'a> {
+    fn new(conn: &'a Connection) -> Result<Self> {
+        conn.execute_batch("SAVEPOINT classifier_response")?;
+        Ok(Self { conn, done: false })
+    }
+    fn commit(mut self) -> Result<()> {
+        self.conn.execute_batch("RELEASE classifier_response")?;
+        self.done = true;
+        Ok(())
+    }
+}
+impl Drop for ResponseTransaction<'_> {
+    fn drop(&mut self) {
+        if !self.done {
+            let _ = self
+                .conn
+                .execute_batch("ROLLBACK TO classifier_response; RELEASE classifier_response");
+        }
+    }
+}
+
+struct TaskUnit {
+    kind: &'static str,
+    key: String,
+    task: TaskRef,
+    turns: Arc<Vec<TurnFacts>>,
+    repo: Option<String>,
+}
+impl TaskUnit {
+    fn build(&self, level: Level) -> (BuiltState, Map<String, Value>) {
+        let mut built = task_state(
+            &self.task.harness,
+            &self.turns,
+            &self.task.turns,
+            self.task.commits,
+            self.task.subagents,
+            level,
+        );
+        if self.kind == "task" {
+            let questions = task_label_questions(built.level);
+            return (built, questions);
+        }
+        let task_turns: Vec<_> = self
+            .turns
+            .iter()
+            .filter(|t| self.task.turns.contains(&t.index))
+            .collect();
+        let skip = task_turns.len().saturating_sub(MAX_COMPLETION_OPTIONS);
+        let mut redactions = 0;
+        let options: Vec<_> = task_turns[skip..]
+            .iter()
+            .map(|t| (t.index, turn_option(t, built.level, &mut redactions)))
+            .collect();
+        built.redactions += redactions;
+        (built, completion_question(&options))
+    }
+}
+struct ReplyClient<'a> {
+    response: Mutex<
+        Option<
+            std::result::Result<
+                crate::classify::client::DecisionResponse,
+                crate::classify::client::ClientError,
+            >,
+        >,
+    >,
+    fallback: &'a dyn DecisionClient,
+}
+impl DecisionClient for ReplyClient<'_> {
+    fn decide(
+        &self,
+        request: &DecisionRequest,
+    ) -> std::result::Result<
+        crate::classify::client::DecisionResponse,
+        crate::classify::client::ClientError,
+    > {
+        if let Some(response) = self
+            .response
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            response
+        } else {
+            self.fallback.decide(request)
+        }
+    }
+}
+impl Runner<'_> {
+    fn record_job_unit(
+        &self,
+        kind: &str,
+        unit_key: &str,
+        fingerprint: &str,
+        state: &str,
+        error: Option<&str>,
+    ) -> Result<()> {
+        if let Some(job) = self.job_id {
+            let parts: Vec<_> = unit_key.split('|').collect();
+            let provider = parts.first().copied().unwrap_or(kind);
+            let session = parts.get(1).copied().unwrap_or(unit_key);
+            self.conn.execute("INSERT INTO classification_job_unit(job_id,provider,session_id,repo_root,fingerprint,state,pass,error) VALUES(?1,?2,?3,NULL,?4,?5,?6,?7) ON CONFLICT(job_id,provider,session_id,pass) DO UPDATE SET fingerprint=excluded.fingerprint,state=excluded.state,error=excluded.error",params![job,provider,session,fingerprint,state,format!("{kind}:{}",parts.get(2).copied().unwrap_or(unit_key)),error])?;
+        }
+        Ok(())
+    }
+    fn prefetch_tasks(&mut self, units: &[TaskUnit]) -> Result<()> {
+        let Some(client) = self.client else {
+            return Ok(());
+        };
+        let concurrency = self.config.concurrency.clamp(1, 16);
+        let mut at = 0;
+        while at < units.len() && !self.stopped() {
+            if self.deadline.is_some_and(|d| Instant::now() >= d) {
+                self.summary.stopped = Some(
+                    "dispatch time budget reached; resume the saved classification job".into(),
+                );
+                break;
+            }
+            let mut indices = vec![];
+            let mut requests = vec![];
+            let mut reserved = 0.0;
+            let mut project_reserved: BTreeMap<String, f64> = BTreeMap::new();
+            while at < units.len() && requests.len() < concurrency {
+                let index = at;
+                at += 1;
+                let unit = &units[index];
+                let (built, questions) = unit.build(self.level);
+                let key = cache_key(&self.config.model, built.level, &questions, &built.state);
+                if self
+                    .cached(unit.kind, &unit.key, &key, &questions)?
+                    .is_some()
+                {
+                    continue;
+                }
+                let request = DecisionRequest {
+                    model: self.config.model.clone(),
+                    state: built.state,
+                    questions,
+                    provider: self.config.provider.clone(),
+                };
+                let estimate = self.config.estimate_usd(estimate_tokens(&request.body()));
+                if self.summary.cost_usd + reserved + estimate > self.budget {
+                    self.summary.stopped = Some(
+                        "run budget reached; resume pending work within remaining limits".into(),
+                    );
+                    break;
+                }
+                let repo = crate::insights::observation::canonical_repo(
+                    self.conn,
+                    unit.repo
+                        .as_deref()
+                        .unwrap_or(super::automatic::UNATTRIBUTED_PROJECT),
+                )?;
+                let cap = super::automatic::project_cap(
+                    self.conn,
+                    &repo,
+                    self.config.project_monthly_budget_usd,
+                )?;
+                if super::automatic::project_spend(self.conn, &repo)?
+                    + project_reserved.get(&repo).copied().unwrap_or(0.0)
+                    + estimate
+                    > cap
+                {
+                    self.summary.stopped = Some(format!("project budget reached: {repo}"));
+                    break;
+                }
+                reserved += estimate;
+                *project_reserved.entry(repo).or_default() += estimate;
+                indices.push(index);
+                requests.push(request);
+            }
+            if requests.is_empty() {
+                continue;
+            }
+            let mut error = None;
+            client.decide_many(&requests, &mut |index, response| {
+                let unit = &units[indices[index]];
+                let reply = ReplyClient {
+                    response: Mutex::new(Some(response)),
+                    fallback: client,
+                };
+                let mut child = Runner {
+                    conn: self.conn,
+                    client: Some(&reply),
+                    config: self.config,
+                    level: self.level,
+                    run_id: self.run_id,
+                    budget: self.budget,
+                    summary: self.summary.clone(),
+                    deadline: self.deadline,
+                    prepaid: true,
+                    prefetched: BTreeSet::new(),
+                    prefetched_tasks: BTreeSet::new(),
+                    job_id: self.job_id,
+                };
+                let result = child.ask(unit.kind, &unit.key, &|level| unit.build(level));
+                self.summary = child.summary;
+                self.prefetched_tasks.insert(unit.key.clone());
+                let (built, questions) = unit.build(self.level);
+                self.prefetched.insert(cache_key(
+                    &self.config.model,
+                    built.level,
+                    &questions,
+                    &built.state,
+                ));
+                if let Err(e) = result {
+                    error = Some(e);
+                }
+            });
+            if let Some(e) = error {
+                return Err(e);
+            }
+        }
+        Ok(())
+    }
+    fn classify_prs(&mut self, sessions: &[SessionRef]) -> Result<()> {
+        use crate::insights::{delivery, observation};
+        let roots: BTreeSet<_> = sessions
+            .iter()
+            .filter_map(|s| s.repo_root.as_deref())
+            .map(|r| observation::canonical_repo(self.conn, r))
+            .collect::<Result<_>>()?;
+        for pr in delivery::prs(self.conn)? {
+            if !roots.contains(&observation::canonical_repo(self.conn, &pr.repo_key)?) {
+                continue;
+            }
+            let (source_intent, source) = delivery::intent(self.conn, &pr)?;
+            if source == "override" || source == "mapping" {
+                let _ = source_intent;
+                continue;
+            }
+            let build = |level: Level| {
+                let text = format!("{}\n{}", pr.title, pr.description);
+                let text = if level == Level::EvidenceOnly {
+                    String::new()
+                } else if level == Level::Full {
+                    text
+                } else {
+                    crate::classify::state::strip_code_blocks(&text)
+                };
+                let (text, redactions) = redact(&head_tail(&text, 12000));
+                (
+                    BuiltState {
+                        state: json!({"pull_request":{"title_and_description":text,"labels":pr.labels,"state":pr.state,"files":pr.files}}),
+                        level,
+                        redactions,
+                        est_tokens: 0,
+                    },
+                    crate::classify::questions::pr_questions(),
+                )
+            };
+            if let Some(asked) = self.ask("pr", &pr.id, &build)?
+                && let Some((answer, band)) = asked.answers.get("intent")
+                && matches!(*band, "confident" | "tentative")
+                && let Some(label) = answer.label.as_deref()
+            {
+                delivery::set_intent(self.conn, &pr.id, label, "classifier")?;
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -401,6 +941,40 @@ fn task_request_text(turn: &TurnFacts) -> String {
     redact(&head_tail(&turn.user, 200)).0.replace('\n', " ")
 }
 
+fn post_skill_actions(
+    conn: &Connection,
+    provider: &str,
+    session_id: &str,
+    task_index: i64,
+    after: Option<&str>,
+) -> Result<Vec<Value>> {
+    let Some(after) = after else {
+        return Ok(Vec::new());
+    };
+    let end: Option<String> = conn
+        .query_row(
+            "SELECT COALESCE(completed_at, last_activity_at) FROM derived_task
+         WHERE provider = ?1 AND session_id = ?2 AND task_index = ?3",
+            params![provider, session_id, task_index],
+            |row| row.get(0),
+        )
+        .unwrap_or(None);
+    let mut stmt = conn.prepare(
+        "SELECT tool_name, tool_category, status, validation_kind FROM fact_session_tool_call
+         WHERE provider = ?1 AND session_id = ?2 AND ts >= ?3
+           AND (?4 IS NULL OR ts <= ?4) ORDER BY ts, call_index LIMIT 100",
+    )?;
+    let rows = stmt.query_map(params![provider, session_id, after, end], |row| {
+        Ok(json!({
+            "tool": row.get::<_, String>(0)?,
+            "category": row.get::<_, String>(1)?,
+            "status": row.get::<_, String>(2)?,
+            "validation": row.get::<_, Option<String>>(3)?,
+        }))
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
 impl Runner<'_> {
     fn stopped(&self) -> bool {
         self.summary.stopped.is_some()
@@ -409,17 +983,35 @@ impl Runner<'_> {
     /// Ask one unit's questions, from cache when the content is unchanged.
     fn ask(&mut self, unit_kind: &str, unit_key: &str, build: &Builder) -> Result<Option<Asked>> {
         *self.summary.units.entry(unit_kind.to_string()).or_default() += 1;
-        if self.stopped() {
-            return Ok(None);
-        }
         let mut level = self.level;
         let mut degraded = false;
         loop {
             let (built, questions) = build(level);
             let key = cache_key(&self.config.model, built.level, &questions, &built.state);
             if let Some(cached) = self.cached(unit_kind, unit_key, &key, &questions)? {
-                self.summary.cached += 1;
+                if self.prefetched.remove(&key) {
+                    *self.summary.units.entry(unit_kind.into()).or_default() -= 1;
+                } else {
+                    self.summary.cached += 1;
+                }
+                self.record_job_unit(unit_kind, unit_key, &key, "completed", None)?;
                 return Ok(Some(cached));
+            }
+            if self.prefetched.remove(&key) {
+                *self.summary.units.entry(unit_kind.into()).or_default() -= 1;
+                return Ok(None);
+            }
+            if !self.prepaid {
+                if self.deadline.is_some_and(|d| Instant::now() >= d)
+                    && self.summary.stopped.is_none()
+                {
+                    self.summary.stopped = Some(
+                        "dispatch time budget reached; resume the saved classification job".into(),
+                    );
+                }
+                if self.stopped() {
+                    return Ok(None);
+                }
             }
             let request = DecisionRequest {
                 model: self.config.model.clone(),
@@ -434,7 +1026,46 @@ impl Runner<'_> {
                 return Ok(None);
             };
             let est_usd = self.config.estimate_usd(tokens);
-            if self.summary.cost_usd + est_usd > self.budget {
+            let parts: Vec<_> = unit_key.split('|').collect();
+            let project: Option<String> = if unit_kind == "pr" {
+                let repo: Option<String> = self
+                    .conn
+                    .query_row(
+                        "SELECT repo_key FROM pull_request_record WHERE id=?1",
+                        [unit_key],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                if let Some(repo) = repo {
+                    Some(
+                        crate::delivery_sources::sources(self.conn)?
+                            .into_iter()
+                            .find(|s| s.repo_key() == repo)
+                            .map(|s| s.repo_root)
+                            .unwrap_or(repo),
+                    )
+                } else {
+                    None
+                }
+            } else if parts.len() >= 2 {
+                self.conn.query_row("SELECT COALESCE(r.repo_root,?3) FROM metadata_sessions s LEFT JOIN metadata_repositories r ON r.id=s.repository_id WHERE s.provider=?1 AND s.session_id=?2", params![parts[0],parts[1],super::automatic::UNATTRIBUTED_PROJECT], |r|r.get(0)).ok()
+            } else {
+                None
+            };
+            if !self.prepaid
+                && let Some(repo) = &project
+            {
+                let cap = super::automatic::project_cap(
+                    self.conn,
+                    repo,
+                    self.config.project_monthly_budget_usd,
+                )?;
+                if crate::classify::automatic::project_spend(self.conn, repo)? + est_usd > cap {
+                    self.summary.stopped = Some(format!("project budget reached: {repo}"));
+                    return Ok(None);
+                }
+            }
+            if !self.prepaid && self.summary.cost_usd + est_usd > self.budget {
                 self.summary.stopped = Some(format!(
                     "budget reached (${:.4} spent of ${:.4})",
                     self.summary.cost_usd, self.budget
@@ -444,11 +1075,31 @@ impl Runner<'_> {
             let payload_digest = format!("{:x}", md5::compute(request.body().to_string()));
             let degraded_level =
                 (degraded || built.level != self.level).then(|| built.level.as_str());
+            self.prepaid = false;
             match client.decide(&request) {
                 Ok(response) => {
-                    let cost = response.cost_usd.unwrap_or(est_usd);
+                    let response_transaction = ResponseTransaction::new(self.conn)?;
+                    let cost = response
+                        .cost_usd
+                        .filter(|c| c.is_finite() && *c >= 0.0)
+                        .unwrap_or(est_usd);
                     self.summary.sent += 1;
                     self.summary.cost_usd += cost;
+                    if let Some(job) = self.job_id {
+                        self.conn.execute("UPDATE classification_job SET spent_usd=spent_usd+?2,updated_at=datetime('now') WHERE id=?1",params![job,cost])?;
+                    }
+                    if self.summary.cost_usd > self.budget {
+                        self.summary.stopped = Some(format!(
+                            "Reported cost exceeded dispatch estimate: ${:.4} spent, ${:.4} run limit",
+                            self.summary.cost_usd, self.budget
+                        ));
+                    }
+                    if let Some(run_id) = self.run_id {
+                        self.conn.execute(
+                            "UPDATE classifier_run SET cost_usd=?2,units_sent=?3 WHERE run_id=?1",
+                            params![run_id, self.summary.cost_usd, self.summary.sent as i64],
+                        )?;
+                    }
                     self.summary.input_tokens += response.input_tokens.unwrap_or(tokens as i64);
                     if degraded_level.is_some() {
                         self.summary.degraded += 1;
@@ -488,6 +1139,10 @@ impl Runner<'_> {
                         built.redactions,
                         None,
                     )?;
+                    if let Some(repo) = &project {
+                        self.conn.execute("INSERT OR IGNORE INTO classifier_project_spend(request_id,repo_root,at,usd) VALUES(?1,?2,datetime('now'),?3)",params![self.conn.last_insert_rowid(),repo,cost])?;
+                    }
+                    response_transaction.commit()?;
                     return Ok(Some(Asked { answers }));
                 }
                 Err(error) => {
@@ -614,7 +1269,11 @@ impl Runner<'_> {
                 unit_kind,
                 unit_key,
                 question,
-                QUESTION_SET_VERSION,
+                if question == "skill_follow_through" {
+                    SKILL_QUESTION_VERSION
+                } else {
+                    QUESTION_SET_VERSION
+                },
                 answer.label,
                 answer.score,
                 answer.probability,
@@ -682,6 +1341,17 @@ impl Runner<'_> {
                 redactions as i64,
                 error
             ],
+        )?;
+        self.record_job_unit(
+            unit_kind,
+            unit_key,
+            key,
+            if status == "ok" {
+                "completed"
+            } else {
+                "pending"
+            },
+            error,
         )?;
         Ok(())
     }
@@ -907,6 +1577,87 @@ impl Runner<'_> {
         Ok(())
     }
 
+    fn classify_skills(
+        &mut self,
+        session: &SessionRef,
+        turns: &[TurnFacts],
+        task: &TaskRef,
+    ) -> Result<()> {
+        let Some(repo_root) = session.repo_root.as_deref() else {
+            return Ok(());
+        };
+        for event in crate::explore::skills::session_skill_events(
+            self.conn,
+            &session.provider,
+            &session.session_id,
+        )? {
+            if event.task_index != Some(task.index)
+                || event.kind == "listed"
+                || (event.kind == "call" && event.status != "ok")
+            {
+                continue;
+            }
+            let Some(instructions) =
+                crate::explore::skills::local_skill_instructions(repo_root, &event.skill_id)
+            else {
+                continue;
+            };
+            let start = event
+                .ts
+                .as_deref()
+                .and_then(crate::insights::structure::parse_ts);
+            let first_turn = turns
+                .iter()
+                .filter(|turn| task.turns.contains(&turn.index))
+                .filter(|turn| start.is_none_or(|start| turn.ts.is_some_and(|ts| ts <= start)))
+                .map(|turn| turn.index)
+                .max();
+            let after: Vec<TurnFacts> = turns
+                .iter()
+                .filter(|turn| {
+                    task.turns.contains(&turn.index)
+                        && first_turn.is_none_or(|first| turn.index >= first)
+                })
+                .cloned()
+                .collect();
+            if after.is_empty() {
+                continue;
+            }
+            let turn_ids: Vec<i64> = after.iter().map(|turn| turn.index).collect();
+            let post_actions = post_skill_actions(
+                self.conn,
+                &session.provider,
+                &session.session_id,
+                task.index,
+                event.ts.as_deref(),
+            )?;
+            let skill_id = event.skill_id.clone();
+            let build = |level: Level| {
+                let mut built = task_state(
+                    &task.harness,
+                    &after,
+                    &turn_ids,
+                    task.commits,
+                    task.subagents,
+                    level,
+                );
+                let (redacted, count) = redact(&head_tail(&instructions, 12_000));
+                built.redactions += count;
+                built.state["skill"] = json!({
+                    "id": skill_id,
+                    "instructions": redacted,
+                    "current_file_fingerprint": format!("{:x}", md5::compute(instructions.as_bytes())),
+                    "historical_version_verified": false,
+                });
+                built.state["post_invocation_tools"] = Value::Array(post_actions.clone());
+                (built, skill_follow_through_question())
+            };
+            let key = format!("{}|{}|{}", session.provider, session.session_id, event.key);
+            self.ask("skill", &key, &build)?;
+        }
+        Ok(())
+    }
+
     fn complete_task(
         &mut self,
         session: &SessionRef,
@@ -982,12 +1733,93 @@ impl Runner<'_> {
         if self.client.is_none() {
             return Ok(());
         }
+        let prior:bool=self.conn.query_row("SELECT EXISTS(SELECT 1 FROM task_completion_mark WHERE provider=?1 AND session_id=?2 AND task_index=?3 AND completion_turn IS NOT NULL)",params![session.provider,session.session_id,task.index],|r|r.get(0))?;
         self.conn.execute(
             "INSERT OR REPLACE INTO task_completion_mark(provider, session_id, task_index, completion_turn, source, confidence)
              VALUES (?1, ?2, ?3, ?4, 'jev', ?5)",
             params![session.provider, session.session_id, task.index, mark, answer.confidence],
         )?;
         self.summary.completions += 1;
+        self.summary.completion_decisions += 1;
+        self.summary.new_completions += usize::from(mark.is_some() && !prior);
+        Ok(())
+    }
+
+    fn classify_work_links(&mut self, selected: &[SessionRef]) -> Result<()> {
+        use crate::insights::work;
+        let items = work::items(self.conn)?;
+        let members: BTreeMap<_, _> = items
+            .iter()
+            .flat_map(|w| w.members.iter())
+            .map(|m| (m.id.clone(), m))
+            .collect();
+        for relation in work::relations(self.conn)?.into_iter().filter(|r| {
+            r.decision == "suggested" && r.source != "manual" && r.review_reason.is_none()
+        }) {
+            let (Some(from), Some(to)) =
+                (members.get(&relation.from_id), members.get(&relation.to_id))
+            else {
+                continue;
+            };
+            if !selected
+                .iter()
+                .any(|s| s.provider == to.task.provider && s.session_id == to.task.session_id)
+                || !self.config.project_allowed(from.task.repo_root.as_deref())
+            {
+                continue;
+            }
+            let a = (
+                from.task.provider.clone(),
+                from.task.session_id.clone(),
+                from.task.task_index,
+            );
+            let b = (
+                to.task.provider.clone(),
+                to.task.session_id.clone(),
+                to.task.task_index,
+            );
+            let conn = self.conn;
+            let build = |level: Level| {
+                let mut redactions = 0;
+                let earlier = task_side(conn, &a, level, &mut redactions).unwrap_or(Value::Null);
+                let later = task_side(conn, &b, level, &mut redactions).unwrap_or(Value::Null);
+                let state = json!({"unit":"work_relation","earlier_task":earlier,"later_task":later,"candidate_evidence":relation.evidence});
+                let est_tokens = estimate_tokens(&state);
+                (
+                    BuiltState {
+                        state,
+                        level,
+                        redactions,
+                        est_tokens,
+                    },
+                    crate::classify::questions::work_relationship_question(),
+                )
+            };
+            let key = format!(
+                "{}|{}|work:{}",
+                to.task.provider, to.task.session_id, relation.id
+            );
+            if let Some(answer) = self
+                .ask("work_relation", &key, &build)?
+                .and_then(|a| a.answers.get("work_relationship").cloned())
+                && let Some(kind) = answer.0.label.as_deref().filter(|s| *s != "unknown")
+            {
+                work::insert_relation(
+                    self.conn,
+                    &relation.from_id,
+                    &relation.to_id,
+                    kind,
+                    if kind == "unrelated" && answer.1 == "confident" {
+                        "rejected"
+                    } else {
+                        "suggested"
+                    },
+                    "classifier",
+                    &relation.evidence,
+                    answer.0.confidence,
+                )?;
+            }
+        }
         Ok(())
     }
 
@@ -1152,6 +1984,23 @@ mod tests {
     use crate::classify::client::{ClientError, ScriptedClient, canned_response};
     use crate::db::session_store::{MessageRecord, SessionRecord, store_session_record};
 
+    #[test]
+    fn skill_follow_through_state_uses_bounded_structural_actions() -> Result<()> {
+        let conn = Connection::open_in_memory()?;
+        crate::db::init_app_schema(&conn)?;
+        conn.execute(
+            "INSERT INTO fact_session_tool_call
+             (provider, session_id, call_key, call_index, ts, tool_name, tool_category,
+              status, target) VALUES ('claude', 's1', 't1', 0, '2026-10-01T10:00:00Z',
+              'Bash', 'exec', 'ok', 'secret=do-not-send')",
+            [],
+        )?;
+        let actions = post_skill_actions(&conn, "claude", "s1", 0, Some("2026-10-01T10:00:00Z"))?;
+        assert_eq!(actions.len(), 1);
+        assert!(!actions[0].to_string().contains("do-not-send"));
+        Ok(())
+    }
+
     fn message(key: &str, ts: &str, role: &str, text: &str) -> MessageRecord {
         MessageRecord {
             key: key.into(),
@@ -1267,6 +2116,8 @@ mod tests {
             max_usd,
             passes: Passes::ALL,
             dry_run: false,
+            dispatch_seconds: None,
+            job_id: None,
         }
     }
 
@@ -1361,6 +2212,8 @@ mod tests {
             completion: false,
             rework: false,
             stages: false,
+            skills: false,
+            prs: false,
         };
         run(
             &conn,
@@ -1378,6 +2231,45 @@ mod tests {
             |row| row.get(0),
         )?;
         assert_eq!(tasks, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn stopped_jobs_resume_without_resetting_spend_or_mutating_during_planning() -> Result<()> {
+        let (conn, session) = seeded()?;
+        let client = scripted();
+        let cfg = config();
+        let mut opts = options(1.0);
+        opts.dispatch_seconds = Some(0);
+        let first = run(&conn, &client, &cfg, std::slice::from_ref(&session), &opts)?;
+        assert_eq!(first.sent, 0);
+        assert!(first.stopped.is_some());
+        let id = first.job_id.unwrap();
+        conn.execute(
+            "UPDATE classification_job SET spent_usd=0.1 WHERE id=?1",
+            [id],
+        )?;
+        let (sessions, resume) = resume_job(&conn, id, &cfg)?;
+        assert!((resume.max_usd - 0.9).abs() < 1e-9);
+        assert_eq!(
+            conn.query_row(
+                "SELECT state FROM classification_job WHERE id=?1",
+                [id],
+                |r| r.get::<_, String>(0)
+            )?,
+            "pending"
+        );
+        let result = run(&conn, &client, &cfg, &sessions, &resume)?;
+        assert!(result.sent > 0);
+        let spent: f64 = conn.query_row(
+            "SELECT spent_usd FROM classification_job WHERE id=?1",
+            [id],
+            |r| r.get(0),
+        )?;
+        assert!((spent - 0.1 - result.cost_usd).abs() < 1e-9);
+        let mut changed = cfg;
+        changed.model = "different-policy".into();
+        assert!(resume_job(&conn, id, &changed).is_err());
         Ok(())
     }
 
@@ -1534,6 +2426,8 @@ mod tests {
             completion: false,
             rework: true,
             stages: false,
+            skills: false,
+            prs: false,
         };
         let late = SessionRef {
             provider: "claude".into(),
@@ -1597,6 +2491,69 @@ mod tests {
             |row| row.get(0),
         )?;
         assert_eq!(stages, 4);
+        Ok(())
+    }
+    #[test]
+    fn project_limit_and_reported_overrun_are_persisted() -> Result<()> {
+        let (conn, mut session) = seeded()?;
+        conn.execute("INSERT INTO metadata_repositories(id,repo_root,repo_name) VALUES(1,'/project','project')",[])?;
+        conn.execute("UPDATE metadata_sessions SET repository_id=1", [])?;
+        session.repo_root = Some("/project".into());
+        crate::classify::automatic::configure_limits(&conn, "/project", 0.00000001, 0.5, 56)?;
+        let client = scripted();
+        let summary = run(
+            &conn,
+            &client,
+            &config(),
+            std::slice::from_ref(&session),
+            &options(1.0),
+        )?;
+        assert_eq!(client.calls(), 0);
+        assert!(summary.stopped.unwrap().contains("project budget"));
+        crate::classify::automatic::configure_limits(&conn, "/project", 2.0, 0.5, 56)?;
+        let client = ScriptedClient::new(|r| {
+            let mut response = canned_response(r, |_, q| {
+                (
+                    q["criteria"]
+                        .as_object()
+                        .unwrap()
+                        .keys()
+                        .next()
+                        .unwrap()
+                        .clone(),
+                    0.8,
+                )
+            });
+            response.cost_usd = Some(0.7);
+            Ok(response)
+        });
+        let summary = run(&conn, &client, &config(), &[session], &options(0.5))?;
+        assert_eq!(client.calls(), 1);
+        assert_eq!(summary.cost_usd, 0.7);
+        assert!(summary.stopped.is_some());
+        assert_eq!(
+            crate::classify::automatic::project_spend(&conn, "/project")?,
+            0.7
+        );
+        assert_eq!(monthly_spend(&conn)?, 0.7);
+        Ok(())
+    }
+
+    #[test]
+    fn simultaneous_classifier_entry_point_cannot_dispatch() -> Result<()> {
+        use fs2::FileExt;
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("vca.db");
+        let conn = Connection::open(&path)?;
+        crate::db::init_app_schema(&conn)?;
+        let lock = std::fs::File::create(path.with_extension("classifier.lock"))?;
+        lock.try_lock_exclusive()?;
+        let client = scripted();
+        let error = run(&conn, &client, &config(), &[], &options(0.5)).unwrap_err();
+        assert!(error.to_string().contains("Another classification run"));
+        assert_eq!(client.calls(), 0);
+        drop(lock);
+        assert!(run(&conn, &client, &config(), &[], &options(0.5)).is_ok());
         Ok(())
     }
 }

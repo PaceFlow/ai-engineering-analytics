@@ -5,7 +5,27 @@
 use serde_json::{Map, Value, json};
 
 /// Bump when instructions or criteria change; cached results are keyed by it.
-pub const QUESTION_SET_VERSION: &str = "2026-10-q2";
+pub const QUESTION_SET_VERSION: &str = "2026-10-q3";
+pub const SKILL_QUESTION_VERSION: &str = "2026-10-skill-q1";
+
+pub const SKILL_FOLLOW_THROUGH: [(&str, &str); 4] = [
+    (
+        "followed",
+        "Visible actions satisfy the skill's applicable requirements.",
+    ),
+    (
+        "partly",
+        "Some applicable requirements are visible, but others are missed.",
+    ),
+    (
+        "not_followed",
+        "Visible actions contradict or omit applicable requirements.",
+    ),
+    (
+        "unknown",
+        "The trace or skill instructions are insufficient to judge.",
+    ),
+];
 
 pub const INTENTS: [(&str, &str); 12] = [
     ("feature", "Adding new user-visible behavior or capability."),
@@ -326,6 +346,7 @@ pub fn labels_for(question: &str) -> Option<Vec<&'static str>> {
         "outcome" => names(&OUTCOMES),
         "feedback" => names(&FEEDBACK),
         "rework_kind" => names(&REWORK_KINDS),
+        "skill_follow_through" => names(&SKILL_FOLLOW_THROUGH),
         "framing" => vec!["0", "1", "2", "3"],
         "progress" => vec!["0", "1", "2", "3", "4"],
         "frustration" => vec!["0", "1", "2"],
@@ -344,6 +365,7 @@ pub fn unit_kind_for(question: &str) -> &'static str {
         "request_kind" | "turn_stage" => "turn",
         id if TURN_FLAGS.iter().any(|(name, _, _)| *name == id) => "turn",
         "rework_kind" => "relation",
+        "skill_follow_through" => "skill",
         _ => "task",
     }
 }
@@ -419,6 +441,15 @@ pub fn task_label_questions(level: crate::classify::state::Level) -> Map<String,
         }
         questions.insert(id.into(), noul("Does this hold for the task?", yes, no));
     }
+    questions
+}
+
+pub fn skill_follow_through_question() -> Map<String, Value> {
+    let mut questions = Map::new();
+    questions.insert("skill_follow_through".into(), choice(
+        "Compare only visible actions after this skill invocation with applicable requirements in the supplied skill instructions. Choose unknown when the evidence cannot establish compliance; do not infer it from invocation alone.",
+        &SKILL_FOLLOW_THROUGH,
+    ));
     questions
 }
 
@@ -536,7 +567,7 @@ pub fn completion_question(turn_options: &[(i64, String)]) -> Map<String, Value>
     questions.insert(
         "completion_turn".into(),
         choice(
-            "At which turn was this task's goal actually achieved? Achieved means the requested change works or the question was answered. Prefer turns where a validation passed or the user confirmed.",
+            "At which turn was this task's goal actually achieved? Achieved means the requested change works or the question was answered. Use evidence that addresses the actual requested goal. A session ending, an assistant saying done, a commit, or a generic passing command alone is insufficient. A planning or research goal may complete through an answered question or decision. If later correction shows the goal was unmet, choose the subsequent supported completion, or not_completed.",
             &refs,
         ),
     );
@@ -553,6 +584,26 @@ pub fn rework_question() -> Map<String, Value> {
             &REWORK_KINDS,
         ),
     );
+    questions
+}
+
+/// Cross-conversation relationships are suggestions unless backed by explicit references.
+pub fn work_relationship_question() -> Map<String, Value> {
+    let mut questions = Map::new();
+    questions.insert("work_relationship".into(),choice(
+        "How does the later goal relate to the earlier goal? Shared files, branches or similar wording alone do not prove continuation. Distinguish a separate bug fix correcting earlier output from reopening the same unresolved goal.",
+        &[("continuation","Continues the same still-open goal."),
+          ("reopens","Explicitly resumes the same goal after a completion claim proved premature."),
+          ("corrects_previous_work","A separate goal correcting a defect in the earlier output."),
+          ("unrelated","Different goals, including incidental file overlap."),
+          ("unknown","Insufficient evidence to decide.")],
+    ));
+    questions
+}
+
+pub fn pr_questions() -> Map<String, Value> {
+    let mut questions = Map::new();
+    questions.insert("intent".into(),choice("What kind of engineering change does this pull request propose? Judge the change, not review or coordination work around it.",&INTENTS));
     questions
 }
 
