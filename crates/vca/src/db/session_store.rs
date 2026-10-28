@@ -15,7 +15,7 @@ use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension, params};
 
 /// Bump when parsers start extracting new facts so existing sources are re-read.
-pub const SESSION_INGEST_VERSION: i64 = 2;
+pub const SESSION_INGEST_VERSION: i64 = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentKind {
@@ -55,6 +55,8 @@ impl TokenSource {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct UsageRecord {
+    /// Provider-confirmed availability. None keeps zero-filled legacy records uncertain.
+    pub usage_available: Option<bool>,
     /// Natural key unique within the session (API message id, turn id, ...).
     pub key: String,
     pub ts: Option<String>,
@@ -81,6 +83,7 @@ pub struct UsageRecord {
 impl UsageRecord {
     pub fn new(key: impl Into<String>) -> Self {
         Self {
+            usage_available: None,
             key: key.into(),
             ts: None,
             model: None,
@@ -189,11 +192,20 @@ pub struct RateLimitRecord {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct RepositoryHint {
+    pub project_id: String,
+    pub root: String,
+    pub source: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct SessionRecord {
     pub provider: String,
     pub session_id: String,
     pub source_path: Option<String>,
     pub project_path: Option<String>,
+    /// Provider-recorded repository identity, independent of an ephemeral working directory.
+    pub repository_hint: Option<RepositoryHint>,
     pub started_at: Option<String>,
     pub ended_at: Option<String>,
     /// Primary model (most output tokens), used for legacy per-session columns.
@@ -221,6 +233,7 @@ impl SessionRecord {
             session_id: session_id.into(),
             source_path: None,
             project_path: None,
+            repository_hint: None,
             started_at: None,
             ended_at: None,
             model: None,
@@ -288,6 +301,11 @@ impl SessionRecord {
 }
 
 pub(crate) const SESSION_STORE_SCHEMA: &str = "
+CREATE TABLE IF NOT EXISTS fact_session_project (
+    provider TEXT NOT NULL, session_id TEXT NOT NULL, project_id TEXT NOT NULL,
+    project_root TEXT NOT NULL, session_directory TEXT, source TEXT NOT NULL,
+    PRIMARY KEY(provider,session_id)
+);
 CREATE TABLE IF NOT EXISTS session_source_state (
     provider       TEXT NOT NULL,
     source_key     TEXT NOT NULL,
@@ -320,6 +338,7 @@ CREATE TABLE IF NOT EXISTS fact_session_tool_call (
     agent_type        TEXT,
     UNIQUE(provider, session_id, call_key)
 );
+
 
 CREATE TABLE IF NOT EXISTS fact_session_event (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -385,6 +404,8 @@ CREATE INDEX IF NOT EXISTS idx_fact_session_usage_ts
     ON fact_session_usage(usage_ts);
 CREATE INDEX IF NOT EXISTS idx_metadata_sessions_parent
     ON metadata_sessions(provider, parent_session_id);
+CREATE INDEX IF NOT EXISTS idx_metadata_sessions_root
+    ON metadata_sessions(provider, root_session_id, session_id);
 CREATE VIEW IF NOT EXISTS view_session_tree AS
     SELECT provider,
            session_id,
@@ -537,6 +558,26 @@ fn store_session_record_inner(conn: &Connection, record: &SessionRecord) -> Resu
         None,
         primary_model.as_deref(),
     )?;
+    if let Some(hint) = &record.repository_hint {
+        let mapped = crate::path_utils::on_disk(std::path::Path::new(&hint.root));
+        let root = crate::path_utils::path_to_string(&mapped);
+        let repository_id = super::upsert_metadata_repository(conn, &root)?;
+        conn.execute(
+            "UPDATE metadata_sessions SET repository_id=?3 WHERE provider=?1 AND session_id=?2",
+            params![provider, session_id, repository_id],
+        )?;
+        conn.execute(
+            "INSERT OR REPLACE INTO fact_session_project VALUES(?1,?2,?3,?4,?5,?6)",
+            params![
+                provider,
+                session_id,
+                hint.project_id,
+                hint.root,
+                record.project_path,
+                hint.source
+            ],
+        )?;
+    }
     if let Some(model) = primary_model.as_deref() {
         // Re-parsed sessions take the freshly computed primary model.
         let model_id = super::upsert_metadata_model(
@@ -679,6 +720,17 @@ fn store_session_record_inner(conn: &Connection, record: &SessionRecord) -> Resu
             },
             usage.cache_write_1h_tokens.max(0)
         ])?;
+        let availability = match usage.usage_available {
+            Some(false) => "missing",
+            Some(true) if usage.total_tokens() == 0 => "explicit_zero",
+            _ if usage.token_source == TokenSource::EstimatedText => "estimated",
+            _ if usage.total_tokens() > 0 => "native",
+            _ => "suspect_zero",
+        };
+        conn.execute(
+            "INSERT OR REPLACE INTO usage_measurement VALUES(?1,?2,?3,?4,'parser')",
+            params![provider, session_id, usage.key, availability],
+        )?;
         written += 1;
     }
 
@@ -797,6 +849,15 @@ fn store_session_record_inner(conn: &Connection, record: &SessionRecord) -> Resu
             change.ts.as_deref(),
         )?;
         written += 1;
+    }
+
+    // Accepted-change helpers can enrich metadata with an edited path. The source
+    // transcript remains authoritative for re-ingestion and corpus snapshots.
+    if let Some(path) = &record.source_path {
+        conn.execute(
+            "UPDATE metadata_sessions SET source_path=?3 WHERE provider=?1 AND session_id=?2",
+            params![provider, session_id, path],
+        )?;
     }
 
     Ok(written)

@@ -23,17 +23,22 @@ const KEY_FILE: &str = "openrouter_token";
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ClassifierConfig {
+    /// Global opt-in for automatic external classification of all ingested projects.
     pub enabled: bool,
     pub model: String,
     pub endpoint: String,
     pub default_level: String,
     pub monthly_budget_usd: f64,
+    pub project_monthly_budget_usd: f64,
+    pub max_run_usd: f64,
+    pub backfill_days: u32,
     /// USD per million input tokens, used for estimates only; actual cost
     /// comes from each response's `usage.cost`.
     pub input_price_per_million: f64,
     pub allow_projects: Vec<String>,
     pub deny_projects: Vec<String>,
     pub concurrency: usize,
+    pub automatic_dispatch_seconds: u64,
     pub provider: ProviderPrefs,
 }
 
@@ -61,10 +66,14 @@ impl Default for ClassifierConfig {
             endpoint: DEFAULT_ENDPOINT.into(),
             default_level: Level::Conversation.as_str().into(),
             monthly_budget_usd: 2.0,
+            project_monthly_budget_usd: 2.0,
+            max_run_usd: 0.50,
+            backfill_days: 56,
             input_price_per_million: 0.042,
             allow_projects: Vec::new(),
             deny_projects: Vec::new(),
             concurrency: 4,
+            automatic_dispatch_seconds: 60,
             provider: ProviderPrefs::default(),
         }
     }

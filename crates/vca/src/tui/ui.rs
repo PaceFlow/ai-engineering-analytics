@@ -138,16 +138,26 @@ fn render_footer(frame: &mut TermFrame<'_>, app: &App, area: Rect) {
         ))
     } else {
         let hints = match &app.frame().screen {
+            Screen::Trends { .. } => {
+                "Tab view · Enter contributors/compare milestone · n new milestone · f filter · Esc back"
+            }
+            Screen::WorkItems { .. } => "Enter open · L relationships · Esc back",
+            Screen::WorkDetail { .. } => {
+                "Enter conversation · L relationships · l link · d detach member · x evidence · Esc back"
+            }
+            Screen::WorkLinks { .. } => "a accept · d reject · l link · x evidence · Esc back",
             Screen::Overview => {
-                "Tab panel · Enter open · 1-7 screens · t time · f filter · x explain · ? help · q quit"
+                "Tab panel · Enter open · 1-9 screens · t time · f filter · x explain · ? help · q quit"
             }
             Screen::List { .. } => {
-                "Enter open · u sessions/tasks · s sort · m mark · c compare · / search · f filter · Esc back"
+                "Enter open · u sessions/tasks/work items · s sort · m mark · c compare · / search · f filter · Esc back"
             }
             Screen::Groups { .. } => {
                 "g/G dimension · Enter open group · f filter · x explain · Esc back"
             }
-            Screen::Detail { .. } => "Tab section · [ ] prev/next · x explain · m mark · Esc back",
+            Screen::Detail { .. } => {
+                "Tab section · [ ] prev/next · w skill window · x explain · m mark · Esc back"
+            }
             Screen::Usage {
                 tab: UsageTab::Timeline,
                 ..
@@ -164,6 +174,7 @@ fn render_footer(frame: &mut TermFrame<'_>, app: &App, area: Rect) {
                 "Enter open session · [ ] next/prev · M log limit hit · Esc back"
             }
             Screen::ContextItems { .. } => "Enter open session context · x explain · Esc back",
+            Screen::Skills => "Skill calls per session · x explain · Esc back",
             Screen::Delivery => "Enter tasks behind a row · x stage definitions · Esc back",
             Screen::Practices => "Enter tasks with · o tasks without · x definition · Esc back",
             Screen::Compare { .. } => "Esc back · m in lists to change the selection",
@@ -185,6 +196,11 @@ fn render_body(frame: &mut TermFrame<'_>, app: &App, area: Rect) {
         return;
     };
     match (&current.screen, data) {
+        (Screen::Trends { .. }, Data::Trends(_))
+        | (Screen::Trends { .. }, Data::Daily(_))
+        | (_, Data::WorkItems(_))
+        | (_, Data::WorkDetail(_))
+        | (_, Data::WorkLinks(_)) => super::trend_ui::render(frame, app, area),
         (Screen::Overview, Data::Overview(o)) => render_overview(frame, app, o, area),
         (
             Screen::List {
@@ -216,6 +232,7 @@ fn render_body(frame: &mut TermFrame<'_>, app: &App, area: Rect) {
         (Screen::ContextItems { .. }, Data::ContextItems(_)) => {
             render_context_items(frame, app, area)
         }
+        (Screen::Skills, Data::Skills(_)) => render_skill_frequency(frame, app, area),
         (Screen::Delivery, Data::Ladder(..)) => render_ladder(frame, app, area),
         (Screen::Practices, Data::Practices(_)) => render_practices(frame, app, area),
         (Screen::Compare { .. }, Data::Compare(_)) => render_compare(frame, app, area),
@@ -224,7 +241,7 @@ fn render_body(frame: &mut TermFrame<'_>, app: &App, area: Rect) {
 }
 
 /// Table with selection and a persisted scroll offset.
-fn render_table(
+pub(super) fn render_table(
     frame: &mut TermFrame<'_>,
     app: &App,
     area: Rect,
@@ -951,6 +968,152 @@ fn render_groups(frame: &mut TermFrame<'_>, app: &App, dim_index: usize, area: R
     );
 }
 
+fn render_session_overview(frame: &mut TermFrame<'_>, detail: &SessionDetail, area: Rect) {
+    let native_usage = detail.native_usage_available;
+    let tool_calls: i64 = detail.tool_summary.iter().map(|row| row.calls).sum();
+    let failed_tools: i64 = detail.tool_summary.iter().map(|row| row.failed).sum();
+    let skill_calls = detail
+        .skills
+        .iter()
+        .filter(|row| row.kind == "call")
+        .count();
+    let skill_listings = detail
+        .skills
+        .iter()
+        .filter(|row| row.kind == "listed")
+        .count();
+    let skill_injections = detail
+        .skills
+        .iter()
+        .filter(|row| row.kind == "injected")
+        .count();
+    let skill_loads = detail
+        .skills
+        .iter()
+        .filter(|row| row.kind == "loaded")
+        .count();
+    let peak = detail
+        .calls
+        .iter()
+        .map(|call| call.context_tokens)
+        .max()
+        .unwrap_or(0);
+    let partial = detail
+        .calls
+        .iter()
+        .filter(|call| call.capture_completeness != "observed sizes")
+        .count();
+    let regions = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(5),
+            Constraint::Percentage(48),
+            Constraint::Min(5),
+        ])
+        .split(area);
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(format!(
+                "{} model requests · peak observed context {} tokens · {} requests with partial or unavailable capture",
+                detail.calls.len(), if native_usage { fmt::tokens(peak) } else { "unavailable".into() }, partial
+            )),
+            Line::from(format!(
+                "{} tool calls ({} failed) · {} explicit skill calls · {} listings · {} injections · {} file loads",
+                tool_calls, failed_tools, skill_calls, skill_listings, skill_injections, skill_loads
+            )),
+            Line::from(Span::styled(
+                "Context sizes and repeated footprint are estimates from captured material; native usage appears in Context.",
+                dim(),
+            )),
+        ])
+        .block(Block::default().title("Session at a glance").borders(Borders::ALL)),
+        regions[0],
+    );
+
+    let middle = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(56), Constraint::Percentage(44)])
+        .split(regions[1]);
+    let mut context_lines = Vec::new();
+    if detail.context_sources.is_empty() {
+        context_lines.push(Line::from("No captured context items"));
+    } else {
+        for source in &detail.context_sources {
+            context_lines.push(Line::from(format!(
+                "{} · {} items · {} chars · ~{} repeated chars",
+                source.source,
+                source.items,
+                fmt::tokens(source.captured_chars),
+                fmt::tokens(source.repeated_chars)
+            )));
+        }
+    }
+    frame.render_widget(
+        Paragraph::new(context_lines)
+            .block(
+                Block::default()
+                    .title("Context built from")
+                    .borders(Borders::ALL),
+            )
+            .wrap(Wrap { trim: true }),
+        middle[0],
+    );
+    let mut tool_lines = Vec::new();
+    if detail.tool_summary.is_empty() {
+        tool_lines.push(Line::from("No tool calls captured"));
+    } else {
+        for tool in &detail.tool_summary {
+            tool_lines.push(Line::from(format!(
+                "{} · {} calls · {} failed",
+                tool.category, tool.calls, tool.failed
+            )));
+        }
+    }
+    frame.render_widget(
+        Paragraph::new(tool_lines)
+            .block(
+                Block::default()
+                    .title("Tools by type")
+                    .borders(Borders::ALL),
+            )
+            .wrap(Wrap { trim: true }),
+        middle[1],
+    );
+
+    let mut skill_counts = std::collections::BTreeMap::<&str, (usize, usize)>::new();
+    for skill in &detail.skills {
+        let entry = skill_counts.entry(&skill.skill_id).or_default();
+        if skill.kind == "call" {
+            entry.0 += 1;
+        } else if skill.kind == "injected" || skill.kind == "loaded" {
+            entry.1 += 1;
+        }
+    }
+    let mut skill_lines = Vec::new();
+    for (id, (calls, other)) in skill_counts {
+        skill_lines.push(Line::from(format!(
+            "{id} · {calls} calls · {other} injections/loads"
+        )));
+    }
+    if skill_lines.is_empty() {
+        skill_lines.push(Line::from("No named skills observed"));
+    }
+    skill_lines.push(Line::from(Span::styled(
+        "Tab: Conversation → Tasks → Agents → Usage → Context → Skills → Delivery. Select a request in Context and press x for its origins.",
+        dim(),
+    )));
+    frame.render_widget(
+        Paragraph::new(skill_lines)
+            .block(
+                Block::default()
+                    .title("Skills observed")
+                    .borders(Borders::ALL),
+            )
+            .wrap(Wrap { trim: true }),
+        regions[2],
+    );
+}
+
 fn render_detail(
     frame: &mut TermFrame<'_>,
     app: &App,
@@ -959,6 +1122,7 @@ fn render_detail(
     area: Rect,
 ) {
     let s = &detail.session;
+    let native_usage = detail.native_usage_available;
     let parts = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -995,10 +1159,10 @@ fn render_detail(
             Line::from(Span::styled(
                 format!(
                     "API-eq {} tree (subagents {}) · fresh {} · cache read {} · models {}",
-                    fmt::usd(s.cost),
+                    fmt::usd(if native_usage { s.cost } else { None }),
                     fmt::usd(s.subagent_cost),
-                    fmt::tokens(s.fresh_tokens),
-                    fmt::tokens(s.cache_read_tokens),
+                    if native_usage { fmt::tokens(s.fresh_tokens) } else { "—".into() },
+                    if native_usage { fmt::tokens(s.cache_read_tokens) } else { "—".into() },
                     s.models.split(',').map(short_model).collect::<Vec<_>>().join(" → ")
                 ),
                 Style::default().fg(SU),
@@ -1013,6 +1177,7 @@ fn render_detail(
     let body = parts[2];
     let selected = Some(app.frame().selected);
     match tab {
+        DetailTab::Overview => render_session_overview(frame, detail, body),
         DetailTab::Conversation => {
             let rows: Vec<Row> = detail
                 .turns
@@ -1240,8 +1405,12 @@ fn render_detail(
                             24,
                         )),
                         right(a.turns.to_string()),
-                        right(fmt::tokens(a.fresh_tokens)),
-                        right(fmt::usd(a.cost)),
+                        right(if native_usage {
+                            fmt::tokens(a.fresh_tokens)
+                        } else {
+                            "—".into()
+                        }),
+                        right(fmt::usd(if native_usage { a.cost } else { None })),
                         left(if a.background_tokens > 0 {
                             format!("{} unattended", fmt::tokens(a.background_tokens))
                         } else {
@@ -1290,7 +1459,14 @@ fn render_detail(
                 .collect();
             frame.render_widget(
                 Sparkline::default()
-                    .block(Block::default().title(Span::styled("API-equiv per turn", dim())))
+                    .block(Block::default().title(Span::styled(
+                        if native_usage {
+                            "API-equiv per turn"
+                        } else {
+                            "Native usage unavailable"
+                        },
+                        dim(),
+                    )))
                     .data(&burn)
                     .style(Style::default().fg(CY)),
                 split[0],
@@ -1302,10 +1478,22 @@ fn render_detail(
                     Row::new(vec![
                         left(short_model(&m.model)),
                         right(m.calls.to_string()),
-                        right(fmt::tokens(m.fresh_tokens)),
-                        right(fmt::tokens(m.cache_read_tokens)),
-                        right(fmt::tokens(m.output_tokens)),
-                        right(fmt::usd(m.cost)),
+                        right(if native_usage {
+                            fmt::tokens(m.fresh_tokens)
+                        } else {
+                            "—".into()
+                        }),
+                        right(if native_usage {
+                            fmt::tokens(m.cache_read_tokens)
+                        } else {
+                            "—".into()
+                        }),
+                        right(if native_usage {
+                            fmt::tokens(m.output_tokens)
+                        } else {
+                            "—".into()
+                        }),
+                        right(fmt::usd(if native_usage { m.cost } else { None })),
                         left(format!(
                             "{} · pricing {}",
                             m.token_source,
@@ -1343,53 +1531,185 @@ fn render_detail(
         DetailTab::Context => {
             let split = Layout::default()
                 .direction(Direction::Vertical)
-                .constraints([Constraint::Length(5), Constraint::Min(3)])
+                .constraints([
+                    Constraint::Length(4),
+                    Constraint::Length(4),
+                    Constraint::Min(3),
+                ])
                 .split(body);
-            let sizes: Vec<u64> = detail
+            let added: Vec<u64> = detail
                 .calls
                 .iter()
-                .map(|c| c.context_tokens.max(0) as u64)
+                .map(|c| c.new_tokens.max(0) as u64)
                 .collect();
-            let peak = sizes.iter().max().copied().unwrap_or(0);
-            let rebuilds: f64 = detail.calls.iter().filter_map(|c| c.rebuild_extra).sum();
-            let compactions = detail
+            let resent: Vec<u64> = detail
                 .calls
                 .iter()
-                .filter(|c| c.cache_event == "compaction")
-                .count();
+                .map(|c| c.carried_tokens.max(0) as u64)
+                .collect();
             frame.render_widget(
                 Sparkline::default()
-                    .block(Block::default().title(Span::styled(
-                        format!(
-                            "context per call · peak {} · {} calls · {} compaction(s) · cache rebuilds {} extra",
-                            fmt::tokens(peak as i64),
-                            detail.calls.len(),
-                            compactions,
-                            fmt::usd(Some(rebuilds))
-                        ),
-                        dim(),
-                    )))
-                    .data(&sizes)
+                    .block(
+                        Block::default()
+                            .title(Span::styled("Estimated context added per request", dim())),
+                    )
+                    .data(&added)
                     .style(Style::default().fg(AM)),
                 split[0],
             );
+            frame.render_widget(
+                Sparkline::default()
+                    .block(Block::default().title(Span::styled(
+                        "Estimated context carried / resent per request",
+                        dim(),
+                    )))
+                    .data(&resent)
+                    .style(Style::default().fg(CY)),
+                split[1],
+            );
             let rows: Vec<Row> = detail
-                .context_items
+                .calls
                 .iter()
-                .map(|i| {
+                .map(|call| {
+                    let sources = detail
+                        .context_items
+                        .iter()
+                        .filter(|item| item.entered_call == call.call_index)
+                        .take(3)
+                        .map(|item| item.target.as_deref().unwrap_or(&item.kind))
+                        .collect::<Vec<_>>()
+                        .join(", ");
                     Row::new(vec![
-                        left(fmt::truncate(i.tool_name.as_deref().unwrap_or(&i.kind), 18)),
-                        left(fmt::truncate(i.target.as_deref().unwrap_or(""), 60)),
-                        right(fmt::tokens(i.tokens)),
-                        right(format!("c{}", i.entered_call)),
-                        right(i.carried_calls.to_string()),
-                        right(fmt::usd(i.write_usd)),
-                        right(fmt::usd(
-                            i.carry_usd.map(|c| c + i.rebuild_usd.unwrap_or(0.0)),
+                        right(call.call_index.to_string()),
+                        right(
+                            call.task_index
+                                .map(|task| task.to_string())
+                                .unwrap_or_default(),
+                        ),
+                        right(if native_usage {
+                            fmt::tokens(call.new_tokens)
+                        } else {
+                            "—".into()
+                        }),
+                        right(if native_usage {
+                            fmt::tokens(call.carried_tokens)
+                        } else {
+                            "—".into()
+                        }),
+                        right(if native_usage {
+                            fmt::tokens(call.fresh_tokens)
+                        } else {
+                            "—".into()
+                        }),
+                        right(if native_usage {
+                            fmt::tokens(call.cached_tokens)
+                        } else {
+                            "—".into()
+                        }),
+                        right(if native_usage {
+                            fmt::tokens(call.output_tokens)
+                        } else {
+                            "—".into()
+                        }),
+                        right(fmt::usd(call.reported_cost)),
+                        left(call.cache_event.clone()),
+                        left(call.capture_completeness.clone()),
+                        left(fmt::truncate(&sources, 48)),
+                    ])
+                })
+                .collect();
+            render_table(
+                frame,
+                app,
+                split[2],
+                &[
+                    ">Req",
+                    ">Task",
+                    ">~Added",
+                    ">~Resent",
+                    ">Input",
+                    ">Cached",
+                    ">Output",
+                    ">Reported $",
+                    "Event",
+                    "Capture",
+                    "Introduced by",
+                ],
+                &[
+                    Constraint::Length(4),
+                    Constraint::Length(5),
+                    Constraint::Length(8),
+                    Constraint::Length(9),
+                    Constraint::Length(8),
+                    Constraint::Length(8),
+                    Constraint::Length(8),
+                    Constraint::Length(10),
+                    Constraint::Length(12),
+                    Constraint::Length(13),
+                    Constraint::Min(16),
+                ],
+                rows,
+                selected,
+            );
+        }
+        DetailTab::Skills => {
+            let window = app.frame().panel % 3;
+            let label = ["task end", "session end", "next skill"][window];
+            let listed = detail.skills.iter().filter(|s| s.kind == "listed").count();
+            let injected = detail
+                .skills
+                .iter()
+                .filter(|s| s.kind == "injected")
+                .count();
+            let loaded = detail.skills.iter().filter(|s| s.kind == "loaded").count();
+            let succeeded = detail
+                .skills
+                .iter()
+                .filter(|s| s.kind == "call" && s.status == "ok")
+                .count();
+            let failed = detail
+                .skills
+                .iter()
+                .filter(|s| {
+                    s.kind == "call"
+                        && matches!(s.status.as_str(), "error" | "rejected" | "interrupted")
+                })
+                .count();
+            let unknown = detail
+                .skills
+                .iter()
+                .filter(|s| s.kind == "call" && s.status == "unknown")
+                .count();
+            let split = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(3), Constraint::Min(3)])
+                .split(body);
+            frame.render_widget(Paragraph::new(format!(
+                "Calls/session: {succeeded} successful · {failed} failed · {unknown} unknown · {loaded} loaded · {injected} injected · {listed} listings\nDownstream window: {label} (w to change). Windows overlap and are not additive."
+            )).block(Block::default().title("Skill evidence")), split[0]);
+            let rows: Vec<Row> = detail
+                .skills
+                .iter()
+                .map(|skill| {
+                    let usage = match window {
+                        1 => &skill.session,
+                        2 => &skill.next_skill,
+                        _ => &skill.task,
+                    };
+                    Row::new(vec![
+                        left(fmt::truncate(&skill.skill_id, 24)),
+                        left(format!("{} / {}", skill.kind, skill.status)),
+                        right(skill.task_index.map(|i| i.to_string()).unwrap_or_default()),
+                        right(format!("{}", skill.body_chars)),
+                        right(fmt::tokens(skill.body_est_tokens)),
+                        right(skill.carried_calls.to_string()),
+                        right(usage.calls.to_string()),
+                        right(fmt::tokens(
+                            usage.input_tokens + usage.cached_tokens + usage.output_tokens,
                         )),
-                        right(fmt::usd(i.total_usd)),
-                        left(i.purpose.clone().unwrap_or_default()),
-                        left(i.instruction_ref.clone().unwrap_or_default()),
+                        right(fmt::usd(usage.reported_cost_usd.or(usage.api_equiv_usd))),
+                        left(skill.follow_through.clone()),
+                        left(skill.outcome.clone()),
                     ])
                 })
                 .collect();
@@ -1398,20 +1718,21 @@ fn render_detail(
                 app,
                 split[1],
                 &[
-                    "Item", "Target", ">Tokens", ">In", ">Carried", ">Write", ">Carry", ">Total",
-                    "Purpose", "Instr.",
+                    "Skill", "Evidence", ">Task", ">Chars", ">~Body", ">Carry", ">Calls",
+                    ">Tokens", ">Cost*", "Follow", "Outcome",
                 ],
                 &[
-                    Constraint::Length(18),
-                    Constraint::Min(20),
-                    Constraint::Length(7),
+                    Constraint::Length(24),
+                    Constraint::Length(19),
                     Constraint::Length(5),
-                    Constraint::Length(7),
                     Constraint::Length(8),
                     Constraint::Length(8),
-                    Constraint::Length(8),
-                    Constraint::Length(14),
+                    Constraint::Length(6),
+                    Constraint::Length(6),
+                    Constraint::Length(9),
+                    Constraint::Length(9),
                     Constraint::Length(12),
+                    Constraint::Min(10),
                 ],
                 rows,
                 selected,
@@ -1499,6 +1820,83 @@ fn render_detail(
                     selected,
                 );
             }
+        }
+        DetailTab::TurnContext => {
+            let parts = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(2), Constraint::Min(3)])
+                .split(body);
+            frame.render_widget(
+                Paragraph::new(Span::styled(
+                    "User turns are coding-agent boundaries, not confirmed external runs. Prior/new sizes are captured material; ~tokens use character estimates.",
+                    dim(),
+                ))
+                .wrap(Wrap { trim: true }),
+                parts[0],
+            );
+            let rows: Vec<Row> = detail
+                .turn_context
+                .iter()
+                .map(|turn| {
+                    Row::new(vec![
+                        right(turn.turn_index.to_string()),
+                        left(fmt::when(turn.started_at.as_deref())),
+                        right(fmt::minutes(turn.since_previous_minutes)),
+                        right(turn.model_requests.to_string()),
+                        right(turn.tool_calls.to_string()),
+                        right(
+                            turn.first_context_tokens
+                                .map(fmt::tokens)
+                                .unwrap_or_else(|| "—".into()),
+                        ),
+                        right(
+                            turn.last_context_tokens
+                                .map(fmt::tokens)
+                                .unwrap_or_else(|| "—".into()),
+                        ),
+                        right(fmt::tokens(turn.prior_captured_chars)),
+                        right(fmt::tokens(turn.prior_est_tokens)),
+                        right(fmt::tokens(turn.new_captured_chars)),
+                        right(fmt::tokens(turn.new_est_tokens)),
+                        left(turn.capture.clone()),
+                    ])
+                })
+                .collect();
+            render_table(
+                frame,
+                app,
+                parts[1],
+                &[
+                    ">Turn",
+                    "Time",
+                    ">Gap",
+                    ">Req",
+                    ">Tools",
+                    ">First in",
+                    ">Last in",
+                    ">Prior chars",
+                    ">~Prior",
+                    ">New chars",
+                    ">~New",
+                    "Capture",
+                ],
+                &[
+                    Constraint::Length(5),
+                    Constraint::Length(11),
+                    Constraint::Length(8),
+                    Constraint::Length(5),
+                    Constraint::Length(6),
+                    Constraint::Length(9),
+                    Constraint::Length(9),
+                    Constraint::Length(12),
+                    Constraint::Length(8),
+                    Constraint::Length(10),
+                    Constraint::Length(7),
+                    Constraint::Min(12),
+                ],
+                rows,
+                selected,
+            );
         }
     }
 }
@@ -1848,6 +2246,77 @@ fn render_window(
     );
 }
 
+fn render_skill_frequency(frame: &mut TermFrame<'_>, app: &App, area: Rect) {
+    let Some(Data::Skills(skills)) = app.frame().data.as_ref() else {
+        return;
+    };
+    let rows: Vec<Row> = skills
+        .iter()
+        .map(|skill| {
+            Row::new(vec![
+                left(fmt::truncate(&skill.skill_id, 42)),
+                right(skill.calls.to_string()),
+                right(skill.successful.to_string()),
+                right(skill.failed.to_string()),
+                right(skill.unknown_calls.to_string()),
+                right(skill.sessions.to_string()),
+                right(format!("{:.2}", skill.calls_per_session)),
+                right(skill.injected.to_string()),
+                right(skill.loaded.to_string()),
+                right(skill.listed.to_string()),
+                right(skill.distinct_tasks.to_string()),
+                right(
+                    skill
+                        .eligible_tasks
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "?".into()),
+                ),
+                right(skill.verified_tasks.to_string()),
+                right(fmt::usd(skill.cost_per_verified_usd)),
+            ])
+        })
+        .collect();
+    render_table(
+        frame,
+        app,
+        area,
+        &[
+            "Skill",
+            ">Calls",
+            ">OK",
+            ">Failed",
+            ">Unknown",
+            ">Sessions",
+            ">Calls/sess",
+            ">Injected",
+            ">Loaded",
+            ">Listings",
+            ">Tasks",
+            ">Matched",
+            ">Verified",
+            ">$/verified",
+        ],
+        &[
+            Constraint::Min(18),
+            Constraint::Length(7),
+            Constraint::Length(5),
+            Constraint::Length(8),
+            Constraint::Length(8),
+            Constraint::Length(9),
+            Constraint::Length(11),
+            Constraint::Length(10),
+            Constraint::Length(8),
+            Constraint::Length(10),
+            Constraint::Length(7),
+            Constraint::Length(6),
+            Constraint::Length(10),
+            Constraint::Length(11),
+        ],
+        rows,
+        Some(app.frame().selected),
+    );
+}
+
 fn render_context_items(frame: &mut TermFrame<'_>, app: &App, area: Rect) {
     let current = app.frame();
     let Some(Data::ContextItems(rows)) = current.data.as_ref() else {
@@ -2182,6 +2651,19 @@ fn centered(area: Rect, width_pct: u16, height_pct: u16) -> Rect {
 
 fn render_popup(frame: &mut TermFrame<'_>, app: &App, popup: &Popup, area: Rect) {
     match popup {
+        Popup::ObserveInput { kind, text } => {
+            let title = if kind == "milestone" {
+                "Record milestone: YYYY-MM-DD | title"
+            } else {
+                "Link: FROM_MEMBER TO_MEMBER [kind]"
+            };
+            frame.render_widget(Clear, area);
+            frame.render_widget(
+                Paragraph::new(format!("{text}▏\n\nEnter save · Esc cancel"))
+                    .block(Block::default().borders(Borders::ALL).title(title)),
+                area,
+            );
+        }
         Popup::Help => {
             let rect = centered(area, 80, 84);
             frame.render_widget(Clear, rect);

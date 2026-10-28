@@ -142,7 +142,8 @@ pub fn refresh_session_structure(conn: &Connection) -> Result<()> {
     let table = pricing::table();
 
     conn.execute_batch(
-        "DELETE FROM derived_turn;
+        "DELETE FROM derived_work_activity;
+         DELETE FROM derived_turn;
          DELETE FROM derived_usage_event;
          DELETE FROM derived_task;
          DELETE FROM derived_attempt;",
@@ -228,21 +229,24 @@ pub fn refresh_session_structure(conn: &Connection) -> Result<()> {
                 spawned_in.or_else(|| root_turns.map(|turns| turn_for_ts(turns, usage.ts)))
             };
             let task_index = root_turn_index.map(|turn| task_for_turn(assignment, turn));
-            let priced = usage.model.as_deref().and_then(|model| {
-                table.estimate(
-                    model,
-                    UsageForPricing {
-                        input_tokens: usage.input,
-                        cache_read_tokens: usage.cache_read,
-                        cache_write_tokens: usage.cache_write,
-                        cache_write_1h_tokens: usage.cache_write_1h,
-                        output_tokens: usage.output,
-                        reasoning_tokens: usage.reasoning,
-                        reasoning_in_output: usage.reasoning_in_output,
-                        per_call: usage.token_source != "legacy",
-                    },
-                )
-            });
+            let priced = (usage.total > 0)
+                .then_some(usage.model.as_deref())
+                .flatten()
+                .and_then(|model| {
+                    table.estimate(
+                        model,
+                        UsageForPricing {
+                            input_tokens: usage.input,
+                            cache_read_tokens: usage.cache_read,
+                            cache_write_tokens: usage.cache_write,
+                            cache_write_1h_tokens: usage.cache_write_1h,
+                            output_tokens: usage.output,
+                            reasoning_tokens: usage.reasoning,
+                            reasoning_in_output: usage.reasoning_in_output,
+                            per_call: usage.token_source != "legacy",
+                        },
+                    )
+                });
             let fresh = usage.input + usage.cache_write + usage.output;
             let background = match (
                 usage.ts,
@@ -742,6 +746,22 @@ fn write_tasks(
         );
         activity.extend(task_events.iter().filter_map(|event| event.ts));
         activity.sort_unstable();
+        activity.dedup();
+        for pair in activity.windows(2) {
+            if pair[1] > pair[0] && pair[1] - pair[0] <= (IDLE_GAP_MINUTES * 60_000.0) as i64 {
+                conn.execute(
+                    "INSERT INTO derived_work_activity VALUES(?1,?2,?3,?4,?5,?6)",
+                    params![
+                        session.provider,
+                        session.session_id,
+                        task_index,
+                        turn_for_ts(turns, Some(pair[0])),
+                        pair[0],
+                        pair[1]
+                    ],
+                )?;
+            }
+        }
         let last_activity = activity.last().copied();
 
         let attempts = build_attempts(turns, &task_tools, turn_set);
@@ -1452,6 +1472,28 @@ mod tests {
         )?;
         assert!((to_complete + after - task_total).abs() < 1e-9);
         assert!(after > 0.0, "the 11:31 call happened after completion");
+        Ok(())
+    }
+
+    #[test]
+    fn zero_native_usage_leaves_cost_unknown() -> Result<()> {
+        let conn = Connection::open_in_memory()?;
+        init_app_schema(&conn)?;
+        let mut record = SessionRecord::new("opencode", "zero-usage");
+        record.messages = vec![message("m1", "2026-10-01T10:00:00Z", "user", "Review this")];
+        let mut empty = UsageRecord::new("u1");
+        empty.ts = Some("2026-10-01T10:01:00Z".into());
+        empty.model = Some("claude-sonnet-4-5".into());
+        record.usage.push(empty);
+        store_session_record(&conn, &record)?;
+        crate::db::session_store::refresh_session_roots(&conn)?;
+        refresh_session_structure(&conn)?;
+        let cost: Option<f64> = conn.query_row(
+            "SELECT cost_total_usd FROM derived_task WHERE session_id = 'zero-usage'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(cost, None);
         Ok(())
     }
 

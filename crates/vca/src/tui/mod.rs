@@ -4,6 +4,7 @@
 pub mod app;
 pub mod data;
 pub mod explain;
+pub mod trend_ui;
 pub mod ui;
 
 #[cfg(test)]

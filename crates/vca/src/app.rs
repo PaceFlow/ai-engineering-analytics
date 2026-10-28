@@ -59,6 +59,12 @@ pub fn run(
     use crate::cli::Commands;
     use crate::commands;
     match command {
+        Commands::Daily(args) => commands::daily::run(args),
+        Commands::Status(args) => commands::daily::status(args),
+        Commands::Sources(args) => commands::daily::sources_for(args, context),
+        Commands::Trends(args) => commands::observe::run_trends(args),
+        Commands::Work(args) => commands::observe::run_work(args),
+        Commands::Changes(args) => commands::observe::run_changes(args),
         Commands::Ingest(args) => commands::ingest::run_for(verbose, args, context),
         Commands::Session(args) => commands::session::run_for(args, context),
         Commands::Delivery(args) => commands::delivery::run_for(args, context),

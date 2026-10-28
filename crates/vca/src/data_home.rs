@@ -12,7 +12,7 @@ const LEGACY_DATABASES: &[&str] = &[
     ".aea/aea.db",
     ".vibe/vca.db",
 ];
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 4;
 
 pub fn home() -> Result<PathBuf> {
     ["VCA_HOME", "PACEFLOW_HOME", "AIENG_HOME", "AEA_HOME"]

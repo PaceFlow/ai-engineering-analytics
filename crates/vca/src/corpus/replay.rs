@@ -138,6 +138,17 @@ impl GroupReplay {
                 String::from_utf8_lossy(&ingest.stderr)
             );
         }
+        let conn = Connection::open(replay.temp.path().join("vca/.vca/vca.db"))?;
+        conn.execute_batch("SAVEPOINT restore_analytics")?;
+        for snapshot in &group.snapshots {
+            super::observations::restore(
+                &conn,
+                &snapshot.dir.join(super::observations::FILE),
+                &replay.repos,
+            )?;
+        }
+        crate::insights::refresh(&conn)?;
+        conn.execute_batch("RELEASE restore_analytics")?;
         Ok(replay)
     }
 

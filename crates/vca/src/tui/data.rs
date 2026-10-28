@@ -32,6 +32,12 @@ pub enum Query {
     Contributors(QuotaWindowRow),
     ContextGroups(Filters, ContextDim),
     ContextItems(Filters, Option<(ContextDim, String)>),
+    Skills(Filters),
+    Trends(Filters, Option<i64>),
+    Daily(Filters),
+    WorkItems(Filters, Vec<String>),
+    WorkDetail(String),
+    WorkLinks(Filters, Option<String>),
     Ladder(Filters),
     Practices(Filters),
     Compare(Vec<(String, String, i64)>),
@@ -41,6 +47,23 @@ pub enum Query {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Action {
+    DecideWorkLink {
+        id: String,
+        accepted: bool,
+    },
+    LinkWork {
+        from: String,
+        to: String,
+        kind: String,
+    },
+    DetachWork {
+        id: String,
+    },
+    AddMilestone {
+        title: String,
+        at: String,
+        repo: Option<String>,
+    },
     SetLabel {
         unit_kind: String,
         unit_key: String,
@@ -103,6 +126,11 @@ pub struct ReworkData {
 
 #[derive(Debug, Clone)]
 pub enum Data {
+    Trends(Box<crate::insights::trends::Report>),
+    Daily(Box<crate::insights::daily::Report>),
+    WorkItems(Vec<crate::insights::work::WorkItem>),
+    WorkDetail(Option<Box<crate::insights::work::WorkItem>>),
+    WorkLinks(Vec<crate::insights::work::Relation>),
     Overview(Box<OverviewData>),
     Sessions(Vec<SessionRow>),
     Tasks(Vec<TaskRow>),
@@ -113,6 +141,7 @@ pub enum Data {
     Contributors(Vec<QuotaContributor>),
     ContextGroups(Vec<ContextGroupRow>),
     ContextItems(Vec<ContextItemRow>),
+    Skills(Vec<explore::skills::SkillFrequencyRow>),
     Ladder(Vec<LadderRow>, Box<ReworkData>),
     Practices(Vec<PracticeRow>),
     Compare(Vec<CompareColumn>),
@@ -151,6 +180,94 @@ pub fn fetch(conn: &Connection, query: &Query) -> Result<Data> {
             constraint.as_ref().map(|(dim, key)| (*dim, key.as_str())),
             300,
         )?),
+        Query::Skills(filters) => {
+            Data::Skills(explore::skills::skill_frequency_for(conn, filters)?)
+        }
+        Query::Daily(filters) => Data::Daily(Box::new(crate::insights::daily::report(
+            conn,
+            &crate::insights::daily::Options {
+                scope: trend_scope(filters),
+                from: filters.from.clone(),
+                to: filters.to.clone(),
+                follow_up_days: 7,
+                ..Default::default()
+            },
+        )?)),
+        Query::Trends(filters, around) => {
+            let options = crate::insights::trends::Options {
+                scope: trend_scope(filters),
+                from: if around.is_none() {
+                    filters.from.clone()
+                } else {
+                    None
+                },
+                to: if around.is_none() {
+                    filters.to.clone()
+                } else {
+                    None
+                },
+                compare: true,
+                around: *around,
+                ..Default::default()
+            };
+            let mut report = crate::insights::trends::report(conn, &options)?;
+            if around.is_none() {
+                let timeline = crate::insights::trends::report(
+                    conn,
+                    &crate::insights::trends::Options {
+                        compare: false,
+                        ..options
+                    },
+                )?;
+                report.periods = timeline.periods;
+                report.warnings.extend(
+                    timeline
+                        .warnings
+                        .into_iter()
+                        .filter(|w| !report.warnings.contains(w))
+                        .collect::<Vec<_>>(),
+                );
+            }
+            Data::Trends(Box::new(report))
+        }
+        Query::WorkItems(filters, ids) => {
+            let scope = trend_scope(filters);
+            Data::WorkItems(
+                crate::insights::work::items(conn)?
+                    .into_iter()
+                    .filter(|w| {
+                        scope.includes(w)
+                            && (ids.is_empty()
+                                || ids.contains(&w.id)
+                                || w.members.iter().any(|m| ids.contains(&m.id)))
+                            && filters
+                                .search
+                                .as_ref()
+                                .is_none_or(|q| w.title.to_lowercase().contains(&q.to_lowercase()))
+                    })
+                    .collect(),
+            )
+        }
+        Query::WorkDetail(id) => Data::WorkDetail(
+            crate::insights::work::items(conn)?
+                .into_iter()
+                .find(|w| w.id == *id)
+                .map(Box::new),
+        ),
+        Query::WorkLinks(filters, id) => {
+            let scope = trend_scope(filters);
+            let ids: std::collections::BTreeSet<_> = crate::insights::work::items(conn)?
+                .iter()
+                .filter(|w| scope.includes(w) && id.as_ref().is_none_or(|id| w.id == *id))
+                .flat_map(|w| w.members.iter().map(|m| m.id.clone()))
+                .collect();
+            Data::WorkLinks(
+                crate::insights::work::relations(conn)?
+                    .into_iter()
+                    .filter(|r| ids.contains(&r.from_id) || ids.contains(&r.to_id))
+                    .collect(),
+            )
+        }
         Query::Ladder(filters) => Data::Ladder(
             explore::delivery::delivery_ladder(conn, filters)?,
             Box::new(ReworkData {
@@ -190,6 +307,43 @@ fn session_refs(conn: &Connection, sessions: &[(String, String)]) -> Result<Vec<
 
 fn act(conn: &Connection, action: &Action) -> Result<Data> {
     Ok(match action {
+        Action::DecideWorkLink { id, accepted } => {
+            crate::insights::work::decide(conn, id, *accepted)?;
+            Data::Done("Relationship decision saved".into())
+        }
+        Action::LinkWork { from, to, kind } => {
+            let a = crate::insights::work::resolve_member(conn, from)?;
+            let b = crate::insights::work::resolve_member(conn, to)?;
+            crate::insights::work::insert_relation(
+                conn,
+                &a,
+                &b,
+                kind,
+                "accepted",
+                "manual",
+                "Linked in terminal",
+                Some(1.0),
+            )?;
+            Data::Done("Members linked".into())
+        }
+        Action::DetachWork { id } => {
+            conn.execute("UPDATE work_relation SET decision='rejected',source='manual' WHERE (from_id=?1 OR to_id=?1) AND kind IN ('continuation','reopens')",[id])?;
+            Data::Done("Member detached".into())
+        }
+        Action::AddMilestone { title, at, repo } => {
+            let at = crate::commands::observe::milestone_time(conn, at)?;
+            let id = crate::insights::setup::save_milestone(
+                conn,
+                None,
+                title,
+                &at,
+                repo.as_deref(),
+                "workflow",
+                "",
+                None,
+            )?;
+            Data::Done(format!("Milestone #{id} recorded"))
+        }
         Action::SetLabel {
             unit_kind,
             unit_key,
@@ -257,6 +411,8 @@ fn act(conn: &Connection, action: &Action) -> Result<Data> {
                 max_usd: *max_usd,
                 passes: Passes::ALL,
                 dry_run: false,
+                dispatch_seconds: None,
+                job_id: None,
             };
             let summary = classify_run::run(conn, &client, &config, &refs, &options)?;
             let mut text = format!(
@@ -406,5 +562,15 @@ impl Loader for InlineLoader {
 
     fn poll(&mut self) -> Vec<(u64, Result<Data, String>)> {
         std::mem::take(&mut self.done)
+    }
+}
+
+pub fn trend_scope(filters: &Filters) -> crate::insights::trends::Scope {
+    crate::insights::trends::Scope {
+        repo: filters.repo.clone(),
+        providers: filters.providers.clone(),
+        model: filters.model.clone(),
+        intent: filters.intent.clone(),
+        ..Default::default()
     }
 }

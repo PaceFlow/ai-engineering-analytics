@@ -206,7 +206,11 @@ fn drill_into_session_and_back_restores_list_state() -> Result<()> {
     key(&mut app, KeyCode::Enter);
     assert!(matches!(app.frame().screen, Screen::Detail { .. }));
     let screen = render(&app, 140, 40);
-    assert!(screen.contains("Conversation"));
+    assert!(screen.contains("Session at a glance"));
+    assert!(screen.contains("tool calls"), "{screen}");
+    assert!(screen.contains("Context built from"), "{screen}");
+    assert!(screen.contains("Skills observed"), "{screen}");
+    key(&mut app, KeyCode::Tab);
     key(&mut app, KeyCode::Tab);
     key(&mut app, KeyCode::Tab);
     assert!(matches!(
@@ -319,6 +323,59 @@ fn context_tab_and_explain_popup() -> Result<()> {
 }
 
 #[test]
+fn turn_context_shows_coding_agent_turn_growth() -> Result<()> {
+    let conn = seeded()?;
+    let detail = crate::explore::session_detail(&conn, "claude", "sess-alpha")?.unwrap();
+    assert_eq!(detail.turn_context.len(), 2);
+    assert_eq!(detail.turn_context[0].model_requests, 1);
+    assert_eq!(detail.turn_context[1].model_requests, 1);
+    assert_eq!(detail.turn_context[1].since_previous_minutes, Some(20.0));
+    assert!(detail.turn_context[1].first_context_tokens.is_some());
+    let mut app = app()?;
+    key(&mut app, KeyCode::Char('2'));
+    key(&mut app, KeyCode::Enter);
+    for _ in 0..8 {
+        key(&mut app, KeyCode::Tab);
+    }
+    assert!(matches!(
+        app.frame().screen,
+        Screen::Detail {
+            tab: DetailTab::TurnContext,
+            ..
+        }
+    ));
+    let screen = render(&app, 150, 35);
+    assert!(screen.contains("coding-agent boundaries"), "{screen}");
+    Ok(())
+}
+
+#[test]
+fn skills_screen_and_detail_tab_render() -> Result<()> {
+    let mut app = app()?;
+    key(&mut app, KeyCode::Char('8'));
+    assert!(matches!(app.frame().screen, Screen::Skills));
+    let screen = render(&app, 140, 30);
+    assert!(screen.contains("Skill calls per session"), "{screen}");
+    key(&mut app, KeyCode::Char('2'));
+    key(&mut app, KeyCode::Enter);
+    for _ in 0..6 {
+        key(&mut app, KeyCode::Tab);
+    }
+    assert!(matches!(
+        app.frame().screen,
+        Screen::Detail {
+            tab: DetailTab::Skills,
+            ..
+        }
+    ));
+    let detail = render(&app, 140, 30);
+    assert!(detail.contains("Skill evidence"), "{detail}");
+    key(&mut app, KeyCode::Char('w'));
+    assert!(render(&app, 140, 30).contains("session end"));
+    Ok(())
+}
+
+#[test]
 fn mark_and_compare_tasks() -> Result<()> {
     let mut app = app()?;
     key(&mut app, KeyCode::Char('2'));
@@ -393,6 +450,7 @@ fn edit_popup_saves_task_label_override() -> Result<()> {
     key(&mut app, KeyCode::Char('2'));
     key(&mut app, KeyCode::Enter);
     key(&mut app, KeyCode::Tab);
+    key(&mut app, KeyCode::Tab);
     assert!(matches!(
         app.frame().screen,
         Screen::Detail {
@@ -429,6 +487,7 @@ fn edit_popup_on_turn_starts_a_new_task() -> Result<()> {
     let mut app = app()?;
     key(&mut app, KeyCode::Char('2'));
     key(&mut app, KeyCode::Enter);
+    key(&mut app, KeyCode::Tab);
     let before = match app.frame().data.as_ref() {
         Some(super::data::Data::Detail(Some(detail))) => detail.tasks.len(),
         _ => 0,
@@ -488,6 +547,7 @@ fn conversation_shows_stages_and_practices_show_habits() -> Result<()> {
     let mut app = app()?;
     key(&mut app, KeyCode::Char('2'));
     key(&mut app, KeyCode::Enter);
+    key(&mut app, KeyCode::Tab);
     let conversation = render(&app, 160, 40);
     assert!(
         conversation.contains("Stage") && conversation.contains("Asked for"),
@@ -515,6 +575,7 @@ fn edit_popup_sets_turn_stage() -> Result<()> {
     let mut app = app()?;
     key(&mut app, KeyCode::Char('2'));
     key(&mut app, KeyCode::Enter);
+    key(&mut app, KeyCode::Tab);
     key(&mut app, KeyCode::Char('e'));
     for _ in 0..2 {
         key(&mut app, KeyCode::Char('j'));
@@ -533,5 +594,42 @@ fn edit_popup_sets_turn_stage() -> Result<()> {
     );
     let screen = render(&app, 160, 40);
     assert!(screen.contains("review✎"), "{screen}");
+    Ok(())
+}
+
+#[test]
+fn daily_trends_uses_shared_totals_and_drills_into_contributing_work() -> Result<()> {
+    let conn = seeded()?;
+    let expected = crate::insights::daily::report(&conn, &Default::default())?;
+    let tokens = expected
+        .days
+        .iter()
+        .map(|d| d.native_tokens.total)
+        .sum::<i64>();
+    let mut app = App::new(
+        Box::new(InlineLoader::new(conn)),
+        Filters::default(),
+        "Test Analytics",
+    );
+    key(&mut app, KeyCode::Char('9'));
+    for _ in 0..4 {
+        key(&mut app, KeyCode::Tab);
+    }
+    assert!(matches!(app.frame().screen, Screen::Trends { tab: 4, .. }));
+    let Some(super::data::Data::Daily(report)) = &app.frame().data else {
+        panic!("Daily query was not loaded")
+    };
+    assert_eq!(
+        report
+            .days
+            .iter()
+            .map(|d| d.native_tokens.total)
+            .sum::<i64>(),
+        tokens
+    );
+    assert!(render(&app, 160, 45).contains("Daily work"));
+    key(&mut app, KeyCode::End);
+    key(&mut app, KeyCode::Enter);
+    assert!(matches!(app.frame().screen, Screen::WorkItems { .. }));
     Ok(())
 }

@@ -13,6 +13,7 @@ pub mod practices;
 pub mod review;
 pub mod review_checks;
 pub mod rework;
+pub mod skills;
 pub mod stages;
 
 use anyhow::Result;
@@ -532,6 +533,26 @@ pub fn sessions(
         return Ok(Vec::new());
     }
 
+    // Count legacy usage once. A correlated join here scans the usage table for
+    // every session and makes large harness histories slow to browse.
+    let mut legacy_counts: BTreeMap<(String, String), i64> = BTreeMap::new();
+    let mut legacy_stmt = conn.prepare(
+        "SELECT fu.provider, COALESCE(NULLIF(c.root_session_id, ''), c.session_id), COUNT(*)
+         FROM fact_session_usage fu JOIN metadata_sessions c
+           ON c.provider = fu.provider AND c.session_id = fu.session_id
+         WHERE fu.token_source = 'legacy'
+         GROUP BY fu.provider, COALESCE(NULLIF(c.root_session_id, ''), c.session_id)",
+    )?;
+    for row in legacy_stmt.query_map([], |row| {
+        Ok((
+            (row.get::<_, String>(0)?, row.get::<_, String>(1)?),
+            row.get::<_, i64>(2)?,
+        ))
+    })? {
+        let (key, count) = row?;
+        legacy_counts.insert(key, count);
+    }
+
     let mut extra_stmt = conn.prepare(
         "SELECT s.ended_at, COALESCE(s.title, ''), COALESCE(s.source_status, 'ok'),
                 (SELECT COUNT(*) FROM metadata_sessions c
@@ -540,25 +561,19 @@ pub fn sessions(
                 (SELECT COALESCE(SUM(cache_read_tokens), 0) FROM derived_usage_event u
                   WHERE u.provider = s.provider AND u.root_session_id = s.session_id),
                 (SELECT SUM(reported_cost_usd) FROM derived_usage_event u
-                  WHERE u.provider = s.provider AND u.root_session_id = s.session_id),
-                (SELECT COUNT(*) FROM fact_session_usage fu
-                  JOIN metadata_sessions c ON c.provider = fu.provider AND c.session_id = fu.session_id
-                  WHERE fu.provider = s.provider
-                    AND COALESCE(NULLIF(c.root_session_id, ''), c.session_id) = s.session_id
-                    AND fu.token_source = 'legacy')
+                  WHERE u.provider = s.provider AND u.root_session_id = s.session_id)
          FROM metadata_sessions s WHERE s.provider = ?1 AND s.session_id = ?2",
     )?;
 
     let mut rows = Vec::new();
     for ((provider, session_id), tasks) in by_session {
-        let (ended_at, title, source_status, agents, cache_read, reported, legacy): (
+        let (ended_at, title, source_status, agents, cache_read, reported): (
             Option<String>,
             String,
             String,
             i64,
             i64,
             Option<f64>,
-            i64,
         ) = extra_stmt.query_row(rusqlite::params![provider, session_id], |row| {
             Ok((
                 row.get(0)?,
@@ -567,9 +582,12 @@ pub fn sessions(
                 row.get(3)?,
                 row.get(4)?,
                 row.get(5)?,
-                row.get(6)?,
             ))
         })?;
+        let legacy = legacy_counts
+            .get(&(provider.clone(), session_id.clone()))
+            .copied()
+            .unwrap_or(0);
         let first = &tasks[tasks.len() - 1];
         let sum_opt = |f: &dyn Fn(&TaskRow) -> Option<f64>| -> Option<f64> {
             let values: Vec<f64> = tasks.iter().filter_map(f).collect();
@@ -1647,7 +1665,9 @@ pub struct ContextItemRow {
     pub kind: String,
     pub tool_name: Option<String>,
     pub target: Option<String>,
+    pub chars: i64,
     pub tokens: i64,
+    pub est_tokens: i64,
     pub entered_call: i64,
     pub carried_calls: i64,
     pub write_usd: Option<f64>,
@@ -1656,6 +1676,13 @@ pub struct ContextItemRow {
     pub total_usd: Option<f64>,
     pub purpose: Option<String>,
     pub instruction_ref: Option<String>,
+    pub fingerprint: Option<String>,
+    pub fingerprint_kind: Option<String>,
+    pub content_source: Option<String>,
+    pub delivery_path: Option<String>,
+    pub last_request: Option<i64>,
+    pub repeated_chars: Option<i64>,
+    pub completeness: Option<String>,
 }
 
 pub fn context_items(
@@ -1678,10 +1705,14 @@ pub fn context_items_for(
         w.push(&format!("{} = ?", dim.sql()), key.to_string());
     }
     let sql = format!(
-        "SELECT c.provider, c.session_id, c.item_key, c.ts, c.kind, c.tool_name, c.target, c.tokens,
+        "SELECT c.provider, c.session_id, c.item_key, c.ts, c.kind, c.tool_name, c.target, c.chars, c.tokens,
                 c.entered_call, c.carried_calls, c.write_usd, c.carry_usd, c.rebuild_usd,
-                c.total_usd, c.purpose, c.instruction_ref
+                c.total_usd, c.purpose, c.instruction_ref, o.fingerprint, o.fingerprint_kind,
+                o.content_source, o.delivery_path, o.last_request, o.repeated_chars, o.completeness,
+                c.est_tokens
          FROM derived_context_item c
+         LEFT JOIN derived_context_origin o ON o.provider = c.provider
+           AND o.session_id = c.session_id AND o.item_key = c.item_key
          JOIN metadata_sessions s ON s.provider = c.provider AND s.session_id = c.session_id
          LEFT JOIN metadata_repositories r ON r.id = s.repository_id
          WHERE {}
@@ -1693,6 +1724,16 @@ pub fn context_items_for(
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt
         .query_map(params_from_iter(w.params.iter()), |row| {
+            let delivery_path: Option<String> = row.get(20)?;
+            let raw_target: Option<String> = row.get(6)?;
+            let target = if delivery_path.as_deref() == Some("shell") {
+                Some("(shell command)".into())
+            } else {
+                raw_target.map(|value| {
+                    crate::classify::state::redact(&crate::classify::state::head_tail(&value, 160))
+                        .0
+                })
+            };
             Ok(ContextItemRow {
                 provider: row.get(0)?,
                 session_id: row.get(1)?,
@@ -1700,16 +1741,25 @@ pub fn context_items_for(
                 ts: row.get(3)?,
                 kind: row.get(4)?,
                 tool_name: row.get(5)?,
-                target: row.get(6)?,
-                tokens: row.get(7)?,
-                entered_call: row.get(8)?,
-                carried_calls: row.get(9)?,
-                write_usd: row.get(10)?,
-                carry_usd: row.get(11)?,
-                rebuild_usd: row.get(12)?,
-                total_usd: row.get(13)?,
-                purpose: row.get(14)?,
-                instruction_ref: row.get(15)?,
+                target,
+                chars: row.get(7)?,
+                tokens: row.get(8)?,
+                est_tokens: row.get(24)?,
+                entered_call: row.get(9)?,
+                carried_calls: row.get(10)?,
+                write_usd: row.get(11)?,
+                carry_usd: row.get(12)?,
+                rebuild_usd: row.get(13)?,
+                total_usd: row.get(14)?,
+                purpose: row.get(15)?,
+                instruction_ref: row.get(16)?,
+                fingerprint: row.get(17)?,
+                fingerprint_kind: row.get(18)?,
+                content_source: row.get(19)?,
+                delivery_path,
+                last_request: row.get(21)?,
+                repeated_chars: row.get(22)?,
+                completeness: row.get(23)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1807,11 +1857,124 @@ pub struct CommitRow {
 pub struct CallRow {
     pub call_index: i64,
     pub ts: Option<String>,
+    pub task_index: Option<i64>,
+    pub turn_index: Option<i64>,
     pub context_tokens: i64,
     pub new_tokens: i64,
+    pub carried_tokens: i64,
+    pub fresh_tokens: i64,
+    pub cached_tokens: i64,
+    pub output_tokens: i64,
+    pub reported_cost: Option<f64>,
+    pub capture_completeness: String,
     pub cache_event: String,
     pub input_cost: Option<f64>,
     pub rebuild_extra: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct TurnContextRow {
+    pub turn_index: i64,
+    pub started_at: Option<String>,
+    /// Time since the preceding user message, not an asserted external run boundary.
+    pub since_previous_minutes: Option<f64>,
+    pub model_requests: i64,
+    pub tool_calls: i64,
+    pub first_context_tokens: Option<i64>,
+    pub last_context_tokens: Option<i64>,
+    pub prior_captured_chars: i64,
+    pub prior_est_tokens: i64,
+    pub new_captured_chars: i64,
+    pub new_est_tokens: i64,
+    pub capture: String,
+}
+
+fn turn_context_rows(
+    turns: &[TurnRow],
+    calls: &[CallRow],
+    items: &[ContextItemRow],
+) -> Vec<TurnContextRow> {
+    turns
+        .iter()
+        .enumerate()
+        .map(|(index, turn)| {
+            let since_previous_minutes = index.checked_sub(1).and_then(|previous| {
+                let start = turn
+                    .started_at
+                    .as_deref()
+                    .and_then(crate::insights::structure::parse_ts)?;
+                let previous = turns[previous]
+                    .started_at
+                    .as_deref()
+                    .and_then(crate::insights::structure::parse_ts)?;
+                (start >= previous).then_some((start - previous) as f64 / 60_000.0)
+            });
+            let matched: Vec<&CallRow> = calls
+                .iter()
+                .filter(|call| call.turn_index == Some(turn.turn_index))
+                .collect();
+            let first_context_tokens = matched
+                .first()
+                .filter(|call| call.context_tokens > 0)
+                .map(|call| call.context_tokens);
+            let last_context_tokens = matched
+                .last()
+                .filter(|call| call.context_tokens > 0)
+                .map(|call| call.context_tokens);
+            let (mut prior_captured_chars, mut prior_est_tokens) = (0, 0);
+            let (mut new_captured_chars, mut new_est_tokens) = (0, 0);
+            if let (Some(first), Some(last)) = (matched.first(), matched.last()) {
+                for item in items {
+                    if item.entered_call < first.call_index
+                        && item.last_request.is_none_or(|end| end >= first.call_index)
+                    {
+                        prior_captured_chars += item.chars;
+                        prior_est_tokens += item.est_tokens;
+                    } else if item.entered_call >= first.call_index
+                        && item.entered_call <= last.call_index
+                    {
+                        new_captured_chars += item.chars;
+                        new_est_tokens += item.est_tokens;
+                    }
+                }
+            }
+            TurnContextRow {
+                turn_index: turn.turn_index,
+                started_at: turn.started_at.clone(),
+                since_previous_minutes,
+                model_requests: matched.len() as i64,
+                tool_calls: turn.tool_calls,
+                first_context_tokens,
+                last_context_tokens,
+                prior_captured_chars,
+                prior_est_tokens,
+                new_captured_chars,
+                new_est_tokens,
+                capture: if matched.is_empty() {
+                    "no request".into()
+                } else if first_context_tokens.is_some() || last_context_tokens.is_some() {
+                    "native + sizes".into()
+                } else {
+                    "sizes only".into()
+                },
+            }
+        })
+        .collect()
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct SessionToolSummary {
+    pub category: String,
+    pub calls: i64,
+    pub failed: i64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct SessionContextSource {
+    pub source: String,
+    pub items: i64,
+    pub captured_chars: i64,
+    pub repeated_chars: i64,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -1827,6 +1990,11 @@ pub struct SessionDetail {
     pub calls: Vec<CallRow>,
     pub context_items: Vec<ContextItemRow>,
     pub context_kinds: Vec<ContextGroupRow>,
+    pub skills: Vec<skills::SkillEventRow>,
+    pub tool_summary: Vec<SessionToolSummary>,
+    pub context_sources: Vec<SessionContextSource>,
+    pub native_usage_available: bool,
+    pub turn_context: Vec<TurnContextRow>,
 }
 
 pub fn session_detail(
@@ -1991,32 +2159,91 @@ pub fn session_detail(
     let commits = session_commits(conn, provider, session_id)?;
 
     let mut stmt = conn.prepare(
-        "SELECT call_index, ts, context_tokens, new_tokens, cache_event, input_cost_usd, rebuild_extra_usd
-         FROM derived_api_call WHERE provider = ?1 AND session_id = ?2 ORDER BY call_index",
+        "SELECT c.call_index, c.ts, d.task_index, c.context_tokens, c.new_tokens, c.carried_tokens,
+                u.input_tokens + u.cache_creation_tokens, u.cached_input_tokens,
+                u.output_tokens, u.actual_cost_usd,
+                c.cache_event, c.input_cost_usd, c.rebuild_extra_usd,
+                CASE WHEN c.context_tokens = 0 THEN 'usage unavailable'
+                  WHEN EXISTS (
+                    SELECT 1 FROM derived_context_item i WHERE i.provider = c.provider
+                      AND i.session_id = c.session_id AND i.kind IN ('baseline', 'unexplained')
+                      AND i.entered_call <= c.call_index
+                      AND (i.evicted_call IS NULL OR i.evicted_call > c.call_index)
+                ) THEN 'partial' ELSE 'observed sizes' END,
+                d.root_turn_index
+         FROM derived_api_call c JOIN fact_session_usage u ON u.id = c.usage_id
+         LEFT JOIN derived_usage_event d ON d.usage_id = c.usage_id
+         WHERE c.provider = ?1 AND c.session_id = ?2 ORDER BY c.call_index",
     )?;
     let calls = stmt
         .query_map(rusqlite::params![provider, session_id], |row| {
             Ok(CallRow {
                 call_index: row.get(0)?,
                 ts: row.get(1)?,
-                context_tokens: row.get(2)?,
-                new_tokens: row.get(3)?,
-                cache_event: row.get(4)?,
-                input_cost: row.get(5)?,
-                rebuild_extra: row.get(6)?,
+                task_index: row.get(2)?,
+                turn_index: row.get(14)?,
+                context_tokens: row.get(3)?,
+                new_tokens: row.get(4)?,
+                carried_tokens: row.get(5)?,
+                fresh_tokens: row.get(6)?,
+                cached_tokens: row.get(7)?,
+                output_tokens: row.get(8)?,
+                reported_cost: row.get(9)?,
+                cache_event: row.get(10)?,
+                input_cost: row.get(11)?,
+                rebuild_extra: row.get(12)?,
+                capture_completeness: row.get(13)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
+    let native_usage_available = calls.iter().any(|call: &CallRow| {
+        call.context_tokens > 0 || call.output_tokens > 0 || call.reported_cost.is_some()
+    });
 
     let own = Filters {
         session: Some((provider.to_string(), session_id.to_string())),
         ..Filters::default()
     };
-    let context_items = context_items(conn, &own, 200)?
+    let context_items: Vec<ContextItemRow> = context_items(conn, &own, 10_000)?
         .into_iter()
         .filter(|item| item.session_id == session_id)
         .collect();
+    let turn_context = turn_context_rows(&turns, &calls, &context_items);
     let context_kinds = context_groups(conn, &own, ContextDim::Kind)?;
+    let skills = skills::session_skill_events(conn, provider, session_id)?;
+    let mut stmt = conn.prepare(
+        "SELECT tool_category, COUNT(*), SUM(CASE WHEN status IN ('error', 'rejected', 'interrupted') THEN 1 ELSE 0 END)
+         FROM fact_session_tool_call WHERE provider = ?1 AND session_id = ?2
+         GROUP BY tool_category ORDER BY COUNT(*) DESC, tool_category",
+    )?;
+    let tool_summary = stmt
+        .query_map(rusqlite::params![provider, session_id], |row| {
+            Ok(SessionToolSummary {
+                category: row.get(0)?,
+                calls: row.get(1)?,
+                failed: row.get(2)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut stmt = conn.prepare(
+        "SELECT COALESCE(o.content_source, 'unknown'), COUNT(*), SUM(i.chars),
+                SUM(COALESCE(o.repeated_chars, 0))
+         FROM derived_context_item i LEFT JOIN derived_context_origin o
+           ON o.provider = i.provider AND o.session_id = i.session_id AND o.item_key = i.item_key
+         WHERE i.provider = ?1 AND i.session_id = ?2
+         GROUP BY COALESCE(o.content_source, 'unknown')
+         ORDER BY SUM(i.chars) DESC, COALESCE(o.content_source, 'unknown')",
+    )?;
+    let context_sources = stmt
+        .query_map(rusqlite::params![provider, session_id], |row| {
+            Ok(SessionContextSource {
+                source: row.get(0)?,
+                items: row.get(1)?,
+                captured_chars: row.get(2)?,
+                repeated_chars: row.get(3)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
 
     Ok(Some(SessionDetail {
         session,
@@ -2030,6 +2257,11 @@ pub fn session_detail(
         calls,
         context_items,
         context_kinds,
+        skills,
+        tool_summary,
+        context_sources,
+        native_usage_available,
+        turn_context,
     }))
 }
 

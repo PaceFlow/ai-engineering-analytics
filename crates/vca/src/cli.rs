@@ -39,6 +39,18 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Commands {
+    /// Daily work, models, completion and supplementary PR/deployment evidence
+    Daily(crate::commands::daily::DailyArgs),
+    /// Local analytics freshness, backlog, uncertainty and spending
+    Status(crate::commands::daily::StatusArgs),
+    /// Read-only PR/deployment connections, imports and contribution links
+    Sources(crate::commands::daily::SourcesArgs),
+    /// Weekly engineering trends and before/after setup comparisons
+    Trends(crate::commands::observe::TrendsArgs),
+    /// Goals spanning conversations, relationships and evidence
+    Work(crate::commands::observe::WorkArgs),
+    /// Setup observations and dated workflow milestones
+    Changes(crate::commands::observe::ChangesArgs),
     /// Build the analytics data model from local sessions, code changes, and git history
     Ingest(IngestArgs),
     /// Show session efficiency and delivery metrics
@@ -230,7 +242,22 @@ pub struct ReworkArgs {
     pub kind: Option<String>,
 }
 
-const CLASSIFY_AFTER_HELP: &str = "Examples:\n  vca classify plan --days 7                 # what would be sent, estimated cost\n  vca classify preview <session> --pass segment\n  vca classify key set                       # or export OPENROUTER_API_KEY\n  vca classify run --days 7 --max-usd 0.05 --yes\n  vca classify set <session> --task 0 intent bug_fix\n  vca classify set-turn <session> 5 1        # move turn 5 to task 1\n  vca classify eval\n\nNothing is sent unless you run `classify run` and confirm. Without it, each session is one task\nand labels come from local heuristics (marked h).";
+const CLASSIFY_AFTER_HELP: &str = concat!(
+    "Examples:\n  vca classify plan --days 7                 # what would be sent, estimated cost\n",
+    "  vca classify preview <session> --pass segment\n",
+    "  vca classify key set                       # reads stdin when the key is omitted\n",
+    "  vca classify auto enable                   # enable once for all ingested projects\n",
+    "  vca classify auto status --json\n  vca classify auto disable\n",
+    "  vca classify auto limits --repo /path/to/project --monthly-budget 1\n",
+    "  vca classify run --days 7 --max-usd 0.05 --yes\n",
+    "  vca classify set <session> --task 0 intent bug_fix\n",
+    "  vca classify set-turn <session> 5 1         # move turn 5 to task 1\n  vca classify eval\n\n",
+    "Enabling the external classifier covers every current and future ingested project automatically.\n",
+    "Ingestion sends eligible redacted excerpts within configured spending caps and project exclusions.\n",
+    "Saving an API key alone does not enable classification. Manual `classify run` asks for confirmation\n",
+    "unless --yes is supplied. Reports never send content. Without classification, each session is one task\n",
+    "and labels come from local heuristics (marked h)."
+);
 
 #[derive(Args, Debug, Clone)]
 pub struct ClassifyArgs {
@@ -252,6 +279,8 @@ pub struct ClassifySelectArgs {
 
 #[derive(Subcommand, Debug, Clone)]
 pub enum ClassifyCommands {
+    /// Global external-classifier activation and incremental processing after ingestion
+    Auto(crate::commands::observe::AutoArgs),
     /// Count units, tokens and cost a run would send (sends nothing)
     Plan(ClassifySelectArgs),
     /// Print the exact request one unit would send
@@ -281,6 +310,9 @@ pub enum ClassifyCommands {
         /// Do not ask for confirmation
         #[arg(long)]
         yes: bool,
+        /// Resume a saved job using its remaining original spending cap.
+        #[arg(long)]
+        resume: Option<i64>,
     },
     /// Settings, key source, spend and label coverage
     Status,
@@ -481,6 +513,9 @@ pub struct ShowArgs {
     /// Turn-by-turn timeline
     #[arg(long)]
     pub turns: bool,
+    /// Context at each user turn, without prompt text; turn boundaries are not external runs
+    #[arg(long)]
+    pub turn_context: bool,
     /// Rows per section
     #[arg(long, default_value_t = 15)]
     pub limit: usize,

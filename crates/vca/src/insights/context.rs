@@ -77,6 +77,22 @@ CREATE TABLE IF NOT EXISTS derived_context_item (
 
 CREATE INDEX IF NOT EXISTS idx_derived_context_item_kind
     ON derived_context_item(kind, tool_category);
+
+CREATE TABLE IF NOT EXISTS derived_context_origin (
+    provider TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    item_key TEXT NOT NULL,
+    origin_event TEXT NOT NULL,
+    fingerprint TEXT NOT NULL, -- content when captured, otherwise structural origin
+    fingerprint_kind TEXT NOT NULL,
+    content_source TEXT NOT NULL,
+    delivery_path TEXT NOT NULL,
+    first_request INTEGER NOT NULL,
+    last_request INTEGER,
+    repeated_chars INTEGER NOT NULL,
+    completeness TEXT NOT NULL,
+    PRIMARY KEY(provider, session_id, item_key)
+);
 ";
 
 #[derive(Debug, Clone)]
@@ -109,6 +125,7 @@ struct Item {
     tool_category: Option<String>,
     target: Option<String>,
     source: Option<String>,
+    content_fingerprint: Option<String>,
     chars: i64,
     est_tokens: f64,
     tokens: f64,
@@ -123,7 +140,15 @@ struct Item {
 
 impl Item {
     fn new(key: String, kind: &str, ts_text: Option<String>, chars: i64) -> Self {
-        let prose = matches!(kind, "user_message" | "assistant_text" | "instructions");
+        let prose = matches!(
+            kind,
+            "user_message"
+                | "assistant_text"
+                | "instructions"
+                | "skill_injection"
+                | "skill_body"
+                | "skill_listing"
+        );
         let ratio = if prose {
             CHARS_PER_TOKEN_PROSE
         } else {
@@ -138,6 +163,7 @@ impl Item {
             tool_category: None,
             target: None,
             source: None,
+            content_fingerprint: None,
             chars,
             est_tokens: chars.max(0) as f64 / ratio,
             tokens: 0.0,
@@ -157,7 +183,7 @@ struct SessionInfo {
 }
 
 pub fn refresh_context_ledger(conn: &Connection) -> Result<()> {
-    conn.execute_batch("DELETE FROM derived_api_call; DELETE FROM derived_context_item;")?;
+    conn.execute_batch("DELETE FROM derived_api_call; DELETE FROM derived_context_item; DELETE FROM derived_context_origin;")?;
 
     let sessions = load_sessions(conn)?;
     let calls = load_calls(conn)?;
@@ -182,6 +208,12 @@ pub fn refresh_context_ledger(conn: &Connection) -> Result<()> {
             purpose, instruction_ref
          ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17,
                    ?18, ?19, ?20, ?21, ?22, ?23, ?24)",
+    )?;
+    let mut origin_stmt = conn.prepare(
+        "INSERT OR REPLACE INTO derived_context_origin
+         (provider, session_id, item_key, origin_event, fingerprint, fingerprint_kind,
+          content_source, delivery_path, first_request, last_request, repeated_chars, completeness)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
     )?;
 
     for (key, session_calls) in calls {
@@ -267,9 +299,126 @@ pub fn refresh_context_ledger(conn: &Connection) -> Result<()> {
                 purpose,
                 instruction_ref
             ])?;
+            let (content_source, delivery_path, completeness) = origin_labels(item);
+            let structural_fingerprint = format!(
+                "{:x}",
+                md5::compute(format!(
+                    "{}\0{}\0{}\0{}\0{}",
+                    key.0,
+                    key.1,
+                    item.key,
+                    item.kind,
+                    item.target.as_deref().unwrap_or("")
+                ))
+            );
+            let fingerprint = item
+                .content_fingerprint
+                .as_deref()
+                .unwrap_or(&structural_fingerprint);
+            origin_stmt.execute(params![
+                key.0,
+                key.1,
+                item.key,
+                item.key,
+                fingerprint,
+                if item.content_fingerprint.is_some() {
+                    "content_md5"
+                } else {
+                    "origin_md5"
+                },
+                content_source,
+                delivery_path,
+                item.entered_call as i64,
+                (item.entered_call < session_calls.len()).then(|| item
+                    .evicted_call
+                    .unwrap_or(session_calls.len())
+                    .saturating_sub(1)
+                    as i64),
+                if item.entered_call < session_calls.len() {
+                    item.chars.saturating_mul(carried.saturating_add(1))
+                } else {
+                    0
+                },
+                completeness
+            ])?;
         }
     }
     Ok(())
+}
+
+fn origin_labels(item: &Item) -> (&'static str, &'static str, &'static str) {
+    let delivery = if item
+        .tool_name
+        .as_deref()
+        .is_some_and(|name| name.starts_with("mcp__") || name.starts_with("mcp_"))
+    {
+        "mcp_tool"
+    } else if item.tool_name.as_deref().is_some_and(|name| {
+        matches!(
+            name.to_ascii_lowercase().as_str(),
+            "bash"
+                | "exec_command"
+                | "shell"
+                | "run_terminal_cmd"
+                | "run_terminal_command"
+                | "local_shell"
+        )
+    }) {
+        "shell"
+    } else if item.tool_name.is_some() {
+        "tool"
+    } else {
+        "direct"
+    };
+    let source = match item.kind.as_str() {
+        "skill_listing" | "skill_body" | "skill_injection" => "skill",
+        "mcp_instructions" => "mcp_server",
+        "tool_definitions" => "tool_schema",
+        "instructions" | "system_prompt" => "instructions",
+        "user_message" | "assistant_text" | "assistant_output" => "conversation",
+        "baseline" | "unexplained" => "unknown",
+        "tool_result"
+            if item.tool_name.as_deref().is_some_and(|name| {
+                let name = name.to_ascii_lowercase();
+                name == "skill"
+                    || name.ends_with(".skill")
+                    || name.ends_with("_skill")
+                    || name.ends_with(":skill")
+            }) =>
+        {
+            "skill"
+        }
+        "tool_result"
+            if item.target.as_deref().is_some_and(|target| {
+                let normalized = target.replace('\\', "/");
+                normalized.contains("/skills/") && normalized.contains("/SKILL.md")
+            }) =>
+        {
+            "skill"
+        }
+        "tool_result" if item.tool_category.as_deref() == Some("read") => "file",
+        "tool_result"
+            if delivery == "shell"
+                && item.target.as_deref().is_some_and(|target| {
+                    ["cat ", "sed ", "head ", "tail ", "rg "]
+                        .iter()
+                        .any(|prefix| target.trim_start().starts_with(prefix))
+                }) =>
+        {
+            "file"
+        }
+        "tool_result" if delivery == "mcp_tool" => "mcp_server",
+        "tool_result" | "subagent_result" => "tool_result",
+        _ => "other",
+    };
+    let completeness = if source == "unknown" {
+        "unknown"
+    } else if item.kind == "assistant_output" {
+        "estimated"
+    } else {
+        "observed_size"
+    };
+    (source, delivery, completeness)
 }
 
 #[derive(Debug, Default, Clone)]
@@ -749,17 +898,28 @@ fn load_items(conn: &Connection) -> Result<HashMap<Key, Vec<Item>>> {
     }
 
     let mut stmt = conn.prepare(
-        "SELECT provider, session_id, message_index, message_ts, COALESCE(chars, LENGTH(content))
+        "SELECT provider, session_id, message_index, message_ts, COALESCE(chars, LENGTH(content)), content
          FROM fact_session_message WHERE role = 'user'",
     )?;
     let rows = stmt.query_map([], |row| {
-        let item = Item::new(
+        let provider: String = row.get(0)?;
+        let content: String = row.get(5)?;
+        let kind = if provider == "opencode"
+            && (content.trim_start().starts_with("# Skill: ")
+                || content.trim_start().starts_with("<skill name=\""))
+        {
+            "skill_injection"
+        } else {
+            "user_message"
+        };
+        let mut item = Item::new(
             format!("user:{}", row.get::<_, i64>(2)?),
-            "user_message",
+            kind,
             row.get(3)?,
             row.get(4)?,
         );
-        Ok(((row.get::<_, String>(0)?, row.get::<_, String>(1)?), item))
+        item.content_fingerprint = Some(format!("{:x}", md5::compute(content.as_bytes())));
+        Ok(((provider, row.get::<_, String>(1)?), item))
     })?;
     for row in rows {
         let (key, item) = row?;
@@ -951,6 +1111,41 @@ mod tests {
             "unlogged system prompt shows as baseline: {baseline}"
         );
         Ok(())
+    }
+
+    #[test]
+    fn provenance_counts_repeated_file_content_once_per_request() -> Result<()> {
+        let conn = Connection::open_in_memory()?;
+        init_app_schema(&conn)?;
+        seed(&conn)?;
+        refresh_context_ledger(&conn)?;
+        let (source, path, first, last, repeated, fingerprint): (String, String, i64, i64, i64, String) = conn.query_row(
+            "SELECT content_source, delivery_path, first_request, last_request, repeated_chars, fingerprint
+             FROM derived_context_origin WHERE item_key = 'tool:t1'", [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
+        )?;
+        assert_eq!(source, "file");
+        assert_eq!(path, "tool");
+        assert_eq!(first, 1);
+        assert_eq!(last, 3);
+        assert_eq!(repeated, 36_000 * 3);
+        assert_eq!(fingerprint.len(), 32);
+        refresh_context_ledger(&conn)?;
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM derived_context_origin WHERE item_key = 'tool:t1'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(count, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn skill_tool_output_is_attributed_to_skill_content() {
+        let mut item = Item::new("tool:skill-1".into(), "tool_result", None, 6_492);
+        item.tool_name = Some("skill".into());
+        item.target = Some("ai-crm-context".into());
+        assert_eq!(origin_labels(&item), ("skill", "tool", "observed_size"));
     }
 
     #[test]
