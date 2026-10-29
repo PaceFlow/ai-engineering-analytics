@@ -162,6 +162,61 @@ The reports answer four questions:
 
 For metric definitions, status bands, grouped report behavior, and interpretation guidance, see [docs/USER_GUIDE.md](https://github.com/PaceFlow/ai-engineering-analytics/blob/main/docs/USER_GUIDE.md).
 
+## Conversations, Usage, Quota And Tasks
+
+Beyond the four reports, `vca` explains the conversations themselves:
+
+```bash
+vca usage --group-by model        # where tokens and API-equivalent $ went
+vca quota                         # quota windows: observed % (Codex) or token burn
+vca sessions --sort cost          # root sessions with subagents rolled in
+vca tasks --completed-only        # time and cost to complete each task
+vca show <session-id>             # tasks, agents, usage, context, commits of one session
+vca review <session-id>           # local HTML page: full timeline + key numbers to approve/reject
+vca context --group-by dir        # what filled the context and what carrying it cost
+vca rework                        # later work that changed earlier AI lines, defect evidence
+vca stages                        # work by stage: explore, plan, implement, verify, review…
+vca habits                        # the team's 12 habits: adoption and outcomes
+vca tui                           # interactive explorer with drill-down
+```
+
+Sessions are split into **tasks** (one goal each). Without classification each session is one task. The optional classifier (`vca classify`, opt-in, previewable and budget-capped) uses TypeSafe's Jev model through OpenRouter to split long sessions into tasks, decide when each was completed, and label intent, outcome and user feedback. Your own labels (`vca classify set`, or `e` in the TUI) always win. See the [User Guide](USER_GUIDE.md#conversations-usage-quota-and-tasks).
+
+### Reviewing a session's numbers
+
+`vca review <session-id>` writes one self-contained HTML file (nothing is uploaded) with the session's whole timeline — messages, tool calls, every model call's tokens and cost, subagents, compactions, turn and task boundaries — next to about 60 numbers vca derives from it (cost and tokens by type, models, time, tool calls by category, validations, context by kind, commits, per-task cost, stage path and habit verdicts). Click a number to highlight the entries behind it, mark it ✓ or ✗ with a note, and **Export expectations**. `vca review --check expectations.json` then fails if any approved number changes, which is how real sessions become regression tests. A **Files changed** list shows each file the session (with subagents) edited, with line counts.
+
+### Building a reference corpus of real sessions
+
+```bash
+vca corpus review --project nothing-phone --project wargames   # local app: sample, review, save
+vca corpus review --per 3 --seed 7 --provider cursor
+vca corpus list
+vca corpus check                                               # replay all snapshots, compare
+```
+
+`vca corpus review` starts a page on `127.0.0.1` only. It samples up to `--per` sessions per project and tool (same `--seed`, same picks; sessions with fewer than `--min-turns` turns are skipped). Each session opens on a **checklist** of about ten plain statements you can verify by reading the session: how many messages you sent, when and how long it ran, which models answered, which files changed, which tests ran and failed, failed tool calls, subagents, compactions, which commits came out of it, the kind of work and whether it finished, and the list-price cost. Each card explains what the number means and how to check it, and **Show me** highlights the evidence in the timeline. Answer ✓ Right, ✗ Wrong (with a note) or Skip, then **Save & next →**. You never have to go through the full list of numbers (the **All numbers** tab, each with an explanation): whatever the checklist does not cover is recorded automatically as *unreviewed*, so a later change still shows up in `vca corpus check`, labelled as such. `vca corpus wrong` lists every number marked ✗ with its note. Saving writes `~/.vca/corpus/<provider>-<id>/`:
+
+- the session's sources: the Claude transcript with its `subagents/` folder, Codex rollouts, and for Cursor and OpenCode, which keep every session in one database, a copy of that database's schema with **only this session's rows** (Cursor: every `cursorDiskKV` row whose key or value mentions the composer id; OpenCode: its `session`, `message`, `part` and `project` rows plus `storage/session_diff/<id>.json`);
+- `repo.bundle`, a `git bundle --all` of the session's repository, so commit and delivery numbers can be rebuilt;
+- `litellm_prices.json`, the price map in use when it was saved (for reference);
+- `expectations.json` (approved and rejected numbers) and `manifest.json` (files with md5s, source paths, repository HEAD and origin, vca version).
+
+**Replays run per project.** Some numbers depend on other sessions too: commits shared between sessions, rework relations, the corrections habit (marked **project** in the review page). So snapshots of the same repository replay together: their files are laid out as one temporary home (Cursor and OpenCode extracts merged), the repository is restored from the newest bundle with its refs, HEAD and origin as they were, and `vca ingest --offline-pricing` runs there with the corpus' price map. The copied sources are not edited, since token estimates depend on their exact text; `VCA_REPLAY_REPOS` points git and repository file access for the original path at the restored copy.
+
+**Approved values come from that replay.** Saving replays the session's project and stores the replayed value of every number you approved, so the corpus asserts what it can reproduce. If a single-session number replays differently from what you reviewed, the save keeps the replayed value and lists the difference (worth a look). Other snapshots of the same project get their cross-session numbers refreshed, since the set of sessions changed, and are listed if anything else moved. The first save pins `~/.vca/corpus/litellm_prices.json`; every replay prices with it, so costs do not drift when LiteLLM publishes new prices.
+
+`vca corpus check` replays every project and compares all approved numbers (`vca corpus check <snapshot>` replays that snapshot's project and reports only it; `--keep` keeps the temporary home). Replays must run on the same OS family as the snapshots. Cursor's `History` folder (local file versions) is not copied. Snapshots contain full transcripts; they never leave the machine unless you pack and move them yourself.
+
+## Provider Assumptions
+
+- **Claude Code**: usage is counted once per API message id (the transcript repeats it per content block), timestamped per call and priced per model; 1-hour cache writes are priced separately. `subagents/agent-*.jsonl` files become child sessions of their parent. A resumed or forked session's file starts with a copy of the earlier conversation (lines keeping the earlier `sessionId`); those lines are skipped and the session rolls up into the one it continued, so no call is counted twice. Attachments (CLAUDE.md, skills, MCP and tool listings) feed the context ledger. There is no local quota telemetry.
+- **Codex**: one usage event per `token_count` delta; `output_tokens` already includes reasoning, so reasoning is never billed twice. `rate_limits` (5-hour and weekly windows, plan) are stored as observed quota. `apply_patch` custom tool calls count as accepted edits, and command exit codes classify validation runs. Parent links for Codex subagents are read from `session_meta.source` when present. Rollouts from Codex CLI 0.160+ are read from their newer records: prompts from `UserMessage` items, usage from per-response `token_usage_record` lines (preferred over `token_count` deltas; they include compaction calls and cache writes), and tools run inside code-mode `exec` scripts from `item_completed` events (`CommandExecution` with exit code, `FileChange` with per-file diffs, `ImageView`); the script's input and output size are attributed to its first inner call.
+- **OpenCode**: usage per message, with `cost` kept as provider-reported cost (it may be 0 on subscription routes). `parent_id` links child sessions; tool parts become tool calls. Lines changed come from `storage/session_diff/<session>.json` when it exists, otherwise from the diff each completed `edit`, `apply_patch` and `write` call stores in its metadata (`write` counts the written lines as added).
+- **Cursor**: bubble `tokenCount` is used when present, otherwise tokens are estimated from text (`~`). `auto`/`default` models are unpriced. Sub-composers become child sessions. Context composition is not available. Older composers (2025, no per-bubble `createdAt`) get message times from each response's `timingInfo` (request sent, response finished), so active time is measured.
+- **Pricing** comes from LiteLLM's public model price map (`model_prices_and_context_window.json` in BerriAI/litellm), the same data LiteLLM uses, and follows its rules: per-call long-context tiers (`*_above_200k_tokens` etc., strictly above), cache rates falling back to the input rate, 1-hour cache writes at their own rate, reasoning at its own rate when not already inside output. `vca ingest` downloads it at most daily into `~/.vca/pricing/`; offline (or with `VCA_PRICING_OFFLINE=1` / `--offline-pricing`) the cached or bundled copy (`crates/vca/pricing/litellm_prices.json`) is used. Names resolve by exact key, provider-stripped key, normalized name (dates, Cursor-style names), then router names without their vendor path and `-latest`/`-MMDD` suffixes (`z-ai/glm-5.3`, `~deepseek/deepseek-v4-flash-latest`) tried bare and under the model maker's own LiteLLM key (`xai/`, `zai/`, `moonshot/`, `minimax/`, `dashscope/`, …; resellers are never used), then the longest first-party family key; unknown models stay unpriced. `~/.vca/pricing.json` (`{"models": [{"id", "aliases", "input", "output", "cache_read"}]}`, USD per million) overrides or adds models. `vca pricing show <model>` explains a price. A new price map re-prices history on the next ingest (Paceflow re-uploads changed cost events once). Amounts are API list-price estimates, not invoices; describe how each tool is billed in `~/.vca/billing.json`.
+- **Re-ingest**: sessions are re-parsed whenever their source changes, so running sessions pick up new turns. Sessions whose source was deleted (for example by Claude Code cleanup) keep their stored data. The first ingest after upgrading prints how the corrected accounting changed totals and writes it to `~/.vca/logs/migration-v2.txt`.
+
 ## Common Options
 
 `session`, `delivery`, `quality`, and `cost` share the same filter interface:

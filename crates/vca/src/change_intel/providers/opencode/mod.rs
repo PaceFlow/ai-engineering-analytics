@@ -169,25 +169,15 @@ fn ingest_source_db(
 fn load_sessions(db_path: &Path) -> Result<Vec<OpenCodeSessionRef>> {
     let source = open_readonly_db(db_path)?;
     let db_source_file = db_path.to_string_lossy().to_string();
-    let mut stmt = source.prepare(
-        "SELECT s.id, s.directory, s.time_updated, p.worktree
-         FROM session s
-         LEFT JOIN project p ON p.id = s.project_id
-         ORDER BY s.time_updated, s.id",
-    )?;
-
-    stmt.query_map([], |row| {
-        let directory: Option<String> = row.get(1)?;
-        let worktree: Option<String> = row.get(3)?;
-        Ok(OpenCodeSessionRef {
-            session_id: row.get(0)?,
-            directory: directory.or(worktree),
+    Ok(crate::providers::opencode::session_headers(&source)?
+        .into_iter()
+        .map(|header| OpenCodeSessionRef {
+            session_id: header.id,
+            directory: header.directory.or(header.project_root),
             source_file: db_source_file.clone(),
-            last_seen_at: ms_to_iso(row.get::<_, i64>(2)?),
+            last_seen_at: ms_to_iso(header.updated_ms),
         })
-    })?
-    .collect::<std::result::Result<Vec<_>, _>>()
-    .map_err(Into::into)
+        .collect())
 }
 
 fn parse_diff_file(path: &Path) -> Result<Vec<SessionDiffEntry>> {

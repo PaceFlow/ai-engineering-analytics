@@ -80,7 +80,7 @@ pub fn plan_provider_code_changes_for(
         }),
         "claude" => Ok(ProviderCodeChangePlan {
             provider,
-            sources: crate::providers::claude::plan_session_files()?,
+            sources: crate::providers::claude::plan_change_sources()?,
         }),
         "cursor" => Ok(ProviderCodeChangePlan {
             provider,
@@ -225,8 +225,7 @@ fn ingest_codex_sources(
 }
 
 fn discover_codex_sources() -> Result<Vec<PathBuf>> {
-    let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Home directory not found"))?;
-    let root = home.join(".codex").join("sessions");
+    let root = crate::path_utils::codex_home()?.join("sessions");
 
     if !root.exists() {
         return Ok(Vec::new());

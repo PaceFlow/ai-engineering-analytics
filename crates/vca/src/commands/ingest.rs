@@ -1,5 +1,6 @@
 use anyhow::Result;
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
+use std::collections::BTreeMap;
 
 use crate::analytics;
 use crate::change_intel::commit_assoc;
@@ -26,6 +27,16 @@ pub fn run_for(verbose: bool, args: IngestArgs, context: crate::app::AppContext)
         connection
     } else {
         db::open()?
+    };
+    if args.offline_pricing {
+        crate::cost::pricing::reload();
+    } else if let Some(message) = crate::cost::litellm::refresh_price_map(false).message() {
+        println!("{message}");
+    }
+    let accounting_before = if args.fresh {
+        None
+    } else {
+        accounting_snapshot_if_pending(&db)?
     };
     let providers = providers::all_providers();
     println!("Planning ingest...");
@@ -80,8 +91,23 @@ pub fn run_for(verbose: bool, args: IngestArgs, context: crate::app::AppContext)
                     println!("  {} rows written", n);
                 }
                 grand_total += n;
+                db.execute(
+                    "DELETE FROM analytics_setting WHERE key=?1",
+                    [format!("source_error:{provider_name}")],
+                )?;
+                crate::insights::observation::scanned(
+                    &db,
+                    provider_name,
+                    provider_name == "opencode" && context.env("OPENCODE_DB_PATH").is_some(),
+                )?;
             }
-            Err(e) => println!("  error: {}", e),
+            Err(e) => {
+                db.execute(
+                    "INSERT OR REPLACE INTO analytics_setting(key,value) VALUES(?1,?2)",
+                    rusqlite::params![format!("source_error:{provider_name}"), format!("{e:#}")],
+                )?;
+                println!("  error: {}", e);
+            }
         }
 
         let change_result = {
@@ -139,6 +165,7 @@ pub fn run_for(verbose: bool, args: IngestArgs, context: crate::app::AppContext)
     {
         {
             let mut observer = progress.stage("Session Events", 1);
+            crate::db::session_store::refresh_session_roots(&db)?;
             analytics::refresh_session_events(&db)?;
             observer.advance("session events refreshed");
         }
@@ -218,7 +245,33 @@ pub fn run_for(verbose: bool, args: IngestArgs, context: crate::app::AppContext)
         );
     }
 
+    crate::db::session_store::refresh_session_roots(&db)?;
+    crate::insights::refresh(&db)?;
+
+    match crate::insights::setup::capture(&db, None, &[]) {
+        Ok(_) => {}
+        Err(error) => eprintln!("Setup history incomplete: {error}"),
+    }
+    match crate::delivery_sources::sync_for(&db, None, context) {
+        Ok(results) => {
+            for result in results {
+                if !result["error"].is_null() {
+                    eprintln!("PR/deployment source incomplete: {}", result);
+                }
+            }
+        }
+        Err(error) => eprintln!("PR/deployment collection pending: {error}"),
+    }
+    match crate::classify::automatic::after_ingest(&db) {
+        Ok(messages) => {
+            for message in messages {
+                println!("{message}");
+            }
+        }
+        Err(error) => eprintln!("Automatic classification pending: {error}"),
+    }
     progress.finish();
+    report_accounting_correction(&db, accounting_before)?;
 
     let github_token_configured = github::auth::github_token_source_for(context)?.is_some();
     let github_sync_plan = if github_token_configured {
@@ -316,6 +369,110 @@ pub fn run_for(verbose: bool, args: IngestArgs, context: crate::app::AppContext)
     Ok(())
 }
 
+/// `schema_migrations` marker: the v2 accounting summary was shown.
+const ACCOUNTING_SUMMARY_MARKER: i64 = 102;
+
+/// Tokens, API-equivalent cost and sessions per provider, as last materialized.
+type AccountingSnapshot = BTreeMap<String, (i64, f64, i64)>;
+
+fn accounting_snapshot(db: &Connection) -> Result<AccountingSnapshot> {
+    let mut stmt = db.prepare(
+        "SELECT provider, COALESCE(SUM(total_tokens), 0), COALESCE(SUM(estimated_cost_usd), 0), COUNT(*)
+         FROM event_session_cost GROUP BY provider",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get(0)?, (row.get(1)?, row.get(2)?, row.get(3)?)))
+    })?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+/// The pre-upgrade numbers, when the one-time summary is still due.
+fn accounting_snapshot_if_pending(db: &Connection) -> Result<Option<AccountingSnapshot>> {
+    let shown: Option<i64> = db
+        .query_row(
+            "SELECT version FROM schema_migrations WHERE version = ?1",
+            [ACCOUNTING_SUMMARY_MARKER],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if shown.is_some() {
+        return Ok(None);
+    }
+    let snapshot = accounting_snapshot(db)?;
+    if snapshot.is_empty() {
+        // New database: nothing was ever counted the old way.
+        db.execute(
+            "INSERT OR IGNORE INTO schema_migrations(version) VALUES (?1)",
+            [ACCOUNTING_SUMMARY_MARKER],
+        )?;
+        return Ok(None);
+    }
+    Ok(Some(snapshot))
+}
+
+/// Print and log how corrected accounting changed totals (once per database).
+fn report_accounting_correction(db: &Connection, before: Option<AccountingSnapshot>) -> Result<()> {
+    let Some(before) = before else {
+        return Ok(());
+    };
+    let after = accounting_snapshot(db)?;
+    let legacy: i64 = db.query_row(
+        "SELECT COUNT(DISTINCT provider || session_id) FROM fact_session_usage WHERE token_source = 'legacy'",
+        [],
+        |row| row.get(0),
+    )?;
+    let text = accounting_summary_text(&before, &after, legacy);
+    println!("\n{text}");
+    if let Ok(dir) = crate::data_home::directory() {
+        let logs = dir.join("logs");
+        if std::fs::create_dir_all(&logs).is_ok() {
+            let _ = std::fs::write(logs.join("migration-v2.txt"), &text);
+        }
+    }
+    db.execute(
+        "INSERT OR IGNORE INTO schema_migrations(version) VALUES (?1)",
+        [ACCOUNTING_SUMMARY_MARKER],
+    )?;
+    Ok(())
+}
+
+fn accounting_summary_text(
+    before: &AccountingSnapshot,
+    after: &AccountingSnapshot,
+    legacy: i64,
+) -> String {
+    let mut out = String::from(
+        "Accounting corrected (one-time summary): Claude usage is now counted once per API message,\n\
+         Codex reasoning is no longer billed twice, usage is timestamped per call and priced per model.\n",
+    );
+    out.push_str(&format!(
+        "{:<10} {:>14} {:>14} {:>12} {:>12}\n",
+        "Tool", "Tokens before", "Tokens after", "$ before", "$ after"
+    ));
+    let providers: std::collections::BTreeSet<&String> =
+        before.keys().chain(after.keys()).collect();
+    for provider in providers {
+        let (tokens_before, cost_before, _) = before.get(provider).copied().unwrap_or_default();
+        let (tokens_after, cost_after, _) = after.get(provider).copied().unwrap_or_default();
+        out.push_str(&format!(
+            "{:<10} {:>14} {:>14} {:>12} {:>12}\n",
+            provider,
+            tokens_before,
+            tokens_after,
+            format!("${cost_before:.2}"),
+            format!("${cost_after:.2}"),
+        ));
+    }
+    if legacy > 0 {
+        out.push_str(&format!(
+            "{legacy} sessions keep their old usage rows because the source transcript is gone \
+             (marked ! in reports; Claude may be over-counted there).\n"
+        ));
+    }
+    out.push_str("$ = API list-price estimate, not an invoice.\n");
+    out
+}
+
 fn format_provider_stage(provider_name: &str, phase: &str) -> String {
     format!("{provider_name} {phase}")
 }
@@ -372,4 +529,38 @@ fn github_commit_evidence_changed(summary: &github::types::GitHubSyncSummary) ->
         || summary.issue_scans_refreshed > 0
         || summary.issue_fix_pull_requests_upserted > 0
         || summary.pull_request_removed_hashes_upserted > 0
+}
+
+#[cfg(test)]
+mod accounting_summary_tests {
+    use super::*;
+
+    #[test]
+    fn summary_compares_before_and_after_per_tool() {
+        let before: AccountingSnapshot = [("claude".to_string(), (3_000, 9.0, 2))].into();
+        let after: AccountingSnapshot = [
+            ("claude".to_string(), (1_200, 3.6, 2)),
+            ("codex".to_string(), (500, 0.5, 1)),
+        ]
+        .into();
+        let text = accounting_summary_text(&before, &after, 1);
+        assert!(text.contains("claude") && text.contains("3000") && text.contains("1200"));
+        assert!(text.contains("$9.00") && text.contains("$3.60"));
+        assert!(text.contains("codex"));
+        assert!(text.contains("1 sessions keep their old usage rows"));
+    }
+
+    #[test]
+    fn new_database_marks_summary_as_shown() -> Result<()> {
+        let conn = Connection::open_in_memory()?;
+        crate::db::init_app_schema(&conn)?;
+        assert!(accounting_snapshot_if_pending(&conn)?.is_none());
+        conn.execute(
+            "INSERT INTO event_session_cost(provider, session_id, total_tokens, estimated_cost_usd) VALUES ('claude', 's', 10, 1.0)",
+            [],
+        )?;
+        // Marker already set by the empty check, so an old-style row later does not trigger it.
+        assert!(accounting_snapshot_if_pending(&conn)?.is_none());
+        Ok(())
+    }
 }

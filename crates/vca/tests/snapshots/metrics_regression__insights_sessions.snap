@@ -1,0 +1,15 @@
+---
+source: crates/vca/tests/metrics_regression.rs
+expression: output
+---
+Started      Tool      Id        Model          Project           Title / first ask                             API-equiv  Fresh  Agt  Tasks  Outcome                 Done
+03-03 09:41  codex     019cb311  gpt-5.3-codex                    Can you investigate the current implementat…    ~$42.87  10.9M    0      1  completed_verified h     1/1
+03-10 06:41  codex     019cd678  gpt-5.3-codex                    Can you investigate the current implementat…     ~$7.71   1.8M    0      1  completed_verified h     1/1
+03-15 12:05  opencode  ses_open                 fixture-cursor    hi                                                    —      0    0      1  unclear h                0/1
+03-15 12:00  opencode  ses_open                 fixture-paceflow  add an opencode fixture file                          —      0    0      1  completed_unverified h   0/1
+03-10 09:20  claude    11111111                 fixture-paceflow  Please review the implementation and keep t…          —      0    0      1  completed_unverified h   0/1
+03-05 07:02  cursor    b052dae4                                   Readme update and data refresh                        —      0    0      1  unclear h                0/1
+—            cursor    fe3cc3e4                                                                                         —      0    0      1  unclear h                0/1
+
+all data · ~ = API list-price estimate (pricing litellm@2026-10-13), not an invoice
+Totals include subagents. h = heuristic label, ? = tentative, ◌ = unclassified, ! = legacy usage rows.

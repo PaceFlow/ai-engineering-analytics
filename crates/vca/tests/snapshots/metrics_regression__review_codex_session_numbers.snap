@@ -1,0 +1,88 @@
+---
+source: crates/vca/tests/metrics_regression.rs
+expression: stats
+---
+calls.model_calls: 195
+checks.failures: 3
+checks.runs: 37
+context.assistant_output:
+  items: 167
+  tokens: 58888
+  total_usd: 0.869976
+context.baseline:
+  items: 1
+  tokens: 6727
+  total_usd: 0.351123
+context.system_prompt:
+  items: 4
+  tokens: 4297
+  total_usd: 0.114733
+context.tool_result:
+  items: 256
+  tokens: 112461
+  total_usd: 1.771194
+context.unexplained:
+  items: 115
+  tokens: 173215
+  total_usd: 3.396176
+context.user_message:
+  items: 15
+  tokens: 18
+  total_usd: 0.000469
+cost.subagent_usd: ~
+cost.total_usd: 7.712145
+delivery.ai_lines: 0
+delivery.commits: 0
+delivery.rework_relations: 0
+model.gpt-5.3-codex:
+  calls: 195
+  cost_usd: 7.712145
+shape.compactions: 1
+shape.subagents: 0
+shape.turns: 15
+shape.user_messages: 15
+task.0.active_minutes: 127.7
+task.0.completed: true
+task.0.completion_source: validation_pass
+task.0.cost_to_complete_usd: 7.502804
+task.0.cost_total_usd: 7.712145
+task.0.edit_calls: 32
+task.0.habit.01_know_done: not_followed
+task.0.habit.02_plan_first: followed
+task.0.habit.03_make_it_ask: not_followed
+task.0.habit.04_ground_it: followed
+task.0.habit.05_small_slices: followed
+task.0.habit.06_minimal_diff: unknown
+task.0.habit.07_tests_can_fail: not_followed
+task.0.habit.08_evidence: followed
+task.0.habit.09_independent_review: followed
+task.0.habit.10_defend_without_ai: unknown
+task.0.habit.11_self_review: followed
+task.0.habit.12_rules_from_corrections: na
+task.0.intent: bug_fix
+task.0.lines_changed: 1254
+task.0.outcome: completed_verified
+task.0.stage_path: explore→verify→debug→verify→explore→docs→debug→explore→implement
+task.0.turns: 15
+task.0.validations:
+  failures: 3
+  runs: 37
+tasks.completed: 1
+tasks.count: 1
+time.active_minutes: 128.7
+time.wall_minutes: 1859.2
+tokens.cache_read: 20224512
+tokens.cache_write: 0
+tokens.fresh: 1780823
+tokens.input_uncached: 1694585
+tokens.output: 86238
+tokens.reasoning: 44512
+tokens.total: 22005335
+tokens.unpriced: 0
+tools.calls: 256
+tools.edit: 32
+tools.exec: 185
+tools.failed: 6
+tools.files_edited: 13
+tools.plan: 2
+tools.validate: 37

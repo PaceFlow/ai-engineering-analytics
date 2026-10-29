@@ -12,7 +12,7 @@ const LEGACY_DATABASES: &[&str] = &[
     ".aea/aea.db",
     ".vibe/vca.db",
 ];
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 4;
 
 pub fn home() -> Result<PathBuf> {
     ["VCA_HOME", "PACEFLOW_HOME", "AIENG_HOME", "AEA_HOME"]
@@ -22,7 +22,7 @@ pub fn home() -> Result<PathBuf> {
                 .filter(|v| !v.is_empty())
                 .map(PathBuf::from)
         })
-        .or_else(dirs::home_dir)
+        .or_else(crate::path_utils::agent_home)
         .ok_or_else(|| anyhow::anyhow!("Home directory not found"))
 }
 
