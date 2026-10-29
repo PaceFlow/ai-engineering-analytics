@@ -734,7 +734,7 @@ pub fn items(conn: &Connection) -> Result<Vec<WorkItem>> {
             .cloned()
             .collect();
     }
-    result.sort_by(|a, b| b.started_at.cmp(&a.started_at));
+    result.sort_by_key(|a| std::cmp::Reverse(a.started_at));
     Ok(result)
 }
 fn load_usage(conn: &Connection, t: &TaskRow) -> Result<Vec<Usage>> {

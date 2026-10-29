@@ -253,7 +253,7 @@ fn scan(
     }
     let mut identities = BTreeSet::new();
     for file in files {
-        let identity = file.to_string_lossy().to_string();
+        let identity = file.to_string_lossy().replace('\\', "/");
         match std::fs::metadata(&file) {
             Ok(meta) if meta.is_file() && meta.len() <= 128_000 => {}
             Ok(_) => {

@@ -297,7 +297,7 @@ impl SessionHeader {
         let root = self.project_root.as_deref()?.trim();
         let mapped = crate::path_utils::on_disk(Path::new(root));
         // OpenCode's global project uses '/'; it is not a repository identity.
-        (mapped.is_absolute() && mapped.parent().is_some()).then(|| RepositoryHint {
+        (mapped.has_root() && mapped.parent().is_some()).then(|| RepositoryHint {
             project_id: self.project_id.clone(),
             root: root.into(),
             source: "opencode:project.worktree".into(),
