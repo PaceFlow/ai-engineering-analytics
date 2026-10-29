@@ -496,12 +496,16 @@ impl Passes {
     }
 }
 
+// SQLite otherwise favors scanning the provider's ordered fact index for each
+// conversation. Keep session selection first, then perform indexed fact lookups.
+const SESSION_FINGERPRINT_QUERIES: [&str; 2] = [
+    "SELECT COALESCE(m.message_key,'')||':'||COALESCE(m.message_ts,'')||':'||m.role||':'||m.content FROM metadata_sessions s CROSS JOIN fact_session_message m ON m.provider=s.provider AND m.session_id=s.session_id WHERE s.provider=?1 AND (s.root_session_id=?2 OR (s.root_session_id IS NULL AND s.session_id=?2)) ORDER BY m.session_id,m.message_index",
+    "SELECT t.call_key||':'||COALESCE(t.ts,'')||':'||t.tool_name||':'||COALESCE(t.target,'')||':'||t.status FROM metadata_sessions s CROSS JOIN fact_session_tool_call t ON t.provider=s.provider AND t.session_id=s.session_id WHERE s.provider=?1 AND (s.root_session_id=?2 OR (s.root_session_id IS NULL AND s.session_id=?2)) ORDER BY t.session_id,t.call_index",
+];
+
 pub fn session_fingerprint(conn: &Connection, session: &SessionRef) -> Result<String> {
     let mut material = String::new();
-    for sql in [
-        "SELECT COALESCE(m.message_key,'')||':'||COALESCE(m.message_ts,'')||':'||m.role||':'||m.content FROM fact_session_message m JOIN metadata_sessions s USING(provider,session_id) WHERE s.provider=?1 AND (s.root_session_id=?2 OR (s.root_session_id IS NULL AND s.session_id=?2)) ORDER BY m.session_id,m.message_index",
-        "SELECT t.call_key||':'||COALESCE(t.ts,'')||':'||t.tool_name||':'||COALESCE(t.target,'')||':'||t.status FROM fact_session_tool_call t JOIN metadata_sessions s USING(provider,session_id) WHERE s.provider=?1 AND (s.root_session_id=?2 OR (s.root_session_id IS NULL AND s.session_id=?2)) ORDER BY t.session_id,t.call_index",
-    ] {
+    for sql in SESSION_FINGERPRINT_QUERIES {
         for value in conn
             .prepare(sql)?
             .query_map(params![session.provider, session.session_id], |r| {
@@ -2126,6 +2130,63 @@ mod tests {
             monthly_budget_usd: 10.0,
             ..ClassifierConfig::default()
         }
+    }
+
+    #[test]
+    fn fingerprint_scopes_indexed_facts_to_the_conversation_and_subagents() -> Result<()> {
+        use crate::db::session_store::{AgentKind, ToolCallRecord, refresh_session_roots};
+        let (conn, root) = seeded()?;
+        let original = session_fingerprint(&conn, &root)?;
+        let mut other = SessionRecord::new("claude", "other");
+        other.messages.push(message(
+            "other-request",
+            "2026-10-01T12:00:00Z",
+            "user",
+            "Unrelated work",
+        ));
+        store_session_record(&conn, &other)?;
+        refresh_session_roots(&conn)?;
+        assert_eq!(session_fingerprint(&conn, &root)?, original);
+        let mut child = SessionRecord::new("claude", "child");
+        child.parent_session_id = Some("s1".into());
+        child.agent_kind = AgentKind::Subagent;
+        child.messages.push(message(
+            "child-request",
+            "2026-10-01T10:01:00Z",
+            "user",
+            "Check this goal",
+        ));
+        child.tool_calls.push(ToolCallRecord {
+            key: "child-tool".into(),
+            tool_name: "Bash".into(),
+            target: Some("cargo test".into()),
+            status: "ok".into(),
+            ..Default::default()
+        });
+        store_session_record(&conn, &child)?;
+        refresh_session_roots(&conn)?;
+        let with_child = session_fingerprint(&conn, &root)?;
+        assert_ne!(with_child, original);
+        conn.execute(
+            "UPDATE fact_session_tool_call SET target='cargo build' WHERE session_id='child'",
+            [],
+        )?;
+        assert_ne!(session_fingerprint(&conn, &root)?, with_child);
+        for (sql, alias) in SESSION_FINGERPRINT_QUERIES.into_iter().zip(["m", "t"]) {
+            let plan = conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))?
+                .query_map(params![root.provider, root.session_id], |r| {
+                    r.get::<_, String>(3)
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            assert!(
+                plan.iter()
+                    .any(|detail| detail.starts_with(&format!("SEARCH {alias} "))
+                        && detail.contains("provider=? AND session_id=?")),
+                "Fact lookups must constrain both conversation keys: {plan:?}"
+            );
+        }
+        Ok(())
     }
 
     #[test]
