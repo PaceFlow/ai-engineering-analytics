@@ -440,7 +440,7 @@ pub(crate) fn run_automatic(
     }
     let chosen = fairly_scheduled(conn, chosen)?;
     let sessions: Vec<_> = chosen.iter().map(|c| c.session.clone()).collect();
-    let resumable:Option<(i64,f64,f64)>=conn.query_row("SELECT id,max_usd,spent_usd FROM classification_job WHERE state='pending_auto' AND passes=?1 AND policy=?2 AND spent_usd<max_usd ORDER BY id DESC LIMIT 1",params![passes.names(),QUESTION_SET_VERSION],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
+    let resumable:Option<(i64,f64,f64)>=conn.query_row("SELECT id,max_usd,spent_usd FROM classification_job WHERE state='pending_auto' AND passes=?1 AND policy=?2 AND spent_usd<max_usd ORDER BY id DESC LIMIT 1",params![passes.names(),run::job_policy(config)],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
     let options = RunOptions {
         level: config.level(),
         max_usd: resumable
@@ -626,6 +626,48 @@ mod tests {
         add_session(&conn, "after-disable", Some("/work/later"))?;
         run_automatic(&conn, &config, &client)?;
         assert_eq!(client.calls(), calls);
+        Ok(())
+    }
+
+    #[test]
+    fn automatic_resume_uses_full_policy_and_keeps_the_original_job_cap() -> Result<()> {
+        let conn = Connection::open_in_memory()?;
+        crate::db::init_app_schema(&conn)?;
+        add_session(&conn, "first", Some("/work/first"))?;
+        let client = client();
+        let mut config = ClassifierConfig {
+            enabled: true,
+            automatic_dispatch_seconds: 0,
+            ..Default::default()
+        };
+        run_automatic(&conn, &config, &client)?;
+        let original: i64 =
+            conn.query_row("SELECT MAX(id) FROM classification_job", [], |r| r.get(0))?;
+        conn.execute(
+            "UPDATE classification_job SET spent_usd=0.1 WHERE id=?1",
+            [original],
+        )?;
+        run_automatic(&conn, &config, &client)?;
+        assert_eq!(client.calls(), 0);
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM classification_job", [], |r| r
+                .get::<_, i64>(0))?,
+            1
+        );
+        let (max, spent): (f64, f64) = conn.query_row(
+            "SELECT max_usd,spent_usd FROM classification_job WHERE id=?1",
+            [original],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        assert_eq!(max, 0.5);
+        assert_eq!(spent, 0.1);
+        config.model = "different-policy".into();
+        run_automatic(&conn, &config, &client)?;
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM classification_job", [], |r| r
+                .get::<_, i64>(0))?,
+            2
+        );
         Ok(())
     }
 
