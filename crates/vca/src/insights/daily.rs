@@ -121,6 +121,8 @@ pub struct PrMetrics {
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct Day {
+    #[serde(default)]
+    pub corrective: super::corrective::Summary,
     pub date: String,
     pub start_ms: i64,
     pub end_ms: i64,
@@ -284,6 +286,7 @@ fn report_inner(conn: &Connection, options: &Options, now: DateTime<Utc>) -> Res
     if published.is_none() {
         warnings.push("No published daily index. Run ingest to refresh retained facts.".into());
     }
+    let purpose_index = super::corrective::Index::load(conn)?;
     let works = load_work(conn, &scope)?;
     let ids: BTreeSet<_> = works.iter().map(|w| w.id.clone()).collect();
     let usage = load_usage(conn, &scope, &ids)?;
@@ -666,6 +669,12 @@ fn report_inner(conn: &Connection, options: &Options, now: DateTime<Utc>) -> Res
                 g
             })
             .collect();
+        day.corrective = purpose_index.summarize(
+            &touched,
+            Some(&day_usage.iter().map(|u| u.id.clone()).collect()),
+            start,
+            cutoff,
+        );
         day.models = models.into_values().collect();
         let mut delivery_lead = vec![];
         let mut pr_lead = vec![];
@@ -897,7 +906,7 @@ fn report_inner(conn: &Connection, options: &Options, now: DateTime<Utc>) -> Res
     let classification_versions=conn.prepare("SELECT DISTINCT question_version||':'||COALESCE(model_version,source) FROM classification_result WHERE superseded_by IS NULL ORDER BY 1")?.query_map([],|r|r.get::<_,String>(0))?.collect::<rusqlite::Result<_>>()?;
     Ok(Report {
         schema_version: 1,
-        metric_version: "work-daily-1".into(),
+        metric_version: "work-daily-2".into(),
         generated_at: now.to_rfc3339(),
         published_revision: published,
         timezone: tz.name().into(),

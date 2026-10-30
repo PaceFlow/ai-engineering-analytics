@@ -5,7 +5,7 @@
 use serde_json::{Map, Value, json};
 
 /// Bump when instructions or criteria change; cached results are keyed by it.
-pub const QUESTION_SET_VERSION: &str = "2026-10-q3";
+pub const QUESTION_SET_VERSION: &str = "2026-10-q4-request-1";
 pub const SKILL_QUESTION_VERSION: &str = "2026-10-skill-q1";
 
 pub const SKILL_FOLLOW_THROUGH: [(&str, &str); 4] = [
@@ -67,6 +67,45 @@ pub const INTENTS: [(&str, &str); 12] = [
         "One-off data analysis, queries or scripts that are not part of the product.",
     ),
     ("other", "None of the above clearly fits."),
+];
+
+pub const PURPOSES: [(&str, &str); 4] = [
+    (
+        "corrective",
+        "Repairing, tuning or improving existing behavior, including operations and usability.",
+    ),
+    (
+        "new_capability",
+        "Adding behavior or capability that did not exist before.",
+    ),
+    (
+        "other",
+        "Review, research or other work without a clear corrective or new-capability goal.",
+    ),
+    (
+        "unknown",
+        "The substantive goal is missing or evidence is insufficient.",
+    ),
+];
+pub const CORRECTIVE_SUBTYPES: [(&str, &str); 6] = [
+    (
+        "defect_repair",
+        "Restoring expected behavior after a defect; does not establish who introduced it.",
+    ),
+    (
+        "performance_resource",
+        "Tuning performance or resource use.",
+    ),
+    ("usability", "Improving existing usability."),
+    (
+        "configuration_reliability",
+        "Improving configuration, deployment or operational reliability.",
+    ),
+    (
+        "unspecified",
+        "Corrective work without enough evidence for a narrower subtype.",
+    ),
+    ("not_applicable", "The purpose is not corrective."),
 ];
 
 pub const OUTCOMES: [(&str, &str); 8] = [
@@ -343,6 +382,8 @@ pub fn labels_for(question: &str) -> Option<Vec<&'static str>> {
         |options: &[(&'static str, &'static str)]| options.iter().map(|(name, _)| *name).collect();
     Some(match question {
         "intent" => names(&INTENTS),
+        "purpose" | "activity_purpose" => names(&PURPOSES),
+        "corrective_subtype" | "activity_corrective_subtype" => names(&CORRECTIVE_SUBTYPES),
         "outcome" => names(&OUTCOMES),
         "feedback" => names(&FEEDBACK),
         "rework_kind" => names(&REWORK_KINDS),
@@ -362,7 +403,9 @@ pub fn labels_for(question: &str) -> Option<Vec<&'static str>> {
 pub fn unit_kind_for(question: &str) -> &'static str {
     match question {
         "feedback" | "frustration" => "exchange",
-        "request_kind" | "turn_stage" => "turn",
+        "request_kind" | "turn_stage" | "activity_purpose" | "activity_corrective_subtype" => {
+            "turn"
+        }
         id if TURN_FLAGS.iter().any(|(name, _, _)| *name == id) => "turn",
         "rework_kind" => "relation",
         "skill_follow_through" => "skill",
@@ -391,6 +434,8 @@ pub fn task_label_questions(level: crate::classify::state::Level) -> Map<String,
     use crate::classify::state::Level;
     let mut questions = Map::new();
     if level != Level::EvidenceOnly {
+        questions.insert("purpose".into(), choice("Classify the primary substantive goal, ignoring routing boilerplate. Corrective does not mean AI-caused defect.", &PURPOSES));
+        questions.insert("corrective_subtype".into(), choice("Classify corrective purpose; use not_applicable for non-corrective work and unspecified when unclear.", &CORRECTIVE_SUBTYPES));
         questions.insert(
             "intent".into(),
             choice(
@@ -478,6 +523,23 @@ pub fn exchange_questions() -> Map<String, Value> {
 pub fn turn_questions(level: crate::classify::state::Level) -> Map<String, Value> {
     use crate::classify::state::Level;
     let mut questions = Map::new();
+    if level != crate::classify::state::Level::EvidenceOnly {
+        questions.insert(
+            "activity_purpose".into(),
+            choice(
+                "Classify this turn's activity, independently of the task's overall goal.",
+                &PURPOSES,
+            ),
+        );
+        questions.insert(
+            "activity_corrective_subtype".into(),
+            choice(
+                "Classify corrective activity; use not_applicable for non-corrective activity.",
+                &CORRECTIVE_SUBTYPES,
+            ),
+        );
+    }
+
     questions.insert(
         "turn_stage".into(),
         choice(

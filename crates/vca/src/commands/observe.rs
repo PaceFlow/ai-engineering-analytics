@@ -106,6 +106,14 @@ pub enum WorkCommand {
     List,
     Show {
         id: String,
+        #[arg(long)]
+        explain: bool,
+        #[arg(long)]
+        evidence: bool,
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        #[arg(long)]
+        cursor: Option<String>,
     },
     /// Join two member IDs (or provider:session#task references).
     Link {
@@ -436,7 +444,13 @@ pub fn run_work(args: WorkArgs) -> Result<()> {
                 }
             }
         }
-        WorkCommand::Show { id } => {
+        WorkCommand::Show {
+            id,
+            explain,
+            evidence,
+            limit,
+            cursor,
+        } => {
             let rows: Vec<_> = work::items(&conn)?
                 .into_iter()
                 .filter(|w| {
@@ -447,10 +461,28 @@ pub fn run_work(args: WorkArgs) -> Result<()> {
             if rows.len() != 1 {
                 bail!("Reference must identify one work item in scope");
             }
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&envelope(&conn, &scope, &rows[0])?)?
-            );
+            if explain || evidence {
+                let report = crate::insights::investigation::explain(
+                    &conn,
+                    &rows[0],
+                    evidence,
+                    limit,
+                    cursor.as_deref(),
+                )?;
+                if args.scope.json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&envelope(&conn, &scope, &report)?)?
+                    );
+                } else {
+                    print!("{}", crate::insights::investigation::text(&report));
+                }
+            } else {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&envelope(&conn, &scope, &rows[0])?)?
+                );
+            }
         }
         WorkCommand::Link {
             from,

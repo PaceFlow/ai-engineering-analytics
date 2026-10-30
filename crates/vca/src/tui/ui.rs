@@ -755,7 +755,7 @@ fn render_tasks(frame: &mut TermFrame<'_>, app: &App, area: Rect) {
             } else {
                 " "
             };
-            let done = if t.completed_at.is_some() {
+            let done = if t.supported_completed_at.is_some() {
                 t.completion_source.clone()
             } else {
                 "not observed".into()
@@ -796,7 +796,14 @@ fn render_tasks(frame: &mut TermFrame<'_>, app: &App, area: Rect) {
                 } else {
                     t.attempts.to_string()
                 }),
-                colored(done, if t.completed_at.is_some() { SU } else { MU }),
+                colored(
+                    done,
+                    if t.supported_completed_at.is_some() {
+                        SU
+                    } else {
+                        MU
+                    },
+                ),
             ])
         })
         .collect();
@@ -837,7 +844,10 @@ fn render_tasks(frame: &mut TermFrame<'_>, app: &App, area: Rect) {
         table_rows,
         Some(current.selected),
     );
-    let completed = rows.iter().filter(|t| t.completed_at.is_some()).count();
+    let completed = rows
+        .iter()
+        .filter(|t| t.supported_completed_at.is_some())
+        .count();
     frame.render_widget(
         Paragraph::new(Span::styled(
             format!(
@@ -1035,6 +1045,17 @@ fn render_session_overview(frame: &mut TermFrame<'_>, detail: &SessionDetail, ar
         .constraints([Constraint::Percentage(56), Constraint::Percentage(44)])
         .split(regions[1]);
     let mut context_lines = Vec::new();
+    for report in &detail.investigations {
+        context_lines.push(Line::from(format!(
+            "Work {} · {} · purpose {}",
+            &report.work_id[..report.work_id.len().min(8)],
+            report.state,
+            report.corrective_purpose
+        )));
+        for line in report.statements.iter().chain(report.gaps.iter()).take(5) {
+            context_lines.push(Line::from(line.clone()));
+        }
+    }
     if detail.context_sources.is_empty() {
         context_lines.push(Line::from("No captured context items"));
     } else {
@@ -1134,7 +1155,7 @@ fn render_detail(
     let completed = detail
         .tasks
         .iter()
-        .filter(|t| t.completed_at.is_some())
+        .filter(|t| t.supported_completed_at.is_some())
         .count();
     frame.render_widget(
         Paragraph::new(vec![
@@ -1304,7 +1325,7 @@ fn render_detail(
                             ),
                             outcome_color(t.outcome.as_deref()),
                         ),
-                        left(fmt::when(t.completed_at.as_deref())),
+                        left(fmt::when(t.supported_completion_time().as_deref())),
                         right(fmt::minutes(
                             t.active_minutes_to_complete.or(t.active_minutes_total),
                         )),

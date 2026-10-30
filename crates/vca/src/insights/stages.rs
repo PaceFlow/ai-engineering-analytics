@@ -287,7 +287,7 @@ pub fn heuristic_request(text: &str, first_turn: bool) -> &'static str {
 fn evidence_for(turn: &crate::classify::state::TurnFacts) -> TurnEvidence {
     let mut evidence = TurnEvidence {
         slash_command: slash_command(&turn.user),
-        user_text: turn.user.clone(),
+        user_text: crate::classify::request::normalize(&turn.user).text,
         ..TurnEvidence::default()
     };
     for tool in &turn.tools {
@@ -443,6 +443,9 @@ pub fn refresh_stages(conn: &Connection) -> Result<()> {
                 turn.user.chars().count() as i64,
             ])?;
             let key = turn_unit_key(provider, session, turn.index);
+            let (purpose, subtype) = crate::classify::heuristic::corrective_purpose(&turn.user);
+            insert_heuristic(conn, "turn", &key, "activity_purpose", purpose)?;
+            insert_heuristic(conn, "turn", &key, "activity_corrective_subtype", subtype)?;
             insert_heuristic(
                 conn,
                 "turn",

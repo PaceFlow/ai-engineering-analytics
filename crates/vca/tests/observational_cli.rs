@@ -87,7 +87,7 @@ fn upgrade_and_reports_keep_missing_sources_and_export_contract() -> Result<()> 
     vca::db::init_app_schema(&conn)?;
     assert_eq!(
         conn.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))?,
-        4
+        vca::data_home::SCHEMA_VERSION
     );
     assert_eq!(
         conn.query_row("SELECT COUNT(*) FROM metadata_sessions", [], |r| r

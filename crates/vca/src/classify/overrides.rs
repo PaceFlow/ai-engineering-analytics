@@ -2,7 +2,7 @@
 //! survive re-classification and double as gold labels for evaluation.
 
 use anyhow::{Result, bail};
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::classify::questions::labels_for;
 
@@ -99,7 +99,22 @@ pub fn set_completion(
             params![provider, session_id, task],
         )?,
     };
-    crate::insights::refresh(conn)
+    crate::insights::refresh(conn)?;
+    let member:Option<String>=conn.query_row("SELECT identity_id FROM derived_work_member WHERE provider=?1 AND session_id=?2 AND task_index=?3",params![provider,session_id,task],|r|r.get(0)).optional()?;
+    if let Some(member) = member {
+        let at=completion.and_then(|turn|conn.query_row("SELECT COALESCE(ended_at,started_at) FROM derived_turn WHERE provider=?1 AND session_id=?2 AND turn_index=?3",params![provider,session_id,turn],|r|r.get::<_,Option<String>>(0)).ok().flatten()).as_deref().and_then(crate::insights::structure::parse_ts);
+        crate::insights::audit::record_completion(
+            conn,
+            &member,
+            "manual",
+            at,
+            true,
+            vec![],
+            "Manual completion override cleared",
+        )?;
+        crate::insights::observation::publish(conn)?;
+    }
+    Ok(())
 }
 
 /// Remove every override of one session; returns how many were removed.
@@ -117,6 +132,21 @@ pub fn clear_session(conn: &Connection, provider: &str, session_id: &str) -> Res
         "DELETE FROM classification_override WHERE substr(unit_key, 1, length(?1)) = ?1",
         params![prefix],
     )?;
+    let members = conn
+        .prepare("SELECT identity_id FROM derived_work_member WHERE provider=?1 AND session_id=?2")?
+        .query_map(params![provider, session_id], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for member in members {
+        crate::insights::audit::record_completion(
+            conn,
+            &member,
+            "manual",
+            None,
+            false,
+            vec![],
+            "Manual completion override cleared",
+        )?;
+    }
     crate::insights::refresh(conn)?;
     Ok(removed)
 }
