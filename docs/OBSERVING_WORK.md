@@ -193,3 +193,102 @@ Classification jobs persist selected passes, per-request progress, content finge
 ### Persistent analytics home and rollback
 
 `VCA_HOME` names a parent directory; the database is `$VCA_HOME/.vca/vca.db`. Use a private persistent directory such as `/home/user/.local/share/vca`. Before moving existing data, stop analytics writers and take a consistent SQLite backup (including committed WAL data). Copy only the analytics database and allowlisted private classifier/token files, preserve mode 0600, and retain the previous binary with its compatible pre-upgrade database. Do not copy production application configuration. Validate the migrated database and reconcile work IDs, token totals and labels before switching the analytics launcher. Roll back using the paired binary/database backup; an old binary may reject schema 4. This migration requires no changes to application services.
+
+## Investigating long conversations (schema 5)
+
+Use `vca sessions --days 0 --sort active`, `--sort elapsed`, or `--sort requests`
+for different views of long conversations. Requests count captured usage events;
+missing requests remain unknown. Elapsed span includes waiting and is not work time.
+
+`vca work show <id> --explain` and `vca show <session> --explain` give deterministic,
+local explanations without classifier calls. Add `--json` for structured output.
+`vca work show <id> --evidence --limit 20` includes bounded, redacted source excerpts;
+pass the returned `--cursor` for the next page. Cursors expire when evidence changes.
+The existing TUI detail loader shows the same supported state and evidence gaps.
+
+Multica transport envelopes are separated from substantive requests before labeling.
+An assignment containing only an external issue reference has an unknown goal;
+VCA does not infer the issue contents from reply instructions. Corrective purpose
+includes repairs and tuning; it is separate from intent, activity stage and evidence
+that earlier AI work introduced a defect. Task and turn purpose labels have their
+own coverage, including unknown and heuristic categories. Old classifier answers
+remain visible as stale until backfilled under the existing budgets.
+
+Schema 5 adds one table, `audit_work_event`, provenance JSON on classifier requests
+and answers, and purpose fields on existing published projections. Original messages
+remain intact. Legacy completion marks are preserved as legacy decisions observed
+at migration time; their original observation time is unknown. Historical completion
+fields are retained for compatibility; `supported_completed_at` on task records and
+`supported_completed_tasks` on session records identify current supported completion.
+
+### Structured lifecycle import
+
+`vca sources import <file>` accepts version 1 delivery files and version 2 files
+containing `work_event` records. NDJSON accepts the same record objects. Example:
+
+```json
+{
+  "schema_version": 2,
+  "records": [{
+    "kind": "work_event",
+    "record": {
+      "id": "acceptance-required-1",
+      "subject_kind": "task",
+      "subject_key": "STABLE_MEMBER_ID_FROM_WORK_SHOW",
+      "occurred_at": "2026-10-17T15:29:00Z",
+      "observed_at": "2026-10-29T09:00:00Z",
+      "source": "import",
+      "source_key": "acceptance-required-1",
+      "schema_version": 1,
+      "payload": {
+        "type": "acceptance_required",
+        "criterion_id": "authenticated-export",
+        "evidence": []
+      },
+      "supersedes_id": null
+    }
+  }]
+}
+```
+
+Use stable task member IDs, not the current numeric task index. `pr` subjects use
+provider/repository PR identities. Unknown subjects remain inspectable through
+status uncertainty and do not attach to unrelated work. References may identify
+messages (provider/session/message key), tool calls (provider/session/call key),
+tasks, PR revisions, deployments or classifier results. Missing evidence prevents
+an imported completion from establishing supported completion. An imported
+completion needs at least one available supporting reference; a manual decision
+can explicitly confirm completion. These are evidence assertions, not automatic
+proof of AI causation.
+
+Event payload types are `completion_supported`, `completion_withdrawn`, `reopened`,
+`blocked`, `unblocked`, `approval_requested`, `approval_granted`, `approval_declined`,
+`acceptance_required`, `acceptance_passed`, `acceptance_failed`,
+`acceptance_withdrawn`, and `correction_decision`. Block transitions require
+`block_id`; approval transitions require `approval_id`; acceptance requires
+`criterion_id`. Completion support includes `verified`; withdrawals/reopening
+include `reason`. Correction decisions include nullable origin member/turn and
+correction-turn references, `correction_type`, `attribution`, `reason`, and evidence.
+Classifier output can suggest attribution but cannot confirm or corroborate it.
+
+Repeated imports are idempotent. Changing an event requires a new ID/source key
+and an explicit `supersedes_id`; prior history is retained. An unblocking transition
+is normally a new event, not a replacement for the blocking event. Only paired
+structured records support waiting durations. A generic passing command, green CI,
+merge, or assistant claim does not establish goal completion or live delivery.
+Passing acceptance after withdrawal still needs a subsequent supported completion.
+Deployment evidence remains independent of outstanding acceptance.
+
+Reports flag repeated instruction loads and status checks as investigation
+candidates. They do not compute avoided spend or claim that the operations were
+unnecessary. Unavailable source detail remains unknown.
+
+### Data-model naming correspondence
+
+The existing SQLite storage names remain compatible. Conceptually, normalized
+`fact_session_*` records are staging (`stg_`); `derived_*` transformations are
+intermediate (`int_`); entity metadata corresponds to dimensions (`dim_`); published
+measurements correspond to analytical facts (`fct_`); shared reports correspond to
+`rpt_`. `audit_work_event` is preserved decision/lifecycle history, and job/cursor
+records are control data (`ctl_`). No general event store or physical renaming is
+introduced. Paceflow backend event/export contracts remain unchanged.

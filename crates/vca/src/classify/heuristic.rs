@@ -5,7 +5,7 @@
 use anyhow::Result;
 use rusqlite::{Connection, params};
 
-pub const QUESTION_VERSION: &str = "heuristic-1";
+pub const QUESTION_VERSION: &str = "heuristic-2";
 
 fn contains_any(text: &str, words: &[&str]) -> bool {
     words.iter().any(|word| text.contains(word))
@@ -13,7 +13,29 @@ fn contains_any(text: &str, words: &[&str]) -> bool {
 
 /// Intent from the opening request and the task's tool activity.
 pub fn task_intent(first_request: &str, edit_calls: i64, reads: i64) -> &'static str {
-    let text = first_request.to_lowercase();
+    let request = super::request::normalize(first_request);
+    let text = request.text.to_lowercase();
+    if request.extraction == "uncertain" {
+        return "other";
+    }
+    if contains_any(
+        &text,
+        &[
+            "cache",
+            "maintenance",
+            "retention",
+            "deploy",
+            "pipeline",
+            "reliability",
+            "config",
+        ],
+    ) && !contains_any(&text, &["write documentation", "document the", "readme"])
+    {
+        return "ops_config";
+    }
+    if contains_any(&text, &["fix", "bug", "broken", "crash", "regression"]) {
+        return "bug_fix";
+    }
     if contains_any(
         &text,
         &[
@@ -140,7 +162,10 @@ pub fn task_outcome(
 
 /// How a user message reacts to the previous assistant output.
 pub fn exchange_feedback(user_text: &str) -> &'static str {
-    let text = user_text.trim().to_lowercase();
+    let text = super::request::normalize(user_text)
+        .text
+        .trim()
+        .to_lowercase();
     if text.is_empty() {
         return "other";
     }
@@ -322,6 +347,9 @@ pub fn refresh_heuristic_labels(conn: &Connection) -> Result<()> {
     ) in rows
     {
         let key = task_unit_key(&provider, &session_id, task);
+        let (purpose, subtype) = corrective_purpose(&title);
+        insert(conn, "task", &key, "purpose", purpose)?;
+        insert(conn, "task", &key, "corrective_subtype", subtype)?;
         insert(
             conn,
             "task",
@@ -423,6 +451,56 @@ pub fn rework_kind(later_ask: &str) -> &'static str {
     } else {
         "unclear"
     }
+}
+
+pub fn corrective_purpose(text: &str) -> (&'static str, &'static str) {
+    let request = super::request::normalize(text);
+    let text = request.text.to_lowercase();
+    if request.extraction == "uncertain" || text.contains("substantive goal unavailable") {
+        return ("unknown", "not_applicable");
+    }
+    if contains_any(
+        &text,
+        &["fix", "broken", "crash", "bug", "regression", "repair"],
+    ) {
+        return ("corrective", "defect_repair");
+    }
+    if contains_any(
+        &text,
+        &[
+            "cache",
+            "retention",
+            "performance",
+            "memory",
+            "latency",
+            "optimize",
+            "tune",
+        ],
+    ) {
+        return ("corrective", "performance_resource");
+    }
+    if contains_any(
+        &text,
+        &[
+            "reliability",
+            "deployment failure",
+            "configure",
+            "maintenance",
+            "pin ",
+        ],
+    ) {
+        return ("corrective", "configuration_reliability");
+    }
+    if contains_any(&text, &["usability", "polish", "simplify", "refine"]) {
+        return ("corrective", "usability");
+    }
+    if contains_any(&text, &["improve", "adjust"]) {
+        return ("corrective", "unspecified");
+    }
+    if contains_any(&text, &["add ", "implement ", "create ", "build "]) {
+        return ("new_capability", "not_applicable");
+    }
+    ("other", "not_applicable")
 }
 
 #[cfg(test)]

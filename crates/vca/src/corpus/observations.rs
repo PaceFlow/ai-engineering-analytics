@@ -9,6 +9,7 @@ use std::path::Path;
 
 pub const FILE: &str = "analytics-inputs.json";
 const TABLES: &[&str] = &[
+    "audit_work_event",
     "work_identity",
     "work_relation",
     "work_saved_decision",
@@ -110,6 +111,14 @@ pub fn save(
                     field("alias") == repo
                         || field("canonical") == canonical.as_deref() && canonical.is_some()
                 }
+                "audit_work_event" => {
+                    (field("subject_kind") == Some("task")
+                        && field("subject_key")
+                            .is_some_and(|id| identities.iter().any(|i| i == id)))
+                        || (field("subject_kind") == Some("pr")
+                            && field("subject_key")
+                                .is_some_and(|id| pr_ids.iter().any(|i| i == id)))
+                }
                 "work_pr_link" => {
                     field("member_id").is_some_and(|id| identities.iter().any(|i| i == id))
                 }
@@ -183,14 +192,22 @@ pub fn restore(
             .prepare(&format!("PRAGMA table_info({})", table.name))?
             .query_map([], |r| r.get(1))?
             .collect::<rusqlite::Result<_>>()?;
-        if table.columns != known {
+        let compatible = table.columns.iter().all(|c| known.contains(c))
+            && known
+                .iter()
+                .filter(|c| !table.columns.contains(c))
+                .all(|c| table.name == "classification_result" && c == "evidence_json");
+        if !compatible {
             bail!("Analytics input columns differ for {}", table.name);
         }
-        let placeholders = (0..known.len()).map(|_| "?").collect::<Vec<_>>().join(",");
+        let placeholders = (0..table.columns.len())
+            .map(|_| "?")
+            .collect::<Vec<_>>()
+            .join(",");
         let sql = format!(
             "INSERT OR REPLACE INTO {} ({}) VALUES({placeholders})",
             table.name,
-            known.join(",")
+            table.columns.join(",")
         );
         for row in table.rows {
             let values = row

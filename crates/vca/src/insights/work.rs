@@ -642,16 +642,10 @@ pub fn items(conn: &Connection) -> Result<Vec<WorkItem>> {
             work.last_activity_at = work
                 .last_activity_at
                 .max(last.as_deref().and_then(parse_ts));
-            let supported = t.completion_source == "override"
-                || (t.completion_source == "jev"
-                    && matches!(
-                        t.outcome.as_deref(),
-                        Some("completed_verified" | "completed_unverified" | "answered")
-                    ));
-            if supported && let Some(at) = t.completed_at.as_deref().and_then(parse_ts) {
+            if let Some(at) = t.supported_completed_at {
                 work.completions.push(Completion {
                     at,
-                    verified: t.outcome.as_deref() == Some("completed_verified"),
+                    verified: t.supported_verified,
                     source: t.completion_source.clone(),
                     member_id: member.id.clone(),
                 });

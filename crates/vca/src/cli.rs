@@ -473,7 +473,7 @@ pub enum QuotaCommands {
 pub struct SessionsArgs {
     #[command(flatten)]
     pub filters: InsightFilterArgs,
-    /// cost | tokens | fresh | cache | started | turns | failures | agents
+    /// cost | tokens | fresh | cache | started | turns | failures | agents | active | elapsed | requests
     #[arg(long, default_value = "cost")]
     pub sort: String,
     /// Group instead of listing: cost | tokens | model | tool | project | intent | outcome | branch | week | day
@@ -498,6 +498,9 @@ pub struct TasksArgs {
 
 #[derive(Args, Debug, Clone)]
 pub struct ShowArgs {
+    /// Explain supported state, lifecycle evidence and investigation gaps.
+    #[arg(long)]
+    pub explain: bool,
     /// Session id, id prefix, or provider:id
     pub session: String,
     #[arg(long)]

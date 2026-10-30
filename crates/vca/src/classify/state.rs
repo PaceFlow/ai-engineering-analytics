@@ -137,6 +137,7 @@ pub fn head_tail(text: &str, max: usize) -> String {
 #[derive(Debug, Clone, Default)]
 pub struct TurnFacts {
     pub index: i64,
+    pub source_refs: Vec<Value>,
     pub ts: Option<i64>,
     pub user: String,
     pub assistant: String,
@@ -189,11 +190,38 @@ impl TurnFacts {
     }
 }
 
+// References accompany only bounded visible text/summary inputs, not the entire
+// conversation. The complete reference set stays local for evidence pagination.
+fn visible_refs(turn: &TurnFacts, level: Level) -> Vec<Value> {
+    let mut refs = Vec::new();
+    if level > Level::EvidenceOnly {
+        let messages: Vec<_> = turn
+            .source_refs
+            .iter()
+            .filter(|v| v["type"] == "message")
+            .collect();
+        for r in messages.iter().take(2).chain(messages.last().into_iter()) {
+            if !refs.contains(*r) {
+                refs.push((*r).clone());
+            }
+        }
+    }
+    for r in turn
+        .source_refs
+        .iter()
+        .filter(|v| v["type"] == "tool")
+        .take(2)
+    {
+        refs.push(r.clone());
+    }
+    refs
+}
+
 /// Load turns of a session in the same shape the structure pass uses.
 pub fn load_turns(conn: &Connection, provider: &str, session_id: &str) -> Result<Vec<TurnFacts>> {
     let mut turns: Vec<TurnFacts> = Vec::new();
     let mut stmt = conn.prepare(
-        "SELECT message_ts, role, content, is_compaction_summary FROM fact_session_message
+        "SELECT message_ts, role, content, is_compaction_summary, COALESCE(message_key,'index:' || message_index) FROM fact_session_message
          WHERE provider = ?1 AND session_id = ?2 ORDER BY message_index",
     )?;
     let rows = stmt.query_map(params![provider, session_id], |row| {
@@ -202,13 +230,16 @@ pub fn load_turns(conn: &Connection, provider: &str, session_id: &str) -> Result
             row.get::<_, String>(1)?,
             row.get::<_, String>(2)?,
             row.get::<_, i64>(3)? != 0,
+            row.get::<_, String>(4)?,
         ))
     })?;
     for row in rows {
-        let (ts, role, content, compaction) = row?;
+        let (ts, role, content, compaction, message_key) = row?;
+        let reference = json!({"type":"message","provider":provider,"session_id":session_id,"message_key":message_key});
         if role == "user" && !compaction {
             turns.push(TurnFacts {
                 index: turns.len() as i64,
+                source_refs: vec![reference.clone()],
                 ts: ts.as_deref().and_then(parse_ts),
                 user: content,
                 ..TurnFacts::default()
@@ -221,6 +252,7 @@ pub fn load_turns(conn: &Connection, provider: &str, session_id: &str) -> Result
                 turn.assistant.push('\n');
             }
             turn.assistant.push_str(&content);
+            turn.source_refs.push(reference);
         }
     }
     if turns.is_empty() {
@@ -240,13 +272,14 @@ pub fn load_turns(conn: &Connection, provider: &str, session_id: &str) -> Result
     };
 
     let mut stmt = conn.prepare(
-        "SELECT ts, tool_name, tool_category, validation_kind, status, exit_code, error_signature, target
+        "SELECT ts, tool_name, tool_category, validation_kind, status, exit_code, error_signature, target, call_key
          FROM fact_session_tool_call WHERE provider = ?1 AND session_id = ?2 ORDER BY call_index",
     )?;
     let tools = stmt
         .query_map(params![provider, session_id], |row| {
             Ok((
                 row.get::<_, Option<String>>(0)?,
+                row.get::<_, String>(8)?,
                 ToolFact {
                     name: row.get(1)?,
                     category: row.get(2)?,
@@ -259,7 +292,7 @@ pub fn load_turns(conn: &Connection, provider: &str, session_id: &str) -> Result
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    for (ts, tool) in tools {
+    for (ts, call_key, tool) in tools {
         let index = turn_for(&turns, ts.as_deref().and_then(parse_ts));
         if tool.category == "edit"
             && let Some(target) = tool.target.clone()
@@ -267,6 +300,9 @@ pub fn load_turns(conn: &Connection, provider: &str, session_id: &str) -> Result
         {
             turns[index].files.push(target);
         }
+        turns[index].source_refs.push(
+            json!({"type":"tool","provider":provider,"session_id":session_id,"call_key":call_key}),
+        );
         turns[index].tools.push(tool);
     }
 
@@ -334,7 +370,7 @@ pub fn load_turns(conn: &Connection, provider: &str, session_id: &str) -> Result
 
 /// Redacted, level-filtered text of one turn's user message.
 fn user_text(turn: &TurnFacts, max: usize, redactions: &mut usize) -> String {
-    let (text, count) = redact(&head_tail(&turn.user, max));
+    let (text, count) = redact(&head_tail(&super::request::normalize(&turn.user).text, max));
     *redactions += count;
     text
 }
@@ -439,8 +475,7 @@ pub fn task_state(
                     transcript.push(json!({"omitted": omitted_summary(&omitted)}));
                     omitted.clear();
                 }
-                let mut entry =
-                    json!({"turn": turn.index, "user": user_text(turn, user_max, redactions)});
+                let mut entry = json!({"turn": turn.index, "user": user_text(turn, user_max, redactions), "source_refs": visible_refs(turn,level)});
                 if let Some(text) = assistant_text(turn, level, assistant_max, redactions) {
                     entry["assistant"] = Value::String(text);
                 }
@@ -458,6 +493,8 @@ pub fn task_state(
             "turns": selected.len(),
             "evidence": evidence,
             "transcript": transcript,
+            "request_policy": super::request::VERSION,
+            "request_extraction": selected.iter().map(|t| { let r=super::request::normalize(&t.user); json!({"turn":t.index,"speaker":r.speaker,"extraction":r.extraction}) }).collect::<Vec<_>>(),
         })
     };
 
@@ -529,6 +566,9 @@ pub fn exchange_state(turns: &[TurnFacts], turn_index: usize, level: Level) -> B
     let current = &turns[turn_index];
     let mut state = json!({
         "unit": "exchange",
+        "speaker": super::request::normalize(&current.user).speaker,
+        "source_refs": ([visible_refs(previous,level), visible_refs(current,level)].concat()),
+        "request_policy": super::request::VERSION,
         "previous_tools": previous.tool_summary(level),
         "user_message": if level > Level::EvidenceOnly { user_text(current, 1500, &mut redactions) } else { String::new() },
     });

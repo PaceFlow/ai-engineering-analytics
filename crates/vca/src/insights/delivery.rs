@@ -506,6 +506,7 @@ pub enum ImportRecord {
     PullRequest(PullRequest),
     Deployment(Deployment),
     Coverage(super::observation::SourceCoverage),
+    WorkEvent(super::audit::Event),
 }
 #[derive(Debug, Deserialize, Serialize)]
 pub struct Import {
@@ -516,7 +517,7 @@ pub fn import(conn: &Connection, bytes: &[u8]) -> Result<usize> {
     let records = if bytes.iter().find(|b| !b.is_ascii_whitespace()) == Some(&b'{') {
         if let Ok(envelope) = serde_json::from_slice::<Import>(bytes) {
             ensure!(
-                envelope.schema_version == 1,
+                matches!(envelope.schema_version, 1 | 2),
                 "Unsupported delivery import schema"
             );
             envelope.records
@@ -539,9 +540,13 @@ pub fn import(conn: &Connection, bytes: &[u8]) -> Result<usize> {
                 }
                 ImportRecord::Deployment(d) => save_deployment(conn, d)?,
                 ImportRecord::Coverage(c) => super::observation::record(conn, c)?,
+                ImportRecord::WorkEvent(e) => {
+                    super::audit::save(conn, e)?;
+                }
             }
         }
         refresh_links(conn)?;
+        super::observation::publish(conn)?;
         Ok(records.len())
     })();
     match result {

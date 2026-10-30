@@ -82,7 +82,7 @@ pub fn init_app_schema(conn: &Connection) -> Result<()> {
     init_metadata_schema(conn)?;
 
     init_change_intel_schema(conn)?;
-    if previous > 0 && previous < 4 {
+    if previous > 0 && previous < 5 {
         crate::insights::refresh(conn)?;
     }
     Ok(())

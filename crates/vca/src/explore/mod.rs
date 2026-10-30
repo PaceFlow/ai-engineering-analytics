@@ -151,6 +151,8 @@ impl Where {
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct TaskRow {
+    pub supported_completed_at: Option<i64>,
+    pub supported_verified: bool,
     pub provider: String,
     pub session_id: String,
     pub task_index: i64,
@@ -197,6 +199,11 @@ pub struct TaskRow {
 }
 
 impl TaskRow {
+    pub fn supported_completion_time(&self) -> Option<String> {
+        self.supported_completed_at
+            .and_then(chrono::DateTime::from_timestamp_millis)
+            .map(|t| t.to_rfc3339())
+    }
     pub fn is_completed(&self) -> bool {
         self.completed_at.is_some()
     }
@@ -348,6 +355,8 @@ const TASK_JOINS: &str = "
 
 fn task_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskRow> {
     Ok(TaskRow {
+        supported_completed_at: None,
+        supported_verified: false,
         provider: row.get(0)?,
         session_id: row.get(1)?,
         task_index: row.get(2)?,
@@ -407,9 +416,14 @@ pub fn tasks(
         limit.max(1)
     );
     let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt
+    let mut rows = stmt
         .query_map(params_from_iter(w.params.iter()), task_from_row)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
+    for task in &mut rows {
+        let resolution = crate::insights::audit::task_resolution(conn, task)?;
+        task.supported_completed_at = resolution.completed_at;
+        task.supported_verified = resolution.verified;
+    }
     Ok(rows)
 }
 
@@ -441,6 +455,8 @@ pub struct SessionRow {
     pub unpriced_tokens: i64,
     pub estimated_tokens: i64,
     pub active_minutes: Option<f64>,
+    pub model_requests: i64,
+    pub supported_completed_tasks: i64,
     pub completed_tasks: i64,
     pub commits: i64,
     pub source_status: String,
@@ -452,6 +468,9 @@ pub struct SessionRow {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
 pub enum SessionSort {
+    Active,
+    Elapsed,
+    Requests,
     #[default]
     Cost,
     Tokens,
@@ -464,7 +483,7 @@ pub enum SessionSort {
 }
 
 impl SessionSort {
-    pub const ALL: [SessionSort; 8] = [
+    pub const ALL: [SessionSort; 11] = [
         Self::Cost,
         Self::Tokens,
         Self::FreshTokens,
@@ -473,10 +492,16 @@ impl SessionSort {
         Self::Turns,
         Self::Failures,
         Self::Agents,
+        Self::Active,
+        Self::Elapsed,
+        Self::Requests,
     ];
 
     pub fn label(self) -> &'static str {
         match self {
+            Self::Active => "active",
+            Self::Elapsed => "elapsed",
+            Self::Requests => "requests",
             Self::Cost => "cost",
             Self::Tokens => "tokens",
             Self::FreshTokens => "fresh tokens",
@@ -491,6 +516,19 @@ impl SessionSort {
     fn sort(self, rows: &mut [SessionRow]) {
         let key = |row: &SessionRow| -> f64 {
             match self {
+                Self::Active => row.active_minutes.unwrap_or(-1.0),
+                Self::Elapsed => row
+                    .started_at
+                    .as_deref()
+                    .and_then(crate::insights::structure::parse_ts)
+                    .zip(
+                        row.ended_at
+                            .as_deref()
+                            .and_then(crate::insights::structure::parse_ts),
+                    )
+                    .map(|(a, b)| (b - a).max(0) as f64)
+                    .unwrap_or(-1.0),
+                Self::Requests => row.model_requests as f64,
                 Self::Cost => row.cost.unwrap_or(-1.0),
                 Self::Tokens => row.tokens_total as f64,
                 Self::FreshTokens => row.fresh_tokens as f64,
@@ -628,6 +666,11 @@ pub fn sessions(
             git_branch: first.git_branch.clone(),
             models: models.join(","),
             primary_model: heaviest.primary_model.clone(),
+            model_requests: conn.query_row(
+                "SELECT COUNT(*) FROM derived_usage_event WHERE provider=?1 AND root_session_id=?2",
+                rusqlite::params![provider, session_id],
+                |r| r.get(0),
+            )?,
             tasks: tasks.len() as i64,
             turns: tasks.iter().map(|task| task.turns).sum(),
             agents,
@@ -643,6 +686,10 @@ pub fn sessions(
             unpriced_tokens: tasks.iter().map(|task| task.unpriced_tokens).sum(),
             estimated_tokens: tasks.iter().map(|task| task.estimated_tokens).sum(),
             active_minutes: sum_opt(&|task| task.active_minutes_total),
+            supported_completed_tasks: tasks
+                .iter()
+                .filter(|t| t.supported_completed_at.is_some())
+                .count() as i64,
             completed_tasks: tasks.iter().filter(|task| task.is_completed()).count() as i64,
             commits: tasks.iter().map(|task| task.commits).max().unwrap_or(0),
             source_status,
@@ -1979,6 +2026,7 @@ pub struct SessionContextSource {
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct SessionDetail {
+    pub investigations: Vec<crate::insights::investigation::Explanation>,
     pub session: SessionRow,
     pub tasks: Vec<TaskRow>,
     pub turns: Vec<TurnRow>,
@@ -2245,7 +2293,17 @@ pub fn session_detail(
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
 
+    let investigations = crate::insights::work::items(conn)?
+        .iter()
+        .filter(|w| {
+            w.members
+                .iter()
+                .any(|m| m.task.provider == provider && m.task.session_id == session_id)
+        })
+        .map(|w| crate::insights::investigation::explain(conn, w, false, 20, None))
+        .collect::<Result<Vec<_>>>()?;
     Ok(Some(SessionDetail {
+        investigations,
         session,
         tasks,
         turns,
@@ -2352,6 +2410,8 @@ mod tests {
         model: &str,
     ) -> TaskRow {
         TaskRow {
+            supported_completed_at: None,
+            supported_verified: false,
             provider: provider.into(),
             session_id: format!("{provider}-{fresh}"),
             task_index: 0,
