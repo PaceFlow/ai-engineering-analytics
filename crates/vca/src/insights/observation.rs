@@ -160,7 +160,7 @@ pub fn publish(conn: &Connection) -> Result<()> {
         "DELETE FROM published_work_lifecycle; DELETE FROM published_work_conversation;",
     )?;
     let mut index = conn.prepare_cached(
-        "INSERT INTO derived_work_index VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+        "INSERT INTO derived_work_index VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
     )?;
     let mut member =
         conn.prepare_cached("INSERT INTO derived_work_index_member VALUES(?1,?2,?3,?4,?5,?6)")?;
@@ -221,7 +221,8 @@ pub fn publish(conn: &Connection) -> Result<()> {
             w.corrections,
             w.validation_failures,
             w.observed_activity,
-            w.members_missing_usage as i64
+            w.members_missing_usage as i64,
+            {let first=&w.members[0];let (purpose,subtype,source)=super::investigation::purpose(conn,&first.task.provider,&first.task.session_id,first.task.task_index)?;let history:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM audit_work_event a JOIN derived_work_member m ON m.identity_id=a.subject_key WHERE a.subject_kind='task' AND a.source IN ('manual','import') AND m.identity_id IN (SELECT value FROM json_each(?1)))",[serde_json::to_string(&w.members.iter().map(|m|&m.id).collect::<Vec<_>>())?],|r|r.get(0))?;serde_json::json!({"purpose":purpose,"subtype":subtype,"source":source,"history":history}).to_string()}
         ])?;
         for m in w.members {
             let repo = m
@@ -242,8 +243,8 @@ pub fn publish(conn: &Connection) -> Result<()> {
     }
     conn.execute_batch("DELETE FROM published_work_usage; DELETE FROM published_work_activity; DELETE FROM published_work_models; DELETE FROM published_work_event;
       INSERT INTO published_work_models SELECT m.provider,m.session_id,m.task_index,t.models FROM derived_work_index_member m JOIN derived_task t USING(provider,session_id,task_index);
-      INSERT INTO published_work_usage SELECT d.usage_id,m.work_id,d.usage_ts,d.provider,COALESCE(d.model_name,'unknown'),d.token_source,COALESCE(a.availability,CASE WHEN d.total_tokens>0 THEN CASE WHEN d.token_source='reported' THEN 'native' ELSE 'estimated' END ELSE 'suspect_zero' END),u.input_tokens,u.cache_creation_tokens,u.cached_input_tokens,u.output_tokens,CASE WHEN COALESCE(u.reasoning_in_output,0)=0 THEN u.reasoning_tokens ELSE 0 END,d.total_tokens,d.reported_cost_usd,d.api_equiv_usd,COALESCE(s.stage,'unclassified'),d.context_tokens FROM derived_usage_event d JOIN fact_session_usage u ON u.id=d.usage_id JOIN derived_work_index_member m ON m.provider=d.provider AND m.session_id=d.root_session_id AND m.task_index=d.task_index LEFT JOIN usage_measurement a ON a.provider=u.provider AND a.session_id=u.session_id AND a.usage_key=u.usage_key LEFT JOIN derived_turn_stage s ON s.provider=d.provider AND s.session_id=d.root_session_id AND s.turn_index=d.root_turn_index;
-      INSERT INTO published_work_activity SELECT m.work_id,a.start_ms,a.end_ms,COALESCE(s.stage,'unclassified') FROM derived_work_activity a JOIN derived_work_index_member m USING(provider,session_id,task_index) LEFT JOIN derived_turn_stage s ON s.provider=a.provider AND s.session_id=a.session_id AND s.turn_index=a.turn_index;
+      INSERT INTO published_work_usage SELECT d.usage_id,m.work_id,d.usage_ts,d.provider,COALESCE(d.model_name,'unknown'),d.token_source,COALESCE(a.availability,CASE WHEN d.total_tokens>0 THEN CASE WHEN d.token_source='reported' THEN 'native' ELSE 'estimated' END ELSE 'suspect_zero' END),u.input_tokens,u.cache_creation_tokens,u.cached_input_tokens,u.output_tokens,CASE WHEN COALESCE(u.reasoning_in_output,0)=0 THEN u.reasoning_tokens ELSE 0 END,d.total_tokens,d.reported_cost_usd,d.api_equiv_usd,COALESCE(s.stage,'unclassified'),d.context_tokens,COALESCE(p.label,'unknown') FROM derived_usage_event d JOIN fact_session_usage u ON u.id=d.usage_id JOIN derived_work_index_member m ON m.provider=d.provider AND m.session_id=d.root_session_id AND m.task_index=d.task_index LEFT JOIN usage_measurement a ON a.provider=u.provider AND a.session_id=u.session_id AND a.usage_key=u.usage_key LEFT JOIN derived_turn_stage s ON s.provider=d.provider AND s.session_id=d.root_session_id AND s.turn_index=d.root_turn_index LEFT JOIN view_label_effective p ON p.unit_kind='turn' AND p.question_id='activity_purpose' AND p.unit_key=d.provider || '|' || d.root_session_id || '|' || d.root_turn_index;
+      INSERT INTO published_work_activity SELECT m.work_id,a.start_ms,a.end_ms,COALESCE(s.stage,'unclassified'),COALESCE(p.label,'unknown') FROM derived_work_activity a JOIN derived_work_index_member m USING(provider,session_id,task_index) LEFT JOIN derived_turn_stage s ON s.provider=a.provider AND s.session_id=a.session_id AND s.turn_index=a.turn_index LEFT JOIN view_label_effective p ON p.unit_kind='turn' AND p.question_id='activity_purpose' AND p.unit_key=a.provider || '|' || a.session_id || '|' || a.turn_index;
       INSERT INTO published_work_event SELECT m.work_id,a.started_at,a.validation_result FROM derived_attempt a JOIN derived_work_index_member m USING(provider,session_id,task_index);
       INSERT INTO published_work_event SELECT m.work_id,t.started_at,'correction' FROM view_label_effective l JOIN derived_turn t ON l.unit_key=t.provider||'|'||t.session_id||'|'||t.turn_index JOIN derived_task k ON k.provider=t.provider AND k.session_id=t.session_id AND (','||k.turn_list||',') LIKE '%,'||t.turn_index||',%' JOIN derived_work_index_member m ON m.provider=k.provider AND m.session_id=k.session_id AND m.task_index=k.task_index WHERE l.unit_kind='exchange' AND l.question_id='feedback' AND l.label='correct_defect';")?;
     conn.execute(

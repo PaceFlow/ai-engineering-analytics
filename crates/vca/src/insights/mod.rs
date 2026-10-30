@@ -1,9 +1,12 @@
 //! Conversation, usage and practice insights built on top of ingested facts.
+pub mod audit;
 pub mod billing;
 pub mod context;
+pub mod corrective;
 pub mod daily;
 pub mod delivery;
 pub mod habits;
+pub mod investigation;
 pub mod observation;
 pub mod quota;
 pub mod relations;
@@ -29,6 +32,7 @@ pub(crate) fn init_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(setup::SCHEMA)?;
     conn.execute_batch(observation::SCHEMA)?;
     conn.execute_batch(delivery::SCHEMA)?;
+    audit::init(conn)?;
     Ok(())
 }
 
@@ -69,6 +73,8 @@ fn refresh_inner(conn: &Connection) -> Result<()> {
     stages::refresh_stages(conn)?;
     habits::refresh_habits(conn)?;
     work::refresh(conn)?;
+    audit::preserve_legacy(conn)?;
+    audit::capture_corrections(conn)?;
     observation::publish(conn)?;
     delivery::refresh_links(conn)?;
     Ok(())
@@ -94,6 +100,8 @@ fn refresh_label_dependents_inner(conn: &Connection) -> Result<()> {
     stages::refresh_stages(conn)?;
     habits::refresh_habits(conn)?;
     work::refresh(conn)?;
+    audit::preserve_legacy(conn)?;
+    audit::capture_corrections(conn)?;
     observation::publish(conn)?;
     Ok(())
 }

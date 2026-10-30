@@ -348,6 +348,9 @@ pub fn run_sessions(args: SessionsArgs, _context: AppContext) -> Result<()> {
     let conn = open()?;
     let filters = filters_from_args(&args.filters);
     let sort = match args.sort.as_str() {
+        "active" => SessionSort::Active,
+        "elapsed" => SessionSort::Elapsed,
+        "requests" => SessionSort::Requests,
         "cost" => SessionSort::Cost,
         "tokens" => SessionSort::Tokens,
         "fresh" => SessionSort::FreshTokens,
@@ -440,8 +443,10 @@ pub fn run_sessions(args: SessionsArgs, _context: AppContext) -> Result<()> {
                 fmt::tokens(row.fresh_tokens),
                 row.agents.to_string(),
                 row.tasks.to_string(),
+                fmt::minutes(row.active_minutes),
+                row.model_requests.to_string(),
                 fmt::label(row.outcome.as_deref(), row.label_source.as_deref(), None),
-                format!("{}/{}", row.completed_tasks, row.tasks),
+                format!("{}/{}", row.supported_completed_tasks, row.tasks),
                 flags,
             ]
         })
@@ -460,6 +465,8 @@ pub fn run_sessions(args: SessionsArgs, _context: AppContext) -> Result<()> {
                 ">Fresh",
                 ">Agt",
                 ">Tasks",
+                ">Active",
+                ">Requests",
                 "Outcome",
                 ">Done",
                 ""
@@ -469,7 +476,7 @@ pub fn run_sessions(args: SessionsArgs, _context: AppContext) -> Result<()> {
     );
     print_footer(&filters);
     println!(
-        "Totals include subagents. h = heuristic label, ? = tentative, ◌ = unclassified, ! = legacy usage rows."
+        "Totals include subagents. Requests count recorded usage events; uncaptured requests are unknown. Done counts supported completions. h = heuristic label, ? = tentative, ◌ = unclassified, ! = legacy usage rows."
     );
     Ok(())
 }
@@ -498,7 +505,7 @@ pub fn run_tasks(args: TasksArgs, _context: AppContext) -> Result<()> {
             .collect::<Result<_>>()?;
         let mut all = explore::tasks(&conn, &filters, TaskSort::Started, 1_000_000)?;
         if args.completed_only {
-            all.retain(|task| task.is_completed());
+            all.retain(|task| task.supported_completed_at.is_some());
         }
         // Composite grouping: key = join of each dimension's key.
         let mut grouped: std::collections::BTreeMap<String, Vec<explore::TaskRow>> =
@@ -573,7 +580,7 @@ pub fn run_tasks(args: TasksArgs, _context: AppContext) -> Result<()> {
     filters.min_cost = filters.min_cost.or(args.filters.min_cost);
     let mut rows = explore::tasks(&conn, &filters, sort, args.filters.limit)?;
     if args.completed_only {
-        rows.retain(|task| task.is_completed());
+        rows.retain(|task| task.supported_completed_at.is_some());
     }
     if args.filters.json {
         return print_json(&rows);
@@ -657,10 +664,23 @@ pub fn run_tasks(args: TasksArgs, _context: AppContext) -> Result<()> {
 
 pub fn run_show(args: ShowArgs, _context: AppContext) -> Result<()> {
     let conn = open()?;
+    let _snapshot = conn.unchecked_transaction()?;
     let (provider, session_id) = resolve_session(&conn, &args.session)?;
     let Some(detail) = explore::session_detail(&conn, &provider, &session_id)? else {
         bail!("session {} not found", args.session);
     };
+    if args.explain {
+        let reports = &detail.investigations;
+        if args.json {
+            return print_json(
+                &serde_json::json!({"schema_version":1,"session":format!("{provider}:{session_id}"),"work":reports}),
+            );
+        }
+        for report in reports {
+            print!("{}", crate::insights::investigation::text(report));
+        }
+        return Ok(());
+    }
     if args.json {
         return print_json(&session_detail_export(&detail)?);
     }
@@ -792,7 +812,7 @@ pub fn run_show(args: ShowArgs, _context: AppContext) -> Result<()> {
                         t.outcome_band.as_deref(),
                     ),
                     fmt::when(t.started_at.as_deref()),
-                    fmt::when(t.completed_at.as_deref()),
+                    fmt::when(t.supported_completion_time().as_deref()),
                     fmt::minutes(t.active_minutes_to_complete.or(t.active_minutes_total)),
                     fmt::usd(t.cost_to_complete.or(t.cost_total)),
                     fmt::usd(t.post_completion_cost),
