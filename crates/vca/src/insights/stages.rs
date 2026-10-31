@@ -138,6 +138,9 @@ pub(crate) fn edit_kind(target: &str) -> EditKind {
         || lower.contains("/var/folders/")
         || lower.contains("/scratchpad/")
         || lower.contains("/.multica/");
+    // Multica's per-issue `workdir` is not a checkout; files at its top are
+    // drafts of what the agent posts back (issue description, reply, caption).
+    let issue_draft = parent.ends_with("/workdir");
     let draft = [
         "reply",
         "comment",
@@ -147,12 +150,16 @@ pub(crate) fn edit_kind(target: &str) -> EditKind {
         "pr_body",
         "commit-msg",
         "commit_msg",
+        "description",
+        "desc_",
+        "desc.",
+        "caption",
     ]
     .iter()
     .any(|cue| file.starts_with(cue));
     if is_test_path(target) {
         EditKind::Test
-    } else if temp || (doc && draft) {
+    } else if temp || (doc && (draft || issue_draft)) {
         EditKind::Scratch
     } else if doc
         && ["plan", "design", "spec", "rfc", "adr"]
@@ -660,6 +667,19 @@ mod tests {
             EditKind::Scratch
         );
         assert_eq!(edit_kind("/repo/comment-body.md"), EditKind::Scratch);
+        assert_eq!(
+            edit_kind("/ws/klik-199/workdir/notes.md"),
+            EditKind::Scratch
+        );
+        assert_eq!(
+            edit_kind("/ws/aicr-60/worktree/description.md"),
+            EditKind::Scratch
+        );
+        assert_eq!(
+            edit_kind("/ws/aicr-60/workdir/repo/docs/guide.md"),
+            EditKind::Doc
+        );
+        assert_eq!(edit_kind("/ws/aicr-60/workdir/main.rs"), EditKind::Source);
         assert_eq!(edit_kind("/repo/docs/guide.md"), EditKind::Doc);
         assert_eq!(edit_kind("/tmp/repo/README.md"), EditKind::Doc);
         assert_eq!(edit_kind("/repo/docs/design-v2.md"), EditKind::PlanDoc);
