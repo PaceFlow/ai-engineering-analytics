@@ -180,6 +180,10 @@ fn usage(id: &str, data: &Value, ts: Option<String>, out: &mut OpenCodeSession) 
     normalized["role"] = json!("assistant");
     if let Some(mut usage) = parse_opencode_usage(&normalized) {
         usage.key = id.into();
+        if ts.is_some() {
+            // A finish time means the tokens are final, zeros included.
+            usage.usage_available = Some(true);
+        }
         usage.timestamp = ts;
         usage.model_name = data
             .pointer("/model/id")

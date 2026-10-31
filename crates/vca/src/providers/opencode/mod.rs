@@ -50,6 +50,8 @@ struct OpenCodeMessage {
 
 #[derive(Debug, Clone, PartialEq)]
 struct OpenCodeUsageEvent {
+    /// Some(true) once the tokens are final; None while they may still be streaming.
+    usage_available: Option<bool>,
     key: String,
     timestamp: Option<String>,
     model_name: Option<String>,
@@ -243,6 +245,7 @@ fn session_record(
         .iter()
         .map(|usage| {
             let mut out = UsageRecord::new(usage.key.clone());
+            out.usage_available = usage.usage_available;
             out.ts = usage.timestamp.clone();
             out.model = usage.model_name.clone();
             out.provider_route = usage.provider_id.clone();
@@ -527,12 +530,20 @@ fn parse_opencode_usage(parsed: &Value) -> Option<OpenCodeUsageEvent> {
             + cached_input_tokens
             + cache_creation_tokens,
     );
+    // OpenCode writes zero tokens while a message streams; only a completed
+    // message's zeros are a measurement.
+    let completed = parsed
+        .get("time")
+        .and_then(|time| time.get("completed"))
+        .is_some_and(|value| !value.is_null());
+    let usage_available = (total_tokens > 0 || completed).then_some(true);
     let actual_cost_usd = parsed
         .get("cost")
         .and_then(Value::as_f64)
         .filter(|value| *value > 0.0);
 
     Some(OpenCodeUsageEvent {
+        usage_available,
         key: String::new(),
         timestamp: None,
         model_name: None,
@@ -918,6 +929,7 @@ mod tests {
         assert_eq!(
             usage,
             OpenCodeUsageEvent {
+                usage_available: Some(true),
                 key: String::new(),
                 timestamp: None,
                 model_name: None,
