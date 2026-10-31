@@ -274,7 +274,7 @@ pub fn csv(report: &daily::Report, cohorts: bool) -> String {
             );
         }
     } else {
-        out.push_str("date,partial,started,active_work,completed,open,bug_work_active,native_tokens,estimated_tokens,reported_cost_usd,api_equivalent_usd,attempts,corrections,work_activity_minutes,prs_opened,prs_merged,prs_deployed,bug_fix_prs_deployed,pending_delivery,available_usage_events,usage_events,work_without_pr,bug_work_started,bug_work_completed,bug_work_verified,bug_work_open,corrective_goal_work,unknown_goal_work,corrective_native_tokens,structured_history_work\n");
+        out.push_str("date,partial,started,active_work,completed,open,bug_work_active,native_tokens,estimated_tokens,reported_cost_usd,api_equivalent_usd,attempts,corrections,work_activity_minutes,prs_opened,prs_merged,prs_deployed,bug_fix_prs_deployed,pending_delivery,available_usage_events,usage_events,work_without_pr,bug_work_started,bug_work_completed,bug_work_verified,bug_work_open,corrective_goal_work,unknown_goal_work,corrective_native_tokens,structured_history_work,open_age_median_minutes,open_age_max_minutes\n");
         for d in &report.days {
             let _ = writeln!(
                 out,

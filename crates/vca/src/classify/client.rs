@@ -533,6 +533,8 @@ mod tests {
             }
             let n = streams.len();
             for stream in streams {
+                // Accepted sockets inherit the listener's non-blocking mode on Windows.
+                stream.set_nonblocking(false).unwrap();
                 stream
                     .set_read_timeout(Some(Duration::from_secs(5)))
                     .unwrap();
