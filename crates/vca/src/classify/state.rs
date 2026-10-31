@@ -200,7 +200,7 @@ fn visible_refs(turn: &TurnFacts, level: Level) -> Vec<Value> {
             .iter()
             .filter(|v| v["type"] == "message")
             .collect();
-        for r in messages.iter().take(2).chain(messages.last().into_iter()) {
+        for r in messages.iter().take(2).chain(messages.last()) {
             if !refs.contains(*r) {
                 refs.push((*r).clone());
             }
