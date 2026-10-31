@@ -516,5 +516,10 @@ fn daily_reports_open_work_age_and_per_model_usage() -> Result<()> {
     assert!(text.contains("open work age at cutoff: median 11.0h · max 14.0h"));
     assert!(text.contains("model model-a (codex) · 2 usage events, 2 measured"));
     assert!(text.contains("API eq $"));
+
+    let csv = vca::commands::daily::csv(&r, false);
+    let mut lines = csv.lines();
+    let header = lines.next().unwrap().split(',').count();
+    assert!(lines.all(|row| row.split(',').count() == header));
     Ok(())
 }
