@@ -530,13 +530,9 @@ fn parse_opencode_usage(parsed: &Value) -> Option<OpenCodeUsageEvent> {
             + cached_input_tokens
             + cache_creation_tokens,
     );
-    // OpenCode writes zero tokens while a message streams; only a completed
-    // message's zeros are a measurement.
-    let completed = parsed
-        .get("time")
-        .and_then(|time| time.get("completed"))
-        .is_some_and(|value| !value.is_null());
-    let usage_available = (total_tokens > 0 || completed).then_some(true);
+    // OpenCode writes zero tokens while a message streams and also on completed
+    // gateway calls whose usage it never recorded, so a zero is not a measurement.
+    let usage_available = (total_tokens > 0).then_some(true);
     let actual_cost_usd = parsed
         .get("cost")
         .and_then(Value::as_f64)
@@ -943,6 +939,19 @@ mod tests {
                 actual_cost_usd: Some(0.0125),
             }
         );
+    }
+
+    #[test]
+    fn completed_zero_token_message_is_not_a_measured_zero() {
+        // Gateway calls finish with zero tokens when OpenCode recorded no usage.
+        let usage = parse_opencode_usage(&json!({
+            "role": "assistant",
+            "providerID": "openrouter",
+            "time": {"created": 1, "completed": 2},
+            "tokens": {"input": 0, "output": 0, "reasoning": 0, "cache": {"read": 0, "write": 0}}
+        }))
+        .expect("usage should parse");
+        assert_eq!(usage.usage_available, None);
     }
 
     #[test]
