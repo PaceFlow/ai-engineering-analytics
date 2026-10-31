@@ -494,7 +494,7 @@ pub fn task_state(
             "evidence": evidence,
             "transcript": transcript,
             "request_policy": super::request::VERSION,
-            "request_extraction": selected.iter().map(|t| { let r=super::request::normalize(&t.user); json!({"turn":t.index,"speaker":r.speaker,"extraction":r.extraction}) }).collect::<Vec<_>>(),
+            "request_extraction": selected.iter().map(|t| { let r=super::request::normalize(&t.user); json!({"turn":t.index,"speaker":r.speaker,"extraction":r.extraction,"stripped":r.stripped}) }).collect::<Vec<_>>(),
         })
     };
 
