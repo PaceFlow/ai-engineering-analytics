@@ -527,6 +527,7 @@ fn parse_session(path: &PathBuf) -> Result<Option<SessionRecord>> {
                                 lines_added: change.1,
                                 lines_removed: change.2,
                                 ts: ts.clone(),
+                                line_hashes: Vec::new(),
                             });
                         }
                         let target = if name
@@ -771,6 +772,7 @@ fn push_completed_item(
                             lines_added: added,
                             lines_removed: removed,
                             ts: ended.clone(),
+                            line_hashes: Vec::new(),
                         });
                     }
                 }

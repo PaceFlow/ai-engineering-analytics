@@ -15,7 +15,7 @@ use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension, params};
 
 /// Bump when parsers start extracting new facts so existing sources are re-read.
-pub const SESSION_INGEST_VERSION: i64 = 5;
+pub const SESSION_INGEST_VERSION: i64 = 6;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentKind {
@@ -158,6 +158,8 @@ pub struct AcceptedChangeRecord {
     pub lines_added: i64,
     pub lines_removed: i64,
     pub ts: Option<String>,
+    /// Added/removed line hashes when the provider records edit content.
+    pub line_hashes: Vec<crate::change_intel::types::LineHashCount>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -638,6 +640,13 @@ fn store_session_record_inner(conn: &Connection, record: &SessionRecord) -> Resu
             params![provider, session_id],
         )?;
     }
+    // Foreign keys are not enforced, so remove the line hashes explicitly.
+    conn.execute(
+        "DELETE FROM fact_session_code_change_line_hashes WHERE code_change_id IN (
+            SELECT id FROM fact_session_code_change
+            WHERE provider = ?1 AND session_id = ?2 AND source_kind = 'accepted_change')",
+        params![provider, session_id],
+    )?;
     conn.execute(
         "DELETE FROM fact_session_code_change
          WHERE provider = ?1 AND session_id = ?2 AND source_kind = 'accepted_change'",
@@ -838,17 +847,19 @@ fn store_session_record_inner(conn: &Connection, record: &SessionRecord) -> Resu
         ])?;
     }
 
+    let mut dirty_by_repo: std::collections::BTreeMap<String, std::collections::BTreeSet<_>> =
+        Default::default();
     for change in &record.accepted_changes {
-        super::ingest_accepted_code_change(
-            conn,
-            provider,
-            session_id,
-            &change.abs_path,
-            change.lines_added,
-            change.lines_removed,
-            change.ts.as_deref(),
-        )?;
+        let repo_root = super::ingest_accepted_code_change(conn, provider, session_id, change)?;
+        if let Some(repo_root) = repo_root {
+            dirty_by_repo.entry(repo_root).or_default().extend(
+                crate::change_intel::storage::dirty_hash_keys(&change.line_hashes),
+            );
+        }
         written += 1;
+    }
+    for (repo_root, hashes) in dirty_by_repo {
+        crate::change_intel::storage::mark_hashes_dirty(conn, &repo_root, &hashes)?;
     }
 
     // Accepted-change helpers can enrich metadata with an edited path. The source
@@ -1010,6 +1021,34 @@ mod tests {
         )?;
         assert_eq!(usage_rows, 2);
         assert_eq!(message_rows, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn accepted_change_line_hashes_are_stored_and_replaced() -> Result<()> {
+        let conn = Connection::open_in_memory()?;
+        init_app_schema(&conn)?;
+        let mut record = SessionRecord::new("opencode", "s1");
+        record.started_at = Some("2026-01-01T00:00:00Z".into());
+        record.accepted_changes.push(AcceptedChangeRecord {
+            abs_path: "/repo/src/lib.rs".into(),
+            lines_added: 2,
+            lines_removed: 0,
+            ts: None,
+            line_hashes: crate::change_intel::line_hash::hashes_for_text(
+                "first\nsecond\n",
+                crate::change_intel::types::LineSide::Added,
+            ),
+        });
+        store_session_record(&conn, &record)?;
+        store_session_record(&conn, &record)?;
+
+        let hashes: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM fact_session_code_change_line_hashes",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(hashes, 2);
         Ok(())
     }
 

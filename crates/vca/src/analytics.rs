@@ -4034,19 +4034,20 @@ fn load_commit_removed_hashes(conn: &Connection, repo_root: &str) -> Result<Comm
 }
 
 fn load_session_added_availability(conn: &Connection, repo_root: &str) -> Result<PathHashCounts> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare(&format!(
         "SELECT rel_path, line_hash, SUM(provider_max) AS avail_total
          FROM (
             SELECT co.rel_path AS rel_path, hol.line_hash AS line_hash, co.provider AS provider, MAX(hol.count) AS provider_max
             FROM fact_session_code_change co
             CROSS JOIN fact_session_code_change_line_hashes hol ON hol.code_change_id = co.id
-            WHERE co.repo_root = ?1
+            WHERE co.repo_root IN ({})
               AND co.rel_path IS NOT NULL
               AND hol.side = '+'
             GROUP BY co.rel_path, hol.line_hash, co.provider
          )
          GROUP BY rel_path, line_hash",
-    )?;
+        crate::change_intel::storage::SAME_REPOSITORY_ROOTS
+    ))?;
     let rows = stmt.query_map(params![repo_root], |row| {
         Ok((
             row.get::<_, String>(0)?,

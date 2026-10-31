@@ -646,6 +646,7 @@ fn build_session_record(
             lines_added: edit.added_lines,
             lines_removed: edit.removed_lines,
             ts: edit.timestamp.clone().or(timestamp.clone()),
+            line_hashes: Vec::new(),
         });
     }
 
@@ -673,6 +674,7 @@ fn build_session_record(
                 lines_added,
                 lines_removed,
                 ts: timestamp.clone(),
+                line_hashes: Vec::new(),
             });
         }
     }
@@ -686,6 +688,7 @@ fn build_session_record(
             lines_added: added,
             lines_removed: removed,
             ts: timestamp.clone(),
+            line_hashes: Vec::new(),
         });
     }
 

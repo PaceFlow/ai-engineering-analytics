@@ -50,6 +50,37 @@ pub fn hashes_for_text(text: &str, side: LineSide) -> Vec<LineHashCount> {
         .collect()
 }
 
+/// Hashes the added and removed lines inside a unified diff's hunks; file headers are skipped.
+pub fn hashes_for_unified_patch(patch: &str) -> Vec<LineHashCount> {
+    let mut counts: HashMap<(LineSide, String), i64> = HashMap::new();
+    let mut in_hunk = false;
+    for line in patch.lines() {
+        if line.starts_with("@@") {
+            in_hunk = true;
+            continue;
+        }
+        if !in_hunk {
+            continue;
+        }
+        let (side, content) = if let Some(content) = line.strip_prefix('+') {
+            (LineSide::Added, content)
+        } else if let Some(content) = line.strip_prefix('-') {
+            (LineSide::Removed, content)
+        } else {
+            continue;
+        };
+        *counts.entry((side, hash_line(content))).or_insert(0) += 1;
+    }
+    counts
+        .into_iter()
+        .map(|((side, line_hash), count)| LineHashCount {
+            side,
+            line_hash,
+            count,
+        })
+        .collect()
+}
+
 pub fn diff_with_hashes(before: &str, after: &str) -> DiffSummary {
     let mut added = 0i64;
     let mut removed = 0i64;
