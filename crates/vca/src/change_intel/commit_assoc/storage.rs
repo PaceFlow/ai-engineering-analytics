@@ -42,6 +42,49 @@ pub fn min_ai_timestamp(conn: &Connection, repo_root: &str) -> Result<Option<Str
     .map_err(Into::into)
 }
 
+/// Directories directly under `repo_root` that hold recorded edits.
+pub fn first_path_segments(conn: &Connection, repo_root: &str) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT substr(rel_path, 1, instr(rel_path, '/') - 1)
+         FROM fact_session_code_change
+         WHERE repo_root = ?1 AND instr(rel_path, '/') > 1",
+    )?;
+    let segments = stmt
+        .query_map(params![repo_root], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(segments
+        .into_iter()
+        .filter(|segment| segment != "." && segment != "..")
+        .collect())
+}
+
+/// Moves edits recorded under `from_root` at `prefix/…` to `prefix`'s repository at
+/// `to_root`, dropping the prefix, and returns their line-hash keys for re-matching.
+pub fn rehome_prefixed_edits(
+    conn: &Connection,
+    from_root: &str,
+    prefix: &str,
+    to_root: &str,
+) -> Result<BTreeSet<(String, String)>> {
+    let pattern = format!("{}/%", prefix.replace('%', "\\%").replace('_', "\\_"));
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT h.side, h.line_hash
+         FROM fact_session_code_change c
+         JOIN fact_session_code_change_line_hashes h ON h.code_change_id = c.id
+         WHERE c.repo_root = ?1 AND c.rel_path LIKE ?2 ESCAPE '\\'",
+    )?;
+    let hashes = stmt
+        .query_map(params![from_root, pattern], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<BTreeSet<(String, String)>>>()?;
+    conn.execute(
+        "UPDATE fact_session_code_change
+         SET repo_root = ?3, rel_path = substr(rel_path, length(?4) + 2)
+         WHERE repo_root = ?1 AND rel_path LIKE ?2 ESCAPE '\\'",
+        params![from_root, pattern, to_root, prefix],
+    )?;
+    Ok(hashes)
+}
+
 /// Moves a worktree's stored commits under its repository's shared root, dropping copies the
 /// shared root already has. Commits only the worktree saw, such as ones on since-deleted
 /// branches, are kept; their line hashes are returned so they can be matched again there.

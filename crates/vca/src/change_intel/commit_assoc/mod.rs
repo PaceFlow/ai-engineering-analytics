@@ -1,7 +1,7 @@
 use anyhow::Result;
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use rusqlite::{Connection, TransactionBehavior};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 pub mod git_scan;
 pub mod matcher;
@@ -39,8 +39,17 @@ pub fn run(conn: &mut Connection, verbose: bool) -> Result<AssociationSummary> {
 pub fn plan(conn: &Connection) -> Result<AssociationWorkPlan> {
     let mut repo_plans = Vec::new();
     let mut shared: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
+    let mut tops = BTreeMap::new();
     for repo_root in list_repo_roots_from_session_facts(conn)? {
-        let located = validate_git_repo(&repo_root).and_then(|top| match top {
+        let top = validate_git_repo(&repo_root);
+        tops.insert(repo_root, top);
+    }
+    if rehome_vanished_checkouts(conn, &tops)? {
+        let roots = list_repo_roots_from_session_facts(conn)?;
+        tops.retain(|root, _| roots.contains(root));
+    }
+    for (repo_root, top) in tops {
+        let located = top.and_then(|top| match top {
             Some(top) => Ok(shared_repository_root(&repo_root)?.map(|root| (top, root))),
             None => Ok(None),
         });
@@ -64,6 +73,53 @@ pub fn plan(conn: &Connection) -> Result<AssociationWorkPlan> {
         repo_plans.push(plan_repo(conn, repo_root, absorbed_roots)?);
     }
     Ok(AssociationWorkPlan { repo_plans })
+}
+
+/// Agents that work in a scratch directory check repositories out beneath it (`dir/<repo>/…`)
+/// and the checkout is often deleted before ingestion, leaving edits under the non-git
+/// directory. Edits whose first path segment names exactly one known repository move to
+/// that repository; matching still requires their lines to appear in a commit.
+fn rehome_vanished_checkouts(
+    conn: &Connection,
+    tops: &BTreeMap<String, Result<Option<String>>>,
+) -> Result<bool> {
+    let mut by_name: BTreeMap<String, BTreeSet<(String, String)>> = BTreeMap::new();
+    for (root, top) in tops {
+        if !matches!(top, Ok(Some(_))) {
+            continue;
+        }
+        let canonical = observation::canonical_repo(conn, root)?;
+        let name = canonical
+            .rsplit(['/', ':'])
+            .next()
+            .unwrap_or("")
+            .trim_end_matches(".git");
+        if !name.is_empty() {
+            by_name
+                .entry(name.to_owned())
+                .or_default()
+                .insert((canonical.clone(), root.clone()));
+        }
+    }
+    let mut moved_any = false;
+    for (root, top) in tops {
+        if !matches!(top, Ok(None)) {
+            continue;
+        }
+        for prefix in storage::first_path_segments(conn, root)? {
+            let Some(targets) = by_name.get(&prefix) else {
+                continue;
+            };
+            let canonicals: BTreeSet<&String> = targets.iter().map(|(c, _)| c).collect();
+            let Some((_, target)) = targets.first().filter(|_| canonicals.len() == 1) else {
+                continue;
+            };
+            let hashes = storage::rehome_prefixed_edits(conn, root, &prefix, target)?;
+            change_storage::mark_hashes_dirty(conn, target, &hashes)?;
+            moved_any = true;
+        }
+    }
+    Ok(moved_any)
 }
 
 /// Worktrees share their repository's branches, so each repository is scanned once at its
@@ -660,6 +716,66 @@ mod tests {
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
             .collect::<rusqlite::Result<_>>()?;
         assert_eq!(matched, [("s1".to_string(), "add lib".to_string())]);
+        Ok(())
+    }
+
+    #[test]
+    fn edits_in_a_deleted_checkout_match_the_repository_it_was_named_after() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let repo = dir.path().join("app");
+        std::fs::create_dir(&repo)?;
+        git(&repo, &["init", "-q", "-b", "main"]);
+        std::fs::write(repo.join("README"), "start\n")?;
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-q", "-m", "start"]);
+        let content = "fn alpha() {}\nfn beta() {}\nfn gamma() {}\n";
+        std::fs::write(repo.join("lib.rs"), content)?;
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-q", "-m", "add lib"]);
+
+        let root = validate_git_repo(repo.to_str().unwrap())?.unwrap();
+        let gone = dir.path().join("issue").join("workdir");
+        let gone = gone.to_str().unwrap();
+        let mut conn = Connection::open_in_memory()?;
+        crate::db::init_app_schema(&conn)?;
+        let edited = (Utc::now() - Duration::hours(1)).to_rfc3339();
+        for (session, edit_root, rel_path, text) in [
+            ("s1", root.as_str(), "README", "start\n"),
+            ("s2", gone, "app/lib.rs", content),
+            ("s2", gone, "reply.md", "Done.\n"),
+        ] {
+            conn.execute(
+                "INSERT INTO fact_session_code_change (provider, session_id, source_kind, repo_root, rel_path, change_ts)
+                 VALUES ('opencode', ?1, 'accepted_change', ?2, ?3, ?4)",
+                params![session, edit_root, rel_path, edited],
+            )?;
+            let change_id = conn.last_insert_rowid();
+            for hash in hashes_for_text(text, LineSide::Added) {
+                conn.execute(
+                    "INSERT INTO fact_session_code_change_line_hashes VALUES (?1, '+', ?2, ?3)",
+                    params![change_id, hash.line_hash, hash.count],
+                )?;
+            }
+        }
+        let work = plan(&conn)?;
+        run_with_plan(&mut conn, &work, false, None)?;
+
+        let edits: Vec<(String, String)> = conn
+            .prepare("SELECT repo_root, rel_path FROM fact_session_code_change WHERE session_id = 's2' ORDER BY rel_path")?
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        assert_eq!(
+            edits,
+            [
+                (root.clone(), "lib.rs".to_string()),
+                (gone.to_string(), "reply.md".to_string()),
+            ]
+        );
+        let matched: Vec<String> = conn
+            .prepare("SELECT c.subject FROM fact_commit_session_match m JOIN fact_commit c USING (repo_root, commit_sha) WHERE m.session_id = 's2' AND m.matched_lines > 0")?
+            .query_map([], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        assert_eq!(matched, ["add lib"]);
         Ok(())
     }
 
