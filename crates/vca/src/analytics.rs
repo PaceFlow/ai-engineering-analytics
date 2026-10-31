@@ -3716,7 +3716,7 @@ fn format_elapsed(elapsed_ms: u128) -> String {
     format!("{:.1}s", elapsed_ms as f64 / 1000.0)
 }
 
-fn resolve_mainline_ref(repo_root: &str) -> Result<Option<String>> {
+pub(crate) fn resolve_mainline_ref(repo_root: &str) -> Result<Option<String>> {
     if let Some(head_ref) = resolve_origin_head_ref(repo_root)?
         && git_ref_exists(repo_root, &head_ref)?
     {

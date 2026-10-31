@@ -19,9 +19,9 @@ use git_scan::{
 };
 use matcher::{compute_commit_attribution, preload_repo_match_data};
 use storage::{
-    insert_commit_assoc_error, list_cached_commit_shas, list_dirty_cached_commit_shas,
-    list_repo_roots_from_session_facts, load_cached_commit_diff, min_ai_timestamp,
-    remove_duplicate_worktree_commits, upsert_commit_attribution, upsert_commit_task_attribution,
+    absorb_worktree_commits, insert_commit_assoc_error, list_cached_commit_shas,
+    list_dirty_cached_commit_shas, list_repo_roots_from_session_facts, load_cached_commit_diff,
+    min_ai_timestamp, upsert_commit_attribution, upsert_commit_task_attribution,
     upsert_git_commit_with_diffs,
 };
 use task_matcher::{RepoBranchContext, attribute_commit_to_task, load_repo_branch_context};
@@ -91,6 +91,22 @@ fn choose_scan_roots(
         scan_roots.push((scan_root, absorbed));
     }
     observation::requeue_changed_aliases(conn, &before)?;
+    for (scan_root, absorbed) in &scan_roots {
+        for worktree_root in absorbed {
+            conn.execute_batch("SAVEPOINT absorb_worktree")?;
+            // The worktree itself is no longer scanned, so it keeps no queue of its own.
+            let moved = absorb_worktree_commits(conn, worktree_root, scan_root)
+                .and_then(|hashes| change_storage::mark_hashes_dirty(conn, scan_root, &hashes))
+                .and_then(|()| change_storage::clear_dirty_hashes(conn, worktree_root));
+            match moved {
+                Ok(()) => conn.execute_batch("RELEASE absorb_worktree")?,
+                Err(error) => {
+                    conn.execute_batch("ROLLBACK TO absorb_worktree; RELEASE absorb_worktree")?;
+                    return Err(error);
+                }
+            }
+        }
+    }
     Ok(scan_roots)
 }
 
@@ -262,7 +278,6 @@ pub fn run_with_plan(
         }
 
         if !should_process_repo(repo_plan) {
-            remove_absorbed_duplicates(conn, repo_plan)?;
             if let Some(observer) = progress.as_mut() {
                 observer.advance(&format!("{} warmup skipped", repo_root));
             }
@@ -289,27 +304,11 @@ pub fn run_with_plan(
                 &err.to_string(),
             )?;
         }
-        remove_absorbed_duplicates(conn, repo_plan)?;
 
         summary.repo_summaries.push(repo_summary);
     }
 
     Ok(summary)
-}
-
-fn remove_absorbed_duplicates(
-    conn: &mut Connection,
-    repo_plan: &RepoAssociationPlan,
-) -> Result<()> {
-    if repo_plan.absorbed_roots.is_empty() {
-        return Ok(());
-    }
-    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    for worktree_root in &repo_plan.absorbed_roots {
-        remove_duplicate_worktree_commits(&tx, worktree_root, &repo_plan.repo_root)?;
-    }
-    tx.commit()?;
-    Ok(())
 }
 
 fn determine_commit_scope(repo_root: &str, ai_min_ts: &str) -> Result<Vec<String>> {
@@ -628,23 +627,21 @@ mod tests {
                 params![change_id, hash.line_hash, hash.count],
             )?;
         }
-        // Copies kept from when the worktree was scanned on its own: one of a commit the
-        // repository still has, one of a commit from a since-deleted branch.
-        let head = std::process::Command::new("git")
-            .arg("-C")
-            .arg(&worktree)
-            .args(["rev-parse", "HEAD"])
-            .output()?;
-        let head = String::from_utf8(head.stdout)?.trim().to_string();
-        for (sha, subject) in [(head.as_str(), "add lib"), ("gone", "deleted branch")] {
-            conn.execute(
-                "INSERT INTO fact_commit (repo_root, commit_sha, commit_time, subject) VALUES (?1, ?2, ?3, ?4)",
-                params![worktree_root, sha, edited, subject],
-            )?;
-        }
-
-        let plan = plan(&conn)?;
-        run_with_plan(&mut conn, &plan, false, None)?;
+        // A commit from a since-deleted branch, kept from when the worktree was scanned alone.
+        conn.execute(
+            "INSERT INTO fact_commit (repo_root, commit_sha, commit_time, subject) VALUES (?1, 'gone', ?2, 'deleted branch')",
+            params![worktree_root, edited],
+        )?;
+        let work = plan(&conn)?;
+        run_with_plan(&mut conn, &work, false, None)?;
+        // A worktree copy of a commit the shared root already holds.
+        conn.execute(
+            "INSERT INTO fact_commit (repo_root, commit_sha, commit_time, subject)
+             SELECT ?1, commit_sha, commit_time, subject FROM fact_commit WHERE subject = 'add lib'",
+            params![worktree_root],
+        )?;
+        let work = plan(&conn)?;
+        run_with_plan(&mut conn, &work, false, None)?;
 
         let commits: Vec<(String, String)> = conn
             .prepare("SELECT repo_root, subject FROM fact_commit ORDER BY subject")?
@@ -654,7 +651,7 @@ mod tests {
             commits,
             [
                 (main_root.clone(), "add lib".to_string()),
-                (worktree_root, "deleted branch".to_string()),
+                (main_root.clone(), "deleted branch".to_string()),
                 (main_root, "start".to_string()),
             ]
         );

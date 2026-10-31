@@ -1,6 +1,6 @@
 use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension, params};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::change_intel::storage::SAME_REPOSITORY_ROOTS;
 use crate::change_intel::types::{LineHashCount, LineSide};
@@ -42,13 +42,14 @@ pub fn min_ai_timestamp(conn: &Connection, repo_root: &str) -> Result<Option<Str
     .map_err(Into::into)
 }
 
-/// Drops a worktree's copies of commits now stored under its repository's shared root.
-/// Commits only the worktree saw, such as ones on since-deleted branches, are kept.
-pub fn remove_duplicate_worktree_commits(
+/// Moves a worktree's stored commits under its repository's shared root, dropping copies the
+/// shared root already has. Commits only the worktree saw, such as ones on since-deleted
+/// branches, are kept; their line hashes are returned so they can be matched again there.
+pub fn absorb_worktree_commits(
     conn: &Connection,
     worktree_root: &str,
     scan_root: &str,
-) -> Result<()> {
+) -> Result<BTreeSet<(String, String)>> {
     const SHARED: &str = "commit_sha IN (SELECT commit_sha FROM fact_commit WHERE repo_root = ?2)";
     conn.execute(
         &format!(
@@ -57,18 +58,32 @@ pub fn remove_duplicate_worktree_commits(
         ),
         params![worktree_root, scan_root],
     )?;
-    for table in [
+    let tables = [
         "fact_commit_file_change",
         "fact_commit_session_match",
         "fact_task_commit_assignment",
         "fact_commit",
-    ] {
+    ];
+    for table in tables {
         conn.execute(
             &format!("DELETE FROM {table} WHERE repo_root = ?1 AND {SHARED}"),
             params![worktree_root, scan_root],
         )?;
     }
-    Ok(())
+    let hashes = conn
+        .prepare(
+            "SELECT DISTINCT h.side, h.line_hash FROM fact_commit_file_change_line_hashes h
+             JOIN fact_commit_file_change f ON f.id = h.file_change_id WHERE f.repo_root = ?1",
+        )?
+        .query_map(params![worktree_root], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    for table in tables {
+        conn.execute(
+            &format!("UPDATE {table} SET repo_root = ?2 WHERE repo_root = ?1"),
+            params![worktree_root, scan_root],
+        )?;
+    }
+    Ok(hashes)
 }
 
 pub fn upsert_git_commit_with_diffs(
