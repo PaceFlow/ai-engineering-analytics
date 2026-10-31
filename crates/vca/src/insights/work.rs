@@ -131,6 +131,18 @@ pub struct WorkItem {
     pub execution_outcomes: Vec<ExecutionOutcome>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub pull_requests: Vec<super::delivery::PrEvidence>,
+    /// Commits are delivery evidence kept beside completion; they never complete the goal.
+    pub code: CodeOutcome,
+}
+/// How far the goal's committed code got.
+#[derive(Debug, Clone, Default, Serialize, PartialEq)]
+pub struct CodeOutcome {
+    pub commits: usize,
+    pub landed_commits: usize,
+    pub reverted_commits: usize,
+    pub first_committed_at: Option<i64>,
+    /// When the last landed commit reached the mainline.
+    pub last_landed_at: Option<i64>,
 }
 impl WorkItem {
     pub fn cycle_minutes(&self) -> Option<f64> {
@@ -616,6 +628,7 @@ pub fn items(conn: &Connection) -> Result<Vec<WorkItem>> {
             observed_activity: false,
             execution_outcomes: vec![],
             pull_requests: vec![],
+            code: CodeOutcome::default(),
         };
         for member in &members {
             let t = &member.task;
@@ -716,6 +729,32 @@ pub fn items(conn: &Connection) -> Result<Vec<WorkItem>> {
         work.members = members;
         result.push(work);
     }
+    let code = code_outcomes(conn)?;
+    for work in &mut result {
+        let shas: BTreeSet<&String> = work
+            .members
+            .iter()
+            .filter_map(|m| code.members.get(&m.id))
+            .flatten()
+            .collect();
+        for sha in shas {
+            let Some(commit) = code.commits.get(sha) else {
+                continue;
+            };
+            let outcome = &mut work.code;
+            outcome.commits += 1;
+            outcome.first_committed_at = outcome
+                .first_committed_at
+                .into_iter()
+                .chain(commit.committed_at)
+                .min();
+            if let Some(landed) = commit.landed_at {
+                outcome.landed_commits += 1;
+                outcome.last_landed_at = outcome.last_landed_at.max(Some(landed));
+            }
+            outcome.reverted_commits += usize::from(commit.reverted);
+        }
+    }
     let prs = super::delivery::evidence(conn)?;
     for work in &mut result {
         work.pull_requests = prs
@@ -730,6 +769,43 @@ pub fn items(conn: &Connection) -> Result<Vec<WorkItem>> {
     }
     result.sort_by_key(|a| std::cmp::Reverse(a.started_at));
     Ok(result)
+}
+struct CommitOutcome {
+    committed_at: Option<i64>,
+    landed_at: Option<i64>,
+    reverted: bool,
+}
+struct CodeOutcomes {
+    members: BTreeMap<String, Vec<String>>,
+    commits: BTreeMap<String, CommitOutcome>,
+}
+/// A commit stored for several clones counts once, landed if any clone saw it reach mainline.
+fn code_outcomes(conn: &Connection) -> Result<CodeOutcomes> {
+    let mut members: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (member, sha) in super::delivery::commit_members(conn)? {
+        members.entry(member).or_default().push(sha);
+    }
+    let mut q = conn.prepare(
+        "SELECT commit_sha, MIN(commit_time),
+                MIN(CASE WHEN merged_to_mainline_flag = 1 THEN COALESCE(mainline_reached_at, commit_time) END),
+                MAX(reverted_later_flag)
+         FROM event_commit_outcome GROUP BY commit_sha",
+    )?;
+    let commits = q
+        .query_map([], |r| {
+            let committed: Option<String> = r.get(1)?;
+            let landed: Option<String> = r.get(2)?;
+            Ok((
+                r.get::<_, String>(0)?,
+                CommitOutcome {
+                    committed_at: committed.as_deref().and_then(parse_ts),
+                    landed_at: landed.as_deref().and_then(parse_ts),
+                    reverted: r.get::<_, i64>(3)? != 0,
+                },
+            ))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(CodeOutcomes { members, commits })
 }
 fn load_usage(conn: &Connection, t: &TaskRow) -> Result<Vec<Usage>> {
     let mut stmt=conn.prepare("SELECT d.usage_ts,d.provider,d.model_name,u.input_tokens,u.cache_creation_tokens,u.cached_input_tokens,u.output_tokens,

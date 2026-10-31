@@ -416,6 +416,22 @@ fn envelope<T: serde::Serialize>(
         serde_json::json!({"schema_version":1,"metric_version":trends::METRIC_VERSION,"data_cutoff":chrono::Utc::now().to_rfc3339(),"timezone":tz.name(),"scope":scope,"period_boundaries":null,"provenance":{"classification_version":crate::classify::questions::QUESTION_SET_VERSION},"coverage":{"saved_decisions_needing_review":review_decisions},"warnings":warning.into_iter().collect::<Vec<_>>(),"data":data}),
     )
 }
+/// Landing is reported next to the goal's state, never in place of it.
+fn code_status(code: &work::CodeOutcome) -> String {
+    if code.commits == 0 {
+        return String::new();
+    }
+    let reverted = if code.reverted_commits > 0 {
+        format!(", {} reverted", code.reverted_commits)
+    } else {
+        String::new()
+    };
+    format!(
+        "{}/{} commits landed{} · ",
+        code.landed_commits, code.commits, reverted
+    )
+}
+
 pub fn run_work(args: WorkArgs) -> Result<()> {
     let conn = crate::db::open()?;
     let scope = args.scope.scope()?;
@@ -433,12 +449,13 @@ pub fn run_work(args: WorkArgs) -> Result<()> {
             } else {
                 for w in rows {
                     println!(
-                        "{} {} · {} · {} chats · {} min · {}",
+                        "{} {} · {} · {} chats · {} min · {}{}",
                         w.id,
                         w.state,
                         w.intent,
                         w.conversations,
                         num(w.cycle_minutes()),
+                        code_status(&w.code),
                         w.title
                     );
                 }
