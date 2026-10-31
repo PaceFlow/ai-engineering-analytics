@@ -175,6 +175,7 @@ pub fn run_for(verbose: bool, args: IngestArgs, context: crate::app::AppContext)
     if verbose {
         println!("\nAssociating commits ...");
     }
+    crate::insights::observation::record_repository_aliases(&db)?;
     let association_plan = commit_assoc::plan(&db)?;
     progress.replace_future_units(
         execution_plan.association_units_estimate,

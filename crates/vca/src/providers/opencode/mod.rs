@@ -6,6 +6,8 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use crate::change_intel::line_hash::{hashes_for_text, hashes_for_unified_patch};
+use crate::change_intel::types::{LineHashCount, LineSide};
 use crate::db::session_store::{
     self, AcceptedChangeRecord, AgentKind, ContextInjectionRecord, MessageRecord, RepositoryHint,
     SessionEventRecord, SessionRecord, ToolCallRecord, UsageRecord,
@@ -68,6 +70,8 @@ struct OpenCodeAcceptedChange {
     removed_lines: i64,
     /// When the edit happened; session diffs only have the session end.
     ts: Option<String>,
+    /// Lets commit association match the edit to committed lines.
+    line_hashes: Vec<LineHashCount>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -261,6 +265,7 @@ fn session_record(
             lines_added: change.added_lines,
             lines_removed: change.removed_lines,
             ts: change.ts.or_else(|| change_ts.clone()),
+            line_hashes: change.line_hashes,
         })
         .collect();
     record.model = record
@@ -615,11 +620,8 @@ fn edits_from_tool_part(
     let state = part.get("state").unwrap_or(&Value::Null);
     let meta = state.get("metadata").unwrap_or(&Value::Null);
     let change = |file: &str, entry: &Value| {
-        let counted = entry
-            .get("patch")
-            .and_then(Value::as_str)
-            .map(count_unified_patch_lines)
-            .unwrap_or((0, 0));
+        let patch = entry.get("patch").and_then(Value::as_str);
+        let counted = patch.map(count_unified_patch_lines).unwrap_or((0, 0));
         let int = |key: &str| entry.get(key).and_then(Value::as_i64);
         let (added, removed) = (
             int("additions").unwrap_or(counted.0),
@@ -632,6 +634,7 @@ fn edits_from_tool_part(
             added_lines: added,
             removed_lines: removed,
             ts: ts.clone(),
+            line_hashes: patch.map(hashes_for_unified_patch).unwrap_or_default(),
         })
     };
     let text = |value: &Value, key: &str| value.get(key).and_then(Value::as_str).map(str::to_owned);
@@ -673,11 +676,8 @@ fn edits_from_tool_part(
         // The previous content is not stored; count the written lines as added.
         Some("write") => {
             let input = state.get("input").unwrap_or(&Value::Null);
-            let lines = input
-                .get("content")
-                .and_then(Value::as_str)
-                .map(|content| content.lines().count() as i64)
-                .unwrap_or(0);
+            let content = input.get("content").and_then(Value::as_str).unwrap_or("");
+            let lines = content.lines().count() as i64;
             text(input, "filePath")
                 .or_else(|| text(input, "path"))
                 .or_else(|| text(input, "file_path"))
@@ -689,6 +689,7 @@ fn edits_from_tool_part(
                     added_lines: lines,
                     removed_lines: 0,
                     ts: ts.clone(),
+                    line_hashes: hashes_for_text(content, LineSide::Added),
                 })
                 .into_iter()
                 .collect()
@@ -843,6 +844,7 @@ fn parse_accepted_changes(
             added_lines,
             removed_lines,
             ts: None,
+            line_hashes: hashes_for_unified_patch(&entry.patch),
         });
     }
 

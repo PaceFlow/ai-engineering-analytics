@@ -132,8 +132,9 @@ pub fn set_alias(conn: &Connection, alias: &str, canonical: &str, source: &str) 
     Ok(())
 }
 
-/// Called inside the insight refresh savepoint. Readers see one complete generation.
-pub fn publish(conn: &Connection) -> Result<()> {
+/// Maps worktrees and clones to their canonical repository from git remotes and
+/// provider-recorded project roots. Commit association runs it before matching.
+pub fn record_repository_aliases(conn: &Connection) -> Result<()> {
     let roots = conn
         .prepare("SELECT repo_root FROM metadata_repositories")?
         .query_map([], |r| r.get::<_, String>(0))?
@@ -152,6 +153,12 @@ pub fn publish(conn: &Connection) -> Result<()> {
             set_alias(conn, &alias, &target, "provider")?;
         }
     }
+    Ok(())
+}
+
+/// Called inside the insight refresh savepoint. Readers see one complete generation.
+pub fn publish(conn: &Connection) -> Result<()> {
+    record_repository_aliases(conn)?;
     conn.execute("INSERT OR IGNORE INTO usage_measurement SELECT provider,session_id,usage_key,CASE WHEN total_tokens>0 THEN CASE WHEN token_source='reported' THEN 'native' ELSE 'estimated' END ELSE 'suspect_zero' END,'retained_fact' FROM fact_session_usage WHERE usage_key IS NOT NULL",[])?;
     let items = super::work::items(conn)?;
     conn.execute("DELETE FROM derived_work_index_member", [])?;

@@ -3,6 +3,7 @@ use rusqlite::{Connection, params};
 use std::collections::HashMap;
 
 use crate::change_intel::lockfiles::is_lock_file;
+use crate::change_intel::storage::SAME_REPOSITORY_ROOTS;
 use crate::change_intel::types::LineSide;
 
 use super::types::{CommitAttribution, GitCommitDiff, SessionAttributionRow};
@@ -370,16 +371,16 @@ fn load_session_availability_map(
     conn: &Connection,
     repo_root: &str,
 ) -> Result<HashMap<SessionAvailabilityKey, Vec<SessionAvailability>>> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare(&format!(
         "SELECT co.rel_path, hol.side, hol.line_hash, co.provider, co.session_id, MAX(hol.count) AS avail,
                 MIN(ms.started_at)
          FROM fact_session_code_change co
          CROSS JOIN fact_session_code_change_line_hashes hol ON hol.code_change_id = co.id
          LEFT JOIN metadata_sessions ms ON ms.provider = co.provider AND ms.session_id = co.session_id
-         WHERE co.repo_root = ?1
+         WHERE co.repo_root IN ({SAME_REPOSITORY_ROOTS})
            AND co.rel_path IS NOT NULL
-         GROUP BY co.rel_path, hol.side, hol.line_hash, co.provider, co.session_id",
-    )?;
+         GROUP BY co.rel_path, hol.side, hol.line_hash, co.provider, co.session_id"
+    ))?;
 
     let rows = stmt.query_map(params![repo_root], |row| {
         Ok((
@@ -413,14 +414,14 @@ fn load_alias_candidate_map(
     conn: &Connection,
     repo_root: &str,
 ) -> Result<HashMap<AliasCandidateKey, Vec<(String, i64)>>> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare(&format!(
         "SELECT co.rel_path, hol.side, hol.line_hash, MAX(hol.count) AS avail
          FROM fact_session_code_change co
          JOIN fact_session_code_change_line_hashes hol ON hol.code_change_id = co.id
-         WHERE co.repo_root = ?1
+         WHERE co.repo_root IN ({SAME_REPOSITORY_ROOTS})
            AND co.rel_path IS NOT NULL
-         GROUP BY co.rel_path, hol.side, hol.line_hash",
-    )?;
+         GROUP BY co.rel_path, hol.side, hol.line_hash"
+    ))?;
 
     let rows = stmt.query_map(params![repo_root], |row| {
         Ok((
@@ -522,6 +523,38 @@ mod tests {
         let (_, rows) = compute_commit_attribution(&commit, &preload)?;
         let ids: Vec<&str> = rows.iter().map(|r| r.session_id.as_str()).collect();
         assert_eq!(ids, ["before", "within_slack"]);
+        Ok(())
+    }
+
+    #[test]
+    fn edits_in_another_worktree_of_the_same_repository_match() -> Result<()> {
+        let conn = Connection::open_in_memory()?;
+        crate::db::init_app_schema(&conn)?;
+        crate::insights::observation::set_alias(&conn, "/w/issue-1/worktree", "git:repo", "git")?;
+        crate::insights::observation::set_alias(
+            &conn,
+            "/w/issue-2/workdir/repo",
+            "git:repo",
+            "git",
+        )?;
+        crate::insights::observation::set_alias(&conn, "/other", "git:other", "git")?;
+        for (session, root) in [("s1", "/w/issue-1/worktree"), ("s2", "/other")] {
+            conn.execute(
+                "INSERT INTO fact_session_code_change (provider, session_id, source_kind, repo_root, rel_path)
+                 VALUES ('opencode', ?1, 'accepted_change', ?2, 'src/lib.rs')",
+                params![session, root],
+            )?;
+            conn.execute(
+                "INSERT INTO fact_session_code_change_line_hashes VALUES (?1, '+', 'h1', 4)",
+                params![conn.last_insert_rowid()],
+            )?;
+        }
+
+        let preload = preload_repo_match_data(&conn, "/w/issue-2/workdir/repo")?;
+        let (_, rows) = compute_commit_attribution(&sample_commit(), &preload)?;
+
+        let ids: Vec<&str> = rows.iter().map(|r| r.session_id.as_str()).collect();
+        assert_eq!(ids, ["s1"]);
         Ok(())
     }
 

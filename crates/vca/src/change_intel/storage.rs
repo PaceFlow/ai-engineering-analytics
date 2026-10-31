@@ -43,6 +43,41 @@ pub fn replace_line_hashes(
     db::replace_fact_session_code_change_line_hashes(conn, op_id, line_hashes)
 }
 
+/// Every recorded path of the repository at `?1`: worktrees and clones that
+/// `repository_alias` maps to the same canonical repository, including `?1` itself.
+pub const SAME_REPOSITORY_ROOTS: &str = "SELECT ?1 UNION SELECT alias FROM repository_alias
+     WHERE canonical = COALESCE((SELECT canonical FROM repository_alias WHERE alias = ?1), ?1)";
+
+pub fn same_repository_roots(conn: &Connection, repo_root: &str) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(SAME_REPOSITORY_ROOTS)?;
+    let rows = stmt.query_map(params![repo_root], |row| row.get::<_, String>(0))?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+/// Marks session line hashes for re-association in every path of the repository,
+/// so commits scanned from a different worktree than the edit are re-matched.
+pub fn mark_hashes_dirty(
+    conn: &Connection,
+    repo_root: &str,
+    hashes: &BTreeSet<(String, String)>,
+) -> Result<()> {
+    if hashes.is_empty() {
+        return Ok(());
+    }
+    for root in same_repository_roots(conn, repo_root)? {
+        bump_repo_session_facts_version(conn, &root)?;
+        insert_dirty_hashes(conn, &root, hashes)?;
+    }
+    Ok(())
+}
+
+pub fn dirty_hash_keys(line_hashes: &[LineHashCount]) -> BTreeSet<(String, String)> {
+    line_hashes
+        .iter()
+        .map(|h| (h.side.as_str().to_string(), h.line_hash.clone()))
+        .collect()
+}
+
 #[derive(Debug, Clone)]
 pub struct RepoAssocState {
     pub session_facts_version: i64,
@@ -138,8 +173,7 @@ pub fn reconcile_source_tool_writes(
         if hashes.is_empty() {
             continue;
         }
-        bump_repo_session_facts_version(conn, &repo_root)?;
-        insert_dirty_hashes(conn, &repo_root, &hashes)?;
+        mark_hashes_dirty(conn, &repo_root, &hashes)?;
         summary.repos_marked_dirty += 1;
     }
 
