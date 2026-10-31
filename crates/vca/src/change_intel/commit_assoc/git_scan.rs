@@ -43,7 +43,33 @@ pub fn validate_git_repo(repo_root: &str) -> Result<Option<String>> {
     Ok(Some(top))
 }
 
-pub fn list_commits_since_all_local_branches(
+/// Returns the repository shared by all worktrees of `repo_root`: the main worktree of a
+/// regular clone, or the bare repository itself.
+pub fn shared_repository_root(repo_root: &str) -> Result<Option<String>> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(crate::path_utils::on_disk_str(repo_root))
+        .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
+        .output()?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let common = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if common.is_empty() {
+        return Ok(None);
+    }
+    let common = crate::path_utils::from_disk(std::path::Path::new(&common))
+        .to_string_lossy()
+        .to_string();
+    Ok(Some(match common.strip_suffix("/.git") {
+        Some(main_worktree) => main_worktree.to_string(),
+        None => common,
+    }))
+}
+
+/// Lists commits on local branches and on the remote mainline, which also holds work merged
+/// elsewhere (for example squash merges done on the hosting service).
+pub fn list_commits_since_branches_and_mainline(
     repo_root: &str,
     since_ts: &str,
     include_merges: bool,
@@ -58,6 +84,26 @@ pub fn list_commits_since_all_local_branches(
     }
     args.push(format!("--since={since_ts}"));
     args.push("--branches".to_string());
+    let mainline = run_git_capture(
+        repo_root,
+        &[
+            "for-each-ref".to_string(),
+            "--format=%(refname)".to_string(),
+            "refs/remotes/origin/main".to_string(),
+            "refs/remotes/origin/master".to_string(),
+        ],
+    )?;
+    args.extend(
+        mainline
+            .lines()
+            .filter(|line| {
+                matches!(
+                    *line,
+                    "refs/remotes/origin/main" | "refs/remotes/origin/master"
+                )
+            })
+            .map(ToOwned::to_owned),
+    );
 
     list_from_rev_list(repo_root, &args)
 }
