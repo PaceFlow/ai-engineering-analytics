@@ -42,25 +42,30 @@ pub fn min_ai_timestamp(conn: &Connection, repo_root: &str) -> Result<Option<Str
     .map_err(Into::into)
 }
 
-/// Drops the commits stored for a worktree whose repository is now scanned once at its
-/// shared root, so each commit is kept a single time.
-pub fn remove_worktree_commits(conn: &Connection, worktree_root: &str) -> Result<()> {
+/// Drops a worktree's copies of commits now stored under its repository's shared root.
+/// Commits only the worktree saw, such as ones on since-deleted branches, are kept.
+pub fn remove_duplicate_worktree_commits(
+    conn: &Connection,
+    worktree_root: &str,
+    scan_root: &str,
+) -> Result<()> {
+    const SHARED: &str = "commit_sha IN (SELECT commit_sha FROM fact_commit WHERE repo_root = ?2)";
     conn.execute(
-        "DELETE FROM fact_commit_file_change_line_hashes WHERE file_change_id IN
-            (SELECT id FROM fact_commit_file_change WHERE repo_root = ?1)",
-        params![worktree_root],
+        &format!(
+            "DELETE FROM fact_commit_file_change_line_hashes WHERE file_change_id IN
+                (SELECT id FROM fact_commit_file_change WHERE repo_root = ?1 AND {SHARED})"
+        ),
+        params![worktree_root, scan_root],
     )?;
     for table in [
         "fact_commit_file_change",
         "fact_commit_session_match",
         "fact_task_commit_assignment",
         "fact_commit",
-        "commit_assoc_repo_state",
-        "commit_assoc_dirty_hash",
     ] {
         conn.execute(
-            &format!("DELETE FROM {table} WHERE repo_root = ?1"),
-            params![worktree_root],
+            &format!("DELETE FROM {table} WHERE repo_root = ?1 AND {SHARED}"),
+            params![worktree_root, scan_root],
         )?;
     }
     Ok(())

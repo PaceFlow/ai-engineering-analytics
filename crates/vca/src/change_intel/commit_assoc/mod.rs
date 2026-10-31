@@ -21,7 +21,7 @@ use matcher::{compute_commit_attribution, preload_repo_match_data};
 use storage::{
     insert_commit_assoc_error, list_cached_commit_shas, list_dirty_cached_commit_shas,
     list_repo_roots_from_session_facts, load_cached_commit_diff, min_ai_timestamp,
-    remove_worktree_commits, upsert_commit_attribution, upsert_commit_task_attribution,
+    remove_duplicate_worktree_commits, upsert_commit_attribution, upsert_commit_task_attribution,
     upsert_git_commit_with_diffs,
 };
 use task_matcher::{RepoBranchContext, attribute_commit_to_task, load_repo_branch_context};
@@ -261,15 +261,8 @@ pub fn run_with_plan(
             continue;
         }
 
-        if !repo_plan.absorbed_roots.is_empty() {
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            for worktree_root in &repo_plan.absorbed_roots {
-                remove_worktree_commits(&tx, worktree_root)?;
-            }
-            tx.commit()?;
-        }
-
         if !should_process_repo(repo_plan) {
+            remove_absorbed_duplicates(conn, repo_plan)?;
             if let Some(observer) = progress.as_mut() {
                 observer.advance(&format!("{} warmup skipped", repo_root));
             }
@@ -296,11 +289,27 @@ pub fn run_with_plan(
                 &err.to_string(),
             )?;
         }
+        remove_absorbed_duplicates(conn, repo_plan)?;
 
         summary.repo_summaries.push(repo_summary);
     }
 
     Ok(summary)
+}
+
+fn remove_absorbed_duplicates(
+    conn: &mut Connection,
+    repo_plan: &RepoAssociationPlan,
+) -> Result<()> {
+    if repo_plan.absorbed_roots.is_empty() {
+        return Ok(());
+    }
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    for worktree_root in &repo_plan.absorbed_roots {
+        remove_duplicate_worktree_commits(&tx, worktree_root, &repo_plan.repo_root)?;
+    }
+    tx.commit()?;
+    Ok(())
 }
 
 fn determine_commit_scope(repo_root: &str, ai_min_ts: &str) -> Result<Vec<String>> {
@@ -619,20 +628,36 @@ mod tests {
                 params![change_id, hash.line_hash, hash.count],
             )?;
         }
-        // A copy kept from when the worktree was scanned on its own.
-        conn.execute(
-            "INSERT INTO fact_commit (repo_root, commit_sha, commit_time, subject) VALUES (?1, 'old', ?2, 'old')",
-            params![worktree_root, edited],
-        )?;
+        // Copies kept from when the worktree was scanned on its own: one of a commit the
+        // repository still has, one of a commit from a since-deleted branch.
+        let head = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&worktree)
+            .args(["rev-parse", "HEAD"])
+            .output()?;
+        let head = String::from_utf8(head.stdout)?.trim().to_string();
+        for (sha, subject) in [(head.as_str(), "add lib"), ("gone", "deleted branch")] {
+            conn.execute(
+                "INSERT INTO fact_commit (repo_root, commit_sha, commit_time, subject) VALUES (?1, ?2, ?3, ?4)",
+                params![worktree_root, sha, edited, subject],
+            )?;
+        }
 
         let plan = plan(&conn)?;
         run_with_plan(&mut conn, &plan, false, None)?;
 
-        let roots: Vec<String> = conn
-            .prepare("SELECT DISTINCT repo_root FROM fact_commit")?
-            .query_map([], |r| r.get(0))?
+        let commits: Vec<(String, String)> = conn
+            .prepare("SELECT repo_root, subject FROM fact_commit ORDER BY subject")?
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
             .collect::<rusqlite::Result<_>>()?;
-        assert_eq!(roots, [main_root]);
+        assert_eq!(
+            commits,
+            [
+                (main_root.clone(), "add lib".to_string()),
+                (worktree_root, "deleted branch".to_string()),
+                (main_root, "start".to_string()),
+            ]
+        );
         let matched: Vec<(String, String)> = conn
             .prepare("SELECT m.session_id, c.subject FROM fact_commit_session_match m JOIN fact_commit c USING (repo_root, commit_sha) WHERE m.session_id = 's1'")?
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
