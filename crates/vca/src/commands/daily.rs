@@ -354,7 +354,9 @@ pub fn sources_for(args: SourcesArgs, context: crate::app::AppContext) -> Result
             serde_json::json!({"pr":pr,"intent":intent})
         }
         SourceCommand::Alias { alias, canonical } => {
+            let before = observation::alias_targets(&conn)?;
             observation::set_alias(&conn, &alias, &canonical, "manual")?;
+            observation::requeue_changed_aliases(&conn, &before)?;
             crate::insights::refresh(&conn)?;
             serde_json::json!({"alias":alias,"canonical":canonical})
         }
