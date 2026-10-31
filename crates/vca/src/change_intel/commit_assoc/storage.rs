@@ -2,6 +2,7 @@ use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension, params};
 use std::collections::BTreeMap;
 
+use crate::change_intel::storage::SAME_REPOSITORY_ROOTS;
 use crate::change_intel::types::{LineHashCount, LineSide};
 use crate::db;
 
@@ -25,17 +26,44 @@ pub fn list_repo_roots_from_session_facts(conn: &Connection) -> Result<Vec<Strin
     Ok(out)
 }
 
+/// Earliest edit in any worktree or clone of the repository, so one scan covers them all.
 pub fn min_ai_timestamp(conn: &Connection, repo_root: &str) -> Result<Option<String>> {
     conn.query_row(
-        "SELECT MIN(change_ts)
-         FROM fact_session_code_change
-         WHERE repo_root = ?1 AND change_ts IS NOT NULL",
+        &format!(
+            "SELECT MIN(change_ts)
+             FROM fact_session_code_change
+             WHERE repo_root IN ({SAME_REPOSITORY_ROOTS}) AND change_ts IS NOT NULL"
+        ),
         params![repo_root],
         |r| r.get::<_, Option<String>>(0),
     )
     .optional()
     .map(|v| v.flatten())
     .map_err(Into::into)
+}
+
+/// Drops the commits stored for a worktree whose repository is now scanned once at its
+/// shared root, so each commit is kept a single time.
+pub fn remove_worktree_commits(conn: &Connection, worktree_root: &str) -> Result<()> {
+    conn.execute(
+        "DELETE FROM fact_commit_file_change_line_hashes WHERE file_change_id IN
+            (SELECT id FROM fact_commit_file_change WHERE repo_root = ?1)",
+        params![worktree_root],
+    )?;
+    for table in [
+        "fact_commit_file_change",
+        "fact_commit_session_match",
+        "fact_task_commit_assignment",
+        "fact_commit",
+        "commit_assoc_repo_state",
+        "commit_assoc_dirty_hash",
+    ] {
+        conn.execute(
+            &format!("DELETE FROM {table} WHERE repo_root = ?1"),
+            params![worktree_root],
+        )?;
+    }
+    Ok(())
 }
 
 pub fn upsert_git_commit_with_diffs(
