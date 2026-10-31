@@ -1,9 +1,12 @@
 //! Conversation, usage and practice insights built on top of ingested facts.
+pub mod audit;
 pub mod billing;
 pub mod context;
+pub mod corrective;
 pub mod daily;
 pub mod delivery;
 pub mod habits;
+pub mod investigation;
 pub mod observation;
 pub mod quota;
 pub mod relations;
@@ -29,6 +32,8 @@ pub(crate) fn init_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(setup::SCHEMA)?;
     conn.execute_batch(observation::SCHEMA)?;
     conn.execute_batch(delivery::SCHEMA)?;
+    audit::init(conn)?;
+    crate::classify::overrides::migrate(conn)?;
     Ok(())
 }
 
@@ -56,7 +61,9 @@ fn refresh_inner(conn: &Connection) -> Result<()> {
         [],
         |r| r.get(0),
     )?;
-    if saved {
+    // Goal-keyed label overrides resolve through work members, so those must
+    // follow the new segmentation before any label is read.
+    if saved || crate::classify::overrides::has_goal_keyed(conn)? {
         work::refresh(conn)?;
         if work::reconcile_decisions(conn)? {
             structure::refresh_session_structure(conn)?;
@@ -69,6 +76,8 @@ fn refresh_inner(conn: &Connection) -> Result<()> {
     stages::refresh_stages(conn)?;
     habits::refresh_habits(conn)?;
     work::refresh(conn)?;
+    audit::preserve_legacy(conn)?;
+    audit::capture_corrections(conn)?;
     observation::publish(conn)?;
     delivery::refresh_links(conn)?;
     Ok(())
@@ -94,6 +103,8 @@ fn refresh_label_dependents_inner(conn: &Connection) -> Result<()> {
     stages::refresh_stages(conn)?;
     habits::refresh_habits(conn)?;
     work::refresh(conn)?;
+    audit::preserve_legacy(conn)?;
+    audit::capture_corrections(conn)?;
     observation::publish(conn)?;
     Ok(())
 }

@@ -182,7 +182,7 @@ fn migrated_v2_replaces_v1_once_and_preserves_request_anchor_and_manual_links() 
         original
     );
     assert_eq!(crate::insights::work::items(&c)?.len(), 1);
-    assert_eq!(c.query_row("SELECT label FROM classification_override WHERE unit_key='opencode|s|0' AND question_id='intent'",[],|r|r.get::<_,String>(0))?,"feature");
+    assert_eq!(c.query_row("SELECT label FROM view_label_effective WHERE unit_key='opencode|s|0' AND question_id='intent' AND source='override'",[],|r|r.get::<_,String>(0))?,"feature");
     assert_eq!(
         c.query_row(
             "SELECT COUNT(*) FROM metadata_sessions WHERE provider='opencode'",
@@ -275,8 +275,33 @@ fn v2_file_metadata_and_write_paths_preserve_code_changes() {
     assert_eq!(edits.len(), 1);
     assert_eq!((edits[0].added_lines, edits[0].removed_lines), (2, 1));
     assert!(edits[0].file_path.ends_with("src/lib.rs"));
+    let mut sides: Vec<_> = edits[0]
+        .line_hashes
+        .iter()
+        .map(|h| (h.side, h.line_hash.clone()))
+        .collect();
+    let hash = crate::change_intel::line_hash::hash_line;
+    let mut expected = vec![
+        (LineSide::Added, hash("new")),
+        (LineSide::Added, hash("line")),
+        (LineSide::Removed, hash("old")),
+    ];
+    sides.sort();
+    expected.sort();
+    assert_eq!(sides, expected);
     let write = json!({"type":"tool","tool":"write","state":{"input":{"path":"src/new.rs","content":"first\nsecond\n"}}});
     let writes = edits_from_tool_part(&write, Some("/removed/worktree"), &None);
     assert_eq!(writes.len(), 1);
     assert_eq!(writes[0].added_lines, 2);
+    assert_eq!(writes[0].line_hashes.len(), 2);
+}
+
+#[test]
+fn edit_filediff_with_string_counts_keeps_patch_hashes() {
+    let edit = json!({"type":"tool","tool":"edit","state":{"metadata":{"filediff":{"file":"/w/CHANGELOG.md","patch":"Index: /w/CHANGELOG.md\n--- /w/CHANGELOG.md\n+++ /w/CHANGELOG.md\n@@ -1 +1,2 @@\n # Changelog\n+### Added","additions":"1","deletions":"0"}}}});
+    let edits = edits_from_tool_part(&edit, None, &None);
+    assert_eq!(edits.len(), 1);
+    assert_eq!((edits[0].added_lines, edits[0].removed_lines), (1, 0));
+    assert_eq!(edits[0].line_hashes.len(), 1);
+    assert_eq!(edits[0].line_hashes[0].side, LineSide::Added);
 }

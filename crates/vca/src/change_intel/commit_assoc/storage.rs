@@ -1,7 +1,8 @@
 use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension, params};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
+use crate::change_intel::storage::SAME_REPOSITORY_ROOTS;
 use crate::change_intel::types::{LineHashCount, LineSide};
 use crate::db;
 
@@ -25,17 +26,107 @@ pub fn list_repo_roots_from_session_facts(conn: &Connection) -> Result<Vec<Strin
     Ok(out)
 }
 
+/// Earliest edit in any worktree or clone of the repository, so one scan covers them all.
 pub fn min_ai_timestamp(conn: &Connection, repo_root: &str) -> Result<Option<String>> {
     conn.query_row(
-        "SELECT MIN(change_ts)
-         FROM fact_session_code_change
-         WHERE repo_root = ?1 AND change_ts IS NOT NULL",
+        &format!(
+            "SELECT MIN(change_ts)
+             FROM fact_session_code_change
+             WHERE repo_root IN ({SAME_REPOSITORY_ROOTS}) AND change_ts IS NOT NULL"
+        ),
         params![repo_root],
         |r| r.get::<_, Option<String>>(0),
     )
     .optional()
     .map(|v| v.flatten())
     .map_err(Into::into)
+}
+
+/// Directories directly under `repo_root` that hold recorded edits.
+pub fn first_path_segments(conn: &Connection, repo_root: &str) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT substr(rel_path, 1, instr(rel_path, '/') - 1)
+         FROM fact_session_code_change
+         WHERE repo_root = ?1 AND instr(rel_path, '/') > 1",
+    )?;
+    let segments = stmt
+        .query_map(params![repo_root], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(segments
+        .into_iter()
+        .filter(|segment| segment != "." && segment != "..")
+        .collect())
+}
+
+/// Moves edits recorded under `from_root` at `prefix/…` to `prefix`'s repository at
+/// `to_root`, dropping the prefix, and returns their line-hash keys for re-matching.
+pub fn rehome_prefixed_edits(
+    conn: &Connection,
+    from_root: &str,
+    prefix: &str,
+    to_root: &str,
+) -> Result<BTreeSet<(String, String)>> {
+    let pattern = format!("{}/%", prefix.replace('%', "\\%").replace('_', "\\_"));
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT h.side, h.line_hash
+         FROM fact_session_code_change c
+         JOIN fact_session_code_change_line_hashes h ON h.code_change_id = c.id
+         WHERE c.repo_root = ?1 AND c.rel_path LIKE ?2 ESCAPE '\\'",
+    )?;
+    let hashes = stmt
+        .query_map(params![from_root, pattern], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<BTreeSet<(String, String)>>>()?;
+    conn.execute(
+        "UPDATE fact_session_code_change
+         SET repo_root = ?3, rel_path = substr(rel_path, length(?4) + 2)
+         WHERE repo_root = ?1 AND rel_path LIKE ?2 ESCAPE '\\'",
+        params![from_root, pattern, to_root, prefix],
+    )?;
+    Ok(hashes)
+}
+
+/// Moves a worktree's stored commits under its repository's shared root, dropping copies the
+/// shared root already has. Commits only the worktree saw, such as ones on since-deleted
+/// branches, are kept; their line hashes are returned so they can be matched again there.
+pub fn absorb_worktree_commits(
+    conn: &Connection,
+    worktree_root: &str,
+    scan_root: &str,
+) -> Result<BTreeSet<(String, String)>> {
+    const SHARED: &str = "commit_sha IN (SELECT commit_sha FROM fact_commit WHERE repo_root = ?2)";
+    conn.execute(
+        &format!(
+            "DELETE FROM fact_commit_file_change_line_hashes WHERE file_change_id IN
+                (SELECT id FROM fact_commit_file_change WHERE repo_root = ?1 AND {SHARED})"
+        ),
+        params![worktree_root, scan_root],
+    )?;
+    let tables = [
+        "fact_commit_file_change",
+        "fact_commit_session_match",
+        "fact_task_commit_assignment",
+        "fact_commit",
+    ];
+    for table in tables {
+        conn.execute(
+            &format!("DELETE FROM {table} WHERE repo_root = ?1 AND {SHARED}"),
+            params![worktree_root, scan_root],
+        )?;
+    }
+    let hashes = conn
+        .prepare(
+            "SELECT DISTINCT h.side, h.line_hash FROM fact_commit_file_change_line_hashes h
+             JOIN fact_commit_file_change f ON f.id = h.file_change_id WHERE f.repo_root = ?1",
+        )?
+        .query_map(params![worktree_root], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    for table in tables {
+        conn.execute(
+            &format!("UPDATE {table} SET repo_root = ?2 WHERE repo_root = ?1"),
+            params![worktree_root, scan_root],
+        )?;
+    }
+    Ok(hashes)
 }
 
 pub fn upsert_git_commit_with_diffs(

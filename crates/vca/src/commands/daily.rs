@@ -72,6 +72,46 @@ pub fn run(args: DailyArgs) -> Result<()> {
 fn optional(v: Option<f64>) -> String {
     v.map(|n| format!("{n:.2}")).unwrap_or_else(|| "—".into())
 }
+fn age(minutes: Option<f64>) -> String {
+    match minutes {
+        None => "—".into(),
+        Some(m) if m < 60.0 => format!("{m:.0}m"),
+        Some(m) if m < 48.0 * 60.0 => format!("{:.1}h", m / 60.0),
+        Some(m) => format!("{:.1}d", m / 1440.0),
+    }
+}
+/// One model's usage for the day; zero-filled and missing events are named so
+/// they are not read as measured zero.
+fn model_line(m: &daily::ModelUsage) -> String {
+    let mut gaps = vec![];
+    for (n, label) in [
+        (m.explicit_zero_events, "reported zero"),
+        (m.missing_events, "missing"),
+        (m.suspect_zero_events, "unverified zero"),
+    ] {
+        if n > 0 {
+            gaps.push(format!("{n} {label}"));
+        }
+    }
+    let mut line = format!(
+        "model {} ({}) · {} usage events, {} measured",
+        m.model, m.provider, m.usage_events, m.available_events
+    );
+    if !gaps.is_empty() {
+        let _ = write!(line, " ({})", gaps.join(", "));
+    }
+    let _ = write!(
+        line,
+        " · {} tokens · reported $ {} · API eq $ {}",
+        m.native_tokens.total,
+        optional(m.reported_cost_usd),
+        optional(m.api_equivalent_usd)
+    );
+    if m.estimated_tokens.total > 0 {
+        let _ = write!(line, " · {} estimated tokens", m.estimated_tokens.total);
+    }
+    line
+}
 pub fn text(report: &daily::Report, cohorts: bool) -> String {
     let mut out = String::new();
     let _ = writeln!(
@@ -115,7 +155,7 @@ pub fn text(report: &daily::Report, cohorts: bool) -> String {
     } else {
         let _ = writeln!(
             out,
-            "Date        Start Active Done Open Bug active/done  Tokens  Reported $  PR merged/deployed  Leading model"
+            "Date        Start Active Done Open Bug active/done  Tokens  Reported $  API eq $  PR merged/deployed  Leading model"
         );
         for d in &report.days {
             let model = d
@@ -126,7 +166,7 @@ pub fn text(report: &daily::Report, cohorts: bool) -> String {
                 .unwrap_or_else(|| "—".into());
             let _ = writeln!(
                 out,
-                "{}{} {:>4} {:>6} {:>4} {:>4} {:>8} {:>8} {:>10} {:>5}/{:<5} {}",
+                "{}{} {:>4} {:>6} {:>4} {:>4} {:>8} {:>8} {:>10} {:>9} {:>5}/{:<5} {}",
                 d.date,
                 if d.partial { "*" } else { " " },
                 d.started,
@@ -136,6 +176,7 @@ pub fn text(report: &daily::Report, cohorts: bool) -> String {
                 format!("{}/{}", d.bug_work_active, d.bug_work_completed),
                 d.native_tokens.total,
                 optional(d.reported_cost_usd),
+                optional(d.api_equivalent_usd),
                 d.pull_requests.merged,
                 d.pull_requests.deployed,
                 model
@@ -155,6 +196,30 @@ pub fn text(report: &daily::Report, cohorts: bool) -> String {
                 d.coverage.work_without_pr,
                 d.pull_requests.pending_delivery
             );
+            let _ = writeln!(
+                out,
+                "  corrective goals {} · unknown purpose {} · corrective activity {} native tokens · structured history {}/{}",
+                d.corrective.corrective_goal_work,
+                d.corrective.unknown_goal_work,
+                d.corrective
+                    .native_tokens_by_activity_purpose
+                    .get("corrective")
+                    .copied()
+                    .unwrap_or(0),
+                d.corrective.structured_history_work,
+                d.active_work
+            );
+            if d.open > 0 {
+                let _ = writeln!(
+                    out,
+                    "  open work age at cutoff: median {} · max {}",
+                    age(d.open_age_minutes.median),
+                    age(d.open_age_max_minutes)
+                );
+            }
+            for m in &d.models {
+                let _ = writeln!(out, "  {}", model_line(m));
+            }
             if !d.goal_mix.is_empty() {
                 let _ = writeln!(
                     out,
@@ -209,11 +274,11 @@ pub fn csv(report: &daily::Report, cohorts: bool) -> String {
             );
         }
     } else {
-        out.push_str("date,partial,started,active_work,completed,open,bug_work_active,native_tokens,estimated_tokens,reported_cost_usd,api_equivalent_usd,attempts,corrections,work_activity_minutes,prs_opened,prs_merged,prs_deployed,bug_fix_prs_deployed,pending_delivery,available_usage_events,usage_events,work_without_pr,bug_work_started,bug_work_completed,bug_work_verified,bug_work_open\n");
+        out.push_str("date,partial,started,active_work,completed,open,bug_work_active,native_tokens,estimated_tokens,reported_cost_usd,api_equivalent_usd,attempts,corrections,work_activity_minutes,prs_opened,prs_merged,prs_deployed,bug_fix_prs_deployed,pending_delivery,available_usage_events,usage_events,work_without_pr,bug_work_started,bug_work_completed,bug_work_verified,bug_work_open,corrective_goal_work,unknown_goal_work,corrective_native_tokens,structured_history_work,open_age_median_minutes,open_age_max_minutes\n");
         for d in &report.days {
             let _ = writeln!(
                 out,
-                "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+                "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
                 d.date,
                 d.partial,
                 d.started,
@@ -243,7 +308,22 @@ pub fn csv(report: &daily::Report, cohorts: bool) -> String {
                 d.bug_work_started,
                 d.bug_work_completed,
                 d.bug_work_verified,
-                d.bug_work_open
+                d.bug_work_open,
+                d.corrective.corrective_goal_work,
+                d.corrective.unknown_goal_work,
+                d.corrective
+                    .native_tokens_by_activity_purpose
+                    .get("corrective")
+                    .copied()
+                    .unwrap_or(0),
+                d.corrective.structured_history_work,
+                d.open_age_minutes
+                    .median
+                    .map(|v| v.to_string())
+                    .unwrap_or_default(),
+                d.open_age_max_minutes
+                    .map(|v| v.to_string())
+                    .unwrap_or_default()
             );
         }
     }
@@ -333,7 +413,9 @@ pub fn sources_for(args: SourcesArgs, context: crate::app::AppContext) -> Result
             serde_json::json!({"pr":pr,"intent":intent})
         }
         SourceCommand::Alias { alias, canonical } => {
+            let before = observation::alias_targets(&conn)?;
             observation::set_alias(&conn, &alias, &canonical, "manual")?;
+            observation::requeue_changed_aliases(&conn, &before)?;
             crate::insights::refresh(&conn)?;
             serde_json::json!({"alias":alias,"canonical":canonical})
         }
@@ -377,7 +459,8 @@ pub fn status(args: StatusArgs) -> Result<()> {
         [],
         |r| r.get(0),
     )?;
-    let result = serde_json::json!({"schema_version":1,"generated_at":chrono::Utc::now().to_rfc3339(),"published_revision":revision,"automatic_classification":config.enabled,"classification_projects":crate::classify::automatic::status(&conn,None,&config)?,"sources":observation::coverage(&conn)?,"classification_jobs":jobs,"uncertain_work_intents":uncertain,"unresolved_work_links":unresolved,"classification_monthly_spend_usd":crate::classify::run::monthly_spend(&conn)?});
+    let unresolved_events:i64=conn.query_row("SELECT COUNT(*) FROM audit_work_event a WHERE (a.subject_kind='task' AND NOT EXISTS(SELECT 1 FROM derived_work_member m JOIN work_identity i ON i.id=m.identity_id WHERE m.identity_id=a.subject_key AND i.review_reason IS NULL)) OR (a.subject_kind='pr' AND NOT EXISTS(SELECT 1 FROM pull_request_record p WHERE p.id=a.subject_key))",[],|r|r.get(0))?;
+    let result = serde_json::json!({"unresolved_lifecycle_events":unresolved_events,"schema_version":1,"generated_at":chrono::Utc::now().to_rfc3339(),"published_revision":revision,"automatic_classification":config.enabled,"classification_projects":crate::classify::automatic::status(&conn,None,&config)?,"sources":observation::coverage(&conn)?,"classification_jobs":jobs,"uncertain_work_intents":uncertain,"unresolved_work_links":unresolved,"classification_monthly_spend_usd":crate::classify::run::monthly_spend(&conn)?});
     if args.json {
         println!("{}", serde_json::to_string_pretty(&result)?);
     } else {

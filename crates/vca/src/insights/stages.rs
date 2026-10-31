@@ -113,6 +113,67 @@ fn stage_group(stage: &str) -> &'static str {
 
 const DOC_EXTENSIONS: [&str; 4] = [".md", ".mdx", ".rst", ".txt"];
 
+/// What an edited file is, for stage and intent evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EditKind {
+    Test,
+    /// Plan, design or spec document.
+    PlanDoc,
+    Doc,
+    Source,
+    /// Temporary files and reply drafts (an issue comment body, a PR body):
+    /// how the answer is delivered, not work on the project.
+    Scratch,
+}
+
+pub(crate) fn edit_kind(target: &str) -> EditKind {
+    let lower = target.replace('\\', "/").to_ascii_lowercase();
+    let file = lower.rsplit('/').next().unwrap_or("");
+    let doc = DOC_EXTENSIONS.iter().any(|ext| file.ends_with(ext));
+    // Directly in a temp dir; a repository checked out under /tmp is real work.
+    let parent = lower.rsplit_once('/').map_or("", |(dir, _)| dir);
+    let temp = parent.ends_with("/tmp")
+        || parent == "tmp"
+        || parent.ends_with("/temp")
+        || lower.contains("/var/folders/")
+        || lower.contains("/scratchpad/")
+        || lower.contains("/.multica/");
+    // Multica's per-issue `workdir` is not a checkout; files at its top are
+    // drafts of what the agent posts back (issue description, reply, caption).
+    let issue_draft = parent.ends_with("/workdir");
+    let draft = [
+        "reply",
+        "comment",
+        "response",
+        "answer",
+        "pr-body",
+        "pr_body",
+        "commit-msg",
+        "commit_msg",
+        "description",
+        "desc_",
+        "desc.",
+        "caption",
+    ]
+    .iter()
+    .any(|cue| file.starts_with(cue));
+    if is_test_path(target) {
+        EditKind::Test
+    } else if temp || (doc && (draft || issue_draft)) {
+        EditKind::Scratch
+    } else if doc
+        && ["plan", "design", "spec", "rfc", "adr"]
+            .iter()
+            .any(|cue| file.contains(cue))
+    {
+        EditKind::PlanDoc
+    } else if doc {
+        EditKind::Doc
+    } else {
+        EditKind::Source
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct TurnEvidence {
     pub reads: i64,
@@ -287,7 +348,7 @@ pub fn heuristic_request(text: &str, first_turn: bool) -> &'static str {
 fn evidence_for(turn: &crate::classify::state::TurnFacts) -> TurnEvidence {
     let mut evidence = TurnEvidence {
         slash_command: slash_command(&turn.user),
-        user_text: turn.user.clone(),
+        user_text: crate::classify::request::normalize(&turn.user).text,
         ..TurnEvidence::default()
     };
     for tool in &turn.tools {
@@ -298,33 +359,21 @@ fn evidence_for(turn: &crate::classify::state::TurnFacts) -> TurnEvidence {
             "web" => evidence.web += 1,
             "plan" => evidence.plan_tools += 1,
             "agent" => evidence.agent_calls += 1,
-            "edit" => {
-                evidence.edits += 1;
-                if is_test_path(target) {
-                    evidence.test_edits += 1;
-                } else if DOC_EXTENSIONS
-                    .iter()
-                    .any(|ext| target.to_ascii_lowercase().ends_with(ext))
-                    && ["plan", "design", "spec", "rfc", "adr"].iter().any(|cue| {
-                        target
-                            .to_ascii_lowercase()
-                            .rsplit(['/', '\\'])
-                            .next()
-                            .unwrap_or("")
-                            .contains(cue)
-                    })
-                {
-                    evidence.doc_edits += 1;
-                    evidence.plan_doc_edits += 1;
-                } else if DOC_EXTENSIONS
-                    .iter()
-                    .any(|ext| target.to_ascii_lowercase().ends_with(ext))
-                {
-                    evidence.doc_edits += 1;
-                } else {
-                    evidence.source_edits += 1;
+            "edit" => match edit_kind(target) {
+                EditKind::Scratch => {}
+                kind => {
+                    evidence.edits += 1;
+                    match kind {
+                        EditKind::Test => evidence.test_edits += 1,
+                        EditKind::PlanDoc => {
+                            evidence.doc_edits += 1;
+                            evidence.plan_doc_edits += 1;
+                        }
+                        EditKind::Doc => evidence.doc_edits += 1,
+                        _ => evidence.source_edits += 1,
+                    }
                 }
-            }
+            },
             _ => {}
         }
         if is_ask_tool(&tool.name) || tool.category == "ask" {
@@ -443,6 +492,9 @@ pub fn refresh_stages(conn: &Connection) -> Result<()> {
                 turn.user.chars().count() as i64,
             ])?;
             let key = turn_unit_key(provider, session, turn.index);
+            let (purpose, subtype) = crate::classify::heuristic::corrective_purpose(&turn.user);
+            insert_heuristic(conn, "turn", &key, "activity_purpose", purpose)?;
+            insert_heuristic(conn, "turn", &key, "activity_corrective_subtype", subtype)?;
             insert_heuristic(
                 conn,
                 "turn",
@@ -606,6 +658,34 @@ fn session_kind(groups: &GroupTotals) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reply_drafts_and_temp_files_are_not_doc_edits() {
+        assert_eq!(edit_kind("/tmp/reply.md"), EditKind::Scratch);
+        assert_eq!(
+            edit_kind(r"C:\Users\me\AppData\Local\Temp\x.md"),
+            EditKind::Scratch
+        );
+        assert_eq!(edit_kind("/repo/comment-body.md"), EditKind::Scratch);
+        assert_eq!(
+            edit_kind("/ws/klik-199/workdir/notes.md"),
+            EditKind::Scratch
+        );
+        assert_eq!(
+            edit_kind("/ws/aicr-60/worktree/description.md"),
+            EditKind::Scratch
+        );
+        assert_eq!(
+            edit_kind("/ws/aicr-60/workdir/repo/docs/guide.md"),
+            EditKind::Doc
+        );
+        assert_eq!(edit_kind("/ws/aicr-60/workdir/main.rs"), EditKind::Source);
+        assert_eq!(edit_kind("/repo/docs/guide.md"), EditKind::Doc);
+        assert_eq!(edit_kind("/tmp/repo/README.md"), EditKind::Doc);
+        assert_eq!(edit_kind("/repo/docs/design-v2.md"), EditKind::PlanDoc);
+        assert_eq!(edit_kind("/repo/src/comment.rs"), EditKind::Source);
+        assert_eq!(edit_kind("/repo/tests/sync.rs"), EditKind::Test);
+    }
 
     fn evidence(text: &str) -> TurnEvidence {
         TurnEvidence {

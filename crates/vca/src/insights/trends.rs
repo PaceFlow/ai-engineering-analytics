@@ -10,7 +10,7 @@ use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
-pub const METRIC_VERSION: &str = "work-trends-2";
+pub const METRIC_VERSION: &str = "work-trends-3";
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct Scope {
     pub repo: Option<String>,
@@ -137,6 +137,7 @@ pub struct Coverage {
 }
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct Period {
+    pub corrective: super::corrective::Summary,
     pub from: String,
     pub to: String,
     pub start_ms: i64,
@@ -447,7 +448,9 @@ pub fn report_at(conn: &Connection, options: &Options, now: DateTime<Utc>) -> Re
                     .any(|id| selected.iter().any(|w| &w.id == id)))
         })
         .collect::<Vec<_>>();
+    let purpose_index = super::corrective::Index::load(conn)?;
     let context = Context {
+        purpose_index: &purpose_index,
         all: &all,
         scope: &options.scope,
         tz,
@@ -661,6 +664,7 @@ pub fn report_at(conn: &Connection, options: &Options, now: DateTime<Utc>) -> Re
     })
 }
 struct Context<'a> {
+    purpose_index: &'a super::corrective::Index,
     delivery_evidence: &'a [super::delivery::PrEvidence],
     all: &'a [WorkItem],
     scope: &'a Scope,
@@ -744,6 +748,7 @@ fn summarize(
         api_equivalent_usd: None,
         unpriced_events: 0,
         work_activity_minutes: 0.0,
+        corrective: Default::default(),
         goal_mix: vec![],
         activity_mix: vec![],
         tokens_by_state: BTreeMap::new(),
@@ -1170,6 +1175,12 @@ fn summarize(
         row.token_share = (denom > 0).then(|| row.native_tokens as f64 / denom as f64);
         p.activity_mix.push(row);
     }
+    p.corrective = ctx.purpose_index.summarize(
+        &p.contributing_work_ids.iter().cloned().collect(),
+        None,
+        start,
+        cutoff,
+    );
     Ok(p)
 }
 fn deltas(a: &Period, b: &Period) -> Vec<Delta> {
@@ -1233,6 +1244,16 @@ fn deltas(a: &Period, b: &Period) -> Vec<Delta> {
         ));
     }
     for (metric, x, y) in [
+        (
+            "corrective_goal_work",
+            a.corrective.corrective_goal_work,
+            b.corrective.corrective_goal_work,
+        ),
+        (
+            "unknown_goal_work",
+            a.corrective.unknown_goal_work,
+            b.corrective.unknown_goal_work,
+        ),
         ("completed", a.completed, b.completed),
         ("started", a.started, b.started),
         ("open", a.open, b.open),

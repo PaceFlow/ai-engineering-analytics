@@ -328,6 +328,7 @@ fn parse_session(path: &PathBuf) -> Result<Option<SessionRecord>> {
                         previous_totals = totals;
                         if delta.is_positive() {
                             let mut usage = UsageRecord::new(format!("tc:{line_no}"));
+                            usage.usage_available = Some(true);
                             usage.ts = ts.clone();
                             usage.model = current_model.clone();
                             usage.input_tokens = (delta.input - delta.cached).max(0);
@@ -527,6 +528,7 @@ fn parse_session(path: &PathBuf) -> Result<Option<SessionRecord>> {
                                 lines_added: change.1,
                                 lines_removed: change.2,
                                 ts: ts.clone(),
+                                line_hashes: Vec::new(),
                             });
                         }
                         let target = if name
@@ -618,21 +620,25 @@ fn parse_session(path: &PathBuf) -> Result<Option<SessionRecord>> {
                 }
             }
             "token_usage_record" => {
+                let key = line
+                    .payload
+                    .get("response_id")
+                    .and_then(Value::as_str)
+                    .map(|id| format!("resp:{id}"))
+                    .unwrap_or_else(|| format!("tur:{line_no}"));
+                let mut usage = UsageRecord::new(key);
+                usage.ts = ts.clone();
+                usage.model = current_model.clone();
+                usage.provider_route = meta.model_provider.clone();
+                // A record without a usage object is a call whose usage was not reported.
+                usage.usage_available = Some(false);
                 if let Some(per_call) = line.payload.get("usage").filter(|usage| usage.is_object())
                 {
-                    saw_usage_records = true;
                     let int = |key: &str| per_call.get(key).and_then(Value::as_i64).unwrap_or(0);
                     let (input, cached) = (int("input_tokens"), int("cached_input_tokens"));
                     let cache_write = int("cache_write_input_tokens");
-                    let key = line
-                        .payload
-                        .get("response_id")
-                        .and_then(Value::as_str)
-                        .map(|id| format!("resp:{id}"))
-                        .unwrap_or_else(|| format!("tur:{line_no}"));
-                    let mut usage = UsageRecord::new(key);
-                    usage.ts = ts.clone();
-                    usage.model = current_model.clone();
+                    usage.usage_available = Some(true);
+                    saw_usage_records = true;
                     usage.input_tokens = (input - cached - cache_write).max(0);
                     usage.cache_read_tokens = cached;
                     usage.cache_write_tokens = cache_write;
@@ -640,9 +646,8 @@ fn parse_session(path: &PathBuf) -> Result<Option<SessionRecord>> {
                     usage.reasoning_tokens = int("reasoning_output_tokens");
                     usage.reasoning_in_output = true;
                     usage.context_window = context_window;
-                    usage.provider_route = meta.model_provider.clone();
-                    record.usage.push(usage);
                 }
+                record.usage.push(usage);
             }
             _ => {}
         }
@@ -771,6 +776,7 @@ fn push_completed_item(
                             lines_added: added,
                             lines_removed: removed,
                             ts: ended.clone(),
+                            line_hashes: Vec::new(),
                         });
                     }
                 }
@@ -1298,6 +1304,53 @@ mod tests {
         let body: Vec<String> = lines.iter().map(Value::to_string).collect();
         std::fs::write(&path, body.join("\n"))?;
         Ok(path)
+    }
+
+    #[test]
+    fn usage_records_mark_reported_zero_and_missing_usage() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let record = |id: &str, usage: Option<Value>| {
+            let mut payload = json!({"thread_id": "s3", "response_id": id});
+            if let Some(usage) = usage {
+                payload["usage"] = usage;
+            }
+            json!({"timestamp": "2026-10-11T21:17:44Z", "type": "token_usage_record",
+                "payload": payload})
+        };
+        let path = write_rollout(
+            dir.path(),
+            &[
+                json!({"timestamp":"2026-10-11T21:17:40Z","type":"session_meta","payload":{"id":"s3","cwd":"/tmp/game","cli_version":"0.161.0"}}),
+                record("r1", Some(json!({"input_tokens": 0, "output_tokens": 0}))),
+                record("r2", None),
+            ],
+        )?;
+        let parsed = parse_session(&path)?.expect("record");
+
+        let usage: Vec<(&str, Option<bool>)> = parsed
+            .usage
+            .iter()
+            .map(|u| (u.key.as_str(), u.usage_available))
+            .collect();
+        assert_eq!(usage, [("resp:r1", Some(true)), ("resp:r2", Some(false))]);
+        Ok(())
+    }
+
+    #[test]
+    fn token_count_deltas_are_reported_usage() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = write_rollout(
+            dir.path(),
+            &[
+                json!({"timestamp":"2026-10-11T21:17:40Z","type":"session_meta","payload":{"id":"s4","cwd":"/tmp/game","cli_version":"0.120.0"}}),
+                json!({"timestamp":"2026-10-11T21:17:44Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":0,"output_tokens":5,"reasoning_output_tokens":0,"total_tokens":105}}}}),
+            ],
+        )?;
+        let parsed = parse_session(&path)?.expect("record");
+
+        assert_eq!(parsed.usage.len(), 1);
+        assert_eq!(parsed.usage[0].usage_available, Some(true));
+        Ok(())
     }
 
     /// Codex CLI 0.160+ rollouts: prompts as `UserMessage` items, per-response

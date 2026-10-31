@@ -488,3 +488,38 @@ fn release_components_order_by_instant_across_different_utc_offsets() -> Result<
     );
     Ok(())
 }
+
+#[test]
+fn daily_reports_open_work_age_and_per_model_usage() -> Result<()> {
+    let c = db()?;
+    session(
+        &c,
+        "early",
+        "/repo",
+        "2026-10-01T10:00:00Z",
+        "2026-10-01T10:10:00Z",
+    )?;
+    session(
+        &c,
+        "late",
+        "/repo",
+        "2026-10-01T16:00:00Z",
+        "2026-10-01T16:10:00Z",
+    )?;
+    let r = daily::report_at(&c, &opts("2026-10-01", "2026-10-01"), at())?;
+    let d = &r.days[0];
+    assert_eq!(d.open, 2);
+    assert_eq!(d.open_age_minutes.median, Some(660.0));
+    assert_eq!(d.open_age_max_minutes, Some(840.0));
+
+    let text = vca::commands::daily::text(&r, false);
+    assert!(text.contains("open work age at cutoff: median 11.0h · max 14.0h"));
+    assert!(text.contains("model model-a (codex) · 2 usage events, 2 measured"));
+    assert!(text.contains("API eq $"));
+
+    let csv = vca::commands::daily::csv(&r, false);
+    let mut lines = csv.lines();
+    let header = lines.next().unwrap().split(',').count();
+    assert!(lines.all(|row| row.split(',').count() == header));
+    Ok(())
+}

@@ -917,7 +917,7 @@ fn write_tasks(
         let title = if first.user_head.trim().is_empty() {
             session.title.clone()
         } else {
-            Some(first.user_head.clone())
+            Some(crate::classify::request::normalize(&first.user_head).text)
         };
         let turn_list = turn_set
             .iter()

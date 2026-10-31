@@ -504,7 +504,7 @@ const SESSION_FINGERPRINT_QUERIES: [&str; 2] = [
 ];
 
 pub fn session_fingerprint(conn: &Connection, session: &SessionRef) -> Result<String> {
-    let mut material = String::new();
+    let mut material = super::request::VERSION.to_owned();
     for sql in SESSION_FINGERPRINT_QUERIES {
         for value in conn
             .prepare(sql)?
@@ -1143,6 +1143,9 @@ impl Runner<'_> {
                         built.redactions,
                         None,
                     )?;
+                    let manifest = input_manifest(&built.state, built.level);
+                    self.conn.execute("UPDATE classifier_request SET input_manifest_json=?1 WHERE request_id=last_insert_rowid()",[manifest.to_string()])?;
+                    self.conn.execute("UPDATE classification_result SET evidence_json=?1 WHERE unit_kind=?2 AND unit_key=?3 AND cache_key=?4 AND source='jev'", params![json!({"input_refs":manifest["source_refs"],"supports":[],"contradicts":[],"citation_status":"uncited"}).to_string(),unit_kind,unit_key,key])?;
                     if let Some(repo) = &project {
                         self.conn.execute("INSERT OR IGNORE INTO classifier_project_spend(request_id,repo_root,at,usd) VALUES(?1,?2,datetime('now'),?3)",params![self.conn.last_insert_rowid(),repo,cost])?;
                     }
@@ -1718,21 +1721,8 @@ impl Runner<'_> {
         if let Some(turn) = mark
             && let Some(reopened_at) = self.defect_report_after(session, &task.turns, turn)?
         {
-            mark = answer
-                .probabilities
-                .as_ref()
-                .and_then(Value::as_object)
-                .and_then(|probabilities| {
-                    probabilities
-                        .iter()
-                        .filter_map(|(name, p)| {
-                            let turn = name.strip_prefix("turn_")?.parse::<i64>().ok()?;
-                            (turn >= reopened_at).then_some((turn, p.as_f64().unwrap_or(0.0)))
-                        })
-                        .max_by(|a, b| a.1.total_cmp(&b.1))
-                        .filter(|(_, p)| *p >= 0.1)
-                        .map(|(turn, _)| turn)
-                });
+            let _ = reopened_at;
+            mark = None; // A new supported decision is required after a correction.
         }
         if self.client.is_none() {
             return Ok(());
@@ -1743,6 +1733,35 @@ impl Runner<'_> {
              VALUES (?1, ?2, ?3, ?4, 'jev', ?5)",
             params![session.provider, session.session_id, task.index, mark, answer.confidence],
         )?;
+        let member: Option<String> = self.conn.query_row("SELECT identity_id FROM derived_work_member WHERE provider=?1 AND session_id=?2 AND task_index=?3",params![session.provider,session.session_id,task.index],|r|r.get(0)).optional()?;
+        if let Some(member) = member {
+            let result_id:Option<i64>=self.conn.query_row("SELECT id FROM classification_result WHERE unit_kind='task_completion' AND unit_key=?1 AND question_id='completion_turn' AND source='jev' AND superseded_by IS NULL ORDER BY id DESC LIMIT 1",[&key],|r|r.get(0)).optional()?;
+            let evidence = result_id
+                .into_iter()
+                .map(|id| crate::insights::audit::Reference::Classification { id })
+                .collect();
+            let outcome:Option<String>=self.conn.query_row("SELECT label FROM view_label_effective WHERE unit_kind='task' AND unit_key=?1 AND question_id='outcome'",[&key],|r|r.get(0)).optional()?;
+            let supported = matches!(
+                outcome.as_deref(),
+                Some("completed_verified" | "completed_unverified" | "answered")
+            );
+            // Completion is observed at the end of the selected turn, not at
+            // the request that started it. Unknown timestamps stay unknown.
+            let at = if let Some(turn) = mark.filter(|_| supported) {
+                self.conn.query_row("SELECT ended_at FROM derived_turn WHERE provider=?1 AND session_id=?2 AND turn_index=?3",params![session.provider,session.session_id,turn],|r|r.get::<_,Option<String>>(0)).optional()?.flatten().as_deref().and_then(crate::insights::structure::parse_ts)
+            } else {
+                None
+            };
+            crate::insights::audit::record_completion(
+                self.conn,
+                &member,
+                "classifier",
+                at,
+                outcome.as_deref() == Some("completed_verified"),
+                evidence,
+                "classifier reassessment: no supported completion",
+            )?;
+        }
         self.summary.completions += 1;
         self.summary.completion_decisions += 1;
         self.summary.new_completions += usize::from(mark.is_some() && !prior);
@@ -1980,6 +1999,39 @@ pub fn preview(
         "endpoint": config.endpoint,
         "request": body,
     }))
+}
+
+fn input_manifest(state: &Value, level: Level) -> Value {
+    fn walk(value: &Value, refs: &mut Vec<Value>, omitted: &mut Vec<Value>) {
+        match value {
+            Value::Object(map) => {
+                for (key, value) in map {
+                    if key == "source_refs" {
+                        if let Some(items) = value.as_array() {
+                            for item in items {
+                                if !refs.contains(item) {
+                                    refs.push(item.clone());
+                                }
+                            }
+                        }
+                    } else if key == "omitted" {
+                        omitted.push(value.clone());
+                    } else {
+                        walk(value, refs, omitted);
+                    }
+                }
+            }
+            Value::Array(items) => {
+                for item in items {
+                    walk(item, refs, omitted);
+                }
+            }
+            _ => {}
+        }
+    }
+    let (mut refs, mut omitted) = (vec![], vec![]);
+    walk(state, &mut refs, &mut omitted);
+    json!({"normalizer_version":super::request::VERSION,"question_version":QUESTION_SET_VERSION,"content_level":level.as_str(),"source_refs":refs,"omitted_ranges":omitted})
 }
 
 #[cfg(test)]

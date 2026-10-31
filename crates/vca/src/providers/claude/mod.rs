@@ -153,6 +153,7 @@ fn base_record(parsed: &shared::ParsedClaudeSession, session_id: &str) -> Sessio
             lines_added: change.added_lines,
             lines_removed: change.removed_lines,
             ts: change.timestamp.clone(),
+            line_hashes: Vec::new(),
         })
         .collect();
     record.model = record
@@ -283,7 +284,9 @@ mod tests {
         let conn = Connection::open_in_memory()?;
         init_app_schema(&conn)?;
         let written = ingest_session(&path, &conn)?;
-        assert_eq!(written, 3);
+        // Two messages, the session row, and one usage row marked missing for the
+        // assistant line without a usage block.
+        assert_eq!(written, 4);
 
         let rows: Vec<(String, String)> = {
             let mut stmt = conn.prepare(

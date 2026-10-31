@@ -338,11 +338,7 @@ pub fn refresh_links(conn: &Connection) -> Result<()> {
         }
     }
     // Existing matched commit attribution is stronger than a shared branch name.
-    let mut q=conn.prepare("SELECT MIN(m.identity_id),a.commit_sha FROM fact_commit_session_match a JOIN metadata_sessions s ON s.provider=a.provider AND s.session_id=a.session_id JOIN derived_work_member m ON m.provider=s.provider AND m.session_id=COALESCE(NULLIF(s.root_session_id,''),s.session_id) WHERE a.matched_lines>0 GROUP BY a.provider,a.session_id,a.commit_sha HAVING COUNT(DISTINCT m.identity_id)=1")?;
-    let rows = q
-        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    for (member, sha) in rows {
+    for (member, sha) in commit_members(conn)? {
         for pr in &prs {
             if pr.artifact_shas().contains(&sha) {
                 link(
@@ -358,6 +354,48 @@ pub fn refresh_links(conn: &Connection) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Credits each matched commit to the goal its session was pursuing at the last edit whose
+/// lines the commit contains, so a session that worked on several goals credits the right one.
+pub fn commit_members(conn: &Connection) -> Result<Vec<(String, String)>> {
+    let mut q = conn.prepare(
+        "WITH matched AS (
+             SELECT a.provider, a.session_id, a.commit_sha, MIN(a.repo_root) AS repo_root,
+                    COALESCE(NULLIF(s.root_session_id,''), s.session_id) AS root_id,
+                    (SELECT julianday(MIN(c.commit_time)) FROM fact_commit c WHERE c.commit_sha = a.commit_sha) AS committed
+             FROM fact_commit_session_match a
+             JOIN metadata_sessions s ON s.provider = a.provider AND s.session_id = a.session_id
+             WHERE a.matched_lines > 0
+             GROUP BY a.provider, a.session_id, a.commit_sha),
+         edited AS (
+             SELECT x.*, COALESCE(
+                 (SELECT MAX(julianday(e.change_ts)) FROM fact_session_code_change e
+                  JOIN fact_session_code_change_line_hashes h ON h.code_change_id = e.id
+                  JOIN fact_commit_file_change f
+                    ON f.repo_root = x.repo_root AND f.commit_sha = x.commit_sha AND f.rel_path = e.rel_path
+                  JOIN fact_commit_file_change_line_hashes fh
+                    ON fh.file_change_id = f.id AND fh.side = h.side AND fh.line_hash = h.line_hash
+                  WHERE e.provider = x.provider AND e.session_id = x.session_id
+                    AND julianday(e.change_ts) <= x.committed),
+                 x.committed) AS last_edit
+             FROM matched x),
+         ranked AS (
+             SELECT m.identity_id AS member, d.commit_sha,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY d.provider, d.session_id, d.commit_sha
+                        ORDER BY julianday(t.started_at) <= d.last_edit DESC,
+                                 CASE WHEN julianday(t.started_at) <= d.last_edit
+                                      THEN -julianday(t.started_at) ELSE julianday(t.started_at) END,
+                                 t.task_index) AS rank
+             FROM edited d
+             JOIN derived_work_member m ON m.provider = d.provider AND m.session_id = d.root_id
+             JOIN derived_task t
+               ON t.provider = m.provider AND t.session_id = m.session_id AND t.task_index = m.task_index)
+         SELECT DISTINCT member, commit_sha FROM ranked WHERE rank = 1",
+    )?;
+    Ok(q.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -506,6 +544,7 @@ pub enum ImportRecord {
     PullRequest(PullRequest),
     Deployment(Deployment),
     Coverage(super::observation::SourceCoverage),
+    WorkEvent(super::audit::Event),
 }
 #[derive(Debug, Deserialize, Serialize)]
 pub struct Import {
@@ -516,7 +555,7 @@ pub fn import(conn: &Connection, bytes: &[u8]) -> Result<usize> {
     let records = if bytes.iter().find(|b| !b.is_ascii_whitespace()) == Some(&b'{') {
         if let Ok(envelope) = serde_json::from_slice::<Import>(bytes) {
             ensure!(
-                envelope.schema_version == 1,
+                matches!(envelope.schema_version, 1 | 2),
                 "Unsupported delivery import schema"
             );
             envelope.records
@@ -539,9 +578,13 @@ pub fn import(conn: &Connection, bytes: &[u8]) -> Result<usize> {
                 }
                 ImportRecord::Deployment(d) => save_deployment(conn, d)?,
                 ImportRecord::Coverage(c) => super::observation::record(conn, c)?,
+                ImportRecord::WorkEvent(e) => {
+                    super::audit::save(conn, e)?;
+                }
             }
         }
         refresh_links(conn)?;
+        super::observation::publish(conn)?;
         Ok(records.len())
     })();
     match result {
@@ -553,5 +596,77 @@ pub fn import(conn: &Connection, bytes: &[u8]) -> Result<usize> {
             conn.execute_batch("ROLLBACK TO delivery_import; RELEASE delivery_import")?;
             Err(e)
         }
+    }
+}
+
+#[cfg(test)]
+mod commit_member_tests {
+    use super::*;
+
+    #[test]
+    fn commits_are_credited_to_the_goal_being_edited() -> Result<()> {
+        let conn = Connection::open_in_memory()?;
+        crate::db::init_app_schema(&conn)?;
+        conn.execute(
+            "INSERT INTO metadata_sessions (provider, session_id) VALUES ('codex', 's')",
+            [],
+        )?;
+        for (index, started, member) in [
+            (0, "2026-10-01T10:00:00Z", "first"),
+            (1, "2026-10-01T12:00:00Z", "second"),
+        ] {
+            conn.execute(
+                "INSERT INTO derived_task (provider, session_id, task_index, segmentation_source, started_at, completion_source, harness)
+                 VALUES ('codex', 's', ?1, 'test', ?2, 'none', 'codex')",
+                params![index, started],
+            )?;
+            conn.execute(
+                "INSERT INTO derived_work_member VALUES (?1, 'codex', 's', ?2)",
+                params![member, index],
+            )?;
+        }
+        for (edited, sha, committed) in [
+            ("2026-10-01T10:30:00+00:00", "early", "2026-10-01T13:00:00Z"),
+            ("2026-10-01T12:30:00Z", "late", "2026-10-01T12:45:00Z"),
+        ] {
+            conn.execute(
+                "INSERT INTO fact_session_code_change (provider, session_id, change_ts, repo_root, rel_path, source_kind, call_id)
+                 VALUES ('codex', 's', ?1, '/r', 'lib.rs', 'tool_write', ?2)",
+                params![edited, sha],
+            )?;
+            conn.execute(
+                "INSERT INTO fact_session_code_change_line_hashes VALUES (?1, '+', ?2, 1)",
+                params![conn.last_insert_rowid(), sha],
+            )?;
+            conn.execute(
+                "INSERT INTO fact_commit (repo_root, commit_sha, commit_time, subject) VALUES ('/r', ?1, ?2, '')",
+                params![sha, committed],
+            )?;
+            conn.execute(
+                "INSERT INTO fact_commit_file_change (repo_root, commit_sha, rel_path, change_type) VALUES ('/r', ?1, 'lib.rs', 'M')",
+                params![sha],
+            )?;
+            conn.execute(
+                "INSERT INTO fact_commit_file_change_line_hashes VALUES (?1, '+', ?2, 1)",
+                params![conn.last_insert_rowid(), sha],
+            )?;
+            conn.execute(
+                "INSERT INTO fact_commit_session_match (repo_root, commit_sha, provider, session_id, matched_lines)
+                 VALUES ('/r', ?1, 'codex', 's', 1)",
+                params![sha],
+            )?;
+        }
+
+        let mut credited = commit_members(&conn)?;
+        credited.sort();
+        // The early commit lands after the second goal began, but its lines were written in the first.
+        assert_eq!(
+            credited,
+            [
+                ("first".to_string(), "early".to_string()),
+                ("second".to_string(), "late".to_string()),
+            ]
+        );
+        Ok(())
     }
 }

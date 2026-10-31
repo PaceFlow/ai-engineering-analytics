@@ -1,7 +1,7 @@
 use anyhow::Result;
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use rusqlite::{Connection, TransactionBehavior};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 pub mod git_scan;
 pub mod matcher;
@@ -11,16 +11,18 @@ pub mod types;
 
 use crate::change_intel::storage as change_storage;
 use crate::ingest_progress::IngestProgressObserver;
+use crate::insights::observation;
 
 use git_scan::{
-    list_commits_since_all_local_branches, list_local_head_branch_tips, load_commit_diff,
-    validate_git_repo,
+    list_commits_since_branches_and_mainline, list_local_head_branch_tips, load_commit_diff,
+    shared_repository_root, validate_git_repo,
 };
 use matcher::{compute_commit_attribution, preload_repo_match_data};
 use storage::{
-    insert_commit_assoc_error, list_cached_commit_shas, list_dirty_cached_commit_shas,
-    list_repo_roots_from_session_facts, load_cached_commit_diff, min_ai_timestamp,
-    upsert_commit_attribution, upsert_commit_task_attribution, upsert_git_commit_with_diffs,
+    absorb_worktree_commits, insert_commit_assoc_error, list_cached_commit_shas,
+    list_dirty_cached_commit_shas, list_repo_roots_from_session_facts, load_cached_commit_diff,
+    min_ai_timestamp, upsert_commit_attribution, upsert_commit_task_attribution,
+    upsert_git_commit_with_diffs,
 };
 use task_matcher::{RepoBranchContext, attribute_commit_to_task, load_repo_branch_context};
 use types::{
@@ -35,112 +37,240 @@ pub fn run(conn: &mut Connection, verbose: bool) -> Result<AssociationSummary> {
 }
 
 pub fn plan(conn: &Connection) -> Result<AssociationWorkPlan> {
-    let repos = list_repo_roots_from_session_facts(conn)?;
-    let mut repo_plans = Vec::with_capacity(repos.len());
-
-    for repo_root in repos {
-        let mut repo_plan = RepoAssociationPlan {
-            repo_root: repo_root.clone(),
-            ..RepoAssociationPlan::default()
-        };
-
-        match validate_git_repo(&repo_root) {
-            Ok(Some(_)) => {}
-            Ok(None) => {
-                repo_plan.skipped_non_git = true;
-                repo_plans.push(repo_plan);
-                continue;
-            }
-            Err(err) => {
-                repo_plan.planning_error_stage = Some("validate_repo".to_string());
-                repo_plan.planning_error_message = Some(err.to_string());
-                repo_plans.push(repo_plan);
-                continue;
-            }
+    let mut repo_plans = Vec::new();
+    let mut shared: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
+    let mut tops = BTreeMap::new();
+    for repo_root in list_repo_roots_from_session_facts(conn)? {
+        let top = validate_git_repo(&repo_root);
+        tops.insert(repo_root, top);
+    }
+    if rehome_vanished_checkouts(conn, &tops)? {
+        let roots = list_repo_roots_from_session_facts(conn)?;
+        tops.retain(|root, _| roots.contains(root));
+    }
+    for (repo_root, top) in tops {
+        let located = top.and_then(|top| match top {
+            Some(top) => Ok(shared_repository_root(&repo_root)?.map(|root| (top, root))),
+            None => Ok(None),
+        });
+        match located {
+            Ok(Some((top, root))) => shared.entry(root).or_default().push((repo_root, top)),
+            Ok(None) => repo_plans.push(RepoAssociationPlan {
+                repo_root,
+                skipped_non_git: true,
+                ..RepoAssociationPlan::default()
+            }),
+            Err(err) => repo_plans.push(RepoAssociationPlan {
+                repo_root,
+                planning_error_stage: Some("validate_repo".to_string()),
+                planning_error_message: Some(err.to_string()),
+                ..RepoAssociationPlan::default()
+            }),
         }
+    }
 
-        let Some(ai_min_ts) = min_ai_timestamp(conn, &repo_root)? else {
-            repo_plans.push(repo_plan);
+    for (repo_root, absorbed_roots) in choose_scan_roots(conn, shared)? {
+        repo_plans.push(plan_repo(conn, repo_root, absorbed_roots)?);
+    }
+    Ok(AssociationWorkPlan { repo_plans })
+}
+
+/// Agents that work in a scratch directory check repositories out beneath it (`dir/<repo>/…`)
+/// and the checkout is often deleted before ingestion, leaving edits under the non-git
+/// directory. Edits whose first path segment names exactly one known repository move to
+/// that repository; matching still requires their lines to appear in a commit.
+fn rehome_vanished_checkouts(
+    conn: &Connection,
+    tops: &BTreeMap<String, Result<Option<String>>>,
+) -> Result<bool> {
+    let mut by_name: BTreeMap<String, BTreeSet<(String, String)>> = BTreeMap::new();
+    for (root, top) in tops {
+        if !matches!(top, Ok(Some(_))) {
             continue;
-        };
-
-        let repo_state = change_storage::get_repo_assoc_state(conn, &repo_root)?;
-        repo_plan.session_facts_version = repo_state.session_facts_version;
-
-        match compute_branch_fingerprint(&repo_root) {
-            Ok(fingerprint) => {
-                repo_plan.branch_fingerprint_changed =
-                    repo_state.task_branch_fingerprint != fingerprint;
-                repo_plan.branch_fingerprint = fingerprint;
-            }
-            Err(err) => {
-                repo_plan.planning_error_stage = Some("compute_branch_fingerprint".to_string());
-                repo_plan.planning_error_message = Some(err.to_string());
-                repo_plans.push(repo_plan);
+        }
+        let canonical = observation::canonical_repo(conn, root)?;
+        let name = canonical
+            .rsplit(['/', ':'])
+            .next()
+            .unwrap_or("")
+            .trim_end_matches(".git");
+        if !name.is_empty() {
+            by_name
+                .entry(name.to_owned())
+                .or_default()
+                .insert((canonical.clone(), root.clone()));
+        }
+    }
+    let mut moved_any = false;
+    for (root, top) in tops {
+        if !matches!(top, Ok(None)) {
+            continue;
+        }
+        for prefix in storage::first_path_segments(conn, root)? {
+            let Some(targets) = by_name.get(&prefix) else {
                 continue;
+            };
+            let canonicals: BTreeSet<&String> = targets.iter().map(|(c, _)| c).collect();
+            let Some((_, target)) = targets.first().filter(|_| canonicals.len() == 1) else {
+                continue;
+            };
+            let hashes = storage::rehome_prefixed_edits(conn, root, &prefix, target)?;
+            change_storage::mark_hashes_dirty(conn, target, &hashes)?;
+            moved_any = true;
+        }
+    }
+    Ok(moved_any)
+}
+
+/// Worktrees share their repository's branches, so each repository is scanned once at its
+/// shared root. The shared root joins the worktrees' repository so their edits still match.
+fn choose_scan_roots(
+    conn: &Connection,
+    shared: BTreeMap<String, Vec<(String, String)>>,
+) -> Result<Vec<(String, Vec<String>)>> {
+    let before = observation::alias_targets(conn)?;
+    let mut scan_roots = Vec::with_capacity(shared.len());
+    for (shared_root, members) in shared {
+        let scan_root = members
+            .iter()
+            .find(|(_, top)| *top == shared_root)
+            .map(|(root, _)| root.clone())
+            .unwrap_or(shared_root);
+        let absorbed: Vec<String> = members
+            .into_iter()
+            .map(|(root, _)| root)
+            .filter(|root| *root != scan_root)
+            .collect();
+        if !absorbed.is_empty() {
+            join_repository(conn, &scan_root, &absorbed)?;
+        }
+        scan_roots.push((scan_root, absorbed));
+    }
+    observation::requeue_changed_aliases(conn, &before)?;
+    for (scan_root, absorbed) in &scan_roots {
+        for worktree_root in absorbed {
+            conn.execute_batch("SAVEPOINT absorb_worktree")?;
+            // The worktree itself is no longer scanned, so it keeps no queue of its own.
+            let moved = absorb_worktree_commits(conn, worktree_root, scan_root)
+                .and_then(|hashes| change_storage::mark_hashes_dirty(conn, scan_root, &hashes))
+                .and_then(|()| change_storage::clear_dirty_hashes(conn, worktree_root));
+            match moved {
+                Ok(()) => conn.execute_batch("RELEASE absorb_worktree")?,
+                Err(error) => {
+                    conn.execute_batch("ROLLBACK TO absorb_worktree; RELEASE absorb_worktree")?;
+                    return Err(error);
+                }
             }
         }
+    }
+    Ok(scan_roots)
+}
 
-        let dirty_hashes = change_storage::list_dirty_hashes(conn, &repo_root)?;
-        repo_plan.has_dirty_hashes = !dirty_hashes.is_empty();
-
-        let commit_shas = match determine_commit_scope(&repo_root, &ai_min_ts) {
-            Ok(commit_shas) => commit_shas,
-            Err(err) => {
-                repo_plan.planning_error_stage = Some("determine_commit_scope".to_string());
-                repo_plan.planning_error_message = Some(err.to_string());
-                repo_plans.push(repo_plan);
-                continue;
+fn join_repository(conn: &Connection, scan_root: &str, worktrees: &[String]) -> Result<()> {
+    let mut target = observation::canonical_repo(conn, scan_root)?;
+    if target == scan_root {
+        for worktree in worktrees {
+            let canonical = observation::canonical_repo(conn, worktree)?;
+            if canonical != *worktree {
+                target = canonical;
+                break;
             }
-        };
+        }
+    }
+    for root in worktrees.iter().map(String::as_str).chain([scan_root]) {
+        if root != target && observation::canonical_repo(conn, root)? == root {
+            observation::set_alias(conn, root, &target, "git")?;
+        }
+    }
+    Ok(())
+}
 
-        let cached_commit_shas = list_cached_commit_shas(conn, &repo_root)?;
-        let cached_lookup: std::collections::HashSet<String> =
-            cached_commit_shas.iter().cloned().collect();
+fn plan_repo(
+    conn: &Connection,
+    repo_root: String,
+    absorbed_roots: Vec<String>,
+) -> Result<RepoAssociationPlan> {
+    let mut repo_plan = RepoAssociationPlan {
+        repo_root: repo_root.clone(),
+        absorbed_roots,
+        ..RepoAssociationPlan::default()
+    };
+    let Some(ai_min_ts) = min_ai_timestamp(conn, &repo_root)? else {
+        return Ok(repo_plan);
+    };
 
-        let mut work_index: HashMap<String, usize> = HashMap::new();
-        let mut commits = Vec::new();
+    let repo_state = change_storage::get_repo_assoc_state(conn, &repo_root)?;
+    repo_plan.session_facts_version = repo_state.session_facts_version;
 
+    match compute_branch_fingerprint(&repo_root) {
+        Ok(fingerprint) => {
+            repo_plan.branch_fingerprint_changed =
+                repo_state.task_branch_fingerprint != fingerprint;
+            repo_plan.branch_fingerprint = fingerprint;
+        }
+        Err(err) => {
+            repo_plan.planning_error_stage = Some("compute_branch_fingerprint".to_string());
+            repo_plan.planning_error_message = Some(err.to_string());
+            return Ok(repo_plan);
+        }
+    }
+
+    let dirty_hashes = change_storage::list_dirty_hashes(conn, &repo_root)?;
+    repo_plan.has_dirty_hashes = !dirty_hashes.is_empty();
+
+    let commit_shas = match determine_commit_scope(&repo_root, &ai_min_ts) {
+        Ok(commit_shas) => commit_shas,
+        Err(err) => {
+            repo_plan.planning_error_stage = Some("determine_commit_scope".to_string());
+            repo_plan.planning_error_message = Some(err.to_string());
+            return Ok(repo_plan);
+        }
+    };
+
+    let cached_commit_shas = list_cached_commit_shas(conn, &repo_root)?;
+    let cached_lookup: std::collections::HashSet<String> =
+        cached_commit_shas.iter().cloned().collect();
+
+    let mut work_index: HashMap<String, usize> = HashMap::new();
+    let mut commits = Vec::new();
+
+    merge_work_items(
+        &mut commits,
+        &mut work_index,
+        commit_shas
+            .into_iter()
+            .filter(|commit_sha| !cached_lookup.contains(commit_sha)),
+        true,
+        true,
+        CommitDiffSource::Git,
+    );
+
+    if repo_plan.session_facts_version > 0 && repo_plan.has_dirty_hashes {
+        let dirty_commits =
+            list_dirty_cached_commit_shas(conn, &repo_root, repo_plan.session_facts_version)?;
         merge_work_items(
             &mut commits,
             &mut work_index,
-            commit_shas
-                .into_iter()
-                .filter(|commit_sha| !cached_lookup.contains(commit_sha)),
+            dirty_commits,
             true,
             true,
-            CommitDiffSource::Git,
+            CommitDiffSource::Cache,
         );
-
-        if repo_plan.session_facts_version > 0 && repo_plan.has_dirty_hashes {
-            let dirty_commits =
-                list_dirty_cached_commit_shas(conn, &repo_root, repo_plan.session_facts_version)?;
-            merge_work_items(
-                &mut commits,
-                &mut work_index,
-                dirty_commits,
-                true,
-                true,
-                CommitDiffSource::Cache,
-            );
-        }
-
-        if repo_plan.branch_fingerprint_changed {
-            merge_work_items(
-                &mut commits,
-                &mut work_index,
-                cached_commit_shas,
-                false,
-                true,
-                CommitDiffSource::None,
-            );
-        }
-
-        repo_plan.commits = commits;
-        repo_plans.push(repo_plan);
     }
 
-    Ok(AssociationWorkPlan { repo_plans })
+    if repo_plan.branch_fingerprint_changed {
+        merge_work_items(
+            &mut commits,
+            &mut work_index,
+            cached_commit_shas,
+            false,
+            true,
+            CommitDiffSource::None,
+        );
+    }
+
+    repo_plan.commits = commits;
+    Ok(repo_plan)
 }
 
 pub fn run_with_plan(
@@ -239,7 +369,7 @@ pub fn run_with_plan(
 
 fn determine_commit_scope(repo_root: &str, ai_min_ts: &str) -> Result<Vec<String>> {
     let ai_scan_from = loosen_scan_start(ai_min_ts, 1);
-    list_commits_since_all_local_branches(repo_root, &ai_scan_from, false, None)
+    list_commits_since_branches_and_mainline(repo_root, &ai_scan_from, false, None)
 }
 
 fn process_repo_plan(
@@ -489,4 +619,199 @@ fn loosen_scan_start(ai_min_ts: &str, days: i64) -> String {
 
 fn short_commit_sha(commit_sha: &str) -> &str {
     &commit_sha[..commit_sha.len().min(8)]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::change_intel::line_hash::hashes_for_text;
+    use crate::change_intel::types::LineSide;
+    use rusqlite::params;
+    use std::path::Path;
+
+    fn git(dir: &Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+            .args(args)
+            .status()
+            .expect("git runs");
+        assert!(status.success(), "git {args:?}");
+    }
+
+    #[test]
+    fn worktrees_of_one_repository_are_scanned_once() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let main = dir.path().join("main");
+        std::fs::create_dir(&main)?;
+        git(&main, &["init", "-q", "-b", "main"]);
+        std::fs::write(main.join("README"), "start\n")?;
+        git(&main, &["add", "."]);
+        git(&main, &["commit", "-q", "-m", "start"]);
+        let worktree = dir.path().join("issue");
+        git(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "agent/x",
+                worktree.to_str().unwrap(),
+            ],
+        );
+        let content = "fn alpha() {}\nfn beta() {}\nfn gamma() {}\n";
+        std::fs::write(worktree.join("lib.rs"), content)?;
+        git(&worktree, &["add", "."]);
+        git(&worktree, &["commit", "-q", "-m", "add lib"]);
+
+        let main_root = validate_git_repo(main.to_str().unwrap())?.unwrap();
+        let worktree_root = validate_git_repo(worktree.to_str().unwrap())?.unwrap();
+        let mut conn = Connection::open_in_memory()?;
+        crate::db::init_app_schema(&conn)?;
+        let edited = (Utc::now() - Duration::hours(1)).to_rfc3339();
+        conn.execute(
+            "INSERT INTO fact_session_code_change (provider, session_id, source_kind, repo_root, rel_path, change_ts)
+             VALUES ('opencode', 's1', 'accepted_change', ?1, 'lib.rs', ?2)",
+            params![worktree_root, edited],
+        )?;
+        let change_id = conn.last_insert_rowid();
+        for hash in hashes_for_text(content, LineSide::Added) {
+            conn.execute(
+                "INSERT INTO fact_session_code_change_line_hashes VALUES (?1, '+', ?2, ?3)",
+                params![change_id, hash.line_hash, hash.count],
+            )?;
+        }
+        // A commit from a since-deleted branch, kept from when the worktree was scanned alone.
+        conn.execute(
+            "INSERT INTO fact_commit (repo_root, commit_sha, commit_time, subject) VALUES (?1, 'gone', ?2, 'deleted branch')",
+            params![worktree_root, edited],
+        )?;
+        let work = plan(&conn)?;
+        run_with_plan(&mut conn, &work, false, None)?;
+        // A worktree copy of a commit the shared root already holds.
+        conn.execute(
+            "INSERT INTO fact_commit (repo_root, commit_sha, commit_time, subject)
+             SELECT ?1, commit_sha, commit_time, subject FROM fact_commit WHERE subject = 'add lib'",
+            params![worktree_root],
+        )?;
+        let work = plan(&conn)?;
+        run_with_plan(&mut conn, &work, false, None)?;
+
+        let commits: Vec<(String, String)> = conn
+            .prepare("SELECT repo_root, subject FROM fact_commit ORDER BY subject")?
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        assert_eq!(
+            commits,
+            [
+                (main_root.clone(), "add lib".to_string()),
+                (main_root.clone(), "deleted branch".to_string()),
+                (main_root, "start".to_string()),
+            ]
+        );
+        let matched: Vec<(String, String)> = conn
+            .prepare("SELECT m.session_id, c.subject FROM fact_commit_session_match m JOIN fact_commit c USING (repo_root, commit_sha) WHERE m.session_id = 's1'")?
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        assert_eq!(matched, [("s1".to_string(), "add lib".to_string())]);
+        Ok(())
+    }
+
+    #[test]
+    fn edits_in_a_deleted_checkout_match_the_repository_it_was_named_after() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let repo = dir.path().join("app");
+        std::fs::create_dir(&repo)?;
+        git(&repo, &["init", "-q", "-b", "main"]);
+        std::fs::write(repo.join("README"), "start\n")?;
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-q", "-m", "start"]);
+        let content = "fn alpha() {}\nfn beta() {}\nfn gamma() {}\n";
+        std::fs::write(repo.join("lib.rs"), content)?;
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-q", "-m", "add lib"]);
+
+        let root = validate_git_repo(repo.to_str().unwrap())?.unwrap();
+        let gone = dir.path().join("issue").join("workdir");
+        let gone = gone.to_str().unwrap();
+        let mut conn = Connection::open_in_memory()?;
+        crate::db::init_app_schema(&conn)?;
+        let edited = (Utc::now() - Duration::hours(1)).to_rfc3339();
+        for (session, edit_root, rel_path, text) in [
+            ("s1", root.as_str(), "README", "start\n"),
+            ("s2", gone, "app/lib.rs", content),
+            ("s2", gone, "reply.md", "Done.\n"),
+        ] {
+            conn.execute(
+                "INSERT INTO fact_session_code_change (provider, session_id, source_kind, repo_root, rel_path, change_ts)
+                 VALUES ('opencode', ?1, 'accepted_change', ?2, ?3, ?4)",
+                params![session, edit_root, rel_path, edited],
+            )?;
+            let change_id = conn.last_insert_rowid();
+            for hash in hashes_for_text(text, LineSide::Added) {
+                conn.execute(
+                    "INSERT INTO fact_session_code_change_line_hashes VALUES (?1, '+', ?2, ?3)",
+                    params![change_id, hash.line_hash, hash.count],
+                )?;
+            }
+        }
+        let work = plan(&conn)?;
+        run_with_plan(&mut conn, &work, false, None)?;
+
+        let edits: Vec<(String, String)> = conn
+            .prepare("SELECT repo_root, rel_path FROM fact_session_code_change WHERE session_id = 's2' ORDER BY rel_path")?
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        assert_eq!(
+            edits,
+            [
+                (root.clone(), "lib.rs".to_string()),
+                (gone.to_string(), "reply.md".to_string()),
+            ]
+        );
+        let matched: Vec<String> = conn
+            .prepare("SELECT c.subject FROM fact_commit_session_match m JOIN fact_commit c USING (repo_root, commit_sha) WHERE m.session_id = 's2' AND m.matched_lines > 0")?
+            .query_map([], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        assert_eq!(matched, ["add lib"]);
+        Ok(())
+    }
+
+    #[test]
+    fn commits_only_on_the_remote_mainline_are_scanned() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        git(dir.path(), &["init", "-q", "-b", "main"]);
+        std::fs::write(
+            dir.path().join("a"),
+            "a
+",
+        )?;
+        git(dir.path(), &["add", "."]);
+        git(dir.path(), &["commit", "-q", "-m", "local"]);
+        git(dir.path(), &["checkout", "-q", "-b", "merged-upstream"]);
+        std::fs::write(
+            dir.path().join("b"),
+            "b
+",
+        )?;
+        git(dir.path(), &["add", "."]);
+        git(
+            dir.path(),
+            &["commit", "-q", "-m", "squash merged upstream"],
+        );
+        git(
+            dir.path(),
+            &["update-ref", "refs/remotes/origin/main", "HEAD"],
+        );
+        git(dir.path(), &["checkout", "-q", "main"]);
+        git(dir.path(), &["branch", "-q", "-D", "merged-upstream"]);
+
+        let root = validate_git_repo(dir.path().to_str().unwrap())?.unwrap();
+        let commits =
+            list_commits_since_branches_and_mainline(&root, "2000-01-01T00:00:00Z", false, None)?;
+        assert_eq!(commits.len(), 2);
+        Ok(())
+    }
 }

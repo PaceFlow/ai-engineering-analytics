@@ -82,7 +82,7 @@ pub fn init_app_schema(conn: &Connection) -> Result<()> {
     init_metadata_schema(conn)?;
 
     init_change_intel_schema(conn)?;
-    if previous > 0 && previous < 4 {
+    if previous > 0 && previous < 5 {
         crate::insights::refresh(conn)?;
     }
     Ok(())
@@ -1222,15 +1222,15 @@ pub fn ingest_session_message(
     )
 }
 
+/// Stores one accepted change and returns the repository root it was assigned to.
 pub fn ingest_accepted_code_change(
     conn: &Connection,
     provider: &str,
     session_id: &str,
-    file_path: &str,
-    lines_added: i64,
-    lines_removed: i64,
-    timestamp: Option<&str>,
-) -> Result<()> {
+    change: &session_store::AcceptedChangeRecord,
+) -> Result<Option<String>> {
+    let file_path = change.abs_path.as_str();
+    let timestamp = change.ts.as_deref();
     let metadata = load_session_metadata(conn, provider, session_id)?;
     let repo_root = metadata
         .repo_root
@@ -1258,9 +1258,17 @@ pub fn ingest_accepted_code_change(
         repo_root.as_deref(),
         file_path,
         rel_path.as_deref(),
-        lines_added,
-        lines_removed,
-    )
+        change.lines_added,
+        change.lines_removed,
+    )?;
+    if !change.line_hashes.is_empty() {
+        replace_fact_session_code_change_line_hashes(
+            conn,
+            conn.last_insert_rowid(),
+            &change.line_hashes,
+        )?;
+    }
+    Ok(repo_root)
 }
 
 fn next_usage_index(conn: &Connection, provider: &str, session_id: &str) -> Result<i64> {

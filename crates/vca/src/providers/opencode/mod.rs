@@ -6,6 +6,8 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use crate::change_intel::line_hash::{hashes_for_text, hashes_for_unified_patch};
+use crate::change_intel::types::{LineHashCount, LineSide};
 use crate::db::session_store::{
     self, AcceptedChangeRecord, AgentKind, ContextInjectionRecord, MessageRecord, RepositoryHint,
     SessionEventRecord, SessionRecord, ToolCallRecord, UsageRecord,
@@ -48,6 +50,8 @@ struct OpenCodeMessage {
 
 #[derive(Debug, Clone, PartialEq)]
 struct OpenCodeUsageEvent {
+    /// Some(true) once the tokens are final; None while they may still be streaming.
+    usage_available: Option<bool>,
     key: String,
     timestamp: Option<String>,
     model_name: Option<String>,
@@ -68,6 +72,8 @@ struct OpenCodeAcceptedChange {
     removed_lines: i64,
     /// When the edit happened; session diffs only have the session end.
     ts: Option<String>,
+    /// Lets commit association match the edit to committed lines.
+    line_hashes: Vec<LineHashCount>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -239,6 +245,7 @@ fn session_record(
         .iter()
         .map(|usage| {
             let mut out = UsageRecord::new(usage.key.clone());
+            out.usage_available = usage.usage_available;
             out.ts = usage.timestamp.clone();
             out.model = usage.model_name.clone();
             out.provider_route = usage.provider_id.clone();
@@ -261,6 +268,7 @@ fn session_record(
             lines_added: change.added_lines,
             lines_removed: change.removed_lines,
             ts: change.ts.or_else(|| change_ts.clone()),
+            line_hashes: change.line_hashes,
         })
         .collect();
     record.model = record
@@ -522,12 +530,16 @@ fn parse_opencode_usage(parsed: &Value) -> Option<OpenCodeUsageEvent> {
             + cached_input_tokens
             + cache_creation_tokens,
     );
+    // OpenCode writes zero tokens while a message streams and also on completed
+    // gateway calls whose usage it never recorded, so a zero is not a measurement.
+    let usage_available = (total_tokens > 0).then_some(true);
     let actual_cost_usd = parsed
         .get("cost")
         .and_then(Value::as_f64)
         .filter(|value| *value > 0.0);
 
     Some(OpenCodeUsageEvent {
+        usage_available,
         key: String::new(),
         timestamp: None,
         model_name: None,
@@ -615,11 +627,8 @@ fn edits_from_tool_part(
     let state = part.get("state").unwrap_or(&Value::Null);
     let meta = state.get("metadata").unwrap_or(&Value::Null);
     let change = |file: &str, entry: &Value| {
-        let counted = entry
-            .get("patch")
-            .and_then(Value::as_str)
-            .map(count_unified_patch_lines)
-            .unwrap_or((0, 0));
+        let patch = entry.get("patch").and_then(Value::as_str);
+        let counted = patch.map(count_unified_patch_lines).unwrap_or((0, 0));
         let int = |key: &str| entry.get(key).and_then(Value::as_i64);
         let (added, removed) = (
             int("additions").unwrap_or(counted.0),
@@ -632,6 +641,7 @@ fn edits_from_tool_part(
             added_lines: added,
             removed_lines: removed,
             ts: ts.clone(),
+            line_hashes: patch.map(hashes_for_unified_patch).unwrap_or_default(),
         })
     };
     let text = |value: &Value, key: &str| value.get(key).and_then(Value::as_str).map(str::to_owned);
@@ -673,11 +683,8 @@ fn edits_from_tool_part(
         // The previous content is not stored; count the written lines as added.
         Some("write") => {
             let input = state.get("input").unwrap_or(&Value::Null);
-            let lines = input
-                .get("content")
-                .and_then(Value::as_str)
-                .map(|content| content.lines().count() as i64)
-                .unwrap_or(0);
+            let content = input.get("content").and_then(Value::as_str).unwrap_or("");
+            let lines = content.lines().count() as i64;
             text(input, "filePath")
                 .or_else(|| text(input, "path"))
                 .or_else(|| text(input, "file_path"))
@@ -689,6 +696,7 @@ fn edits_from_tool_part(
                     added_lines: lines,
                     removed_lines: 0,
                     ts: ts.clone(),
+                    line_hashes: hashes_for_text(content, LineSide::Added),
                 })
                 .into_iter()
                 .collect()
@@ -843,6 +851,7 @@ fn parse_accepted_changes(
             added_lines,
             removed_lines,
             ts: None,
+            line_hashes: hashes_for_unified_patch(&entry.patch),
         });
     }
 
@@ -916,6 +925,7 @@ mod tests {
         assert_eq!(
             usage,
             OpenCodeUsageEvent {
+                usage_available: Some(true),
                 key: String::new(),
                 timestamp: None,
                 model_name: None,
@@ -929,6 +939,19 @@ mod tests {
                 actual_cost_usd: Some(0.0125),
             }
         );
+    }
+
+    #[test]
+    fn completed_zero_token_message_is_not_a_measured_zero() {
+        // Gateway calls finish with zero tokens when OpenCode recorded no usage.
+        let usage = parse_opencode_usage(&json!({
+            "role": "assistant",
+            "providerID": "openrouter",
+            "time": {"created": 1, "completed": 2},
+            "tokens": {"input": 0, "output": 0, "reasoning": 0, "cache": {"read": 0, "write": 0}}
+        }))
+        .expect("usage should parse");
+        assert_eq!(usage.usage_available, None);
     }
 
     #[test]

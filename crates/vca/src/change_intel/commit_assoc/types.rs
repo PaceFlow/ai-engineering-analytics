@@ -35,6 +35,8 @@ pub struct CommitAssociationWorkItem {
 #[derive(Debug, Clone, Default)]
 pub struct RepoAssociationPlan {
     pub repo_root: String,
+    /// Worktrees of the same repository whose commits are kept under `repo_root` instead.
+    pub absorbed_roots: Vec<String>,
     pub commits: Vec<CommitAssociationWorkItem>,
     pub session_facts_version: i64,
     pub branch_fingerprint: Option<String>,
