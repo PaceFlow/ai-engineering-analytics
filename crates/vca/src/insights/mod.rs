@@ -33,6 +33,7 @@ pub(crate) fn init_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(observation::SCHEMA)?;
     conn.execute_batch(delivery::SCHEMA)?;
     audit::init(conn)?;
+    crate::classify::overrides::migrate(conn)?;
     Ok(())
 }
 
@@ -60,7 +61,9 @@ fn refresh_inner(conn: &Connection) -> Result<()> {
         [],
         |r| r.get(0),
     )?;
-    if saved {
+    // Goal-keyed label overrides resolve through work members, so those must
+    // follow the new segmentation before any label is read.
+    if saved || crate::classify::overrides::has_goal_keyed(conn)? {
         work::refresh(conn)?;
         if work::reconcile_decisions(conn)? {
             structure::refresh_session_structure(conn)?;

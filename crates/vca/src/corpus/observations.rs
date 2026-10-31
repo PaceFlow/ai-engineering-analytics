@@ -149,6 +149,8 @@ pub fn save(
                     .is_some_and(|k| {
                         k == format!("{provider}|{session}")
                             || k.starts_with(&format!("{provider}|{session}|"))
+                            || k.strip_prefix("work:")
+                                .is_some_and(|id| identities.iter().any(|i| i == id))
                     }),
                 _ => field("provider") == Some(provider) && field("session_id") == Some(session),
             };

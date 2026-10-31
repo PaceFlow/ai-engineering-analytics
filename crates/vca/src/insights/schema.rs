@@ -212,9 +212,20 @@ CREATE TABLE IF NOT EXISTS classification_gold (
 CREATE INDEX IF NOT EXISTS idx_classification_result_unit
     ON classification_result(unit_kind, unit_key, question_id);
 
--- Effective label per unit and question: override > classifier (non-uncertain,
--- newest) > heuristic. Uncertain classifier answers stay visible via `band`.
-CREATE VIEW IF NOT EXISTS view_label_effective AS
+CREATE INDEX IF NOT EXISTS idx_derived_usage_event_ts ON derived_usage_event(usage_ts);
+CREATE INDEX IF NOT EXISTS idx_derived_usage_event_root
+    ON derived_usage_event(provider, root_session_id, root_turn_index);
+CREATE INDEX IF NOT EXISTS idx_derived_task_started ON derived_task(started_at);
+";
+
+/// Effective label per unit and question: override > classifier (non-uncertain,
+/// newest) > heuristic. Uncertain classifier answers stay visible via `band`.
+/// Task overrides stored under a stable `work:<identity>` key resolve to the
+/// task that currently holds that goal; a goal with no task drops out.
+/// Replaced on every open so older databases pick up the current definition.
+pub(crate) const LABEL_EFFECTIVE_VIEW: &str = "
+DROP VIEW IF EXISTS view_label_effective;
+CREATE VIEW view_label_effective AS
 WITH ranked AS (
     SELECT unit_kind, unit_key, question_id, label, score, probability, confidence, band,
            source,
@@ -229,23 +240,40 @@ WITH ranked AS (
            ) AS rank
     FROM classification_result
     WHERE superseded_by IS NULL
+),
+addressed AS (
+    SELECT o.unit_kind,
+           CASE WHEN o.unit_key LIKE 'work:%'
+                THEN m.provider || '|' || m.session_id || '|' || m.task_index
+                ELSE o.unit_key END AS unit_key,
+           o.question_id, o.label, o.created_at,
+           o.unit_key LIKE 'work:%' AS stable
+    FROM classification_override o
+    LEFT JOIN derived_work_member m
+      ON o.unit_kind = 'task' AND o.unit_key LIKE 'work:%'
+     AND m.identity_id = substr(o.unit_key, 6)
+),
+overrides AS (
+    SELECT unit_kind, unit_key, question_id, label,
+           ROW_NUMBER() OVER (
+               PARTITION BY unit_kind, unit_key, question_id
+               ORDER BY stable DESC, created_at DESC
+           ) AS rank
+    FROM addressed
+    WHERE unit_key IS NOT NULL
 )
 SELECT o.unit_kind, o.unit_key, o.question_id, o.label, NULL AS score, NULL AS probability,
        1.0 AS confidence, 'override' AS band, 'override' AS source
-FROM classification_override o
+FROM overrides o
+WHERE o.rank = 1
 UNION ALL
 SELECT r.unit_kind, r.unit_key, r.question_id, r.label, r.score, r.probability, r.confidence,
        r.band, r.source
 FROM ranked r
 WHERE r.rank = 1
   AND NOT EXISTS (
-      SELECT 1 FROM classification_override o
+      SELECT 1 FROM overrides o
       WHERE o.unit_kind = r.unit_kind AND o.unit_key = r.unit_key
         AND o.question_id = r.question_id
   );
-
-CREATE INDEX IF NOT EXISTS idx_derived_usage_event_ts ON derived_usage_event(usage_ts);
-CREATE INDEX IF NOT EXISTS idx_derived_usage_event_root
-    ON derived_usage_event(provider, root_session_id, root_turn_index);
-CREATE INDEX IF NOT EXISTS idx_derived_task_started ON derived_task(started_at);
 ";
