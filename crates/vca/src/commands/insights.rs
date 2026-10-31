@@ -129,7 +129,11 @@ pub fn run_usage(args: UsageArgs, _context: AppContext) -> Result<()> {
                 fmt::tokens(row.output_tokens),
                 row.sessions.to_string(),
                 row.calls.to_string(),
-                gaps(row.unpriced_tokens, row.estimated_tokens),
+                gaps(
+                    row.unpriced_tokens,
+                    row.estimated_tokens,
+                    row.missing_usage_calls,
+                ),
             ]
         })
         .collect();
@@ -150,6 +154,7 @@ pub fn run_usage(args: UsageArgs, _context: AppContext) -> Result<()> {
         gaps(
             rows.iter().map(|row| row.unpriced_tokens).sum(),
             rows.iter().map(|row| row.estimated_tokens).sum(),
+            rows.iter().map(|row| row.missing_usage_calls).sum(),
         ),
     ]);
     print!(
@@ -177,8 +182,11 @@ pub fn run_usage(args: UsageArgs, _context: AppContext) -> Result<()> {
     Ok(())
 }
 
-fn gaps(unpriced: i64, estimated: i64) -> String {
+fn gaps(unpriced: i64, estimated: i64, missing_calls: i64) -> String {
     let mut parts = Vec::new();
+    if missing_calls > 0 {
+        parts.push(format!("{missing_calls} calls without usage"));
+    }
     if unpriced > 0 {
         parts.push(format!("{} unpriced", fmt::tokens(unpriced)));
     }

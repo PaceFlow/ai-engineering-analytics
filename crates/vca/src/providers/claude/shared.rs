@@ -174,7 +174,7 @@ pub(crate) fn parse_session_file(path: &Path) -> Result<ParsedClaudeSession> {
     let mut ended_at: Option<String> = None;
     let mut state = ParseState::default();
 
-    for raw in text.lines() {
+    for (line_no, raw) in text.lines().enumerate() {
         if raw.trim().is_empty() {
             continue;
         }
@@ -214,7 +214,7 @@ pub(crate) fn parse_session_file(path: &Path) -> Result<ParsedClaudeSession> {
 
         capture_session_attributes(&parsed, &mut state);
         process_auxiliary_record(&parsed, outer_timestamp.as_deref(), &mut state);
-        process_top_level_record(&parsed, &mut state);
+        process_top_level_record(&parsed, line_no, &mut state);
 
         if parsed.get("type").and_then(Value::as_str) == Some("progress")
             && parsed
@@ -323,7 +323,7 @@ fn discover_top_level_jsonl_files(root: &Path) -> Vec<PathBuf> {
     files
 }
 
-fn process_top_level_record(parsed: &Value, state: &mut ParseState) {
+fn process_top_level_record(parsed: &Value, line_no: usize, state: &mut ParseState) {
     let Some(kind) = parsed.get("type").and_then(Value::as_str) else {
         return;
     };
@@ -345,13 +345,13 @@ fn process_top_level_record(parsed: &Value, state: &mut ParseState) {
             if let Some(found_model) = model.clone() {
                 state.model_name = Some(found_model);
             }
-            if let Some(mut usage) = extract_claude_usage(parsed, message, timestamp.clone(), model)
-            {
-                if usage.key.is_empty() {
-                    usage.key = format!("anon:{}", state.usage.len());
-                }
-                state.usage.push(usage);
-            }
+            state.usage.push(extract_claude_usage(
+                parsed,
+                message,
+                line_no,
+                timestamp.clone(),
+                model,
+            ));
             if parsed
                 .get("isApiErrorMessage")
                 .and_then(Value::as_bool)
@@ -414,14 +414,15 @@ fn process_top_level_record(parsed: &Value, state: &mut ParseState) {
     }
 }
 
+/// One usage record per assistant line. A line without a `usage` block yields a
+/// zero record marked missing, so it is not read as a measured zero.
 fn extract_claude_usage(
     record: &Value,
     message: &Value,
+    line_no: usize,
     timestamp: Option<String>,
     model: Option<String>,
-) -> Option<UsageRecord> {
-    let usage = message.get("usage")?;
-    let int = |key: &str| usage.get(key).and_then(Value::as_i64).unwrap_or(0);
+) -> UsageRecord {
     let key = message
         .get("id")
         .and_then(Value::as_str)
@@ -433,10 +434,20 @@ fn extract_claude_usage(
                 .map(|id| format!("req:{id}"))
         })
         .or_else(|| record_key(record).map(|uuid| format!("uuid:{uuid}")))
-        .unwrap_or_default();
+        .unwrap_or_else(|| format!("line:{line_no}"));
     let mut out = UsageRecord::new(key);
     out.ts = timestamp;
     out.model = model;
+    out.stop_reason = message
+        .get("stop_reason")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+    let Some(usage) = message.get("usage").filter(|usage| usage.is_object()) else {
+        out.usage_available = Some(false);
+        return out;
+    };
+    out.usage_available = Some(true);
+    let int = |key: &str| usage.get(key).and_then(Value::as_i64).unwrap_or(0);
     out.input_tokens = int("input_tokens");
     out.cache_write_tokens = int("cache_creation_input_tokens");
     out.cache_read_tokens = int("cache_read_input_tokens");
@@ -457,23 +468,30 @@ fn extract_claude_usage(
         .get("service_tier")
         .and_then(Value::as_str)
         .map(ToOwned::to_owned);
-    out.stop_reason = message
-        .get("stop_reason")
-        .and_then(Value::as_str)
-        .map(ToOwned::to_owned);
-    Some(out)
+    out
 }
 
+/// Keeps the last record per key, preferring one that carried usage over a
+/// later line of the same message that did not.
 fn dedupe_usage_keep_last(usage: &mut Vec<UsageRecord>) {
-    let mut seen = std::collections::HashSet::new();
-    let mut kept: Vec<UsageRecord> = Vec::with_capacity(usage.len());
-    for record in usage.drain(..).rev() {
-        if seen.insert(record.key.clone()) {
-            kept.push(record);
+    let mut best: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for (index, record) in usage.iter().enumerate() {
+        match best.get(&record.key) {
+            Some(&kept)
+                if usage[kept].usage_available == Some(true)
+                    && record.usage_available != Some(true) => {}
+            _ => {
+                best.insert(record.key.clone(), index);
+            }
         }
     }
-    kept.reverse();
-    *usage = kept;
+    let keep: std::collections::HashSet<usize> = best.into_values().collect();
+    let mut index = 0;
+    usage.retain(|_| {
+        let kept = keep.contains(&index);
+        index += 1;
+        kept
+    });
 }
 
 fn record_key(record: &Value) -> Option<String> {
@@ -1385,6 +1403,53 @@ mod tests {
         assert_eq!(usage.total_tokens(), 15711);
         assert_eq!(usage.ts.as_deref(), Some("2026-04-22T09:00:01Z"));
         assert_eq!(usage.model.as_deref(), Some("claude-opus-4-6"));
+        assert_eq!(usage.usage_available, Some(true));
+        Ok(())
+    }
+
+    #[test]
+    fn keyless_calls_get_unique_keys_and_missing_usage_is_marked() -> Result<()> {
+        let tempdir = tempdir()?;
+        let path = tempdir.path().join("keyless.jsonl");
+        let line = |usage: Option<serde_json::Value>| {
+            let mut message = json!({"model": "claude-opus-4-6", "role": "assistant"});
+            if let Some(usage) = usage {
+                message["usage"] = usage;
+            }
+            json!({"type": "assistant", "sessionId": "keyless", "message": message}).to_string()
+        };
+        let zero = json!({"input_tokens": 0, "output_tokens": 0});
+        fs::write(
+            &path,
+            [line(Some(zero.clone())), line(Some(zero)), line(None)].join("\n"),
+        )?;
+
+        let parsed = parse_session_file(&path)?;
+
+        let keys: Vec<_> = parsed.usage.iter().map(|u| u.key.as_str()).collect();
+        assert_eq!(keys, ["line:0", "line:1", "line:2"]);
+        let available: Vec<_> = parsed.usage.iter().map(|u| u.usage_available).collect();
+        assert_eq!(available, [Some(true), Some(true), Some(false)]);
+        Ok(())
+    }
+
+    #[test]
+    fn later_line_without_usage_does_not_replace_reported_usage() -> Result<()> {
+        let tempdir = tempdir()?;
+        let path = tempdir.path().join("chunks.jsonl");
+        let reported = json!({"type": "assistant", "sessionId": "chunks", "message": {
+            "id": "msg_1", "model": "claude-opus-4-6", "role": "assistant",
+            "usage": {"input_tokens": 5, "output_tokens": 7}}});
+        let bare = json!({"type": "assistant", "sessionId": "chunks", "message": {
+            "id": "msg_1", "model": "claude-opus-4-6", "role": "assistant"}});
+        fs::write(&path, format!("{reported}\n{bare}"))?;
+
+        let parsed = parse_session_file(&path)?;
+
+        assert_eq!(parsed.usage.len(), 1);
+        assert_eq!(parsed.usage[0].key, "msg:msg_1");
+        assert_eq!(parsed.usage[0].usage_available, Some(true));
+        assert_eq!(parsed.usage[0].total_tokens(), 12);
         Ok(())
     }
 

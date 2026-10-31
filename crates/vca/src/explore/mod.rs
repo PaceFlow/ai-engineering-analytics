@@ -1154,6 +1154,8 @@ pub struct UsageTotals {
     pub estimated_tokens: i64,
     pub sessions: i64,
     pub calls: i64,
+    /// Calls whose provider recorded no usage; their zero tokens are not a measurement.
+    pub missing_usage_calls: i64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -1210,7 +1212,11 @@ pub fn usage_totals(
                 SUM(u.output_tokens), SUM(u.api_equiv_usd), SUM(u.reported_cost_usd),
                 SUM(CASE WHEN u.api_equiv_usd IS NULL THEN u.total_tokens ELSE 0 END),
                 SUM(CASE WHEN u.token_source != 'reported' THEN u.total_tokens ELSE 0 END),
-                COUNT(DISTINCT u.provider || u.root_session_id), COUNT(*)
+                COUNT(DISTINCT u.provider || u.root_session_id), COUNT(*),
+                SUM(EXISTS(SELECT 1 FROM fact_session_usage f JOIN usage_measurement a
+                    ON a.provider = f.provider AND a.session_id = f.session_id
+                       AND a.usage_key = f.usage_key
+                    WHERE f.id = u.usage_id AND a.availability = 'missing'))
          FROM derived_usage_event u
          WHERE {}
          GROUP BY key
@@ -1233,6 +1239,7 @@ pub fn usage_totals(
                 estimated_tokens: row.get(8)?,
                 sessions: row.get(9)?,
                 calls: row.get(10)?,
+                missing_usage_calls: row.get(11)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;

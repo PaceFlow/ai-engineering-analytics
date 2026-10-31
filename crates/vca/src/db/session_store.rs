@@ -15,7 +15,7 @@ use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension, params};
 
 /// Bump when parsers start extracting new facts so existing sources are re-read.
-pub const SESSION_INGEST_VERSION: i64 = 6;
+pub const SESSION_INGEST_VERSION: i64 = 7;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentKind {
@@ -977,6 +977,48 @@ mod tests {
         assert_eq!(record.usage[0].key, "m1");
         assert_eq!(record.usage[0].output_tokens, 5);
         assert_eq!(record.usage[1].key, "m2");
+    }
+
+    #[test]
+    fn zero_usage_is_measured_only_when_the_provider_reported_it() -> Result<()> {
+        let conn = Connection::open_in_memory()?;
+        init_app_schema(&conn)?;
+        let mut record = SessionRecord::new("claude", "s1");
+        let zero = |key: &str, available: Option<bool>| UsageRecord {
+            usage_available: available,
+            ..UsageRecord::new(key)
+        };
+        record.usage = vec![
+            zero("reported", Some(true)),
+            zero("absent", Some(false)),
+            zero("unknown", None),
+            usage("counted", 5),
+        ];
+        store_session_record(&conn, &record)?;
+
+        let mut stmt = conn.prepare(
+            "SELECT usage_key, availability FROM usage_measurement
+             WHERE session_id = 's1' ORDER BY usage_key",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let rows: Vec<(&str, &str)> = rows
+            .iter()
+            .map(|(key, availability)| (key.as_str(), availability.as_str()))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                ("absent", "missing"),
+                ("counted", "native"),
+                ("reported", "explicit_zero"),
+                ("unknown", "suspect_zero"),
+            ]
+        );
+        Ok(())
     }
 
     #[test]
