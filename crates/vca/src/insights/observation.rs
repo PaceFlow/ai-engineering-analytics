@@ -129,6 +129,13 @@ pub fn set_alias(conn: &Connection, alias: &str, canonical: &str, source: &str) 
         bail!("Repository alias would create a cycle");
     }
     conn.execute("INSERT INTO repository_alias VALUES(?1,?2,?3) ON CONFLICT(alias) DO UPDATE SET canonical=excluded.canonical,source=excluded.source WHERE excluded.source='manual' OR (repository_alias.source!='manual' AND (CASE excluded.source WHEN 'source' THEN 3 WHEN 'git' THEN 2 ELSE 1 END)>=(CASE repository_alias.source WHEN 'source' THEN 3 WHEN 'git' THEN 2 ELSE 1 END))",params![alias,target,source])?;
+    // Keep one step from every path to its repository when a repository key is itself aliased.
+    if canonical_repo(conn, alias)? == target {
+        conn.execute(
+            "UPDATE repository_alias SET canonical = ?2 WHERE canonical = ?1",
+            params![alias, target],
+        )?;
+    }
     Ok(())
 }
 
@@ -137,7 +144,15 @@ pub fn set_alias(conn: &Connection, alias: &str, canonical: &str, source: &str) 
 pub fn record_repository_aliases(conn: &Connection) -> Result<()> {
     let before = alias_targets(conn)?;
     discover_repository_aliases(conn)?;
-    // Edits under a newly mapped path were only queued for their own path when stored.
+    requeue_changed_aliases(conn, &before)
+}
+
+/// Edits under a newly mapped path were only queued for their own path when stored,
+/// so queue them again for every worktree of the repository they now belong to.
+pub fn requeue_changed_aliases(
+    conn: &Connection,
+    before: &std::collections::BTreeMap<String, String>,
+) -> Result<()> {
     for (alias, canonical) in alias_targets(conn)? {
         if before.get(&alias) != Some(&canonical) {
             let hashes = session_hash_keys(conn, &alias)?;
@@ -147,7 +162,7 @@ pub fn record_repository_aliases(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-fn alias_targets(conn: &Connection) -> Result<std::collections::BTreeMap<String, String>> {
+pub fn alias_targets(conn: &Connection) -> Result<std::collections::BTreeMap<String, String>> {
     Ok(conn
         .prepare("SELECT alias, canonical FROM repository_alias")?
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
@@ -398,6 +413,21 @@ mod tests {
         set_alias(&c, "worktree", "other", "git")?;
         assert_eq!(canonical_repo(&c, "worktree")?, "repo");
         assert!(set_alias(&c, "repo", "worktree", "manual").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn aliasing_a_repository_key_moves_its_paths_to_the_new_key() -> Result<()> {
+        let c = Connection::open_in_memory()?;
+        c.execute_batch(SCHEMA)?;
+        set_alias(&c, "/w/issue-1/repo", "git:github/crm", "git")?;
+        set_alias(&c, "git:github/crm", "git:bitbucket/crm", "manual")?;
+        let target: String = c.query_row(
+            "SELECT canonical FROM repository_alias WHERE alias = '/w/issue-1/repo'",
+            [],
+            |r| r.get(0),
+        )?;
+        assert_eq!(target, "git:bitbucket/crm");
         Ok(())
     }
     #[test]
