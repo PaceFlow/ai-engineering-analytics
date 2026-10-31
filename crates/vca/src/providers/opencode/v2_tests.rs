@@ -182,7 +182,7 @@ fn migrated_v2_replaces_v1_once_and_preserves_request_anchor_and_manual_links() 
         original
     );
     assert_eq!(crate::insights::work::items(&c)?.len(), 1);
-    assert_eq!(c.query_row("SELECT label FROM classification_override WHERE unit_key='opencode|s|0' AND question_id='intent'",[],|r|r.get::<_,String>(0))?,"feature");
+    assert_eq!(c.query_row("SELECT label FROM view_label_effective WHERE unit_key='opencode|s|0' AND question_id='intent' AND source='override'",[],|r|r.get::<_,String>(0))?,"feature");
     assert_eq!(
         c.query_row(
             "SELECT COUNT(*) FROM metadata_sessions WHERE provider='opencode'",
