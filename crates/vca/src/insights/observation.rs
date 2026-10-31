@@ -135,6 +135,41 @@ pub fn set_alias(conn: &Connection, alias: &str, canonical: &str, source: &str) 
 /// Maps worktrees and clones to their canonical repository from git remotes and
 /// provider-recorded project roots. Commit association runs it before matching.
 pub fn record_repository_aliases(conn: &Connection) -> Result<()> {
+    let before = alias_targets(conn)?;
+    discover_repository_aliases(conn)?;
+    // Edits under a newly mapped path were only queued for their own path when stored.
+    for (alias, canonical) in alias_targets(conn)? {
+        if before.get(&alias) != Some(&canonical) {
+            let hashes = session_hash_keys(conn, &alias)?;
+            crate::change_intel::storage::mark_hashes_dirty(conn, &alias, &hashes)?;
+        }
+    }
+    Ok(())
+}
+
+fn alias_targets(conn: &Connection) -> Result<std::collections::BTreeMap<String, String>> {
+    Ok(conn
+        .prepare("SELECT alias, canonical FROM repository_alias")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?)
+}
+
+fn session_hash_keys(
+    conn: &Connection,
+    repo_root: &str,
+) -> Result<std::collections::BTreeSet<(String, String)>> {
+    Ok(conn
+        .prepare(
+            "SELECT DISTINCT h.side, h.line_hash
+             FROM fact_session_code_change c
+             JOIN fact_session_code_change_line_hashes h ON h.code_change_id = c.id
+             WHERE c.repo_root = ?1",
+        )?
+        .query_map([repo_root], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?)
+}
+
+fn discover_repository_aliases(conn: &Connection) -> Result<()> {
     let roots = conn
         .prepare("SELECT repo_root FROM metadata_repositories")?
         .query_map([], |r| r.get::<_, String>(0))?
@@ -153,7 +188,57 @@ pub fn record_repository_aliases(conn: &Connection) -> Result<()> {
             set_alias(conn, &alias, &target, "provider")?;
         }
     }
+    infer_removed_worktree_aliases(conn)
+}
+
+/// A removed worktree has no git remote left to identify it. When every known path under
+/// its nearest populated parent belongs to one repository, the worktree belonged to it too.
+fn infer_removed_worktree_aliases(conn: &Connection) -> Result<()> {
+    let known = conn
+        .prepare("SELECT alias, canonical FROM repository_alias")?
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let roots = conn
+        .prepare(
+            "SELECT repo_root FROM metadata_repositories
+             UNION SELECT repo_root FROM fact_session_code_change WHERE repo_root IS NOT NULL",
+        )?
+        .query_map([], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for root in roots {
+        let is_known = known
+            .iter()
+            .any(|(alias, canonical)| *alias == root || *canonical == root);
+        if is_known || std::path::Path::new(&root).exists() {
+            continue;
+        }
+        if let Some(canonical) = sole_repository_near(&root, &known) {
+            set_alias(conn, &root, &canonical, "inferred")?;
+        }
+    }
     Ok(())
+}
+
+fn sole_repository_near(root: &str, known: &[(String, String)]) -> Option<String> {
+    let mut parent = root.trim_end_matches('/');
+    while let Some((up, _)) = parent.rsplit_once('/') {
+        parent = up;
+        if parent.is_empty() {
+            return None;
+        }
+        let prefix = format!("{parent}/");
+        let canonicals: std::collections::BTreeSet<&String> = known
+            .iter()
+            .filter(|(alias, _)| alias.starts_with(&prefix))
+            .map(|(_, canonical)| canonical)
+            .collect();
+        match canonicals.len() {
+            0 => continue,
+            1 => return canonicals.into_iter().next().cloned(),
+            _ => return None,
+        }
+    }
+    None
 }
 
 /// Called inside the insight refresh savepoint. Readers see one complete generation.
@@ -315,6 +400,62 @@ mod tests {
         assert!(set_alias(&c, "repo", "worktree", "manual").is_err());
         Ok(())
     }
+    #[test]
+    fn removed_worktree_takes_the_sole_repository_of_its_workspace() {
+        let known = [
+            (
+                "/w/klikt/klik-1/workdir/mono".to_string(),
+                "git:klikt".to_string(),
+            ),
+            (
+                "/w/klikt/klik-2/worktree".to_string(),
+                "git:klikt".to_string(),
+            ),
+            (
+                "/w/crm/aicr-1/workdir/crm".to_string(),
+                "git:crm".to_string(),
+            ),
+        ];
+        assert_eq!(
+            sole_repository_near("/w/klikt/klik-9/workdir", &known).as_deref(),
+            Some("git:klikt")
+        );
+        // Under /w both repositories are present, so a path there stays unknown.
+        assert_eq!(sole_repository_near("/w/scratch/workdir", &known), None);
+        assert_eq!(sole_repository_near("/elsewhere/repo", &known), None);
+    }
+
+    #[test]
+    fn newly_mapped_worktree_queues_its_edits_in_sibling_paths() -> Result<()> {
+        let c = Connection::open_in_memory()?;
+        crate::db::init_app_schema(&c)?;
+        set_alias(&c, "/removed/ws/issue-1/workdir/repo", "git:repo", "git")?;
+        c.execute(
+            "INSERT INTO fact_session_code_change (provider, session_id, source_kind, repo_root, rel_path)
+             VALUES ('opencode', 's', 'accepted_change', '/removed/ws/issue-2/workdir', 'a.rs')",
+            [],
+        )?;
+        c.execute(
+            "INSERT INTO fact_session_code_change_line_hashes VALUES (?1, '+', 'h1', 1)",
+            [c.last_insert_rowid()],
+        )?;
+
+        record_repository_aliases(&c)?;
+
+        assert_eq!(
+            canonical_repo(&c, "/removed/ws/issue-2/workdir")?,
+            "git:repo"
+        );
+        let queued: i64 = c.query_row(
+            "SELECT COUNT(*) FROM commit_assoc_dirty_hash
+             WHERE repo_root = '/removed/ws/issue-1/workdir/repo' AND line_hash = 'h1'",
+            [],
+            |r| r.get(0),
+        )?;
+        assert_eq!(queued, 1);
+        Ok(())
+    }
+
     #[test]
     fn snapshot_observation_is_not_ingestion_time() -> Result<()> {
         let c = Connection::open_in_memory()?;
