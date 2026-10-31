@@ -72,6 +72,46 @@ pub fn run(args: DailyArgs) -> Result<()> {
 fn optional(v: Option<f64>) -> String {
     v.map(|n| format!("{n:.2}")).unwrap_or_else(|| "—".into())
 }
+fn age(minutes: Option<f64>) -> String {
+    match minutes {
+        None => "—".into(),
+        Some(m) if m < 60.0 => format!("{m:.0}m"),
+        Some(m) if m < 48.0 * 60.0 => format!("{:.1}h", m / 60.0),
+        Some(m) => format!("{:.1}d", m / 1440.0),
+    }
+}
+/// One model's usage for the day; zero-filled and missing events are named so
+/// they are not read as measured zero.
+fn model_line(m: &daily::ModelUsage) -> String {
+    let mut gaps = vec![];
+    for (n, label) in [
+        (m.explicit_zero_events, "reported zero"),
+        (m.missing_events, "missing"),
+        (m.suspect_zero_events, "unverified zero"),
+    ] {
+        if n > 0 {
+            gaps.push(format!("{n} {label}"));
+        }
+    }
+    let mut line = format!(
+        "model {} ({}) · {} usage events, {} measured",
+        m.model, m.provider, m.usage_events, m.available_events
+    );
+    if !gaps.is_empty() {
+        let _ = write!(line, " ({})", gaps.join(", "));
+    }
+    let _ = write!(
+        line,
+        " · {} tokens · reported $ {} · API eq $ {}",
+        m.native_tokens.total,
+        optional(m.reported_cost_usd),
+        optional(m.api_equivalent_usd)
+    );
+    if m.estimated_tokens.total > 0 {
+        let _ = write!(line, " · {} estimated tokens", m.estimated_tokens.total);
+    }
+    line
+}
 pub fn text(report: &daily::Report, cohorts: bool) -> String {
     let mut out = String::new();
     let _ = writeln!(
@@ -115,7 +155,7 @@ pub fn text(report: &daily::Report, cohorts: bool) -> String {
     } else {
         let _ = writeln!(
             out,
-            "Date        Start Active Done Open Bug active/done  Tokens  Reported $  PR merged/deployed  Leading model"
+            "Date        Start Active Done Open Bug active/done  Tokens  Reported $  API eq $  PR merged/deployed  Leading model"
         );
         for d in &report.days {
             let model = d
@@ -126,7 +166,7 @@ pub fn text(report: &daily::Report, cohorts: bool) -> String {
                 .unwrap_or_else(|| "—".into());
             let _ = writeln!(
                 out,
-                "{}{} {:>4} {:>6} {:>4} {:>4} {:>8} {:>8} {:>10} {:>5}/{:<5} {}",
+                "{}{} {:>4} {:>6} {:>4} {:>4} {:>8} {:>8} {:>10} {:>9} {:>5}/{:<5} {}",
                 d.date,
                 if d.partial { "*" } else { " " },
                 d.started,
@@ -136,6 +176,7 @@ pub fn text(report: &daily::Report, cohorts: bool) -> String {
                 format!("{}/{}", d.bug_work_active, d.bug_work_completed),
                 d.native_tokens.total,
                 optional(d.reported_cost_usd),
+                optional(d.api_equivalent_usd),
                 d.pull_requests.merged,
                 d.pull_requests.deployed,
                 model
@@ -168,6 +209,17 @@ pub fn text(report: &daily::Report, cohorts: bool) -> String {
                 d.corrective.structured_history_work,
                 d.active_work
             );
+            if d.open > 0 {
+                let _ = writeln!(
+                    out,
+                    "  open work age at cutoff: median {} · max {}",
+                    age(d.open_age_minutes.median),
+                    age(d.open_age_max_minutes)
+                );
+            }
+            for m in &d.models {
+                let _ = writeln!(out, "  {}", model_line(m));
+            }
             if !d.goal_mix.is_empty() {
                 let _ = writeln!(
                     out,
@@ -226,7 +278,7 @@ pub fn csv(report: &daily::Report, cohorts: bool) -> String {
         for d in &report.days {
             let _ = writeln!(
                 out,
-                "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+                "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
                 d.date,
                 d.partial,
                 d.started,
@@ -264,7 +316,14 @@ pub fn csv(report: &daily::Report, cohorts: bool) -> String {
                     .get("corrective")
                     .copied()
                     .unwrap_or(0),
-                d.corrective.structured_history_work
+                d.corrective.structured_history_work,
+                d.open_age_minutes
+                    .median
+                    .map(|v| v.to_string())
+                    .unwrap_or_default(),
+                d.open_age_max_minutes
+                    .map(|v| v.to_string())
+                    .unwrap_or_default()
             );
         }
     }
