@@ -10,6 +10,7 @@ pub mod db;
 pub mod error;
 pub mod event_identity;
 pub mod explore;
+pub mod git_prs;
 pub mod github;
 pub mod ingest_progress;
 pub mod insights;
