@@ -599,11 +599,21 @@ pub fn items(conn: &Connection) -> Result<Vec<WorkItem>> {
                 .then(a.id.cmp(&b.id))
         });
         let first = &members[0];
+        // A bare assignment names no goal; the first request that states one
+        // describes the work, while the work still starts with the assignment.
+        let stated = members
+            .iter()
+            .find(|m| !crate::classify::request::normalize(&m.task.title).goal_unavailable())
+            .unwrap_or(first);
         let mut work = WorkItem {
             id,
-            title: first.task.title.clone(),
-            intent: first.task.intent.clone().unwrap_or("unclassified".into()),
-            intent_source: first.task.intent_source.clone().unwrap_or("missing".into()),
+            title: stated.task.title.clone(),
+            intent: stated.task.intent.clone().unwrap_or("unclassified".into()),
+            intent_source: stated
+                .task
+                .intent_source
+                .clone()
+                .unwrap_or("missing".into()),
             started_at: first.task.started_at.as_deref().and_then(parse_ts),
             last_activity_at: None,
             completed_at: None,

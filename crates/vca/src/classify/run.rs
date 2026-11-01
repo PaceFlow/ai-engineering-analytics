@@ -3100,6 +3100,27 @@ mod tests {
     }
 
     #[test]
+    fn a_joined_goal_is_described_by_its_first_stated_request() -> Result<()> {
+        let (conn, sessions) = issue_runs()?;
+        run(&conn, &issue_aware(), &config(), &sessions, &starts_only())?;
+        conn.execute(
+            "UPDATE derived_task SET title='Assigned external task; substantive goal unavailable in this request.' WHERE session_id='r1'",
+            [],
+        )?;
+        let goal = crate::insights::work::items(&conn)?
+            .into_iter()
+            .find(|w| w.members.iter().any(|m| m.task.session_id == "r1"))
+            .unwrap();
+        assert!(
+            goal.title.starts_with("Monitoring verdict"),
+            "{}",
+            goal.title
+        );
+        assert_eq!(goal.members[0].task.session_id, "r1");
+        Ok(())
+    }
+
+    #[test]
     fn a_request_continuing_an_earlier_conversation_joins_its_goal() -> Result<()> {
         let (conn, sessions) = issue_runs()?;
         let client = issue_aware();
