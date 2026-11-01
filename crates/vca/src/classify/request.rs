@@ -314,9 +314,57 @@ fn drop_empty_sections(text: &str, stripped: &mut Vec<&'static str>) -> String {
     out.join("\n")
 }
 
+/// Explicit work references in a raw request, kept apart from the goal text:
+/// the issue an agent platform assigned, ticket keys and pull request links.
+/// The envelope that carries them is stripped from the goal, but whether two
+/// conversations name the same issue is evidence about continuing work.
+pub fn references(raw: &str) -> Vec<String> {
+    static PATTERNS: std::sync::OnceLock<[regex::Regex; 3]> = std::sync::OnceLock::new();
+    let [issue, ticket, pull] = PATTERNS.get_or_init(|| {
+        [
+            regex::Regex::new(r"assigned issue ID is:\s*([0-9A-Za-z][0-9A-Za-z-]{7,})")
+                .expect("valid issue regex"),
+            regex::Regex::new(r"\b([A-Z][A-Z0-9]{1,9}-[0-9]{1,6})\b").expect("valid ticket regex"),
+            regex::Regex::new(r"[\w.-]+/[\w.-]+/[\w.-]+/pull(?:-requests)?/[0-9]+")
+                .expect("valid pull regex"),
+        ]
+    });
+    let mut found: Vec<String> = Vec::new();
+    let mut add = |value: String| {
+        if !found.contains(&value) && found.len() < 12 {
+            found.push(value);
+        }
+    };
+    for m in issue.captures_iter(raw) {
+        add(format!("issue:{}", &m[1]));
+    }
+    for m in pull.find_iter(raw) {
+        add(format!("pr:{}", m.as_str()));
+    }
+    for m in ticket.captures_iter(raw) {
+        add(format!("ticket:{}", &m[1]));
+    }
+    found
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn finds_assigned_issue_tickets_and_pull_requests() {
+        let raw = "You are running as a local coding agent for a Multica workspace.\n\nYour assigned issue ID is: 01a19256-52b9-71d5-a7d2-2fb48b90809b\n\n> Same summary on KLIK-209, see https://github.com/aai-labs/app/pull/14 and KLIK-209.";
+        assert_eq!(
+            references(raw),
+            vec![
+                "issue:01a19256-52b9-71d5-a7d2-2fb48b90809b".to_string(),
+                "pr:github.com/aai-labs/app/pull/14".to_string(),
+                "ticket:KLIK-209".to_string(),
+            ]
+        );
+        assert!(references("Fix the cache limit").is_empty());
+        // The goal text never carries the envelope's issue id.
+        assert!(!normalize(raw).text.contains("01a19256"));
+    }
     #[test]
     fn extracts_comment_and_preserves_speaker() {
         let raw = "You are running as a local coding agent for a Multica workspace.\n[NEW COMMENT] Another agent (Ops) just left a new comment.\n> Tune the cache limit and verify service health.\n\nReply as a comment.";

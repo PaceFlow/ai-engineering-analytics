@@ -649,17 +649,31 @@ pub fn rework_question() -> Map<String, Value> {
     questions
 }
 
-/// Cross-conversation relationships are suggestions unless backed by explicit references.
-pub fn work_relationship_question() -> Map<String, Value> {
-    let mut questions = Map::new();
-    questions.insert("work_relationship".into(),choice(
-        "How does the later goal relate to the earlier goal? Shared files, branches or similar wording alone do not prove continuation. Distinguish a separate bug fix correcting earlier output from reopening the same unresolved goal.",
-        &[("continuation","Continues the same still-open goal."),
-          ("reopens","Explicitly resumes the same goal after a completion claim proved premature."),
-          ("corrects_previous_work","A separate goal correcting a defect in the earlier output."),
-          ("unrelated","Different goals, including incidental file overlap."),
-          ("unknown","Insufficient evidence to decide.")],
+/// Whether a conversation's first request continues earlier work or starts a
+/// fundamentally new piece of it. `earlier` holds `(option, description)` for
+/// earlier conversations, e.g. `("resume_C1", "...")`.
+pub fn work_start_question(earlier: &[(String, String)]) -> Map<String, Value> {
+    let mut options: Vec<(String, String)> = earlier.to_vec();
+    options.push((
+        "continues_unlisted".into(),
+        "Continues earlier work, but none of the conversations listed above.".into(),
     ));
+    options.push((
+        "new_work".into(),
+        "Starts a fundamentally new piece of work.".into(),
+    ));
+    let refs: Vec<(&str, &str)> = options
+        .iter()
+        .map(|(a, b)| (a.as_str(), b.as_str()))
+        .collect();
+    let mut questions = Map::new();
+    questions.insert(
+        "work_start".into(),
+        choice(
+            "This conversation's first request either continues earlier work or starts a fundamentally new piece of work. Continuing includes further steps, follow-ups, reviews, fixes and hand-backs toward the same goal, and new triggers or comments on the same issue. A different goal is new work even in the same repository, with similar wording, or as a child of a larger effort. A shared issue, ticket or pull request reference is strong but not conclusive evidence.",
+            &refs,
+        ),
+    );
     questions
 }
 

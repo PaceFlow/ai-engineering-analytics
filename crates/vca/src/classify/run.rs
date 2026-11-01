@@ -20,7 +20,7 @@ use crate::classify::heuristic::{task_unit_key, turn_unit_key};
 use crate::classify::questions::{
     QUESTION_SET_VERSION, SKILL_QUESTION_VERSION, completion_question, exchange_questions,
     rework_question, skill_follow_through_question, task_assignment_question, task_label_questions,
-    turn_questions,
+    turn_questions, work_start_question,
 };
 use crate::classify::state::{
     BuiltState, Level, TurnFacts, assignment_state, estimate_tokens, exchange_state, head_tail,
@@ -46,6 +46,8 @@ pub struct Passes {
     pub stages: bool,
     pub skills: bool,
     pub prs: bool,
+    /// Whether each conversation's first request continues earlier work.
+    pub starts: bool,
 }
 
 impl Passes {
@@ -58,6 +60,7 @@ impl Passes {
         stages: true,
         skills: true,
         prs: true,
+        starts: true,
     };
 
     pub fn parse(value: &str) -> Option<Self> {
@@ -70,6 +73,7 @@ impl Passes {
             stages: false,
             skills: false,
             prs: false,
+            starts: false,
         };
         for part in value.split(',').map(str::trim) {
             match part {
@@ -82,6 +86,7 @@ impl Passes {
                 "stages" | "stage" => passes.stages = true,
                 "skills" => passes.skills = true,
                 "prs" => passes.prs = true,
+                "starts" | "work_starts" => passes.starts = true,
                 _ => return None,
             }
         }
@@ -418,9 +423,14 @@ fn execute(
         }
     }
 
-    if options.passes.rework && !options.dry_run {
-        crate::insights::refresh(conn)?;
-        runner.classify_work_links(sessions)?;
+    if options.passes.starts {
+        // New tasks need goal-member identities before they can be joined.
+        if !options.dry_run && (runner.summary.sent > 0 || options.passes.rework) {
+            crate::insights::refresh(conn)?;
+        }
+        if runner.classify_work_starts(&selected)? && !options.dry_run {
+            crate::insights::refresh(conn)?;
+        }
     }
     runner.summary.est_usd = config.estimate_usd(runner.summary.est_tokens);
     if let Some(run_id) = runner.run_id {
@@ -477,6 +487,7 @@ impl Passes {
         stages: true,
         skills: false,
         prs: true,
+        starts: true,
     };
     pub fn names(self) -> String {
         [
@@ -488,6 +499,7 @@ impl Passes {
             (self.rework, "rework"),
             (self.skills, "skills"),
             (self.prs, "prs"),
+            (self.starts, "starts"),
         ]
         .into_iter()
         .filter_map(|(enabled, name)| enabled.then_some(name))
@@ -889,6 +901,95 @@ fn load_relations(conn: &Connection) -> Result<Vec<RelationRef>> {
         })
     })?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// Most earlier conversations offered when asking whether a request continues one.
+const MAX_WORK_START_OPTIONS: usize = 8;
+/// How long after an earlier conversation a request can still continue it.
+const WORK_START_WINDOW_MS: i64 = 28 * 86_400_000;
+/// Evidence prefix marking the continuation links the work-start pass owns.
+const WORK_START_EVIDENCE: &str = "Work start:";
+
+/// One goal member (a task of a conversation) as a possible continuation target.
+#[derive(Debug, Clone)]
+struct WorkStart {
+    member: String,
+    provider: String,
+    session_id: String,
+    task_index: i64,
+    repo: Option<String>,
+    started_ms: i64,
+    request: String,
+}
+
+fn load_work_starts(conn: &Connection) -> Result<Vec<WorkStart>> {
+    let mut stmt = conn.prepare(
+        "SELECT m.identity_id, m.provider, m.session_id, m.task_index,
+                COALESCE(x.repo_root, t.repo_root), t.started_at, COALESCE(t.title, '')
+         FROM derived_work_member m
+         JOIN derived_task t USING(provider, session_id, task_index)
+         JOIN work_identity i ON i.id = m.identity_id
+         LEFT JOIN derived_work_index_member x ON x.identity_id = m.identity_id
+         WHERE i.review_reason IS NULL",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+            r.get::<_, i64>(3)?,
+            r.get::<_, Option<String>>(4)?,
+            r.get::<_, Option<String>>(5)?,
+            r.get::<_, String>(6)?,
+        ))
+    })?;
+    let mut starts = Vec::new();
+    for row in rows {
+        let (member, provider, session_id, task_index, repo, started, request) = row?;
+        // Without a start time the order of conversations is unknown.
+        let Some(started_ms) = started
+            .as_deref()
+            .and_then(crate::insights::structure::parse_ts)
+        else {
+            continue;
+        };
+        starts.push(WorkStart {
+            member,
+            provider,
+            session_id,
+            task_index,
+            repo,
+            started_ms,
+            request,
+        });
+    }
+    Ok(starts)
+}
+
+/// Explicit references in a conversation's first request, cached per conversation.
+fn session_references(
+    conn: &Connection,
+    cache: &mut BTreeMap<(String, String), Vec<String>>,
+    provider: &str,
+    session_id: &str,
+) -> Result<Vec<String>> {
+    let key = (provider.to_string(), session_id.to_string());
+    if let Some(found) = cache.get(&key) {
+        return Ok(found.clone());
+    }
+    let first: Option<String> = conn
+        .query_row(
+            "SELECT content FROM fact_session_message WHERE provider=?1 AND session_id=?2
+               AND role='user' ORDER BY message_index LIMIT 1",
+            params![provider, session_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let found = first
+        .map(|text| crate::classify::request::references(&text))
+        .unwrap_or_default();
+    cache.insert(key, found.clone());
+    Ok(found)
 }
 
 /// First request and evidence summary of one task, at a content level.
@@ -1768,82 +1869,171 @@ impl Runner<'_> {
         Ok(())
     }
 
-    fn classify_work_links(&mut self, selected: &[SessionRef]) -> Result<()> {
-        use crate::insights::work;
-        let items = work::items(self.conn)?;
-        let members: BTreeMap<_, _> = items
+    /// Ask whether each conversation's first request continues work from an
+    /// earlier conversation or starts a fundamentally new piece of work. A
+    /// confident or tentative continuation joins both into one goal; a manual
+    /// link or unlink of the conversation always wins. Returns whether links changed.
+    fn classify_work_starts(&mut self, selected: &[(&SessionRef, Vec<TurnFacts>)]) -> Result<bool> {
+        let earlier = load_work_starts(self.conn)?;
+        let mut references: BTreeMap<(String, String), Vec<String>> = BTreeMap::new();
+        let mut order: Vec<(&(&SessionRef, Vec<TurnFacts>), &WorkStart)> = selected
             .iter()
-            .flat_map(|w| w.members.iter())
-            .map(|m| (m.id.clone(), m))
+            .filter_map(|entry| {
+                let first = earlier.iter().find(|w| {
+                    w.provider == entry.0.provider
+                        && w.session_id == entry.0.session_id
+                        && w.task_index == 0
+                })?;
+                Some((entry, first))
+            })
             .collect();
-        for relation in work::relations(self.conn)?.into_iter().filter(|r| {
-            r.decision == "suggested" && r.source != "manual" && r.review_reason.is_none()
-        }) {
-            let (Some(from), Some(to)) =
-                (members.get(&relation.from_id), members.get(&relation.to_id))
-            else {
-                continue;
-            };
-            if !selected
-                .iter()
-                .any(|s| s.provider == to.task.provider && s.session_id == to.task.session_id)
-                || !self.config.project_allowed(from.task.repo_root.as_deref())
-            {
+        order.sort_by_key(|(_, first)| first.started_ms);
+        let mut changed = false;
+        for ((session, turns), this) in order {
+            if self.stopped() || turns.is_empty() {
                 continue;
             }
-            let a = (
-                from.task.provider.clone(),
-                from.task.session_id.clone(),
-                from.task.task_index,
-            );
-            let b = (
-                to.task.provider.clone(),
-                to.task.session_id.clone(),
-                to.task.task_index,
-            );
-            let conn = self.conn;
-            let build = |level: Level| {
-                let mut redactions = 0;
-                let earlier = task_side(conn, &a, level, &mut redactions).unwrap_or(Value::Null);
-                let later = task_side(conn, &b, level, &mut redactions).unwrap_or(Value::Null);
-                let state = json!({"unit":"work_relation","earlier_task":earlier,"later_task":later,"candidate_evidence":relation.evidence});
-                let est_tokens = estimate_tokens(&state);
-                (
-                    BuiltState {
-                        state,
-                        level,
-                        redactions,
-                        est_tokens,
-                    },
-                    crate::classify::questions::work_relationship_question(),
-                )
-            };
-            let key = format!(
-                "{}|{}|work:{}",
-                to.task.provider, to.task.session_id, relation.id
-            );
-            if let Some(answer) = self
-                .ask("work_relation", &key, &build)?
-                .and_then(|a| a.answers.get("work_relationship").cloned())
-                && let Some(kind) = answer.0.label.as_deref().filter(|s| *s != "unknown")
-            {
-                work::insert_relation(
+            let manual: bool = self.conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM work_relation WHERE to_id=?1 AND source='manual' AND kind IN ('continuation','reopens'))",
+                [&this.member],
+                |r| r.get(0),
+            )?;
+            if manual {
+                continue;
+            }
+            let own =
+                session_references(self.conn, &mut references, &this.provider, &this.session_id)?;
+            let mut options: Vec<(usize, i64, &WorkStart, Vec<String>)> = Vec::new();
+            for candidate in &earlier {
+                if candidate.session_id == this.session_id
+                    || candidate.started_ms >= this.started_ms
+                    || this.started_ms - candidate.started_ms > WORK_START_WINDOW_MS
+                    || candidate.repo != this.repo
+                {
+                    continue;
+                }
+                let theirs = session_references(
                     self.conn,
-                    &relation.from_id,
-                    &relation.to_id,
-                    kind,
-                    if kind == "unrelated" && answer.1 == "confident" {
-                        "rejected"
-                    } else {
-                        "suggested"
-                    },
-                    "classifier",
-                    &relation.evidence,
-                    answer.0.confidence,
+                    &mut references,
+                    &candidate.provider,
+                    &candidate.session_id,
                 )?;
+                let shared: Vec<String> =
+                    own.iter().filter(|r| theirs.contains(r)).cloned().collect();
+                let weight = shared
+                    .iter()
+                    .map(|r| match r.split(':').next() {
+                        Some("issue") => 4,
+                        Some("pr") => 2,
+                        _ => 1,
+                    })
+                    .sum();
+                options.push((weight, candidate.started_ms, candidate, shared));
             }
+            options.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)));
+            options.truncate(MAX_WORK_START_OPTIONS);
+            if options.is_empty() {
+                changed |= self.set_work_start(this, None)?;
+                continue;
+            }
+            let build = |level: Level| {
+                let mut built = assignment_state(turns, 0, level);
+                let listed: Vec<Value> = options
+                    .iter()
+                    .enumerate()
+                    .map(|(n, (_, started, _, shared))| {
+                        json!({
+                            "option": format!("resume_C{}", n + 1),
+                            "hours_before": ((this.started_ms - started) as f64 / 3_600_000.0).round(),
+                            "shared_references": shared,
+                        })
+                    })
+                    .collect();
+                built.state["unit"] = Value::String("conversation_start".into());
+                built.state["references"] = json!(own);
+                built.state["earlier_conversations"] = Value::Array(listed);
+                built.est_tokens = estimate_tokens(&built.state);
+                let described: Vec<(String, String)> = options
+                    .iter()
+                    .enumerate()
+                    .map(|(n, (_, _, candidate, _))| {
+                        let request = if level > Level::EvidenceOnly {
+                            let (text, count) = redact(&head_tail(&candidate.request, 200));
+                            built.redactions += count;
+                            format!(": '{}'", text.replace('\n', " "))
+                        } else {
+                            String::new()
+                        };
+                        (
+                            format!("resume_C{}", n + 1),
+                            format!(
+                                "Continues the work of earlier conversation C{}{request}.",
+                                n + 1
+                            ),
+                        )
+                    })
+                    .collect();
+                (built, work_start_question(&described))
+            };
+            let key = task_unit_key(&session.provider, &session.session_id, 0);
+            let Some(asked) = self.ask("work_start", &key, &build)? else {
+                continue;
+            };
+            let chosen = asked.answers.get("work_start").and_then(|(answer, band)| {
+                let n: usize = answer
+                    .label
+                    .as_deref()?
+                    .strip_prefix("resume_C")?
+                    .parse()
+                    .ok()?;
+                if !matches!(*band, "confident" | "tentative") {
+                    return None;
+                }
+                let (_, _, candidate, shared) = options.get(n.checked_sub(1)?)?;
+                Some((*candidate, shared.clone(), answer.confidence))
+            });
+            changed |= self.set_work_start(this, chosen)?;
         }
-        Ok(())
+        Ok(changed)
+    }
+
+    /// Replace the classifier's continuation link into `this`. Returns whether it changed.
+    fn set_work_start(
+        &mut self,
+        this: &WorkStart,
+        chosen: Option<(&WorkStart, Vec<String>, Option<f64>)>,
+    ) -> Result<bool> {
+        let keep = chosen.as_ref().map_or("", |(c, _, _)| c.member.as_str());
+        let removed = self.conn.execute(
+            "DELETE FROM work_relation WHERE to_id=?1 AND from_id<>?2 AND source='classifier'
+               AND evidence LIKE ?3 || '%'",
+            params![this.member, keep, WORK_START_EVIDENCE],
+        )?;
+        let Some((candidate, shared, confidence)) = chosen else {
+            return Ok(removed > 0);
+        };
+        let existing: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM work_relation WHERE from_id=?1 AND to_id=?2 AND decision='accepted')",
+            params![candidate.member, this.member],
+            |r| r.get(0),
+        )?;
+        let mut evidence = format!(
+            "{WORK_START_EVIDENCE} classifier judged the first request to continue this work"
+        );
+        if !shared.is_empty() {
+            evidence.push_str(&format!("; shared {}", shared.join(", ")));
+        }
+        crate::insights::work::insert_relation(
+            self.conn,
+            &candidate.member,
+            &this.member,
+            "continuation",
+            "accepted",
+            "classifier",
+            &evidence,
+            confidence,
+        )?;
+        Ok(removed > 0 || !existing)
     }
 
     fn classify_relation(&mut self, relation: &RelationRef) -> Result<()> {
@@ -2327,6 +2517,7 @@ mod tests {
             stages: false,
             skills: false,
             prs: false,
+            starts: false,
         };
         run(
             &conn,
@@ -2541,6 +2732,7 @@ mod tests {
             stages: false,
             skills: false,
             prs: false,
+            starts: false,
         };
         let late = SessionRef {
             provider: "claude".into(),
@@ -2667,6 +2859,175 @@ mod tests {
         assert_eq!(client.calls(), 0);
         drop(lock);
         assert!(run(&conn, &client, &config(), &[], &options(0.5)).is_ok());
+        Ok(())
+    }
+
+    /// Two Multica runs of one issue and an unrelated run, an hour apart each.
+    fn issue_runs() -> Result<(Connection, Vec<SessionRef>)> {
+        let conn = Connection::open_in_memory()?;
+        crate::db::init_app_schema(&conn)?;
+        let runs = [
+            (
+                "r1",
+                "2026-10-01T10:00:00Z",
+                "issue-0001-aaaa",
+                "Fix the RocketReach page size cap",
+            ),
+            (
+                "r2",
+                "2026-10-01T11:00:00Z",
+                "issue-0002-bbbb",
+                "Rotate the staging certificates",
+            ),
+            (
+                "r3",
+                "2026-10-01T12:00:00Z",
+                "issue-0001-aaaa",
+                "Monitoring verdict: page size 100 still fails",
+            ),
+        ];
+        let mut sessions = Vec::new();
+        for (id, ts, issue, comment) in runs {
+            let mut record = SessionRecord::new("opencode", id);
+            record.started_at = Some(ts.into());
+            record.ended_at = Some(ts.into());
+            record.messages = vec![
+                message(
+                    &format!("{id}-u"),
+                    ts,
+                    "user",
+                    &format!(
+                        "You are running as a local coding agent for a Multica workspace.\n\nYour assigned issue ID is: {issue}\n\n[NEW COMMENT] Another agent (Monitoring Agent) just left a new comment.\n\n> {comment}\n\nReply as a comment."
+                    ),
+                ),
+                message(&format!("{id}-a"), ts, "assistant", "Done."),
+            ];
+            store_session_record(&conn, &record)?;
+            sessions.push(SessionRef {
+                provider: "opencode".into(),
+                session_id: id.into(),
+                repo_root: None,
+            });
+        }
+        crate::db::session_store::refresh_session_roots(&conn)?;
+        crate::insights::refresh(&conn)?;
+        Ok((conn, sessions))
+    }
+
+    fn starts_only() -> RunOptions {
+        RunOptions {
+            passes: Passes::parse("starts").unwrap(),
+            ..options(1.0)
+        }
+    }
+
+    /// Continue the earlier conversation that shares an issue, otherwise new work.
+    fn issue_aware() -> ScriptedClient {
+        ScriptedClient::new(|request| {
+            let shared = request.state["earlier_conversations"]
+                .as_array()
+                .and_then(|list| {
+                    list.iter().find(|c| {
+                        c["shared_references"]
+                            .as_array()
+                            .is_some_and(|r| !r.is_empty())
+                    })
+                })
+                .and_then(|c| c["option"].as_str())
+                .map(str::to_owned);
+            Ok(canned_response(request, |name, _| match name {
+                "work_start" => (shared.clone().unwrap_or("new_work".into()), 0.9),
+                _ => ("other".into(), 0.5),
+            }))
+        })
+    }
+
+    fn goal_members(conn: &Connection) -> Result<Vec<Vec<String>>> {
+        let mut goals: Vec<Vec<String>> = crate::insights::work::items(conn)?
+            .into_iter()
+            .map(|w| {
+                let mut ids: Vec<String> = w
+                    .members
+                    .iter()
+                    .map(|m| m.task.session_id.clone())
+                    .collect();
+                ids.sort();
+                ids
+            })
+            .collect();
+        goals.sort();
+        Ok(goals)
+    }
+
+    #[test]
+    fn a_request_continuing_an_earlier_conversation_joins_its_goal() -> Result<()> {
+        let (conn, sessions) = issue_runs()?;
+        let client = issue_aware();
+        run(&conn, &client, &config(), &sessions, &starts_only())?;
+        assert_eq!(
+            goal_members(&conn)?,
+            vec![
+                vec!["r1".to_string(), "r3".to_string()],
+                vec!["r2".to_string()]
+            ]
+        );
+        let requests = client.requests.lock().unwrap().clone();
+        // The first run has nothing earlier to continue, so it is not asked about.
+        assert_eq!(requests.len(), 2);
+        let last = &requests[1];
+        assert_eq!(last.state["references"][0], "issue:issue-0001-aaaa");
+        assert_eq!(
+            last.state["earlier_conversations"][0]["option"],
+            "resume_C1"
+        );
+        assert!(
+            !last.state["new_message"]
+                .as_str()
+                .unwrap()
+                .contains("issue-0001"),
+            "the goal text stays free of the envelope"
+        );
+        // Re-running is served from cache and keeps the same goals.
+        run(&conn, &client, &config(), &sessions, &starts_only())?;
+        assert_eq!(client.calls(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn new_work_and_uncertain_continuations_stay_separate_goals() -> Result<()> {
+        let (conn, sessions) = issue_runs()?;
+        let client = ScriptedClient::new(|request| {
+            let uncertain = request.state["new_message"]
+                .as_str()
+                .is_some_and(|m| m.contains("verdict"));
+            Ok(canned_response(request, |name, _| match name {
+                "work_start" if uncertain => ("resume_C1".into(), 0.2),
+                "work_start" => ("new_work".into(), 0.9),
+                _ => ("other".into(), 0.5),
+            }))
+        });
+        run(&conn, &client, &config(), &sessions, &starts_only())?;
+        assert_eq!(goal_members(&conn)?.len(), 3);
+        Ok(())
+    }
+
+    #[test]
+    fn a_manual_unlink_survives_the_classifier() -> Result<()> {
+        let (conn, sessions) = issue_runs()?;
+        let client = issue_aware();
+        run(&conn, &client, &config(), &sessions, &starts_only())?;
+        let member: String = conn.query_row(
+            "SELECT identity_id FROM derived_work_member WHERE session_id='r3'",
+            [],
+            |r| r.get(0),
+        )?;
+        conn.execute(
+            "UPDATE work_relation SET decision='rejected',source='manual',evidence='Manually detached' WHERE to_id=?1",
+            [&member],
+        )?;
+        crate::insights::refresh(&conn)?;
+        run(&conn, &client, &config(), &sessions, &starts_only())?;
+        assert_eq!(goal_members(&conn)?.len(), 3);
         Ok(())
     }
 }

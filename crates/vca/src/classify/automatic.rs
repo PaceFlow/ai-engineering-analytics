@@ -118,6 +118,17 @@ fn candidates(conn: &Connection, repo: &str, since: &str, policy: &str) -> Resul
     }
     Ok(result)
 }
+/// What a completed automatic classification covered. Adding a core pass
+/// re-queues every conversation once; unchanged questions are served from cache.
+fn auto_policy(config: &ClassifierConfig) -> String {
+    format!(
+        "{}|{}|{}|{}",
+        config.model,
+        config.level().as_str(),
+        config.endpoint,
+        Passes::CORE.names()
+    )
+}
 fn extended_passes() -> Passes {
     Passes {
         rework: true,
@@ -128,6 +139,7 @@ fn extended_passes() -> Passes {
         labels: false,
         completion: false,
         stages: false,
+        starts: false,
     }
 }
 fn extended_current(conn: &Connection, c: &Candidate, config: &ClassifierConfig) -> Result<bool> {
@@ -170,17 +182,7 @@ pub fn status(
     for (repo, since, monthly_budget, max_run_usd) in rows {
         let allowed = config.project_allowed(actual_repo(&repo));
         let enabled = config.enabled && allowed;
-        let candidates = candidates(
-            conn,
-            &repo,
-            &since,
-            &format!(
-                "{}|{}|{}",
-                config.model,
-                config.level().as_str(),
-                config.endpoint
-            ),
-        )?;
+        let candidates = candidates(conn, &repo, &since, &auto_policy(config))?;
         let last_error=conn.query_row("SELECT a.error FROM classifier_auto_state a JOIN metadata_sessions s ON s.provider=a.provider AND s.session_id=a.session_id LEFT JOIN metadata_repositories r ON r.id=s.repository_id WHERE COALESCE(r.repo_root,?2)=?1 AND a.error IS NOT NULL ORDER BY a.updated_at DESC LIMIT 1",params![repo,UNATTRIBUTED_PROJECT],|r|r.get::<_,String>(0)).optional()?;
         let pending_extended = candidates
             .iter()
@@ -316,12 +318,7 @@ pub(crate) fn run_automatic(
         return Ok(vec![]);
     }
     ensure_projects(conn, config)?;
-    let policy = format!(
-        "{}|{}|{}",
-        config.model,
-        config.level().as_str(),
-        config.endpoint
-    );
+    let policy = auto_policy(config);
     let mut queues = Vec::new();
     let mut messages = Vec::new();
     for project in status(conn, None, config)?
@@ -432,6 +429,7 @@ pub(crate) fn run_automatic(
                 labels: false,
                 completion: false,
                 stages: false,
+                starts: false,
             };
         }
     }
