@@ -969,6 +969,8 @@ fn load_work_starts(conn: &Connection) -> Result<Vec<WorkStart>> {
 /// One earlier goal offered as continuation target, by positions in the
 /// chronological member list.
 struct WorkGoal {
+    /// Earliest conversation whose request states a goal (bare assignments
+    /// and notifications do not), else the earliest one.
     first: usize,
     latest: usize,
     conversations: usize,
@@ -2007,6 +2009,12 @@ impl Runner<'_> {
                 });
                 entry.latest = i;
                 entry.conversations += 1;
+                let stated = |w: &WorkStart| {
+                    !crate::classify::request::normalize(&w.request).goal_unavailable()
+                };
+                if !stated(&earlier[entry.first]) && stated(candidate) {
+                    entry.first = i;
+                }
                 entry.same_repo |= candidate.repo.is_some() && candidate.repo == this.repo;
                 for reference in own.iter().filter(|r| theirs.contains(r)) {
                     if !entry.shared.contains(reference) {
@@ -2073,9 +2081,23 @@ impl Runner<'_> {
                                 text(goal.latest)
                             )
                         };
+                        let mut context = format!("{} conversation", goal.conversations);
+                        if goal.conversations != 1 {
+                            context.push('s');
+                        }
+                        for reference in &goal.shared {
+                            let (kind, value) =
+                                reference.split_once(':').unwrap_or(("", reference));
+                            let kind = if kind == "issue" {
+                                "assigned issue"
+                            } else {
+                                kind
+                            };
+                            context.push_str(&format!("; same {kind} {value}"));
+                        }
                         (
                             format!("resume_C{}", n + 1),
-                            format!("Continues earlier work C{}{requests}.", n + 1),
+                            format!("Continues earlier work C{} ({context}){requests}.", n + 1),
                         )
                     })
                     .collect();
@@ -3107,6 +3129,10 @@ mod tests {
             "{described}"
         );
         assert!(described.contains("latest 'Monitoring"), "{described}");
+        assert!(
+            described.contains("(2 conversations; same assigned issue issue-0001-aaaa)"),
+            "{described}"
+        );
         assert!(
             !last.state["new_message"]
                 .as_str()
