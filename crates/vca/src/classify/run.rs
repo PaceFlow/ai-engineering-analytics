@@ -966,6 +966,44 @@ fn load_work_starts(conn: &Connection) -> Result<Vec<WorkStart>> {
     Ok(starts)
 }
 
+/// One earlier goal offered as continuation target, by positions in the
+/// chronological member list.
+struct WorkGoal {
+    first: usize,
+    latest: usize,
+    conversations: usize,
+    same_repo: bool,
+    shared: Vec<String>,
+}
+
+impl WorkGoal {
+    /// Explicit shared references rank first: an assigned issue above a pull
+    /// request above a ticket key mentioned in passing.
+    fn weight(&self) -> usize {
+        self.shared
+            .iter()
+            .map(|r| match r.split(':').next() {
+                Some("issue") => 4,
+                Some("pr") => 2,
+                _ => 1,
+            })
+            .sum()
+    }
+}
+
+fn find(parent: &mut [usize], mut i: usize) -> usize {
+    while parent[i] != i {
+        parent[i] = parent[parent[i]];
+        i = parent[i];
+    }
+    i
+}
+
+fn union(parent: &mut [usize], a: usize, b: usize) {
+    let (a, b) = (find(parent, a), find(parent, b));
+    parent[a.max(b)] = a.min(b);
+}
+
 /// Explicit references in a conversation's first request, cached per conversation.
 fn session_references(
     conn: &Connection,
@@ -1869,17 +1907,24 @@ impl Runner<'_> {
         Ok(())
     }
 
-    /// Ask whether each conversation's first request continues work from an
-    /// earlier conversation or starts a fundamentally new piece of work. A
-    /// confident or tentative continuation joins both into one goal; a manual
-    /// link or unlink of the conversation always wins. Returns whether links changed.
+    /// Ask whether each conversation's first request continues earlier work or
+    /// starts a fundamentally new piece of it. Earlier work is offered per goal
+    /// (its latest conversation), so runs of one goal do not split the answer.
+    /// A confident or tentative continuation joins the conversation to that
+    /// goal; a manual link or unlink of the conversation always wins. Returns
+    /// whether links changed.
     fn classify_work_starts(&mut self, selected: &[(&SessionRef, Vec<TurnFacts>)]) -> Result<bool> {
-        let earlier = load_work_starts(self.conn)?;
-        let mut references: BTreeMap<(String, String), Vec<String>> = BTreeMap::new();
-        let mut order: Vec<(&(&SessionRef, Vec<TurnFacts>), &WorkStart)> = selected
+        let mut earlier = load_work_starts(self.conn)?;
+        earlier.sort_by_key(|w| w.started_ms);
+        let index: BTreeMap<&str, usize> = earlier
+            .iter()
+            .enumerate()
+            .map(|(i, w)| (w.member.as_str(), i))
+            .collect();
+        let mut order: Vec<(&(&SessionRef, Vec<TurnFacts>), usize)> = selected
             .iter()
             .filter_map(|entry| {
-                let first = earlier.iter().find(|w| {
+                let first = earlier.iter().position(|w| {
                     w.provider == entry.0.provider
                         && w.session_id == entry.0.session_id
                         && w.task_index == 0
@@ -1887,9 +1932,38 @@ impl Runner<'_> {
                 Some((entry, first))
             })
             .collect();
-        order.sort_by_key(|(_, first)| first.started_ms);
+        order.sort_by_key(|(_, first)| earlier[*first].started_ms);
+        // Goals as they stand, without the links this pass is about to decide.
+        let deciding: BTreeSet<&str> = order
+            .iter()
+            .map(|(_, i)| earlier[*i].member.as_str())
+            .collect();
+        let mut parent: Vec<usize> = (0..earlier.len()).collect();
+        let links: Vec<(String, String, String, String)> = self
+            .conn
+            .prepare(
+                "SELECT r.from_id, r.to_id, r.source, r.evidence FROM work_relation r
+                 JOIN work_identity a ON a.id = r.from_id JOIN work_identity b ON b.id = r.to_id
+                 WHERE r.decision = 'accepted' AND r.kind IN ('continuation', 'reopens')
+                   AND a.review_reason IS NULL AND b.review_reason IS NULL",
+            )?
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        for (from, to, source, evidence) in &links {
+            if source == "classifier"
+                && evidence.starts_with(WORK_START_EVIDENCE)
+                && deciding.contains(to.as_str())
+            {
+                continue;
+            }
+            if let (Some(&a), Some(&b)) = (index.get(from.as_str()), index.get(to.as_str())) {
+                union(&mut parent, a, b);
+            }
+        }
+        let mut references: BTreeMap<(String, String), Vec<String>> = BTreeMap::new();
         let mut changed = false;
-        for ((session, turns), this) in order {
+        for ((session, turns), position) in order {
+            let this = &earlier[position];
             if self.stopped() || turns.is_empty() {
                 continue;
             }
@@ -1903,13 +1977,19 @@ impl Runner<'_> {
             }
             let own =
                 session_references(self.conn, &mut references, &this.provider, &this.session_id)?;
-            let mut options: Vec<(usize, i64, &WorkStart, Vec<String>)> = Vec::new();
-            for candidate in &earlier {
+            let own_goal = find(&mut parent, position);
+            // Per earlier goal: latest and first conversation in the window,
+            // conversations, same repository, shared references.
+            let mut goals: BTreeMap<usize, WorkGoal> = BTreeMap::new();
+            for (i, candidate) in earlier.iter().enumerate().take(position) {
                 if candidate.session_id == this.session_id
                     || candidate.started_ms >= this.started_ms
                     || this.started_ms - candidate.started_ms > WORK_START_WINDOW_MS
-                    || candidate.repo != this.repo
                 {
+                    continue;
+                }
+                let goal = find(&mut parent, i);
+                if goal == own_goal {
                     continue;
                 }
                 let theirs = session_references(
@@ -1918,19 +1998,37 @@ impl Runner<'_> {
                     &candidate.provider,
                     &candidate.session_id,
                 )?;
-                let shared: Vec<String> =
-                    own.iter().filter(|r| theirs.contains(r)).cloned().collect();
-                let weight = shared
-                    .iter()
-                    .map(|r| match r.split(':').next() {
-                        Some("issue") => 4,
-                        Some("pr") => 2,
-                        _ => 1,
-                    })
-                    .sum();
-                options.push((weight, candidate.started_ms, candidate, shared));
+                let entry = goals.entry(goal).or_insert_with(|| WorkGoal {
+                    first: i,
+                    latest: i,
+                    conversations: 0,
+                    same_repo: false,
+                    shared: Vec::new(),
+                });
+                entry.latest = i;
+                entry.conversations += 1;
+                entry.same_repo |= candidate.repo.is_some() && candidate.repo == this.repo;
+                for reference in own.iter().filter(|r| theirs.contains(r)) {
+                    if !entry.shared.contains(reference) {
+                        entry.shared.push(reference.clone());
+                    }
+                }
             }
-            options.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)));
+            let mut options: Vec<WorkGoal> = goals
+                .into_values()
+                .filter(|g| {
+                    g.same_repo
+                        || !g.shared.is_empty()
+                        || this.repo.is_none() && earlier[g.latest].repo.is_none()
+                })
+                .collect();
+            options.sort_by(|a, b| {
+                b.weight().cmp(&a.weight()).then(
+                    earlier[b.latest]
+                        .started_ms
+                        .cmp(&earlier[a.latest].started_ms),
+                )
+            });
             options.truncate(MAX_WORK_START_OPTIONS);
             if options.is_empty() {
                 changed |= self.set_work_start(this, None)?;
@@ -1941,35 +2039,43 @@ impl Runner<'_> {
                 let listed: Vec<Value> = options
                     .iter()
                     .enumerate()
-                    .map(|(n, (_, started, _, shared))| {
+                    .map(|(n, goal)| {
                         json!({
                             "option": format!("resume_C{}", n + 1),
-                            "hours_before": ((this.started_ms - started) as f64 / 3_600_000.0).round(),
-                            "shared_references": shared,
+                            "hours_since_latest": ((this.started_ms - earlier[goal.latest].started_ms) as f64 / 3_600_000.0).round(),
+                            "conversations": goal.conversations,
+                            "same_repository": goal.same_repo,
+                            "shared_references": goal.shared,
                         })
                     })
                     .collect();
                 built.state["unit"] = Value::String("conversation_start".into());
                 built.state["references"] = json!(own);
-                built.state["earlier_conversations"] = Value::Array(listed);
+                built.state["earlier_work"] = Value::Array(listed);
                 built.est_tokens = estimate_tokens(&built.state);
+                let mut text = |member: usize| {
+                    let (text, count) = redact(&head_tail(&earlier[member].request, 200));
+                    built.redactions += count;
+                    text.replace('\n', " ")
+                };
                 let described: Vec<(String, String)> = options
                     .iter()
                     .enumerate()
-                    .map(|(n, (_, _, candidate, _))| {
-                        let request = if level > Level::EvidenceOnly {
-                            let (text, count) = redact(&head_tail(&candidate.request, 200));
-                            built.redactions += count;
-                            format!(": '{}'", text.replace('\n', " "))
-                        } else {
+                    .map(|(n, goal)| {
+                        let requests = if level <= Level::EvidenceOnly {
                             String::new()
+                        } else if goal.first == goal.latest {
+                            format!(": '{}'", text(goal.latest))
+                        } else {
+                            format!(
+                                ": first '{}'; latest '{}'",
+                                text(goal.first),
+                                text(goal.latest)
+                            )
                         };
                         (
                             format!("resume_C{}", n + 1),
-                            format!(
-                                "Continues the work of earlier conversation C{}{request}.",
-                                n + 1
-                            ),
+                            format!("Continues earlier work C{}{requests}.", n + 1),
                         )
                     })
                     .collect();
@@ -1989,10 +2095,16 @@ impl Runner<'_> {
                 if !matches!(*band, "confident" | "tentative") {
                     return None;
                 }
-                let (_, _, candidate, shared) = options.get(n.checked_sub(1)?)?;
-                Some((*candidate, shared.clone(), answer.confidence))
+                let goal = options.get(n.checked_sub(1)?)?;
+                Some((goal.latest, goal.shared.clone(), answer.confidence))
             });
-            changed |= self.set_work_start(this, chosen)?;
+            if let Some((latest, _, _)) = &chosen {
+                union(&mut parent, *latest, position);
+            }
+            changed |= self.set_work_start(
+                this,
+                chosen.map(|(latest, shared, confidence)| (&earlier[latest], shared, confidence)),
+            )?;
         }
         Ok(changed)
     }
@@ -2885,6 +2997,12 @@ mod tests {
                 "issue-0001-aaaa",
                 "Monitoring verdict: page size 100 still fails",
             ),
+            (
+                "r4",
+                "2026-10-01T13:00:00Z",
+                "issue-0001-aaaa",
+                "Engineering handback: cap set to 15",
+            ),
         ];
         let mut sessions = Vec::new();
         for (id, ts, issue, comment) in runs {
@@ -2924,7 +3042,7 @@ mod tests {
     /// Continue the earlier conversation that shares an issue, otherwise new work.
     fn issue_aware() -> ScriptedClient {
         ScriptedClient::new(|request| {
-            let shared = request.state["earlier_conversations"]
+            let shared = request.state["earlier_work"]
                 .as_array()
                 .and_then(|list| {
                     list.iter().find(|c| {
@@ -2967,19 +3085,28 @@ mod tests {
         assert_eq!(
             goal_members(&conn)?,
             vec![
-                vec!["r1".to_string(), "r3".to_string()],
+                vec!["r1".to_string(), "r3".to_string(), "r4".to_string()],
                 vec!["r2".to_string()]
             ]
         );
         let requests = client.requests.lock().unwrap().clone();
         // The first run has nothing earlier to continue, so it is not asked about.
-        assert_eq!(requests.len(), 2);
-        let last = &requests[1];
+        assert_eq!(requests.len(), 3);
+        let last = &requests[2];
         assert_eq!(last.state["references"][0], "issue:issue-0001-aaaa");
-        assert_eq!(
-            last.state["earlier_conversations"][0]["option"],
-            "resume_C1"
+        // Two runs of the issue are one option, so they cannot split the answer.
+        let offered = last.state["earlier_work"].as_array().unwrap();
+        assert_eq!(offered.len(), 2);
+        assert_eq!(offered[0]["conversations"], 2);
+        assert_eq!(offered[0]["shared_references"][0], "issue:issue-0001-aaaa");
+        let described = last.questions["work_start"]["criteria"]["resume_C1"]
+            .as_str()
+            .unwrap();
+        assert!(
+            described.contains("first 'Fix the RocketReach"),
+            "{described}"
         );
+        assert!(described.contains("latest 'Monitoring"), "{described}");
         assert!(
             !last.state["new_message"]
                 .as_str()
@@ -2989,7 +3116,7 @@ mod tests {
         );
         // Re-running is served from cache and keeps the same goals.
         run(&conn, &client, &config(), &sessions, &starts_only())?;
-        assert_eq!(client.calls(), 2);
+        assert_eq!(client.calls(), 3);
         Ok(())
     }
 
@@ -3007,7 +3134,26 @@ mod tests {
             }))
         });
         run(&conn, &client, &config(), &sessions, &starts_only())?;
-        assert_eq!(goal_members(&conn)?.len(), 3);
+        assert_eq!(goal_members(&conn)?.len(), 4);
+        Ok(())
+    }
+
+    #[test]
+    fn a_shared_issue_reaches_runs_in_another_working_directory() -> Result<()> {
+        let (conn, sessions) = issue_runs()?;
+        conn.execute(
+            "UPDATE derived_task SET repo_root='/work/run-'||session_id",
+            [],
+        )?;
+        let client = issue_aware();
+        run(&conn, &client, &config(), &sessions, &starts_only())?;
+        assert_eq!(
+            goal_members(&conn)?,
+            vec![
+                vec!["r1".to_string(), "r3".to_string(), "r4".to_string()],
+                vec!["r2".to_string()]
+            ]
+        );
         Ok(())
     }
 
