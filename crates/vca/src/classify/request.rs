@@ -158,21 +158,31 @@ fn multica(raw: &str, mut stripped: Vec<&'static str>) -> Request {
         .lines()
         .filter_map(|line| line.strip_prefix("> ").or((line == ">").then_some("")))
         .collect();
-    if !quoted.is_empty() {
-        return finish(&quoted.join("\n"), speaker, "recognized_comment", stripped);
-    }
-    if let Some((_, tail)) = raw.split_once("Instruction:") {
+    let request = if !quoted.is_empty() {
+        finish(
+            &quoted.join("\n"),
+            speaker,
+            "recognized_comment",
+            stripped.clone(),
+        )
+    } else if let Some((_, tail)) = raw.split_once("Instruction:") {
         let text = tail.split("## ").next().unwrap_or(tail);
-        return finish(text, speaker, "recognized_wakeup", stripped);
+        finish(text, speaker, "recognized_wakeup", stripped.clone())
+    } else {
+        // An assignment containing only an issue id supplies no goal. Do not
+        // classify its comment-posting instructions as documentation or invent
+        // the issue body.
+        unavailable(speaker, "uncertain", stripped.clone())
+    };
+    // The issue as the agent read it in this conversation states the goal when
+    // the envelope does not.
+    match issue.filter(|issue| !issue.is_empty() && request.goal_unavailable()) {
+        Some(issue) => {
+            stripped.push("assigned_issue_read");
+            finish(issue, speaker, "agent_issue_read", stripped)
+        }
+        None => request,
     }
-    // An assignment containing only an issue id supplies no goal. Do not classify
-    // its comment-posting instructions as documentation or invent the issue body;
-    // the issue as the agent read it in this conversation states the goal.
-    if let Some(issue) = issue.filter(|issue| !issue.is_empty()) {
-        stripped.push("assigned_issue_read");
-        return finish(issue, speaker, "agent_issue_read", stripped);
-    }
-    unavailable(speaker, "uncertain", stripped)
 }
 
 /// Injected context blocks that are never part of the request.

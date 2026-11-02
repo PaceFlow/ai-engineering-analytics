@@ -189,6 +189,18 @@ mod tests {
             ..issue.clone()
         };
         assert!(attach(ASSIGNMENT, &[other]).is_none());
+        // A comment whose quote states nothing falls back to the issue.
+        let heading_only = "You are running as a local coding agent for a Multica workspace.\n\nYour assigned issue ID is: 01a0d42d-99af-7d42-9f54-65863fbc704c\n\n[NEW COMMENT] A user just left a new comment.\n\n> ## Investigation conclusion\n\nWe investigated the report.";
+        let attached = attach(heading_only, std::slice::from_ref(&issue)).expect("attached");
+        let request = super::super::request::normalize(&attached);
+        assert_eq!(request.extraction, "agent_issue_read");
+        assert_eq!(request.speaker, "human");
+        // A comment that states a goal keeps it.
+        let stated = ASSIGNMENT.replace(
+            "Reply as a comment when done.",
+            "[NEW COMMENT] A user just left a new comment.\n> Rotate the API key.",
+        );
+        assert!(attach(&stated, std::slice::from_ref(&issue)).is_none());
         assert!(attach("Fix the cache limit", &[issue]).is_none());
     }
 }
