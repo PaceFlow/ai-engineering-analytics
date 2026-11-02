@@ -107,6 +107,28 @@ button.primary { background: var(--accent); border-color: var(--accent); color: 
 .saved { color: var(--ok); font-size: 12.5px; }
 .empty { color: var(--muted); padding: 30px 0; text-align: center; }
 .hint { color: var(--muted); font-size: 12px; margin: 6px 0 0; }
+.labels { display: flex; flex-wrap: wrap; gap: 4px; flex-basis: 100%; }
+.lab { font: 11px var(--mono); padding: 0 6px; border-radius: 9px; background: var(--panel); border: 1px solid var(--line); cursor: help; }
+.lab.tentative { border-style: dashed; }
+.lab.uncertain { opacity: .55; text-decoration: line-through dotted; }
+.lab.override { border-color: var(--ok); color: var(--ok); }
+.lab.heuristic { color: var(--muted); }
+.start { margin: 18px 0 4px; padding: 8px 10px; border-radius: 6px; border: 1px solid var(--line); font-size: 13px; background: var(--panel); }
+.start.new { border-color: var(--ok); background: var(--ok-soft); }
+.start.cont { border-color: var(--accent); background: var(--accent-soft); }
+.start .why { color: var(--muted); font-size: 12px; margin-top: 3px; overflow-wrap: anywhere; }
+.ctx { font: 11px var(--mono); color: var(--call); margin-right: 8px; white-space: nowrap; }
+.dm { width: 100%; border-collapse: collapse; font-size: 12px; }
+.dm td, .dm th { border-top: 1px solid var(--line); padding: 3px 4px; text-align: left; vertical-align: top; overflow-wrap: anywhere; }
+.dm th { color: var(--muted); font-weight: 500; font-size: 11px; cursor: pointer; }
+.dm td.n { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.dm tr.dim td { opacity: .5; }
+.goal { border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; margin: 8px 0; font-size: 12.5px; }
+.goal .gt { font-weight: 600; }
+.goal ul { margin: 4px 0 2px 16px; padding: 0; }
+.goal li.this { font-weight: 600; }
+.stack { display: flex; height: 10px; border-radius: 5px; overflow: hidden; margin: 6px 0; background: var(--line); }
+.stack span { display: block; height: 100%; }
 </style>
 </head>
 <body>
@@ -124,13 +146,13 @@ button.primary { background: var(--accent); border-color: var(--accent); color: 
     <button id="saveref" class="primary" hidden title="Save this session and your answers into the reference corpus">Save session</button>
     <button id="savenext" class="primary" hidden title="Save, then open the next session to review">Save &amp; next →</button>
     <span id="savestate" class="saved"></span>
-    <a id="back" class="btn" hidden href="/">← sessions</a>
+    <a id="back" class="btn" hidden href="/sessions">← sessions</a>
   </div>
 </header>
 <main>
   <section id="timeline"></section>
   <aside>
-    <div class="tabs"><button id="tab-checks" class="on">Checklist</button><button id="tab-all">All numbers</button></div>
+    <div class="tabs"><button id="tab-checks" class="on">Checklist</button><button id="tab-all">All numbers</button><button id="tab-model">Data model</button></div>
     <section id="checkpane">
       <p class="hint">Each card says what vca concluded about this session. Check it against the timeline (<b>Show me</b> highlights the evidence) and answer ✓ or ✗. Skip anything you can't judge — every number is still recorded, marked as unreviewed.</p>
       <div id="checks"></div>
@@ -144,6 +166,19 @@ button.primary { background: var(--accent); border-color: var(--accent); color: 
     <div class="chips" id="statfilter"></div>
     <div id="stats"></div>
     </section>
+    <section id="modelpane" hidden>
+      <p class="hint">What vca stored for this session, as rows. Labels with a dashed border are tentative, struck-through ones uncertain (reports ignore them), green ones manual overrides, grey ones heuristic. Hover a label for its probabilities.</p>
+      <h2>Tasks and goals</h2><div id="dm-tasks"></div>
+      <h2>Context composition</h2><div id="dm-comp"></div>
+      <details><summary><h2 style="display:inline">Context items</h2> <small id="dm-itemcount"></small></summary>
+        <p class="hint">Every item that entered the context: the call it entered at, how many later calls carried it (counted again), and what that cost. Click a column to sort.</p>
+        <table class="dm" id="dm-items"></table></details>
+      <details><summary><h2 style="display:inline">API calls</h2> <small id="dm-callcount"></small></summary>
+        <table class="dm" id="dm-calls"></table></details>
+      <details><summary><h2 style="display:inline">All labels</h2> <small id="dm-labelcount"></small></summary>
+        <p class="hint">Every stored answer, newest first per question; ★ marks the one reports use.</p>
+        <table class="dm" id="dm-labels"></table></details>
+    </section>
   </aside>
 </main>
 <script id="data" type="application/json">/*__REVIEW_DATA__*/null</script>
@@ -151,6 +186,7 @@ button.primary { background: var(--accent); border-color: var(--accent); color: 
 <script>
 (function () {
   const DATA = JSON.parse(document.getElementById('data').textContent);
+  const CORPUS_LINKS = !!JSON.parse(document.getElementById('corpus').textContent);
   if (!DATA) { document.getElementById('timeline').innerHTML = '<p class="empty">No data embedded.</p>'; return; }
   const S = DATA.detail.session;
   const STORE = 'vca-review:' + DATA.key;
@@ -199,14 +235,58 @@ button.primary { background: var(--accent); border-color: var(--accent); color: 
     if (m.agent_type) bits.push('<span class="badge agent">' + esc(m.agent_type) + '</span>');
     return bits.join('');
   }
+  const M = DATA.inspect || { labels: [], tasks: [], context: { calls: [], items: [] } };
+  const NL = String.fromCharCode(10);
+  const probs = (p, n) => Object.entries(p).sort((a, b) => b[1] - a[1]).slice(0, n || 99).map(([k, v]) => k + ' ' + Math.round(v * 100) + '%');
+  function labTitle(l) {
+    let t = l.unit_kind + ' ' + l.unit + ' · ' + l.question + ' = ' + l.label + ' · ' + l.source + ' ' + l.band +
+      (l.confidence != null ? ' (confidence ' + Number(l.confidence).toFixed(2) + ')' : '');
+    if (l.probabilities && typeof l.probabilities === 'object') t += NL + probs(l.probabilities).join(', ');
+    if (l.note) t += NL + 'note: ' + l.note;
+    return t;
+  }
+  const labClass = (l) => l.source === 'override' ? 'override' : l.source === 'jev' ? l.band : 'heuristic';
+  const labChip = (l) => '<span class="lab ' + esc(labClass(l)) + '" title="' + esc(labTitle(l)) + '">' + esc(l.question) + ': ' + esc(l.label == null ? '—' : l.label) + '</span>';
+  const effective = M.labels.filter((l) => l.effective);
+  const labelsOf = (kinds, unit) => effective.filter((l) => kinds.includes(l.unit_kind) && l.unit === String(unit));
+  const taskByFirstTurn = new Map(M.tasks.filter((t) => t.first_turn != null).map((t) => [t.first_turn, t]));
+  const reviewUrl = (p, s) => CORPUS_LINKS ? '/review/' + encodeURIComponent(p) + '/' + encodeURIComponent(s) : '#';
+  function ctxPill(c, kind) {
+    if (!c) return '';
+    if (kind === 'call') return '<span class="ctx" title="Context ledger: context size at this call, newly written and carried tokens, cache event">ctx ' +
+      num(c.context) + ' · new ' + num(c.new) + ' · carried ' + num(c.carried) + (c.cache_event && c.cache_event !== 'hit' ? ' · ' + esc(c.cache_event) : '') + '</span>';
+    return '<span class="ctx" title="Entered the context at call ' + c.entered + (c.evicted != null ? ', evicted at call ' + c.evicted : '') +
+      '; counted again by ' + c.carried + ' later calls; ' + (c.usd == null ? 'unpriced' : usd(c.usd)) + ' in total">' + num(c.tokens) + ' tok × ' + c.carried + '</span>';
+  }
+  function startHtml(t) {
+    const ws = labelsOf(['work_start'], t.task)[0];
+    const rel = (t.relations || []).filter((r) => r.direction === 'from' && r.decision === 'accepted' && (r.kind === 'continuation' || r.kind === 'reopens'));
+    const g = t.goal || {};
+    let cls = 'start', head;
+    if (rel.length) {
+      const r = rel[0];
+      cls += ' cont';
+      head = 'Task T' + t.task + ' <b>continues earlier work</b>: ' + esc((r.title || '').slice(0, 120)) + ' <span class="pill">' + esc(r.source) +
+        (r.confidence != null ? ' ' + Number(r.confidence).toFixed(2) : '') + '</span>' +
+        (r.session_id ? ' <a href="' + reviewUrl(r.provider, r.session_id) + '">open ' + esc(r.session_id.slice(0, 14)) + ' T' + r.task + '</a>' : '');
+    } else {
+      cls += ' new';
+      head = 'Task T' + t.task + ' <b>starts new work</b>';
+    }
+    let why = '';
+    if (ws) why += '<div class="why">work-start answer ' + labChip(ws) + (ws.probabilities ? ' ' + esc(probs(ws.probabilities, 4).join(' · ')) : '') + '</div>';
+    if (rel.length) why += '<div class="why">' + esc(rel[0].evidence) + '</div>';
+    why += '<div class="why">goal ' + esc((g.id || '').slice(0, 12)) + ' · ' + esc(g.state || '—') + ' · intent ' + esc(g.intent || '—') + ' · ' + (g.conversations || 1) + ' conversation(s)</div>';
+    return '<div class="' + cls + '">' + head + '<div class="labels">' + labelsOf(['task', 'task_completion'], t.task).map(labChip).join('') + '</div>' + why + '</div>';
+  }
   function entryHtml(e) {
     const sub = e.agent !== 'main';
     const cls = 'e ' + e.kind + (sub ? ' sub' : '') + (highlighted.has(e.id) ? ' hl' : '');
     const agent = sub ? '<span class="badge agent" title="' + esc(e.agent) + '">sub ' + esc(e.agent.slice(0, 8)) + '</span>' : '';
     let head = agent, expandable = false;
-    if (e.kind === 'call') head += callLine(e.meta) + '<span class="title">' + esc(e.title) + '</span>';
-    else if (e.kind === 'tool') { head += toolLine(e.meta) + '<span class="title">' + esc(e.title) + '</span>'; expandable = true; }
-    else { head += '<span class="title">' + esc(e.title || '(empty)') + '</span>'; expandable = e.body && e.body !== e.title; }
+    if (e.kind === 'call') head += callLine(e.meta) + ctxPill(e.meta.ctx, 'call') + '<span class="title">' + esc(e.title) + '</span>';
+    else if (e.kind === 'tool') { head += toolLine(e.meta) + ctxPill(e.meta.ctx) + '<span class="title">' + esc(e.title) + '</span>'; expandable = true; }
+    else { head += ctxPill(e.meta.ctx) + '<span class="title">' + esc(e.title || '(empty)') + '</span>'; expandable = e.body && e.body !== e.title; }
     const left = '<span class="t">' + esc(time(e.ts)) + '</span><span class="k ' + e.kind + '">' + e.kind + '</span>';
     if (!expandable) return '<div class="' + cls + '" data-id="' + e.id + '">' + left + '<div>' + head + '</div></div>';
     return '<div class="' + cls + '" data-id="' + e.id + '">' + left + '<details data-id="' + e.id + '"><summary>' + head + '</summary></details></div>';
@@ -228,11 +308,14 @@ button.primary { background: var(--accent); border-color: var(--accent); color: 
       if (!visible(e)) continue;
       if (e.turn !== lastTurn && e.turn != null) {
         const t = turnInfo.get(e.turn) || {};
+        const starts = taskByFirstTurn.get(e.turn);
+        if (starts) out.push(startHtml(starts));
+        const labs = labelsOf(['turn', 'exchange'], e.turn).map(labChip).join('');
         out.push('<div class="turn"><b>Turn ' + e.turn + '</b>' +
           (t.task != null ? '<span>Task T' + t.task + '</span>' : '<span>no task</span>') +
           (t.stage ? '<span>stage ' + esc(t.stage) + '</span>' : '') +
           (t.request_kind ? '<span>asked for ' + esc(t.request_kind) + '</span>' : '') +
-          '<span class="cost">' + usd(t.cost) + '</span></div>');
+          '<span class="cost">' + usd(t.cost) + '</span>' + (labs ? '<div class="labels">' + labs + '</div>' : '') + '</div>');
         lastTurn = e.turn;
       }
       out.push(entryHtml(e));
@@ -404,14 +487,18 @@ button.primary { background: var(--accent); border-color: var(--accent); color: 
     const id = ev.target.closest('.check').dataset.id;
     answers[id] = Object.assign(answers[id] || { state: 'no' }, { note: ev.target.value }); saveAnswers();
   });
-  const tabs = { checks: document.getElementById('tab-checks'), all: document.getElementById('tab-all') };
+  const tabs = { checks: document.getElementById('tab-checks'), all: document.getElementById('tab-all'), model: document.getElementById('tab-model') };
   const showTab = (name) => {
-    tabs.checks.classList.toggle('on', name === 'checks'); tabs.all.classList.toggle('on', name === 'all');
+    for (const [k, b] of Object.entries(tabs)) b.classList.toggle('on', k === name);
     document.getElementById('checkpane').hidden = name !== 'checks';
     document.getElementById('allpane').hidden = name !== 'all';
+    document.getElementById('modelpane').hidden = name !== 'model';
+    try { localStorage.setItem('vca-review:tab', name); } catch (e) {}
   };
   tabs.checks.onclick = () => showTab('checks');
   tabs.all.onclick = () => showTab('all');
+  tabs.model.onclick = () => showTab('model');
+  try { const t = localStorage.getItem('vca-review:tab'); if (t && tabs[t]) showTab(t); } catch (e) {}
   tabs.all.textContent = 'All numbers (' + DATA.stats.length + ')';
 
   // Checklist answers approve or reject the numbers they cover; a vote on a
@@ -489,6 +576,75 @@ button.primary { background: var(--accent); border-color: var(--accent); color: 
     }).catch((e) => alert('Could not read that file: ' + e));
   };
 
+  // ── Data model ──
+  function renderModel() {
+    document.getElementById('dm-tasks').innerHTML = M.tasks.map((t) => {
+      const g = t.goal || {};
+      const members = (g.members || []).map((m) => '<li class="' + (m.this ? 'this' : '') + '">' + esc((m.started_at || '').slice(0, 16).replace('T', ' ')) + ' · ' +
+        (m.this ? 'this conversation' : '<a href="' + reviewUrl(m.provider, m.session_id) + '">' + esc(m.session_id.slice(0, 14)) + '</a>') +
+        ' T' + m.task + ' · ' + esc((m.title || '').slice(0, 90)) + '</li>').join('');
+      const rels = (t.relations || []).map((r) => '<li>' + (r.direction === 'from' ? '← from ' : '→ to ') + esc(r.kind) + ' · ' + esc(r.decision) + ' · ' + esc(r.source) +
+        (r.confidence != null ? ' ' + Number(r.confidence).toFixed(2) : '') + ' · ' +
+        (r.session_id ? '<a href="' + reviewUrl(r.provider, r.session_id) + '">' + esc(r.session_id.slice(0, 14)) + '</a> T' + r.task : '?') +
+        '<div class="meta">' + esc(r.evidence) + '</div></li>').join('');
+      return '<div class="goal"><div class="gt">T' + t.task + ' · turns ' + t.first_turn + '–' + t.last_turn +
+        (t.completion_turn != null ? ' · done at turn ' + t.completion_turn + ' (' + esc(t.completion_source || '') + ')' : '') + '</div>' +
+        '<div>' + esc(t.title || '') + '</div>' +
+        '<div class="labels">' + labelsOf(['task', 'task_completion', 'work_start'], t.task).map(labChip).join('') + '</div>' +
+        '<div class="meta">segmentation ' + esc(t.segmentation || '—') + ' · cost ' + usd(t.cost) + ' · commits ' + num(t.commits) + '</div>' +
+        '<div class="meta">goal ' + esc(g.id || '—') + ' · ' + esc(g.state || '—') + ' · intent ' + esc(g.intent || '—') + ' (' + esc(g.intent_source || '') + ') · ' +
+        num(g.conversations) + ' conversations · ' + num(g.corrections) + ' corrections · ' + num(g.validation_failures) + ' failed validations</div>' +
+        (members ? '<div>Goal members</div><ul>' + members + '</ul>' : '') + (rels ? '<div>Links</div><ul>' + rels + '</ul>' : '') + '</div>';
+    }).join('') || '<p class="empty">No tasks stored.</p>';
+
+    const items = M.context.items;
+    const byKind = new Map();
+    for (const i of items) {
+      const k = byKind.get(i.kind) || { n: 0, tokens: 0, carried: 0, usd: 0 };
+      k.n++; k.tokens += i.tokens; k.carried += i.tokens * i.carried; k.usd += i.total_usd || 0;
+      byKind.set(i.kind, k);
+    }
+    const kinds = [...byKind.entries()].sort((a, b) => b[1].usd - a[1].usd);
+    const totalUsd = kinds.reduce((s, [, k]) => s + k.usd, 0) || 1;
+    const COLORS = ['var(--user)', 'var(--tool)', 'var(--call)', 'var(--event)', 'var(--ok)', 'var(--bad)', 'var(--assistant)', 'var(--warn)'];
+    const color = (i) => COLORS[i % COLORS.length];
+    document.getElementById('dm-comp').innerHTML = items.length
+      ? '<div class="stack">' + kinds.map(([k, v], i) => '<span title="' + esc(k + ' ' + usd(v.usd)) + '" style="width:' + (100 * v.usd / totalUsd) + '%;background:' + color(i) + '"></span>').join('') + '</div>' +
+        '<table class="dm"><tr><th>kind</th><th>items</th><th>tokens</th><th>tokens × carries</th><th>cost</th></tr>' +
+        kinds.map(([k, v], i) => '<tr><td><span style="color:' + color(i) + '">■</span> ' + esc(k) + '</td><td class="n">' + num(v.n) + '</td><td class="n">' + num(v.tokens) +
+          '</td><td class="n">' + num(v.carried) + '</td><td class="n">' + usd(v.usd) + '</td></tr>').join('') + '</table>'
+      : '<p class="empty">No context ledger for this session.</p>';
+    document.getElementById('dm-itemcount').textContent = '(' + items.length + ')';
+    sortable('dm-items', items, [
+      ['agent', (i) => i.agent === S.session_id ? 'main' : i.agent.slice(0, 8)], ['kind'], ['target', (i) => i.target || i.source || i.tool || i.key],
+      ['entered', null, 1], ['evicted', null, 1], ['carried', null, 1], ['tokens', null, 1], ['total_usd', (i) => usd(i.total_usd), 1, (i) => i.total_usd || 0]], 'carried');
+    document.getElementById('dm-callcount').textContent = '(' + M.context.calls.length + ')';
+    sortable('dm-calls', M.context.calls, [
+      ['call', null, 1], ['ts', (c) => time(c.ts)], ['model'], ['context', null, 1], ['new', null, 1], ['carried', null, 1], ['residual', null, 1],
+      ['cache_event'], ['input_cost', (c) => usd(c.input_cost), 1, (c) => c.input_cost || 0]], 'call', true);
+    document.getElementById('dm-labelcount').textContent = '(' + M.labels.length + ')';
+    sortable('dm-labels', M.labels, [
+      ['effective', (l) => l.effective ? '★' : ''], ['unit_kind'], ['unit', null, 1, (l) => Number(l.unit) || 0], ['question'], ['label'], ['source'], ['band'],
+      ['confidence', (l) => l.confidence == null ? '—' : Number(l.confidence).toFixed(2), 1], ['created_at']], null, true, (l) => !l.effective);
+  }
+  // A table whose header cells sort it. cols: [key, display, numeric, sort value]
+  function sortable(id, rows, cols, initial, asc, dim) {
+    const el = document.getElementById(id);
+    let key = initial, up = !!asc;
+    const draw = () => {
+      const col = cols.find((c) => c[0] === key);
+      const val = col ? (col[3] || ((r) => r[col[0]])) : null;
+      const list = val ? [...rows].sort((a, b) => { const x = val(a), y = val(b); return (x > y ? 1 : x < y ? -1 : 0) * (up ? 1 : -1); }) : rows;
+      const cell = (c, r) => c[1] ? c[1](r) : (r[c[0]] == null ? '—' : typeof r[c[0]] === 'number' ? num(r[c[0]]) : r[c[0]]);
+      el.innerHTML = '<tr>' + cols.map((c) => '<th data-k="' + c[0] + '">' + c[0] + (c[0] === key ? (up ? ' ▲' : ' ▼') : '') + '</th>').join('') + '</tr>' +
+        list.slice(0, 2000).map((r) => '<tr' + (dim && dim(r) ? ' class="dim"' : '') + '>' +
+          cols.map((c) => '<td' + (c[2] ? ' class="n"' : '') + '>' + esc(cell(c, r)) + '</td>').join('') + '</tr>').join('');
+    };
+    el.onclick = (ev) => { const th = ev.target.closest('th'); if (!th) return; if (key === th.dataset.k) up = !up; else { key = th.dataset.k; up = false; } draw(); };
+    draw();
+  }
+
+  renderModel();
   renderTimeline();
   renderStats();
   renderChecks();

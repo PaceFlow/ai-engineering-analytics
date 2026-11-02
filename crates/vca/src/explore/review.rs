@@ -65,6 +65,8 @@ pub struct ReviewData {
     pub files: Vec<FileTouch>,
     /// The short list a person can verify by reading the session.
     pub checks: Vec<super::review_checks::Check>,
+    /// Stored labels, tasks with their goals, and the context ledger.
+    pub inspect: Value,
 }
 
 /// Lines one session changed in one file. `session` counts come from the
@@ -135,6 +137,7 @@ pub fn review(conn: &Connection, provider: &str, session_id: &str) -> Result<Opt
     let stats = stats(conn, &detail, &timeline)?;
     let files = file_touches(conn, provider, &agents)?;
     let checks = super::review_checks::checks(&detail, &stats, &files);
+    let inspect = super::inspect::inspect(conn, provider, session_id, &agents)?;
     Ok(Some(ReviewData {
         key: format!("{provider}:{session_id}"),
         pricing: crate::cost::pricing::pricing_version(),
@@ -144,6 +147,7 @@ pub fn review(conn: &Connection, provider: &str, session_id: &str) -> Result<Opt
         stats,
         files,
         checks,
+        inspect,
     }))
 }
 
@@ -356,6 +360,14 @@ fn timeline(
     turns: &[TurnMark],
 ) -> Result<Vec<Entry>> {
     let mut pending: Vec<Pending> = Vec::new();
+    // How long each message, tool result and call stayed in context.
+    let footprints = super::inspect::footprints(conn, provider, agents)?;
+    let footprint = |agent: &str, key: String| {
+        footprints
+            .get(&format!("{agent} {key}"))
+            .cloned()
+            .unwrap_or(Value::Null)
+    };
     let agent_label = |id: &str| {
         if id == root {
             "main".to_string()
@@ -401,7 +413,12 @@ fn timeline(
                 "assistant"
             };
             let title = first_line(&content, 120);
-            let meta = json!({ "chars": content.chars().count() });
+            let ctx = if role == "user" {
+                footprint(agent, format!("user:{index}"))
+            } else {
+                Value::Null
+            };
+            let meta = json!({ "chars": content.chars().count(), "index": index, "ctx": ctx });
             pending.push((
                 ts.clone(),
                 0,
@@ -413,7 +430,7 @@ fn timeline(
         let mut stmt = conn.prepare(
             "SELECT call_index, ts, ended_ts, tool_name, tool_category, validation_kind, target,
                     input_chars, output_chars, output_in_context, status, exit_code,
-                    error_signature, child_session_id, agent_type
+                    error_signature, child_session_id, agent_type, call_key
              FROM fact_session_tool_call WHERE provider = ?1 AND session_id = ?2
              ORDER BY call_index",
         )?;
@@ -435,6 +452,8 @@ fn timeline(
                     "error": row.get::<_, Option<String>>(12)?,
                     "child_session": row.get::<_, Option<String>>(13)?,
                     "agent_type": row.get::<_, Option<String>>(14)?,
+                    "call_key": row.get::<_, String>(15)?,
+                    "ctx": footprint(agent, format!("tool:{}", row.get::<_, String>(15)?)),
                 }),
             ))
         })?;
@@ -493,7 +512,8 @@ fn timeline(
             ))
         })?;
         for row in rows {
-            let (id, ts, model, root_turn, meta) = row?;
+            let (id, ts, model, root_turn, mut meta) = row?;
+            meta["ctx"] = footprint(agent, format!("usage:{id}"));
             let title = crate::explore::short_model(&model);
             let mut item = entry(ts.clone(), agent, "call", title, String::new(), meta);
             item.turn = root_turn;

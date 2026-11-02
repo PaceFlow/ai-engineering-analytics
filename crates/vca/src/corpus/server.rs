@@ -18,6 +18,8 @@ use std::path::PathBuf;
 use crate::explore::{self, Filters, SessionSort, short_repo};
 
 const APP: &str = include_str!("app.html");
+/// Sessions per page in the browser.
+const PAGE: usize = 100;
 /// Largest request body accepted (expectations JSON).
 const MAX_BODY: usize = 8 * 1024 * 1024;
 
@@ -244,6 +246,14 @@ impl State {
                     &serde_json::to_string(&data)?.replace('<', "\\u003c"),
                 )))
             }
+            ("GET", ["sessions"]) => {
+                let conn = crate::db::open()?;
+                let data = browse(&conn, &req.query)?;
+                Ok(Response::html(APP.replace(
+                    "/*__CORPUS_APP__*/null",
+                    &serde_json::to_string(&data)?.replace('<', "\\u003c"),
+                )))
+            }
             ("GET", ["open"]) => {
                 let input = req.query.get("session").cloned().unwrap_or_default();
                 let conn = crate::db::open()?;
@@ -338,6 +348,71 @@ impl State {
             _ => Ok(Response::text(404, "not found")),
         }
     }
+}
+
+/// Every session, newest first (or by `sort`), filtered by `q` (title, first
+/// request, branch or id), `tool` and `project`, one page at a time.
+fn browse(conn: &Connection, query: &HashMap<String, String>) -> Result<Value> {
+    let get = |key: &str| {
+        query
+            .get(key)
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    };
+    let filters = Filters {
+        providers: get("tool").into_iter().collect(),
+        search: get("q"),
+        ..Filters::default()
+    };
+    let project = get("project").map(|p| p.to_ascii_lowercase());
+    let mut rows: Vec<_> = explore::sessions(conn, &filters, SessionSort::Started, 1_000_000)?
+        .into_iter()
+        .filter(|row| {
+            project.as_ref().is_none_or(|p| {
+                row.repo_root
+                    .as_deref()
+                    .is_some_and(|repo| repo.to_ascii_lowercase().contains(p))
+            })
+        })
+        .collect();
+    let sort = get("sort").unwrap_or_else(|| "started".into());
+    match sort.as_str() {
+        "cost" => rows.sort_by(|a, b| b.cost.unwrap_or(0.0).total_cmp(&a.cost.unwrap_or(0.0))),
+        "turns" => rows.sort_by_key(|r| std::cmp::Reverse(r.turns)),
+        "tasks" => rows.sort_by_key(|r| std::cmp::Reverse(r.tasks)),
+        _ => rows.sort_by(|a, b| b.started_at.cmp(&a.started_at)),
+    }
+    let offset: usize = get("offset").and_then(|o| o.parse().ok()).unwrap_or(0);
+    let page: Vec<Value> = rows
+        .iter()
+        .skip(offset)
+        .take(PAGE)
+        .map(|row| {
+            json!({
+                "provider": row.provider,
+                "session_id": row.session_id,
+                "title": row.title,
+                "project": row.repo_root.as_deref().map(short_repo).unwrap_or_else(|| "(no repo)".into()),
+                "started_at": row.started_at,
+                "turns": row.turns,
+                "tasks": row.tasks,
+                "agents": row.agents,
+                "cost": row.cost,
+            })
+        })
+        .collect();
+    Ok(json!({
+        "browse": {
+            "q": get("q"),
+            "tool": get("tool"),
+            "project": get("project"),
+            "sort": sort,
+            "offset": offset,
+            "page": PAGE,
+            "total": rows.len(),
+            "rows": page,
+        }
+    }))
 }
 
 fn read_request(stream: &TcpStream) -> Result<Request> {

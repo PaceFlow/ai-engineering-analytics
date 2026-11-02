@@ -9,6 +9,7 @@ pub mod compare;
 pub mod delivery;
 pub mod format;
 pub mod habits;
+pub mod inspect;
 pub mod practices;
 pub mod review;
 pub mod review_checks;

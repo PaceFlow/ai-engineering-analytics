@@ -23,7 +23,7 @@ header { background: var(--panel); border-bottom: 1px solid var(--line); padding
 h1 { font-size: 17px; margin: 0 0 2px; font-weight: 600; }
 .sub { color: var(--muted); font-size: 12.5px; overflow-wrap: anywhere; }
 form { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 10px; }
-input, button { font: inherit; font-size: 13px; border: 1px solid var(--line); background: var(--panel); color: var(--ink); border-radius: 6px; padding: 4px 8px; }
+input, button, select { font: inherit; font-size: 13px; border: 1px solid var(--line); background: var(--panel); color: var(--ink); border-radius: 6px; padding: 4px 8px; }
 button { cursor: pointer; } button:hover { border-color: var(--accent); }
 main { padding: 8px 16px 60px; max-width: 1200px; }
 h2 { font-size: 13px; margin: 22px 0 6px; font-weight: 600; }
@@ -49,9 +49,17 @@ a { color: var(--accent); text-decoration: none; } a:hover { text-decoration: un
     <label>per project &amp; tool <input name="per" id="per" size="3"></label>
     <button type="submit">Resample</button>
   </form>
+  <form id="browse" method="get" action="/sessions" hidden>
+    <input name="q" id="bq" placeholder="search title, first request, branch or id" size="36">
+    <input name="project" id="bproject" placeholder="project" size="14">
+    <select name="tool" id="btool"><option value="">all tools</option><option>claude</option><option>codex</option><option>cursor</option><option>opencode</option></select>
+    <select name="sort" id="bsort"><option value="started">newest</option><option value="cost">cost</option><option value="turns">turns</option><option value="tasks">tasks</option></select>
+    <button type="submit">Search</button>
+  </form>
   <form method="get" action="/open">
     <input name="session" placeholder="open any session: id, prefix or provider:id" size="44">
     <button type="submit">Open</button>
+    <a id="mode" href="/sessions">Browse all sessions →</a>
   </form>
 </header>
 <main id="list"></main>
@@ -59,6 +67,7 @@ a { color: var(--accent); text-decoration: none; } a:hover { text-decoration: un
 <script>
 (function () {
   const D = JSON.parse(document.getElementById('data').textContent);
+  if (D.browse) return browse(D.browse);
   const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
   const usd = (n) => n == null ? '—' : '$' + Number(n).toFixed(Number(n) < 1 ? 3 : 2);
   document.getElementById('sub').textContent = 'Saved to ' + D.corpus + ' · projects: ' + (D.projects.length ? D.projects.join(', ') : 'all') +
@@ -84,6 +93,31 @@ a { color: var(--accent); text-decoration: none; } a:hover { text-decoration: un
   document.getElementById('list').innerHTML = out.join('') ||
     '<p class="empty">No sessions match. Widen --project, lower --min-turns, or run vca ingest.</p>';
 })();
+function browse(B) {
+  const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  const usd = (n) => n == null ? '—' : '$' + Number(n).toFixed(Number(n) < 1 ? 3 : 2);
+  document.title = 'Sessions';
+  document.querySelector('h1').textContent = 'Sessions';
+  document.getElementById('resample').hidden = true;
+  document.getElementById('browse').hidden = false;
+  const mode = document.getElementById('mode'); mode.href = '/'; mode.textContent = 'Reference corpus sample →';
+  document.getElementById('bq').value = B.q || '';
+  document.getElementById('bproject').value = B.project || '';
+  document.getElementById('btool').value = B.tool || '';
+  document.getElementById('bsort').value = B.sort || 'started';
+  const last = Math.min(B.offset + B.page, B.total);
+  document.getElementById('sub').textContent = B.total + ' sessions' + (B.total ? ' · showing ' + (B.offset + 1) + '–' + last : '') +
+    ' · open one to see its timeline, labels, work starts and context ledger';
+  const page = (offset) => { const q = new URLSearchParams(location.search); q.set('offset', offset); return '/sessions?' + q.toString(); };
+  const nav = '<p>' + (B.offset > 0 ? '<a href="' + page(Math.max(0, B.offset - B.page)) + '">← newer</a> ' : '') +
+    (last < B.total ? '<a href="' + page(last) + '">more →</a>' : '') + '</p>';
+  document.getElementById('list').innerHTML = B.rows.length ? '<table><tr><th>tool</th><th>started</th><th>project</th><th>title</th><th class="hide-sm">tasks</th><th class="hide-sm">turns</th><th class="hide-sm">agents</th><th>cost</th></tr>' +
+    B.rows.map((c) => '<tr><td class="tool">' + esc(c.provider) + '</td><td class="t">' + esc((c.started_at || '').slice(0, 16).replace('T', ' ')) +
+      '</td><td class="t">' + esc(c.project) + '</td><td><a href="/review/' + encodeURIComponent(c.provider) + '/' + encodeURIComponent(c.session_id) + '">' +
+      esc(c.title || c.session_id) + '</a></td><td class="n hide-sm">' + c.tasks + '</td><td class="n hide-sm">' + c.turns + '</td><td class="n hide-sm">' + c.agents +
+      '</td><td class="n">' + usd(c.cost) + '</td></tr>').join('') + '</table>' + nav
+    : '<p class="empty">No sessions match.</p>';
+}
 </script>
 </body>
 </html>
