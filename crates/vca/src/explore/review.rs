@@ -336,6 +336,71 @@ fn clip(text: &str) -> String {
     )
 }
 
+/// CLIs whose subcommands say what the call did ("multica issue get", "git diff").
+const SUBCOMMAND_CLIS: &[&str] = &[
+    "multica", "git", "gh", "kubectl", "helm", "docker", "cargo", "npm", "pnpm", "yarn", "go",
+    "uv", "pip", "aai-cli", "vca", "paceflow",
+];
+
+/// Groups tool calls into what was run: the tool name, the loaded skill, or for shell
+/// calls the first real command with its subcommands, skipping `cd`, exports and loops.
+fn command_family(tool: &str, category: &str, target: Option<&str>) -> String {
+    let target = target.unwrap_or("").trim();
+    if category == "skill" {
+        return if target.is_empty() {
+            "skill".into()
+        } else {
+            format!("skill {target}")
+        };
+    }
+    if !matches!(category, "exec" | "validate") || target.is_empty() {
+        return tool.to_string();
+    }
+    let segments = target
+        .split(['\n', ';', '|', '&', '(', ')'])
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    for segment in segments {
+        let mut words = segment.split_whitespace().peekable();
+        while words
+            .next_if(|w| matches!(*w, "do" | "then" | "else" | "time" | "sudo") || is_assignment(w))
+            .is_some()
+        {}
+        let Some(program) = words.next() else {
+            continue;
+        };
+        let program = program.rsplit('/').next().unwrap_or(program);
+        if matches!(
+            program,
+            "cd" | "export" | "for" | "while" | "if" | "fi" | "done" | "set" | "true" | "{" | "}"
+        ) {
+            continue;
+        }
+        let mut family = program.to_string();
+        if SUBCOMMAND_CLIS.contains(&program) {
+            for word in words.take(2) {
+                if !word.chars().next().is_some_and(|c| c.is_ascii_lowercase())
+                    || !word
+                        .chars()
+                        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+                {
+                    break;
+                }
+                family.push(' ');
+                family.push_str(word);
+            }
+        }
+        return family;
+    }
+    tool.to_string()
+}
+
+fn is_assignment(word: &str) -> bool {
+    word.split_once('=').is_some_and(|(name, _)| {
+        !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    })
+}
+
 fn first_line(text: &str, max: usize) -> String {
     let line = text
         .lines()
@@ -458,7 +523,12 @@ fn timeline(
             ))
         })?;
         for row in rows {
-            let (index, ts, meta) = row?;
+            let (index, ts, mut meta) = row?;
+            meta["command"] = json!(command_family(
+                meta["tool"].as_str().unwrap_or(""),
+                meta["category"].as_str().unwrap_or(""),
+                meta["target"].as_str(),
+            ));
             let tool = meta["tool"].as_str().unwrap_or("").to_string();
             let target = meta["target"].as_str().unwrap_or("");
             let title = if target.is_empty() {
@@ -1132,6 +1202,33 @@ fn embed(json: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn command_family_names_the_command_that_ran() {
+        let shell = |cmd: &str| command_family("shell", "exec", Some(cmd));
+        assert_eq!(
+            shell("multica issue get 01a1 --output json"),
+            "multica issue get"
+        );
+        assert_eq!(
+            shell("cd klikt-ai-mono && git diff --stat a..b && git diff --check a..b"),
+            "git diff"
+        );
+        assert_eq!(
+            shell("K=/x/kubeconfig\nexport KUBECONFIG=$K\nkubectl -n ns get deploy"),
+            "kubectl"
+        );
+        assert_eq!(
+            shell("for id in a b; do multica issue get $id | head -c 9; done"),
+            "multica issue get"
+        );
+        assert_eq!(shell("/usr/bin/python3 - <<'EOF'"), "python3");
+        assert_eq!(
+            command_family("skill", "skill", Some("pr-ready")),
+            "skill pr-ready"
+        );
+        assert_eq!(command_family("read", "read", Some("a.rs")), "read");
+    }
 
     #[test]
     fn same_compares_numbers_to_six_decimals() {

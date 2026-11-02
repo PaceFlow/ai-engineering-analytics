@@ -169,6 +169,9 @@ button.primary { background: var(--accent); border-color: var(--accent); color: 
     <section id="modelpane" hidden>
       <p class="hint">What vca stored for this session, as rows. Labels with a dashed border are tentative, struck-through ones uncertain (reports ignore them), green ones manual overrides, grey ones heuristic. Hover a label for its probabilities.</p>
       <h2>Tasks and goals</h2><div id="dm-tasks"></div>
+      <h2>Tools and commands</h2>
+      <p class="hint">Calls grouped by what ran: the tool, the loaded skill, or a shell call's command (leading <code>cd</code> and exports skipped). Output tokens are what the calls returned; resent tokens count them again for every later call that carried them. Click a column to sort.</p>
+      <table class="dm" id="dm-tools"></table>
       <h2>Context composition</h2><div id="dm-comp"></div>
       <details><summary><h2 style="display:inline">Context items</h2> <small id="dm-itemcount"></small></summary>
         <p class="hint">Every item that entered the context: the call it entered at, how many later calls carried it (counted again), and what that cost. Click a column to sort.</p>
@@ -256,8 +259,19 @@ button.primary { background: var(--accent); border-color: var(--accent); color: 
     if (kind === 'call') return '<span class="ctx" title="Context ledger: context size at this call, newly written and carried tokens, cache event">ctx ' +
       num(c.context) + ' · new ' + num(c.new) + ' · carried ' + num(c.carried) + (c.cache_event && c.cache_event !== 'hit' ? ' · ' + esc(c.cache_event) : '') + '</span>';
     return '<span class="ctx" title="Entered the context at call ' + c.entered + (c.evicted != null ? ', evicted at call ' + c.evicted : '') +
-      '; counted again by ' + c.carried + ' later calls; ' + (c.usd == null ? 'unpriced' : usd(c.usd)) + ' in total">' + num(c.tokens) + ' tok × ' + c.carried + '</span>';
+      '; counted again by ' + c.carried + ' later calls; ' + (c.usd == null ? 'unpriced' : usd(c.usd)) + ' in total">' + num(c.tokens) + ' tok · resent in ' + c.carried +
+      ' calls' + (c.usd ? ' · ' + usd(c.usd) : '') + '</span>';
   }
+  // How many times each command ran, and which run this row is.
+  const commandRuns = new Map(), commandNth = new Map();
+  for (const e of DATA.timeline) {
+    if (e.kind !== 'tool' || !e.meta.command) continue;
+    const n = (commandRuns.get(e.meta.command) || 0) + 1;
+    commandRuns.set(e.meta.command, n);
+    commandNth.set(e, n);
+  }
+  const commandBadge = (e) => e.meta.command ? '<span class="badge" title="' + esc(e.meta.command + ': run ' + commandNth.get(e) + ' of ' + commandRuns.get(e.meta.command) + ' in this session') + '">' +
+    esc(e.meta.command) + ' ' + commandNth.get(e) + '/' + commandRuns.get(e.meta.command) + '</span>' : '';
   function startHtml(t) {
     const ws = labelsOf(['work_start'], t.task)[0];
     const rel = (t.relations || []).filter((r) => r.direction === 'from' && r.decision === 'accepted' && (r.kind === 'continuation' || r.kind === 'reopens'));
@@ -285,7 +299,7 @@ button.primary { background: var(--accent); border-color: var(--accent); color: 
     const agent = sub ? '<span class="badge agent" title="' + esc(e.agent) + '">sub ' + esc(e.agent.slice(0, 8)) + '</span>' : '';
     let head = agent, expandable = false;
     if (e.kind === 'call') head += callLine(e.meta) + ctxPill(e.meta.ctx, 'call') + '<span class="title">' + esc(e.title) + '</span>';
-    else if (e.kind === 'tool') { head += toolLine(e.meta) + ctxPill(e.meta.ctx) + '<span class="title">' + esc(e.title) + '</span>'; expandable = true; }
+    else if (e.kind === 'tool') { head += toolLine(e.meta) + commandBadge(e) + ctxPill(e.meta.ctx) + '<span class="title">' + esc(e.title) + '</span>'; expandable = true; }
     else { head += ctxPill(e.meta.ctx) + '<span class="title">' + esc(e.title || '(empty)') + '</span>'; expandable = e.body && e.body !== e.title; }
     const left = '<span class="t">' + esc(time(e.ts)) + '</span><span class="k ' + e.kind + '">' + e.kind + '</span>';
     if (!expandable) return '<div class="' + cls + '" data-id="' + e.id + '">' + left + '<div>' + head + '</div></div>';
@@ -596,6 +610,21 @@ button.primary { background: var(--accent); border-color: var(--accent); color: 
         num(g.conversations) + ' conversations · ' + num(g.corrections) + ' corrections · ' + num(g.validation_failures) + ' failed validations</div>' +
         (members ? '<div>Goal members</div><ul>' + members + '</ul>' : '') + (rels ? '<div>Links</div><ul>' + rels + '</ul>' : '') + '</div>';
     }).join('') || '<p class="empty">No tasks stored.</p>';
+
+    const byCommand = new Map();
+    for (const e of DATA.timeline) {
+      if (e.kind !== 'tool') continue;
+      const key = e.meta.command || e.meta.tool;
+      const r = byCommand.get(key) || { command: key, category: e.meta.category, calls: 0, failed: 0, output_tokens: 0, resent_tokens: 0, usd: 0, priced: false };
+      const c = e.meta.ctx;
+      r.calls++;
+      if (e.meta.status === 'error' || (e.meta.exit_code != null && e.meta.exit_code !== 0)) r.failed++;
+      if (c) { r.output_tokens += c.tokens || 0; r.resent_tokens += (c.tokens || 0) * (c.carried || 0); if (c.usd != null) { r.usd += c.usd; r.priced = true; } }
+      byCommand.set(key, r);
+    }
+    sortable('dm-tools', [...byCommand.values()], [
+      ['command'], ['category'], ['calls', null, 1], ['failed', null, 1], ['output_tokens', null, 1], ['resent_tokens', null, 1],
+      ['usd', (r) => r.priced ? usd(r.usd) : '—', 1]], 'usd');
 
     const items = M.context.items;
     const byKind = new Map();

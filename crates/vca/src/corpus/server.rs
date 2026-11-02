@@ -365,6 +365,15 @@ fn browse(conn: &Connection, query: &HashMap<String, String>) -> Result<Value> {
         ..Filters::default()
     };
     let project = get("project").map(|p| p.to_ascii_lowercase());
+    let goal = get("goal");
+    let goals = session_goals(conn)?;
+    let no_goals = Vec::new();
+    let goals_of = |provider: &str, session_id: &str| {
+        goals
+            .sessions
+            .get(&(provider.to_string(), session_id.to_string()))
+            .unwrap_or(&no_goals)
+    };
     let mut rows: Vec<_> = explore::sessions(conn, &filters, SessionSort::Started, 1_000_000)?
         .into_iter()
         .filter(|row| {
@@ -373,6 +382,10 @@ fn browse(conn: &Connection, query: &HashMap<String, String>) -> Result<Value> {
                     .as_deref()
                     .is_some_and(|repo| repo.to_ascii_lowercase().contains(p))
             })
+        })
+        .filter(|row| {
+            goal.as_ref()
+                .is_none_or(|g| goals_of(&row.provider, &row.session_id).contains(g))
         })
         .collect();
     let sort = get("sort").unwrap_or_else(|| "started".into());
@@ -388,11 +401,18 @@ fn browse(conn: &Connection, query: &HashMap<String, String>) -> Result<Value> {
         .skip(offset)
         .take(PAGE)
         .map(|row| {
+            // The goal shared with the most other conversations, so repeated runs show as one.
+            let shared = goals_of(&row.provider, &row.session_id)
+                .iter()
+                .map(|id| (id, goals.conversations.get(id).copied().unwrap_or(1)))
+                .max_by_key(|(_, n)| *n);
             json!({
                 "provider": row.provider,
                 "session_id": row.session_id,
                 "title": row.title,
-                "project": row.repo_root.as_deref().map(short_repo).unwrap_or_else(|| "(no repo)".into()),
+                "project": row.repo_root.as_deref().map(project_label).unwrap_or_else(|| "(no repo)".into()),
+                "goal": shared.map(|(id, _)| id),
+                "goal_conversations": shared.map(|(_, n)| n),
                 "started_at": row.started_at,
                 "turns": row.turns,
                 "tasks": row.tasks,
@@ -406,6 +426,7 @@ fn browse(conn: &Connection, query: &HashMap<String, String>) -> Result<Value> {
             "q": get("q"),
             "tool": get("tool"),
             "project": get("project"),
+            "goal": goal,
             "sort": sort,
             "offset": offset,
             "page": PAGE,
@@ -413,6 +434,58 @@ fn browse(conn: &Connection, query: &HashMap<String, String>) -> Result<Value> {
             "rows": page,
         }
     }))
+}
+
+struct SessionGoals {
+    /// Goals each conversation's tasks belong to.
+    sessions: HashMap<(String, String), Vec<String>>,
+    /// How many conversations each goal spans.
+    conversations: HashMap<String, usize>,
+}
+
+fn session_goals(conn: &Connection) -> Result<SessionGoals> {
+    let mut stmt = conn
+        .prepare("SELECT DISTINCT provider, session_id, work_id FROM derived_work_index_member")?;
+    let mut goals = SessionGoals {
+        sessions: HashMap::new(),
+        conversations: HashMap::new(),
+    };
+    for row in stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+        ))
+    })? {
+        let (provider, session_id, work_id) = row?;
+        *goals.conversations.entry(work_id.clone()).or_default() += 1;
+        goals
+            .sessions
+            .entry((provider, session_id))
+            .or_default()
+            .push(work_id);
+    }
+    Ok(goals)
+}
+
+/// Multica checks each issue out to `<workspace>-<hash>/<issue>-<hash>/workdir`; name
+/// those by workspace and issue instead of the shared `workdir` folder.
+fn project_label(repo: &str) -> String {
+    let parts: Vec<&str> = repo
+        .trim_end_matches(['/', '\\'])
+        .split(['/', '\\'])
+        .collect();
+    let strip_hash = |part: &str| {
+        part.rsplit_once('-')
+            .filter(|(_, hash)| hash.len() >= 8 && hash.chars().all(|c| c.is_ascii_hexdigit()))
+            .map(|(name, _)| name.to_string())
+    };
+    if let [.., workspace, issue, "workdir"] = parts.as_slice()
+        && let (Some(workspace), Some(issue)) = (strip_hash(workspace), strip_hash(issue))
+    {
+        return format!("{workspace} · {}", issue.to_ascii_uppercase());
+    }
+    short_repo(repo)
 }
 
 fn read_request(stream: &TcpStream) -> Result<Request> {
@@ -551,6 +624,17 @@ fn open_url(url: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn project_label_names_multica_workspace_and_issue() {
+        assert_eq!(
+            project_label(
+                "/home/multica/workspaces/klikt-57b94581118d/klik-219-de2ed9281eb2/workdir"
+            ),
+            "klikt · KLIK-219"
+        );
+        assert_eq!(project_label("/home/me/src/vca"), "vca");
+    }
 
     #[test]
     fn parses_query_strings() {

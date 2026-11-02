@@ -110,12 +110,16 @@ function browse(B) {
   document.getElementById('sub').textContent = B.total + ' sessions' + (B.total ? ' · showing ' + (B.offset + 1) + '–' + last : '') +
     ' · open one to see its timeline, labels, work starts and context ledger';
   const page = (offset) => { const q = new URLSearchParams(location.search); q.set('offset', offset); return '/sessions?' + q.toString(); };
+  if (B.goal) document.getElementById('sub').textContent += ' · conversations of goal ' + B.goal.slice(0, 12);
+  const goal = (c) => c.goal_conversations > 1
+    ? '<a href="/sessions?goal=' + encodeURIComponent(c.goal) + '" title="Goal ' + esc(c.goal) + ' spans ' + c.goal_conversations + ' conversations; list them">' + c.goal_conversations + ' runs</a>'
+    : '';
   const nav = '<p>' + (B.offset > 0 ? '<a href="' + page(Math.max(0, B.offset - B.page)) + '">← newer</a> ' : '') +
     (last < B.total ? '<a href="' + page(last) + '">more →</a>' : '') + '</p>';
-  document.getElementById('list').innerHTML = B.rows.length ? '<table><tr><th>tool</th><th>started</th><th>project</th><th>title</th><th class="hide-sm">tasks</th><th class="hide-sm">turns</th><th class="hide-sm">agents</th><th>cost</th></tr>' +
+  document.getElementById('list').innerHTML = B.rows.length ? '<table><tr><th>tool</th><th>started</th><th>project</th><th>title</th><th>goal</th><th class="hide-sm">tasks</th><th class="hide-sm">turns</th><th class="hide-sm">agents</th><th>cost</th></tr>' +
     B.rows.map((c) => '<tr><td class="tool">' + esc(c.provider) + '</td><td class="t">' + esc((c.started_at || '').slice(0, 16).replace('T', ' ')) +
       '</td><td class="t">' + esc(c.project) + '</td><td><a href="/review/' + encodeURIComponent(c.provider) + '/' + encodeURIComponent(c.session_id) + '">' +
-      esc(c.title || c.session_id) + '</a></td><td class="n hide-sm">' + c.tasks + '</td><td class="n hide-sm">' + c.turns + '</td><td class="n hide-sm">' + c.agents +
+      esc(c.title || c.session_id) + '</a></td><td class="t">' + goal(c) + '</td><td class="n hide-sm">' + c.tasks + '</td><td class="n hide-sm">' + c.turns + '</td><td class="n hide-sm">' + c.agents +
       '</td><td class="n">' + usd(c.cost) + '</td></tr>').join('') + '</table>' + nav
     : '<p class="empty">No sessions match.</p>';
 }
