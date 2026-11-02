@@ -39,6 +39,7 @@ pub fn tool_category(tool_name: &str, target: Option<&str>) -> &'static str {
         "task" | "agent" | "subagent" | "spawn_agent" => "agent",
         "todowrite" | "update_plan" | "exitplanmode" | "enterplanmode" | "todo_write"
         | "taskcreate" | "taskupdate" => "plan",
+        "skill" => "skill",
         name if is_ask_tool(name) => "ask",
         _ => "other",
     }

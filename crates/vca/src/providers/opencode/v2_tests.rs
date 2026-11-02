@@ -38,7 +38,7 @@ fn source(path: &Path, mixed: bool) -> Result<Connection> {
         "a",
         "assistant",
         2,
-        json!({"time":{"created":1790848860000_i64,"completed":1790848920000_i64},"model":{"id":"test-model","providerID":"test-provider"},"cost":0.03,"tokens":{"input":100,"output":20,"reasoning":5,"cache":{"read":50,"write":10}},"finish":"tool-calls","content":[{"type":"reasoning","text":"Hidden reasoning"},{"type":"text","text":"Implemented the requested behavior"},{"type":"tool","id":"skill-call","name":"skill","state":{"status":"completed","input":{"name":"pr-ready"},"content":[{"type":"text","text":"Skill instructions"}]},"time":{"created":1790848860000_i64,"ran":1790848860000_i64,"completed":1790848870000_i64}},{"type":"tool","id":"test-call","name":"bash","state":{"status":"completed","input":{"command":"cargo test"},"metadata":{"exit":1},"content":[{"type":"text","text":"Test failed"}]},"time":{"created":1790848880000_i64,"completed":1790848900000_i64}},{"type":"tool","id":"edit-call","name":"edit","state":{"status":"completed","input":{"filePath":"/removed/worktree/src/lib.rs"},"metadata":{"filediff":{"file":"src/lib.rs","additions":1,"deletions":0}},"content":[]},"time":{"created":1790848860000_i64,"completed":1790848870000_i64}}]}),
+        json!({"time":{"created":1790848860000_i64,"completed":1790848920000_i64},"model":{"id":"test-model","providerID":"test-provider"},"cost":0.03,"tokens":{"input":100,"output":20,"reasoning":5,"cache":{"read":50,"write":10}},"finish":"tool-calls","content":[{"type":"reasoning","text":"Hidden reasoning"},{"type":"text","text":"Implemented the requested behavior"},{"type":"tool","id":"skill-call","name":"skill","state":{"status":"completed","input":{"id":"pr-ready"},"content":[{"type":"text","text":"Skill instructions"}]},"time":{"created":1790848860000_i64,"ran":1790848860000_i64,"completed":1790848870000_i64}},{"type":"tool","id":"test-call","name":"bash","state":{"status":"completed","input":{"command":"cargo test"},"metadata":{"exit":1},"content":[{"type":"text","text":"Test failed"}]},"time":{"created":1790848880000_i64,"completed":1790848900000_i64}},{"type":"tool","id":"edit-call","name":"edit","state":{"status":"completed","input":{"filePath":"/removed/worktree/src/lib.rs"},"metadata":{"filediff":{"file":"src/lib.rs","additions":1,"deletions":0}},"content":[]},"time":{"created":1790848860000_i64,"completed":1790848870000_i64}}]}),
     )?;
     event(
         &c,
@@ -101,6 +101,15 @@ fn reads_v2_only_usage_tools_context_and_persistent_project_identity() -> Result
             ("test-call".into(), "bash".into(), "error".into()),
             ("edit-call".into(), "edit".into(), "ok".into())
         ]
+    );
+    // OpenCode 2 names the loaded skill in `input.id`.
+    assert_eq!(
+        c.query_row(
+            "SELECT target, tool_category FROM fact_session_tool_call WHERE call_key='skill-call'",
+            [],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        )?,
+        ("pr-ready".into(), "skill".into())
     );
     assert_eq!(
         c.query_row(

@@ -720,7 +720,9 @@ fn tool_call_from_part(part_id: &str, part: &Value) -> ToolCallRecord {
         .and_then(Value::as_str)
         .is_some_and(|tool| tool.eq_ignore_ascii_case("skill"));
     let target = if skill_call {
-        text(input, "name").or_else(|| text(input, "skill"))
+        text(input, "name")
+            .or_else(|| text(input, "skill"))
+            .or_else(|| text(input, "id"))
     } else {
         text(input, "filePath")
             .or_else(|| text(input, "file_path"))
