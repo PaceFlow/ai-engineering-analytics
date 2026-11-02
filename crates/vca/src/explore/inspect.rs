@@ -144,10 +144,15 @@ fn labels(conn: &Connection, provider: &str, session_id: &str) -> Result<Vec<Val
 /// conversations, and the links into and out of this task.
 fn tasks(conn: &Connection, provider: &str, session_id: &str) -> Result<Vec<Value>> {
     let mut stmt = conn.prepare(
-        "SELECT task_index, first_turn, last_turn, completion_turn, title, started_at,
-                completed_at, completion_source, segmentation_source, identity_id, work_id,
-                cost_total_usd, commits
-         FROM derived_task WHERE provider = ?1 AND session_id = ?2 ORDER BY task_index",
+        "SELECT t.task_index, t.first_turn, t.last_turn, t.completion_turn, t.title, t.started_at,
+                t.completed_at, t.completion_source, t.segmentation_source, m.identity_id,
+                i.work_id, t.cost_total_usd, t.commits
+         FROM derived_task t
+         LEFT JOIN derived_work_member m
+           ON m.provider = t.provider AND m.session_id = t.session_id AND m.task_index = t.task_index
+         LEFT JOIN derived_work_index_member i
+           ON i.provider = t.provider AND i.session_id = t.session_id AND i.task_index = t.task_index
+         WHERE t.provider = ?1 AND t.session_id = ?2 ORDER BY t.task_index",
     )?;
     let rows = stmt
         .query_map(params![provider, session_id], |r| {
@@ -210,7 +215,10 @@ fn goal(conn: &Connection, work_id: &str, provider: &str, session_id: &str) -> R
         .optional()?;
     let mut stmt = conn.prepare(
         "SELECT t.provider, t.session_id, t.task_index, t.title, t.started_at, t.completed_at
-         FROM derived_task t WHERE t.work_id = ?1 ORDER BY t.started_at, t.task_index",
+         FROM derived_work_index_member i
+         JOIN derived_task t
+           ON t.provider = i.provider AND t.session_id = i.session_id AND t.task_index = i.task_index
+         WHERE i.work_id = ?1 ORDER BY t.started_at, t.task_index",
     )?;
     let members = stmt
         .query_map([work_id], |r| {
@@ -435,6 +443,9 @@ mod tests {
             .map(|l| (l["unit"].as_str().unwrap(), l["label"].as_str().unwrap()))
             .collect();
         assert_eq!(chosen, [("0", "follow_up"), ("1", "new_request")]);
+        // Every query of the page runs against the current schema.
+        let all = inspect(&conn, "opencode", "s1", &["s1".to_string()])?;
+        assert_eq!(all["labels"].as_array().map(Vec::len), Some(4));
         Ok(())
     }
 }
