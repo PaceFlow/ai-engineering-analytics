@@ -135,7 +135,16 @@ fn finish(
     }
 }
 
-fn multica(raw: &str, stripped: Vec<&'static str>) -> Request {
+fn multica(raw: &str, mut stripped: Vec<&'static str>) -> Request {
+    // The issue the agent read, attached by `issue::attach`, is not part of
+    // the envelope: its own quotes and headings must not be read as one.
+    let (raw, issue) = match raw.split_once(super::issue::OPEN) {
+        Some((envelope, rest)) => (
+            envelope,
+            rest.split(super::issue::CLOSE).next().map(str::trim),
+        ),
+        None => (raw, None),
+    };
     let speaker = if raw.contains("Another agent (") {
         "agent"
     } else if raw.contains("A user just left") {
@@ -157,7 +166,12 @@ fn multica(raw: &str, stripped: Vec<&'static str>) -> Request {
         return finish(text, speaker, "recognized_wakeup", stripped);
     }
     // An assignment containing only an issue id supplies no goal. Do not classify
-    // its comment-posting instructions as documentation or invent the issue body.
+    // its comment-posting instructions as documentation or invent the issue body;
+    // the issue as the agent read it in this conversation states the goal.
+    if let Some(issue) = issue.filter(|issue| !issue.is_empty()) {
+        stripped.push("assigned_issue_read");
+        return finish(issue, speaker, "agent_issue_read", stripped);
+    }
     unavailable(speaker, "uncertain", stripped)
 }
 

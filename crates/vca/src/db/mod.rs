@@ -723,7 +723,8 @@ fn add_column_if_missing(conn: &Connection, statement: &str) -> Result<()> {
     let columns = query
         .query_map([], |row| row.get::<_, String>(1))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    if !columns.iter().any(|name| name == column) {
+    // A missing table is created later with the column already in it.
+    if !columns.is_empty() && !columns.iter().any(|name| name == column) {
         conn.execute_batch(statement)?;
     }
     Ok(())

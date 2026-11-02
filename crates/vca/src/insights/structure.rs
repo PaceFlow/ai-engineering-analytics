@@ -1137,6 +1137,16 @@ fn load_facts(conn: &Connection) -> Result<Facts> {
         let (key, message) = row?;
         facts.messages.entry(key).or_default().push(message);
     }
+    // A bare assignment states its goal through the issue the agent read.
+    for (key, issues) in crate::classify::issue::load_all(conn)? {
+        for message in facts.messages.get_mut(&key).into_iter().flatten() {
+            if message.role == "user"
+                && let Some(attached) = crate::classify::issue::attach(&message.head, &issues)
+            {
+                message.head = attached;
+            }
+        }
+    }
 
     let mut stmt = conn.prepare(
         "SELECT provider, session_id, ts, ended_ts, tool_category, validation_kind, status,

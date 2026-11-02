@@ -512,7 +512,7 @@ impl Passes {
 // conversation. Keep session selection first, then perform indexed fact lookups.
 const SESSION_FINGERPRINT_QUERIES: [&str; 2] = [
     "SELECT COALESCE(m.message_key,'')||':'||COALESCE(m.message_ts,'')||':'||m.role||':'||m.content FROM metadata_sessions s CROSS JOIN fact_session_message m ON m.provider=s.provider AND m.session_id=s.session_id WHERE s.provider=?1 AND (s.root_session_id=?2 OR (s.root_session_id IS NULL AND s.session_id=?2)) ORDER BY m.session_id,m.message_index",
-    "SELECT t.call_key||':'||COALESCE(t.ts,'')||':'||t.tool_name||':'||COALESCE(t.target,'')||':'||t.status FROM metadata_sessions s CROSS JOIN fact_session_tool_call t ON t.provider=s.provider AND t.session_id=s.session_id WHERE s.provider=?1 AND (s.root_session_id=?2 OR (s.root_session_id IS NULL AND s.session_id=?2)) ORDER BY t.session_id,t.call_index",
+    "SELECT t.call_key||':'||COALESCE(t.ts,'')||':'||t.tool_name||':'||COALESCE(t.target,'')||':'||t.status||COALESCE(':'||t.issue_read,'') FROM metadata_sessions s CROSS JOIN fact_session_tool_call t ON t.provider=s.provider AND t.session_id=s.session_id WHERE s.provider=?1 AND (s.root_session_id=?2 OR (s.root_session_id IS NULL AND s.session_id=?2)) ORDER BY t.session_id,t.call_index",
 ];
 
 pub fn session_fingerprint(conn: &Connection, session: &SessionRef) -> Result<String> {

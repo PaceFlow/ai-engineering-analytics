@@ -4,6 +4,7 @@ pub mod automatic;
 pub mod client;
 pub mod config;
 pub mod heuristic;
+pub mod issue;
 pub mod overrides;
 pub mod questions;
 pub mod run;

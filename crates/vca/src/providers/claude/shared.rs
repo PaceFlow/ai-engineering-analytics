@@ -785,6 +785,7 @@ fn build_tool_call_records(state: &ParseState) -> Vec<ToolCallRecord> {
                             .and_then(Value::as_str)
                             .map(ToOwned::to_owned)
                     }),
+                issue_read: None,
             }
         })
         .collect()

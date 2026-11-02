@@ -747,6 +747,10 @@ fn tool_call_from_part(part_id: &str, part: &Value) -> ToolCallRecord {
         .get("metadata")
         .and_then(|meta| meta.get("exit").or_else(|| meta.get("exitCode")))
         .and_then(Value::as_i64);
+    let issue_read = target
+        .as_deref()
+        .filter(|_| status == "ok" && exit_code.is_none_or(|code| code == 0))
+        .and_then(|command| crate::classify::issue::parse(command, output));
     let time = state.get("time");
     let ms = |key: &str| {
         time.and_then(|time| time.get(key))
@@ -787,6 +791,7 @@ fn tool_call_from_part(part_id: &str, part: &Value) -> ToolCallRecord {
             .and_then(Value::as_str)
             .map(ToOwned::to_owned),
         agent_type: text(input, "subagent_type"),
+        issue_read,
     }
 }
 
@@ -939,6 +944,37 @@ mod tests {
                 actual_cost_usd: Some(0.0125),
             }
         );
+    }
+
+    #[test]
+    fn keeps_the_issue_an_agent_read_with_multica() {
+        let issue = json!({"id": "01a0d42d", "identifier": "KLIK-15", "title": "Migrate email sending", "description": "Use Cloudflare."});
+        let part = |command: &str, status: &str| {
+            json!({"type": "tool", "tool": "bash", "callID": "c1", "state": {
+                "status": status,
+                "input": {"command": command},
+                "output": issue.to_string(),
+                "metadata": {"exit": 0}
+            }})
+        };
+        let read = super::tool_call_from_part(
+            "p1",
+            &part("multica issue get 01a0d42d --output json", "completed"),
+        );
+        let stored: serde_json::Value =
+            serde_json::from_str(read.issue_read.as_deref().expect("issue read")).unwrap();
+        assert_eq!(stored["title"], "Migrate email sending");
+        assert_eq!(stored["identifier"], "KLIK-15");
+        for (command, status) in [
+            ("multica issue get 01a0d42d --output json", "error"),
+            ("cat issue.json", "completed"),
+        ] {
+            assert!(
+                super::tool_call_from_part("p1", &part(command, status))
+                    .issue_read
+                    .is_none()
+            );
+        }
     }
 
     #[test]

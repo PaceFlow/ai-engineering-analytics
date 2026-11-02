@@ -258,6 +258,12 @@ pub fn load_turns(conn: &Connection, provider: &str, session_id: &str) -> Result
     if turns.is_empty() {
         return Ok(turns);
     }
+    let issues = super::issue::load(conn, provider, session_id)?;
+    for turn in &mut turns {
+        if let Some(attached) = super::issue::attach(&turn.user, &issues) {
+            turn.user = attached;
+        }
+    }
     let turn_for = |turns: &[TurnFacts], ts: Option<i64>| -> usize {
         let Some(ts) = ts else {
             return turns.len() - 1;

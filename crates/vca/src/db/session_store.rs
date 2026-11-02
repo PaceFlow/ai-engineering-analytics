@@ -15,7 +15,7 @@ use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension, params};
 
 /// Bump when parsers start extracting new facts so existing sources are re-read.
-pub const SESSION_INGEST_VERSION: i64 = 7;
+pub const SESSION_INGEST_VERSION: i64 = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentKind {
@@ -150,6 +150,8 @@ pub struct ToolCallRecord {
     pub error_head: Option<String>,
     pub child_session_id: Option<String>,
     pub agent_type: Option<String>,
+    /// The agent platform issue this call read (`classify::issue`).
+    pub issue_read: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -338,6 +340,7 @@ CREATE TABLE IF NOT EXISTS fact_session_tool_call (
     error_signature   TEXT,
     child_session_id  TEXT,
     agent_type        TEXT,
+    issue_read        TEXT,
     UNIQUE(provider, session_id, call_key)
 );
 
@@ -442,6 +445,7 @@ pub(crate) const SESSION_STORE_COLUMNS: &[&str] = &[
     "ALTER TABLE fact_session_message ADD COLUMN message_key TEXT;",
     "ALTER TABLE fact_session_message ADD COLUMN is_compaction_summary INTEGER NOT NULL DEFAULT 0;",
     "ALTER TABLE fact_session_message ADD COLUMN chars INTEGER;",
+    "ALTER TABLE fact_session_tool_call ADD COLUMN issue_read TEXT;",
 ];
 
 /// One-time data migrations, recorded in `schema_migrations`.
@@ -747,8 +751,8 @@ fn store_session_record_inner(conn: &Connection, record: &SessionRecord) -> Resu
         "INSERT OR REPLACE INTO fact_session_tool_call (
             provider, session_id, call_key, call_index, ts, ended_ts, tool_name, tool_category,
             validation_kind, target, input_chars, output_chars, output_in_context, status,
-            exit_code, error_signature, child_session_id, agent_type
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
+            exit_code, error_signature, child_session_id, agent_type, issue_read
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
     )?;
     for (call_index, call) in record.tool_calls.iter().enumerate() {
         let category =
@@ -789,7 +793,8 @@ fn store_session_record_inner(conn: &Connection, record: &SessionRecord) -> Resu
             call.exit_code,
             signature,
             call.child_session_id,
-            call.agent_type
+            call.agent_type,
+            call.issue_read
         ])?;
         written += 1;
     }
