@@ -204,7 +204,12 @@ button.primary { background: var(--accent); border-color: var(--accent); color: 
   const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
   const num = (n) => n == null ? '—' : Number(n).toLocaleString('en-US');
   const usd = (n) => n == null ? '—' : '$' + Number(n).toFixed(Number(n) < 1 ? 4 : 2);
-  const time = (ts) => ts ? ts.replace(/^.*T/, '').replace(/(\.\d+)?(Z|[+-]\d\d:\d\d)$/, '').slice(0, 8) : '';
+  // Timeline times are UTC, as the checklist states them.
+  const time = (ts) => {
+    if (!ts) return '';
+    const d = new Date(ts);
+    return isNaN(d) ? ts.replace(/^.*T/, '').slice(0, 8) : d.toISOString().slice(11, 19);
+  };
 
   // Review state: id -> {state: 'ok'|'no', note, value}
   let review = {};
@@ -215,7 +220,7 @@ button.primary { background: var(--accent); border-color: var(--accent); color: 
   document.getElementById('title').textContent = (S.title || '(untitled session)').slice(0, 140);
   document.getElementById('sub').textContent = [
     DATA.key, S.repo_root || '(no repo)', 'branch ' + (S.git_branch || '—'),
-    (S.started_at || '') + ' → ' + (S.ended_at || ''), 'pricing ' + DATA.pricing
+    (S.started_at || '') + ' → ' + (S.ended_at || ''), 'times in UTC', 'pricing ' + DATA.pricing
   ].join(' · ');
 
   // ── Timeline ──
@@ -403,7 +408,7 @@ button.primary { background: var(--accent); border-color: var(--accent); color: 
         const was = r.state && !sameValue(r.value, s.value) ? JSON.stringify(r.value) : (s.id in previous ? JSON.stringify(previous[s.id]) : null);
         out.push('<div class="stat ' + st + (r.note ? ' has-note' : '') + (selected === s.id ? ' active' : '') + '" data-id="' + esc(s.id) + '">' +
           '<div class="row"><span class="label" title="' + esc(s.id) + '">' + esc(s.label) +
-          (s.entries.length ? ' <small>(' + s.entries.length + ')</small>' : '') +
+          (s.entries.length ? ' <small title="Timeline entries behind this number; click the label to highlight them">· ' + s.entries.length + ' in timeline</small>' : '') +
           (s.cross_session ? ' <span class="badge" title="Depends on the project\'s other sessions too. Saving takes its value from a replay of all saved sessions of this project.">project</span>' : '') +
           (s.help ? '<small class="help">' + esc(s.help) + '</small>' : '') + '</span>' +
           '<span class="val">' + esc(s.display) + '</span>' +

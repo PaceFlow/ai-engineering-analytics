@@ -17,6 +17,15 @@ const HUMAN_SESSION_ID: &str = "__human__";
 /// A commit can only contain work from sessions that had started by then;
 /// this allows for clock differences between the agent and git.
 const SESSION_START_SLACK_MS: i64 = 60 * 60 * 1000;
+/// A session is linked to a commit only when it wrote a real part of it. A few
+/// shared lines (imports, braces, a changelog heading) match many unrelated
+/// commits and are not evidence.
+pub const MIN_SESSION_MATCHED_LINES: f64 = 10.0;
+pub const MIN_SESSION_SHARE_OF_COMMIT: f64 = 0.10;
+
+pub fn is_session_match_evidence(matched_lines: f64, share_of_commit: f64) -> bool {
+    matched_lines >= MIN_SESSION_MATCHED_LINES || share_of_commit >= MIN_SESSION_SHARE_OF_COMMIT
+}
 
 type SessionAvailabilityKey = (String, LineSide, String);
 type AliasCandidateKey = (LineSide, String);
@@ -181,8 +190,9 @@ pub fn compute_commit_attribution(
                 },
             },
         )
+        .filter(|row| is_session_match_evidence(row.matched_lines, row.share_of_commit))
         .collect();
-    if matched_total == 0 && session_rows.is_empty() {
+    if session_rows.is_empty() {
         session_rows.push(SessionAttributionRow {
             provider: HUMAN_PROVIDER.to_string(),
             session_id: HUMAN_SESSION_ID.to_string(),
@@ -584,6 +594,76 @@ mod tests {
                 .iter()
                 .all(|row| row.provider != HUMAN_PROVIDER)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn a_few_shared_lines_do_not_link_a_session_to_a_large_commit() -> Result<()> {
+        let mut commit = sample_commit();
+        commit.file_diffs[0].added_lines = 100;
+        commit.file_diffs[0].line_hashes = vec![
+            LineHashCount {
+                side: LineSide::Added,
+                line_hash: "brace".to_string(),
+                count: 2,
+            },
+            LineHashCount {
+                side: LineSide::Added,
+                line_hash: "body".to_string(),
+                count: 98,
+            },
+        ];
+        let mut preload = RepoMatchPreload::default();
+        let session = |id: &str, avail: i64| SessionAvailability {
+            provider: "opencode".to_string(),
+            session_id: id.to_string(),
+            avail,
+            started_ms: None,
+        };
+        preload.session_availability.insert(
+            (
+                "src/lib.rs".to_string(),
+                LineSide::Added,
+                "brace".to_string(),
+            ),
+            vec![session("unrelated", 2)],
+        );
+        preload.session_availability.insert(
+            (
+                "src/lib.rs".to_string(),
+                LineSide::Added,
+                "body".to_string(),
+            ),
+            vec![session("author", 12)],
+        );
+
+        let (_, rows) = compute_commit_attribution(&commit, &preload)?;
+
+        let ids: Vec<&str> = rows.iter().map(|r| r.session_id.as_str()).collect();
+        assert_eq!(ids, ["author"]);
+        Ok(())
+    }
+
+    #[test]
+    fn a_commit_with_only_weak_matches_is_human() -> Result<()> {
+        let mut commit = sample_commit();
+        commit.file_diffs[0].added_lines = 100;
+        commit.file_diffs[0].line_hashes[0].count = 100;
+        let mut preload = RepoMatchPreload::default();
+        preload.session_availability.insert(
+            ("src/lib.rs".to_string(), LineSide::Added, "h1".to_string()),
+            vec![SessionAvailability {
+                provider: "opencode".to_string(),
+                session_id: "unrelated".to_string(),
+                avail: 3,
+                started_ms: None,
+            }],
+        );
+
+        let (_, rows) = compute_commit_attribution(&commit, &preload)?;
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].session_id, HUMAN_SESSION_ID);
         Ok(())
     }
 

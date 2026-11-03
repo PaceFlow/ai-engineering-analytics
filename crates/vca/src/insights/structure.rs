@@ -78,6 +78,8 @@ struct ToolRow {
     exit_code: Option<i64>,
     error_signature: Option<String>,
     child_session_id: Option<String>,
+    /// The command moved a Multica issue to done.
+    closes_issue: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -809,18 +811,28 @@ fn write_tasks(
                             .filter_map(|(_, tool)| tool.ended_ts.or(tool.ts))
                             .next_back()
                     });
-                    match (commit, validation) {
-                        (Some(ts), _) => (
+                    let issue_done = task_tools
+                        .iter()
+                        .filter(|(_, tool)| tool.closes_issue && validation_passed(tool))
+                        .filter_map(|(_, tool)| tool.ended_ts.or(tool.ts))
+                        .next_back();
+                    match (commit, issue_done, validation) {
+                        (Some(ts), _, _) => (
                             Some(turn_for_ts(turns, Some(ts)).min(last.index)),
                             Some(ts),
                             "commit".to_string(),
                         ),
-                        (None, Some(ts)) => (
+                        (None, Some(ts), _) => (
+                            Some(turn_for_ts(turns, Some(ts))),
+                            Some(ts),
+                            "issue_done".to_string(),
+                        ),
+                        (None, None, Some(ts)) => (
                             Some(turn_for_ts(turns, Some(ts))),
                             Some(ts),
                             "validation_pass".to_string(),
                         ),
-                        (None, None) => (None, None, "none".to_string()),
+                        (None, None, None) => (None, None, "none".to_string()),
                     }
                 }
             };
@@ -1150,13 +1162,16 @@ fn load_facts(conn: &Connection) -> Result<Facts> {
 
     let mut stmt = conn.prepare(
         "SELECT provider, session_id, ts, ended_ts, tool_category, validation_kind, status,
-                exit_code, error_signature, child_session_id
+                exit_code, error_signature, child_session_id,
+                CASE WHEN tool_category = 'exec' AND target LIKE '%multica%' AND target LIKE '%done%'
+                     THEN target END
          FROM fact_session_tool_call
          ORDER BY provider, session_id, call_index",
     )?;
     let rows = stmt.query_map([], |row| {
         let ts: Option<String> = row.get(2)?;
         let ended: Option<String> = row.get(3)?;
+        let command: Option<String> = row.get(10)?;
         Ok((
             (row.get::<_, String>(0)?, row.get::<_, String>(1)?),
             ToolRow {
@@ -1168,6 +1183,9 @@ fn load_facts(conn: &Connection) -> Result<Facts> {
                 exit_code: row.get(7)?,
                 error_signature: row.get(8)?,
                 child_session_id: row.get(9)?,
+                closes_issue: command
+                    .as_deref()
+                    .is_some_and(crate::insights::tools::marks_issue_done),
             },
         ))
     })?;
@@ -1456,6 +1474,53 @@ mod tests {
         assert_eq!(attempts, 4);
         assert_eq!(loops, 3, "three same-signature failures form a loop");
         assert_eq!(subagents, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn moving_the_issue_to_done_finishes_an_unclassified_task() -> Result<()> {
+        let conn = Connection::open_in_memory()?;
+        init_app_schema(&conn)?;
+        let mut record = SessionRecord::new("opencode", "triage");
+        record.started_at = Some("2026-11-03T05:05:00Z".into());
+        record.messages = vec![
+            message("u1", "2026-11-03T05:05:00Z", "user", "Triage the digest"),
+            message(
+                "a1",
+                "2026-11-03T05:16:00Z",
+                "assistant",
+                "Triage delivered",
+            ),
+        ];
+        record.usage = vec![usage("m1", "2026-11-03T05:06:00Z", 100)];
+        record.tool_calls = vec![
+            tool(
+                "t1",
+                "2026-11-03T05:13:00Z",
+                "bash",
+                "multica issue status --help 2>&1 | head -25",
+                Some(0),
+                None,
+            ),
+            tool(
+                "t2",
+                "2026-11-03T05:15:24Z",
+                "bash",
+                "multica issue status 01a19fc7 done --no-start",
+                Some(0),
+                None,
+            ),
+        ];
+        store_session_record(&conn, &record)?;
+        refresh_session_structure(&conn)?;
+
+        let (source, completed_at): (String, Option<String>) = conn.query_row(
+            "SELECT completion_source, completed_at FROM derived_task WHERE session_id = 'triage'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        assert_eq!(source, "issue_done");
+        assert!(completed_at.is_some_and(|ts| ts.starts_with("2026-11-03T05:15:24")));
         Ok(())
     }
 

@@ -2352,27 +2352,34 @@ fn task_turn_list(
 }
 
 /// Commits matched to the session or its subagents, with delivery outcomes.
+/// A commit scanned from two checkouts of one repository is listed once.
 pub fn session_commits(
     conn: &Connection,
     provider: &str,
     session_id: &str,
 ) -> Result<Vec<CommitRow>> {
     let mut stmt = conn.prepare(
-        "SELECT c.repo_root, c.commit_sha, c.commit_time, c.subject, COALESCE(c.ai_share, 0),
-                SUM(sm.matched_lines),
-                o.merged_to_mainline_flag, o.reverted_later_flag, b.signal_source,
-                pr.pr_number, pr.pr_merged_flag
-         FROM fact_commit_session_match sm
-         JOIN metadata_sessions s ON s.provider = sm.provider AND s.session_id = sm.session_id
-         JOIN fact_commit c ON c.repo_root = sm.repo_root AND c.commit_sha = sm.commit_sha
-         LEFT JOIN event_commit_outcome o ON o.repo_root = c.repo_root AND o.commit_sha = c.commit_sha
-         LEFT JOIN event_commit_bug_signal b ON b.repo_root = c.repo_root AND b.commit_sha = c.commit_sha
-              AND b.bug_after_merge_flag = 1
-         LEFT JOIN event_commit_pr_outcome pr ON pr.repo_root = c.repo_root AND pr.commit_sha = c.commit_sha
-         WHERE sm.provider = ?1 AND COALESCE(NULLIF(s.root_session_id, ''), s.session_id) = ?2
-           AND sm.matched_lines > 0
-         GROUP BY c.repo_root, c.commit_sha
-         ORDER BY c.commit_time",
+        "SELECT MIN(repo_root), commit_sha, MIN(commit_time), MIN(subject), MAX(ai_share),
+                MAX(matched_lines), MAX(mainline), MAX(reverted), MAX(signal_source),
+                MAX(pr_number), MAX(pr_merged)
+         FROM (
+             SELECT c.repo_root, c.commit_sha, c.commit_time, c.subject,
+                    COALESCE(c.ai_share, 0) AS ai_share, SUM(sm.matched_lines) AS matched_lines,
+                    o.merged_to_mainline_flag AS mainline, o.reverted_later_flag AS reverted,
+                    b.signal_source, pr.pr_number, pr.pr_merged_flag AS pr_merged
+             FROM fact_commit_session_match sm
+             JOIN metadata_sessions s ON s.provider = sm.provider AND s.session_id = sm.session_id
+             JOIN fact_commit c ON c.repo_root = sm.repo_root AND c.commit_sha = sm.commit_sha
+             LEFT JOIN event_commit_outcome o ON o.repo_root = c.repo_root AND o.commit_sha = c.commit_sha
+             LEFT JOIN event_commit_bug_signal b ON b.repo_root = c.repo_root AND b.commit_sha = c.commit_sha
+                  AND b.bug_after_merge_flag = 1
+             LEFT JOIN event_commit_pr_outcome pr ON pr.repo_root = c.repo_root AND pr.commit_sha = c.commit_sha
+             WHERE sm.provider = ?1 AND COALESCE(NULLIF(s.root_session_id, ''), s.session_id) = ?2
+               AND sm.matched_lines > 0
+             GROUP BY c.repo_root, c.commit_sha
+         )
+         GROUP BY commit_sha
+         ORDER BY MIN(commit_time)",
     )?;
     let rows = stmt
         .query_map(rusqlite::params![provider, session_id], |row| {

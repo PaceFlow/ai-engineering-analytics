@@ -125,6 +125,38 @@ pub fn is_diff_check(command: &str) -> bool {
     .any(|needle| lower.contains(needle))
 }
 
+/// A Multica command that moves an issue to done (`multica issue status <id> done`,
+/// `multica issue update <id> --status done`). Help and dry runs do not count.
+pub fn marks_issue_done(command: &str) -> bool {
+    command.split(['\n', ';', '|', '&']).any(|segment| {
+        let words: Vec<&str> = segment.split_whitespace().collect();
+        let Some(at) = words
+            .iter()
+            .position(|w| w.rsplit('/').next() == Some("multica"))
+        else {
+            return false;
+        };
+        let args = &words[at + 1..];
+        if args
+            .iter()
+            .any(|w| matches!(*w, "--help" | "-h" | "--check" | "--dry-run"))
+        {
+            return false;
+        }
+        match args {
+            ["issue", "status", rest @ ..] => {
+                rest.iter().any(|w| w.trim_matches(['"', '\'']) == "done")
+            }
+            ["issue", "update", rest @ ..] => {
+                rest.windows(2)
+                    .any(|pair| pair[0] == "--status" && pair[1] == "done")
+                    || rest.contains(&"--status=done")
+            }
+            _ => false,
+        }
+    })
+}
+
 /// A slash command at the start of a user message (`/review`, `/grill-me`).
 pub fn slash_command(user_text: &str) -> Option<String> {
     let first = user_text.split_whitespace().next()?;
@@ -278,6 +310,29 @@ mod tests {
             target_dir("/work/repo/src/a.rs", Some("/work/repo/"), 3),
             "src/"
         );
+    }
+
+    #[test]
+    fn recognises_multica_commands_that_close_an_issue() {
+        assert!(marks_issue_done(
+            "multica issue status 01a19fc7-8377 done --no-start"
+        ));
+        assert!(marks_issue_done(
+            "cd /w && /usr/local/bin/multica issue update KLIK-1 --status done"
+        ));
+        assert!(marks_issue_done(
+            "multica issue update KLIK-1 --status=done"
+        ));
+        assert!(!marks_issue_done(
+            "multica issue status 01a19fc7 in_progress"
+        ));
+        assert!(!marks_issue_done(
+            "multica issue status --help 2>&1 | head -25"
+        ));
+        assert!(!marks_issue_done(
+            "multica issue get 01a19fc7 --output json"
+        ));
+        assert!(!marks_issue_done("echo done"));
     }
 
     #[test]

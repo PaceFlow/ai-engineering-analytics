@@ -313,18 +313,37 @@ pub fn checks(detail: &SessionDetail, stats: &[Stat], files: &[FileTouch]) -> Ve
             plain(&value("outcome"))
         ));
     }
+    let issue_done = int("tasks.issue_done");
+    if by_id.contains_key("tasks.issue_done") {
+        task_stats.push("tasks.issue_done".into());
+    }
+    let mut statement = match task_items.as_slice() {
+        [only] => only
+            .split_once(": ")
+            .map_or(only.clone(), |(_, rest)| rest.to_string()),
+        _ => format!(
+            "{} tasks, {} finished.",
+            int("tasks.count"),
+            int("tasks.completed")
+        ),
+    };
+    if issue_done > 0 {
+        statement.push_str(" The agent moved the issue to done");
+        if int("tasks.completed") < int("tasks.count") {
+            statement.push_str(", but vca does not count the work as finished: which is right?");
+        } else {
+            statement.push('.');
+        }
+    }
     out.push(Check {
         id: "outcome".into(),
         group: "work".into(),
         title: "Kind of work and outcome".into(),
-        statement: match task_items.as_slice() {
-            [only] => only.split_once(": ").map_or(only.clone(), |(_, rest)| rest.to_string()),
-            _ => format!("{} tasks, {} finished.", int("tasks.count"), int("tasks.completed")),
-        },
-        explain: "A guess from the conversation and git: the kind of work (bug fix, feature, review …) and whether it finished. Finished means a commit or a passing check came after the work.".into(),
-        how: "Does the kind of work fit? Did it actually get done?".into(),
+        statement,
+        explain: "A guess from the conversation and git: the kind of work (bug fix, feature, review …) and whether it finished. The classifier's verdict counts first; without one, a commit, the issue moved to done, or a passing check after the work counts as finished. Moving the issue to done is the agent's own report, shown so you can compare.".into(),
+        how: "Does the kind of work fit? Did it actually get done? “Show me” highlights the status change when there is one.".into(),
         stats: task_stats,
-        entries: vec![],
+        entries: entries("tasks.issue_done"),
         items: if task_items.len() > 1 { task_items } else { vec![] },
     });
 
@@ -415,7 +434,8 @@ pub fn help(id: &str) -> String {
         "delivery.ai_lines" => "Lines in those commits that match lines the agent wrote.",
         "delivery.rework_relations" => "Times later AI work changed lines from this session, or this session changed lines from earlier AI work.",
         "tasks.count" => "Goals vca split the session into (one without classification).",
-        "tasks.completed" => "Tasks judged finished (a commit or passing check followed the work).",
+        "tasks.completed" => "Tasks judged finished (the classifier or you said so; otherwise a commit, the issue moved to done, or a passing check followed the work).",
+        "tasks.issue_done" => "Successful commands that moved a Multica issue to done. The agent's own report, kept apart from whether the goal was met.",
         _ => "",
     }
     .to_string()
@@ -426,10 +446,13 @@ fn task_field(field: &str) -> &'static str {
         "turns" => "Turns in this task.",
         "cost_total_usd" => "List-price cost of the whole task.",
         "cost_to_complete_usd" => "Cost until the task was judged finished.",
-        "active_minutes" => "Active minutes until the task was judged finished.",
+        "active_minutes" => {
+            "Active minutes until the task was judged finished (empty when it was not)."
+        }
+        "active_minutes_total" => "Active minutes of the whole task, finished or not.",
         "completed" => "Whether the task was judged finished.",
         "completion_source" => {
-            "What decided it was finished: a commit, a passing check, a classifier or you."
+            "What decided it was finished: you, the classifier, a commit, the issue moved to done, or a passing check."
         }
         "intent" => "Kind of work: bug fix, feature, review, research …",
         "outcome" => "How it ended: verified, unverified, answered, stalled, abandoned …",
@@ -467,6 +490,7 @@ fn finished_by(source: &str) -> &'static str {
     match source {
         "commit" => "a commit followed the work",
         "validation_pass" => "a passing test or build followed the work",
+        "issue_done" => "the agent moved the issue to done",
         "classifier" | "jev" => "the classifier judged it done",
         "override" | "manual" => "you marked it done",
         _ => "vca saw it finish",
@@ -498,11 +522,12 @@ fn duration(minutes: Option<f64>) -> String {
     }
 }
 
+/// In UTC, like the timeline: the server's own zone says nothing about the reviewer's.
 fn when(ts: Option<&str>) -> String {
     ts.and_then(|ts| chrono::DateTime::parse_from_rfc3339(ts).ok())
         .map(|dt| {
-            dt.with_timezone(&chrono::Local)
-                .format("%-d %b %H:%M")
+            dt.with_timezone(&chrono::Utc)
+                .format("%-d %b %H:%M UTC")
                 .to_string()
         })
         .unwrap_or_else(|| "—".into())

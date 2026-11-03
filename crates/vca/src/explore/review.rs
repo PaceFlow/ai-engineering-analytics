@@ -946,9 +946,10 @@ fn stats(conn: &Connection, detail: &SessionDetail, timeline: &[Entry]) -> Resul
         st.ids(failed),
     );
     let edits = |e: &Entry| tools(e) && e.meta["category"].as_str() == Some("edit");
+    // A failed write (wrong path, rejected) changed nothing.
     let files: BTreeSet<String> = timeline
         .iter()
-        .filter(|e| edits(e))
+        .filter(|e| edits(e) && !failed(e))
         .filter_map(|e| e.meta["target"].as_str())
         .map(|t| {
             t.split(" :: ")
@@ -964,7 +965,21 @@ fn stats(conn: &Connection, detail: &SessionDetail, timeline: &[Entry]) -> Resul
         "Tools",
         "Distinct files edited",
         json!(files.len()),
-        st.ids(edits),
+        st.ids(|e| edits(e) && !failed(e)),
+    );
+    let closes_issue = |e: &Entry| {
+        tools(e)
+            && !failed(e)
+            && e.meta["target"]
+                .as_str()
+                .is_some_and(crate::insights::tools::marks_issue_done)
+    };
+    st.add(
+        "tasks.issue_done",
+        "Tasks",
+        "Issue moved to done by the agent",
+        json!(st.ids(closes_issue).len()),
+        st.ids(closes_issue),
     );
     let checks = |e: &Entry| tools(e) && !e.meta["validation"].is_null();
     let check_fail = |e: &Entry| checks(e) && failed(e);
@@ -1079,10 +1094,14 @@ fn stats(conn: &Connection, detail: &SessionDetail, timeline: &[Entry]) -> Resul
             &format!("task.{n}.active_minutes"),
             &group,
             "Active minutes to completion",
-            minutes(
-                task.active_minutes_to_complete
-                    .or(task.active_minutes_total),
-            ),
+            minutes(task.active_minutes_to_complete),
+            vec![],
+        );
+        st.add(
+            &format!("task.{n}.active_minutes_total"),
+            &group,
+            "Active minutes, whole task",
+            minutes(task.active_minutes_total),
             vec![],
         );
         st.add(

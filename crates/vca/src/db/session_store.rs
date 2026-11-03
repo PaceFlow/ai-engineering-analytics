@@ -464,6 +464,36 @@ pub(crate) fn apply_data_migrations(conn: &Connection) -> Result<()> {
              INSERT OR IGNORE INTO schema_migrations(version) VALUES (2);",
         )?;
     }
+    let applied: Option<i64> = conn
+        .query_row(
+            "SELECT version FROM schema_migrations WHERE version = 3",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if applied.is_none() {
+        // Earlier versions linked a session to any commit sharing a line with it;
+        // keep only matches the matcher now accepts. A commit left without any
+        // session becomes human-written, as the matcher records it.
+        use crate::change_intel::commit_assoc::matcher::{
+            MIN_SESSION_MATCHED_LINES, MIN_SESSION_SHARE_OF_COMMIT,
+        };
+        conn.execute(
+            "DELETE FROM fact_commit_session_match
+             WHERE provider <> 'human' AND matched_lines < ?1 AND share_of_commit < ?2",
+            params![MIN_SESSION_MATCHED_LINES, MIN_SESSION_SHARE_OF_COMMIT],
+        )?;
+        conn.execute_batch(
+            "INSERT OR IGNORE INTO fact_commit_session_match
+                 (repo_root, commit_sha, provider, session_id, matched_lines, share_of_commit, share_of_ai)
+             SELECT c.repo_root, c.commit_sha, 'human', '__human__', 0.0, 1.0, 0.0
+             FROM fact_commit c
+             WHERE NOT EXISTS (SELECT 1 FROM fact_commit_session_match m
+                               WHERE m.repo_root = c.repo_root AND m.commit_sha = c.commit_sha)
+               AND c.assoc_session_facts_version > 0;
+             INSERT OR IGNORE INTO schema_migrations(version) VALUES (3);",
+        )?;
+    }
     Ok(())
 }
 
@@ -971,6 +1001,37 @@ mod tests {
             input_tokens: 10,
             ..UsageRecord::new(key)
         }
+    }
+
+    #[test]
+    fn migration_drops_weak_commit_matches_and_keeps_the_commit_human() -> Result<()> {
+        let conn = Connection::open_in_memory()?;
+        init_app_schema(&conn)?;
+        conn.execute_batch(
+            "INSERT INTO fact_commit (repo_root, commit_sha, commit_time, subject, assoc_session_facts_version)
+             VALUES ('/r', 'shared', '2026-10-31T10:00:00Z', 'a', 1),
+                    ('/r', 'other', '2026-10-31T11:00:00Z', 'b', 1);
+             INSERT INTO fact_commit_session_match (repo_root, commit_sha, provider, session_id, matched_lines, share_of_commit, share_of_ai)
+             VALUES ('/r', 'shared', 'opencode', 'author', 120.0, 0.9, 0.95),
+                    ('/r', 'shared', 'opencode', 'noise', 2.0, 0.01, 0.02),
+                    ('/r', 'other', 'opencode', 'noise', 0.5, 0.002, 1.0);
+             DELETE FROM schema_migrations WHERE version = 3;",
+        )?;
+        apply_data_migrations(&conn)?;
+        let mut stmt = conn.prepare(
+            "SELECT commit_sha, session_id FROM fact_commit_session_match ORDER BY commit_sha, session_id",
+        )?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        assert_eq!(
+            rows,
+            [
+                ("other".to_string(), "__human__".to_string()),
+                ("shared".to_string(), "author".to_string())
+            ]
+        );
+        Ok(())
     }
 
     #[test]

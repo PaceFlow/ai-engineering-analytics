@@ -110,6 +110,7 @@ pub fn explain(app: &App) -> Option<(String, Vec<String>)> {
                 "validation_pass" => {
                     "Done = last passing test/build/lint after the last edit.".into()
                 }
+                "issue_done" => "Done = the agent moved the Multica issue to done.".into(),
                 "none" => {
                     "Not observed complete: wall/active time shown up to the last activity only."
                         .into()

@@ -42,7 +42,7 @@ pub struct SessionDelivery {
 pub fn session_delivery(conn: &Connection) -> Result<HashMap<(String, String), SessionDelivery>> {
     let mut stmt = conn.prepare(
         "SELECT sm.provider, COALESCE(NULLIF(s.root_session_id, ''), s.session_id),
-                COUNT(DISTINCT sm.repo_root || sm.commit_sha),
+                COUNT(DISTINCT sm.commit_sha),
                 MAX(COALESCE(o.merged_to_mainline_flag, 0)),
                 MAX(COALESCE(pr.pr_merged_flag, 0)),
                 MAX(COALESCE(b.bug_after_merge_flag, 0)),

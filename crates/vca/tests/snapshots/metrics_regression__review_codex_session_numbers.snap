@@ -42,6 +42,7 @@ shape.subagents: 0
 shape.turns: 15
 shape.user_messages: 15
 task.0.active_minutes: 127.7
+task.0.active_minutes_total: 128.7
 task.0.completed: true
 task.0.completion_source: validation_pass
 task.0.cost_to_complete_usd: 7.502804
@@ -69,6 +70,7 @@ task.0.validations:
   runs: 37
 tasks.completed: 1
 tasks.count: 1
+tasks.issue_done: 0
 time.active_minutes: 128.7
 time.wall_minutes: 1859.2
 tokens.cache_read: 20224512
