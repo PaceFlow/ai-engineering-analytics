@@ -16,6 +16,8 @@ use super::{SessionDetail, short_id};
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct Check {
     pub id: String,
+    /// Section of the checklist: core, work, tools or context.
+    pub group: String,
     pub title: String,
     /// What vca concluded, in a sentence.
     pub statement: String,
@@ -48,6 +50,7 @@ pub fn checks(detail: &SessionDetail, stats: &[Stat], files: &[FileTouch]) -> Ve
     let messages = int("shape.user_messages");
     out.push(Check {
         id: "messages".into(),
+        group: "core".into(),
         title: "Your messages".into(),
         statement: format!("You sent {messages} message{} to the agent.", plural(messages)),
         explain: "Every message you typed to the main agent. Each one starts a new turn. Tool output and subagent prompts are not counted.".into(),
@@ -61,6 +64,7 @@ pub fn checks(detail: &SessionDetail, stats: &[Stat], files: &[FileTouch]) -> Ve
     let active = num("time.active_minutes");
     out.push(Check {
         id: "time".into(),
+        group: "core".into(),
         title: "When and how long".into(),
         statement: format!(
             "From {} to {} ({} on the clock), about {} of it active.",
@@ -82,6 +86,7 @@ pub fn checks(detail: &SessionDetail, stats: &[Stat], files: &[FileTouch]) -> Ve
         .collect();
     out.push(Check {
         id: "models".into(),
+        group: "core".into(),
         title: "Models".into(),
         statement: if models.is_empty() {
             "No model was recorded.".into()
@@ -108,6 +113,7 @@ pub fn checks(detail: &SessionDetail, stats: &[Stat], files: &[FileTouch]) -> Ve
     let matching_only = files.iter().filter(|f| f.edits == 0).count();
     out.push(Check {
         id: "files".into(),
+        group: "work".into(),
         title: "Files changed".into(),
         statement: {
             let mut text = if edited == 1 {
@@ -152,6 +158,7 @@ pub fn checks(detail: &SessionDetail, stats: &[Stat], files: &[FileTouch]) -> Ve
     let failures = int("checks.failures");
     out.push(Check {
         id: "tests".into(),
+        group: "work".into(),
         title: "Tests and builds".into(),
         statement: format!(
             "{runs} test, build or lint command{} ran; {failures} failed.",
@@ -164,9 +171,49 @@ pub fn checks(detail: &SessionDetail, stats: &[Stat], files: &[FileTouch]) -> Ve
         items: vec![],
     });
 
+    let calls = int("tools.calls");
+    let mut categories: Vec<&Stat> = stats
+        .iter()
+        .filter(|s| {
+            s.id.strip_prefix("tools.")
+                .is_some_and(|c| !matches!(c, "calls" | "failed" | "files_edited"))
+        })
+        .collect();
+    categories.sort_by_key(|s| std::cmp::Reverse(s.value.as_i64().unwrap_or(0)));
+    out.push(Check {
+        id: "tool_calls".into(),
+        group: "tools".into(),
+        title: "Tool calls".into(),
+        statement: format!(
+            "The agent made {calls} tool call{}{}.",
+            plural(calls),
+            if categories.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    ": {}",
+                    categories
+                        .iter()
+                        .map(|s| format!("{} {}", s.display, s.id.trim_start_matches("tools.")))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            }
+        ),
+        explain: "Every tool the agents called, grouped by kind: exec is a shell command, validate a test, build or lint command, skill a loaded skill, read and search look at files. The Data model tab counts each command and its tokens.".into(),
+        how: "Press “Show me” and skim the TOOL entries: do the kinds fit what the agent did?".into(),
+        stats: present(&["tools.calls"])
+            .into_iter()
+            .chain(categories.iter().map(|s| s.id.clone()))
+            .collect(),
+        entries: entries("tools.calls"),
+        items: vec![],
+    });
+
     let failed = int("tools.failed");
     out.push(Check {
         id: "tool_errors".into(),
+        group: "tools".into(),
         title: "Failed tool calls".into(),
         statement: format!("{failed} tool call{} failed.", plural(failed)),
         explain: "Tool calls that returned an error, were rejected, or ended with a non-zero exit code (any command, not only tests).".into(),
@@ -179,6 +226,7 @@ pub fn checks(detail: &SessionDetail, stats: &[Stat], files: &[FileTouch]) -> Ve
     let subagents = int("shape.subagents");
     out.push(Check {
         id: "subagents".into(),
+        group: "tools".into(),
         title: "Subagents".into(),
         statement: format!("The agent started {subagents} subagent{}.", plural(subagents)),
         explain: "Helper agents the main agent launched for side jobs (exploring, reviewing). Their cost is included in this session.".into(),
@@ -191,6 +239,7 @@ pub fn checks(detail: &SessionDetail, stats: &[Stat], files: &[FileTouch]) -> Ve
     let compactions = int("shape.compactions");
     out.push(Check {
         id: "compactions".into(),
+        group: "context".into(),
         title: "Compactions".into(),
         statement: format!(
             "The conversation was compacted {compactions} time{}.",
@@ -206,6 +255,7 @@ pub fn checks(detail: &SessionDetail, stats: &[Stat], files: &[FileTouch]) -> Ve
     let commits = int("delivery.commits");
     out.push(Check {
         id: "commits".into(),
+        group: "work".into(),
         title: "Commits".into(),
         statement: format!(
             "{commits} commit{} contain lines written in this session.",
@@ -265,6 +315,7 @@ pub fn checks(detail: &SessionDetail, stats: &[Stat], files: &[FileTouch]) -> Ve
     }
     out.push(Check {
         id: "outcome".into(),
+        group: "work".into(),
         title: "Kind of work and outcome".into(),
         statement: match task_items.as_slice() {
             [only] => only.split_once(": ").map_or(only.clone(), |(_, rest)| rest.to_string()),
@@ -282,6 +333,7 @@ pub fn checks(detail: &SessionDetail, stats: &[Stat], files: &[FileTouch]) -> Ve
     let cache = int("tokens.cache_read");
     out.push(Check {
         id: "cost".into(),
+        group: "core".into(),
         title: "Cost".into(),
         statement: format!(
             "At API list prices this is about {} for {} tokens over {} model calls ({}% read from cache).",
@@ -299,6 +351,12 @@ pub fn checks(detail: &SessionDetail, stats: &[Stat], files: &[FileTouch]) -> Ve
 
     // Drop checks for numbers this session does not have (e.g. no tasks table).
     out.retain(|check| !check.stats.is_empty());
+    out.sort_by_key(|check| {
+        ["core", "work", "tools", "context"]
+            .iter()
+            .position(|g| *g == check.group)
+            .unwrap_or(usize::MAX)
+    });
     out
 }
 

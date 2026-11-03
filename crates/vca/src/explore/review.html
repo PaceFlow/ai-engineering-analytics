@@ -37,7 +37,14 @@ input[type=search], input[type=text] { font: inherit; font-size: 13px; border: 1
 main { display: grid; grid-template-columns: minmax(0, 1fr) 440px; gap: 0; }
 @media (max-width: 1000px) { main { grid-template-columns: 1fr; } aside { position: static !important; max-height: none !important; border-left: 0 !important; border-top: 1px solid var(--line); } }
 #timeline { padding: 8px 16px 80px; min-width: 0; }
-aside { position: sticky; top: 92px; align-self: start; max-height: calc(100vh - 92px); overflow: auto; border-left: 1px solid var(--line); background: var(--panel); padding: 8px 14px 40px; }
+.kpis { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+.kpi { display: flex; flex-direction: column; align-items: flex-start; padding: 4px 10px; min-width: 92px; line-height: 1.2; }
+.kpi b { font: 600 16px var(--sans); font-variant-numeric: tabular-nums; }
+.kpi span { font-size: 11px; color: var(--muted); }
+.cgroup { display: flex; justify-content: space-between; align-items: baseline; margin: 18px 0 2px; padding-bottom: 4px; border-bottom: 2px solid var(--line); font-weight: 600; font-size: 13px; }
+.cgroup small { color: var(--muted); font-weight: 400; }
+.check.flash { outline: 2px solid var(--accent); }
+aside { position: sticky; top: var(--head, 92px); align-self: start; max-height: calc(100vh - var(--head, 92px)); overflow: auto; border-left: 1px solid var(--line); background: var(--panel); padding: 8px 14px 40px; }
 .turn { margin: 18px 0 6px; padding: 6px 10px; border-radius: 6px; background: var(--accent-soft); color: var(--ink); font-size: 12.5px; display: flex; gap: 10px; flex-wrap: wrap; align-items: baseline; }
 .turn b { font-weight: 600; }
 .turn .cost { margin-left: auto; font-variant-numeric: tabular-nums; }
@@ -135,6 +142,7 @@ button.primary { background: var(--accent); border-color: var(--accent); color: 
 <header>
   <h1 id="title">Session review</h1>
   <div class="sub" id="sub"></div>
+  <div class="kpis" id="kpis"></div>
   <div class="bar">
     <input type="search" id="q" placeholder="Search timeline…" size="28">
     <span class="chips" id="kinds"></span>
@@ -457,24 +465,61 @@ button.primary { background: var(--accent); border-color: var(--accent); color: 
   try { answers = JSON.parse(localStorage.getItem(CSTORE) || '{}') || {}; } catch (e) { answers = {}; }
   const saveAnswers = () => { try { localStorage.setItem(CSTORE, JSON.stringify(answers)); } catch (e) {} };
   function renderChecks() {
-    const out = CHECKS.map((c) => {
+    const out = CHECKS.map((c, i) => {
       const a = answers[c.id] || {};
-      const items = c.items.length ? '<ul>' + c.items.map((i) => '<li>' + esc(i) + '</li>').join('') + '</ul>' : '';
-      return '<div class="check ' + (a.state || '') + '" data-id="' + esc(c.id) + '">' +
-        '<div class="ctitle">' + esc(c.title) + '</div>' +
-        '<div class="statement">' + esc(c.statement) + '</div>' + items +
-        '<details class="why"><summary>What this means · how to check</summary><p>' + esc(c.explain) + '</p><p><b>Check:</b> ' + esc(c.how) + '</p></details>' +
-        '<div class="answer">' +
-        (c.entries.length ? '<button class="show" title="Highlight the evidence in the timeline">Show me (' + c.entries.length + ')</button>' : '') +
-        '<button class="ok' + (a.state === 'ok' ? ' on' : '') + '">✓ Right</button>' +
-        '<button class="no' + (a.state === 'no' ? ' on' : '') + '">✗ Wrong</button>' +
-        '<button class="skip' + (a.state === 'skip' ? ' on' : '') + '" title="Can\'t tell; it is recorded as unreviewed">Skip</button></div>' +
-        '<input type="text" class="note" placeholder="What is wrong? What should it be?" value="' + esc(a.note || '') + '"></div>';
+      let head = '';
+      if (!i || CHECKS[i - 1].group !== c.group) {
+        const mine = CHECKS.filter((x) => x.group === c.group);
+        const answered = mine.filter((x) => answers[x.id] && answers[x.id].state).length;
+        head = '<div class="cgroup"><span>' + esc(GROUPS[c.group] || c.group) + '</span><small>' + answered + ' of ' + mine.length + ' checked</small></div>';
+      }
+      return head + checkHtml(c, a);
     });
     document.getElementById('checks').innerHTML = out.join('') || '<p class="empty">No checks for this session.</p>';
     const done = CHECKS.filter((c) => answers[c.id] && answers[c.id].state).length;
     const bad = CHECKS.filter((c) => answers[c.id] && answers[c.id].state === 'no').length;
     document.getElementById('progress').textContent = done + ' of ' + CHECKS.length + ' answered' + (bad ? ' · ' + bad + ' wrong' : '');
+  }
+  const GROUPS = { core: 'Core numbers', work: 'Work done', tools: 'Tools and agents', context: 'Context' };
+  function checkHtml(c, a) {
+    const items = c.items.length ? '<ul>' + c.items.map((i) => '<li>' + esc(i) + '</li>').join('') + '</ul>' : '';
+    return '<div class="check ' + (a.state || '') + '" data-id="' + esc(c.id) + '">' +
+      '<div class="ctitle">' + esc(c.title) + '</div>' +
+      '<div class="statement">' + esc(c.statement) + '</div>' + items +
+      '<details class="why"><summary>What this means · how to check</summary><p>' + esc(c.explain) + '</p><p><b>Check:</b> ' + esc(c.how) + '</p></details>' +
+      '<div class="answer">' +
+      (c.entries.length ? '<button class="show" title="Highlight the evidence in the timeline">Show me (' + c.entries.length + ')</button>' : '') +
+      '<button class="ok' + (a.state === 'ok' ? ' on' : '') + '">✓ Right</button>' +
+      '<button class="no' + (a.state === 'no' ? ' on' : '') + '">✗ Wrong</button>' +
+      '<button class="skip' + (a.state === 'skip' ? ' on' : '') + '" title="Can\'t tell; it is recorded as unreviewed">Skip</button></div>' +
+      '<input type="text" class="note" placeholder="What is wrong? What should it be?" value="' + esc(a.note || '') + '"></div>';
+  }
+  // The few numbers that sum up the session; each opens its check.
+  function renderKpis() {
+    const v = (id) => { const s = statById.get(id); return s ? s.value : null; };
+    const mins = (m) => m == null ? '—' : m < 60 ? Math.round(m) + 'm' : Math.floor(m / 60) + 'h ' + Math.round(m % 60) + 'm';
+    const short = (n) => n == null ? '—' : n >= 1e6 ? (n / 1e6).toFixed(1) + 'M' : n >= 1e4 ? Math.round(n / 1e3) + 'k' : num(n);
+    const tokens = v('tokens.total'), cache = v('tokens.cache_read');
+    const kpis = [
+      ['time', mins(v('time.active_minutes')), 'active · ' + mins(v('time.wall_minutes')) + ' clock'],
+      ['messages', num(v('shape.user_messages')), 'your messages'],
+      ['tool_calls', num(v('tools.calls')), 'tool calls' + (v('tools.failed') ? ' · ' + v('tools.failed') + ' failed' : '')],
+      ['cost', num(v('calls.model_calls')), 'model calls'],
+      ['cost', short(tokens), 'tokens' + (tokens ? ' · ' + Math.round(100 * (cache || 0) / tokens) + '% cache' : '')],
+      ['cost', v('cost.total_usd') == null ? '—' : usd(v('cost.total_usd')), 'list price'],
+      ['files', num(v('tools.files_edited')), 'files edited'],
+      ['commits', num(v('delivery.commits')), 'commits'],
+    ];
+    document.getElementById('kpis').innerHTML = kpis.map(([id, value, label]) =>
+      '<button class="kpi" data-check="' + id + '"><b>' + esc(value) + '</b><span>' + esc(label) + '</span></button>').join('');
+    document.getElementById('kpis').onclick = (ev) => {
+      const k = ev.target.closest('.kpi'); if (!k) return;
+      tabs.checks.click();
+      const box = document.querySelector('.check[data-id="' + CSS.escape(k.dataset.check) + '"]');
+      if (box) { box.scrollIntoView({ block: 'start', behavior: 'smooth' }); box.classList.add('flash'); setTimeout(() => box.classList.remove('flash'), 1200); }
+    };
+    const fit = () => document.documentElement.style.setProperty('--head', document.querySelector('header').offsetHeight + 'px');
+    fit(); window.addEventListener('resize', fit);
   }
   const checkById = new Map(CHECKS.map((c) => [c.id, c]));
   document.getElementById('checks').addEventListener('click', (ev) => {
@@ -674,6 +719,7 @@ button.primary { background: var(--accent); border-color: var(--accent); color: 
   }
 
   renderModel();
+  renderKpis();
   renderTimeline();
   renderStats();
   renderChecks();
