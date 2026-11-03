@@ -289,7 +289,7 @@ impl State {
             }
             ("POST", ["api", "save", provider, session]) => {
                 if let Some(origin) = req.headers.get("origin")
-                    && origin != &self.origin
+                    && !same_origin(origin, &self.origin)
                 {
                     return Ok(Response::json(
                         403,
@@ -434,6 +434,15 @@ fn browse(conn: &Connection, query: &HashMap<String, String>) -> Result<Value> {
             "rows": page,
         }
     }))
+}
+
+/// This server, whether the page was opened as 127.0.0.1 or localhost (an SSH
+/// tunnel typically uses localhost); any other origin is refused.
+fn same_origin(origin: &str, server: &str) -> bool {
+    origin == server
+        || server
+            .strip_prefix("http://127.0.0.1:")
+            .is_some_and(|port| origin == format!("http://localhost:{port}"))
 }
 
 struct SessionGoals {
@@ -624,6 +633,16 @@ fn open_url(url: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn saving_accepts_localhost_for_the_same_port_only() {
+        let server = "http://127.0.0.1:8790";
+        assert!(same_origin("http://127.0.0.1:8790", server));
+        assert!(same_origin("http://localhost:8790", server));
+        assert!(!same_origin("http://localhost:8791", server));
+        assert!(!same_origin("http://localhost:8790.evil.test", server));
+        assert!(!same_origin("https://example.com", server));
+    }
 
     #[test]
     fn project_label_names_multica_workspace_and_issue() {
