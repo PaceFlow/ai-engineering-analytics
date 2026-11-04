@@ -15,7 +15,7 @@ use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension, params};
 
 /// Bump when parsers start extracting new facts so existing sources are re-read.
-pub const SESSION_INGEST_VERSION: i64 = 8;
+pub const SESSION_INGEST_VERSION: i64 = 9;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentKind {
@@ -60,6 +60,9 @@ pub struct UsageRecord {
     /// Natural key unique within the session (API message id, turn id, ...).
     pub key: String,
     pub ts: Option<String>,
+    /// When the request was sent, for providers whose `ts` marks when the step finished,
+    /// after the tools it ran.
+    pub request_ts: Option<String>,
     pub model: Option<String>,
     /// Fresh (uncached) input tokens.
     pub input_tokens: i64,
@@ -86,6 +89,7 @@ impl UsageRecord {
             usage_available: None,
             key: key.into(),
             ts: None,
+            request_ts: None,
             model: None,
             input_tokens: 0,
             cache_read_tokens: 0,
@@ -442,6 +446,7 @@ pub(crate) const SESSION_STORE_COLUMNS: &[&str] = &[
     "ALTER TABLE fact_session_usage ADD COLUMN context_window INTEGER;",
     "ALTER TABLE fact_session_usage ADD COLUMN ts_quality TEXT NOT NULL DEFAULT 'session';",
     "ALTER TABLE fact_session_usage ADD COLUMN cache_creation_1h_tokens INTEGER NOT NULL DEFAULT 0;",
+    "ALTER TABLE fact_session_usage ADD COLUMN request_ts TEXT;",
     "ALTER TABLE fact_session_message ADD COLUMN message_key TEXT;",
     "ALTER TABLE fact_session_message ADD COLUMN is_compaction_summary INTEGER NOT NULL DEFAULT 0;",
     "ALTER TABLE fact_session_message ADD COLUMN chars INTEGER;",
@@ -723,9 +728,9 @@ fn store_session_record_inner(conn: &Connection, record: &SessionRecord) -> Resu
             cached_input_tokens, cache_creation_tokens, output_tokens, reasoning_tokens,
             total_tokens, actual_cost_usd, cost_source, usage_key, token_source,
             reasoning_in_output, service_tier, provider_route, stop_reason, context_window,
-            ts_quality, cache_creation_1h_tokens
+            ts_quality, cache_creation_1h_tokens, request_ts
          ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17,
-                   ?18, ?19, ?20, ?21, ?22)",
+                   ?18, ?19, ?20, ?21, ?22, ?23)",
     )?;
     for (usage_index, usage) in record.usage.iter().enumerate() {
         let cost_source = if usage.reported_cost_usd.is_some_and(|cost| cost > 0.0) {
@@ -761,7 +766,8 @@ fn store_session_record_inner(conn: &Connection, record: &SessionRecord) -> Resu
             } else {
                 "session"
             },
-            usage.cache_write_1h_tokens.max(0)
+            usage.cache_write_1h_tokens.max(0),
+            usage.request_ts,
         ])?;
         let availability = match usage.usage_available {
             Some(false) => "missing",

@@ -54,6 +54,7 @@ struct OpenCodeUsageEvent {
     usage_available: Option<bool>,
     key: String,
     timestamp: Option<String>,
+    request_timestamp: Option<String>,
     model_name: Option<String>,
     provider_id: Option<String>,
     input_tokens: i64,
@@ -247,6 +248,7 @@ fn session_record(
             let mut out = UsageRecord::new(usage.key.clone());
             out.usage_available = usage.usage_available;
             out.ts = usage.timestamp.clone();
+            out.request_ts = usage.request_timestamp.clone();
             out.model = usage.model_name.clone();
             out.provider_route = usage.provider_id.clone();
             out.input_tokens = usage.input_tokens;
@@ -538,10 +540,17 @@ fn parse_opencode_usage(parsed: &Value) -> Option<OpenCodeUsageEvent> {
         .and_then(Value::as_f64)
         .filter(|value| *value > 0.0);
 
+    // A step completes only after the tools it ran, so its start orders it against them.
+    let request_timestamp = parsed
+        .pointer("/time/created")
+        .and_then(Value::as_i64)
+        .and_then(ms_to_iso);
+
     Some(OpenCodeUsageEvent {
         usage_available,
         key: String::new(),
         timestamp: None,
+        request_timestamp,
         model_name: None,
         provider_id: None,
         input_tokens,
@@ -935,6 +944,7 @@ mod tests {
                 usage_available: Some(true),
                 key: String::new(),
                 timestamp: None,
+                request_timestamp: None,
                 model_name: None,
                 provider_id: None,
                 input_tokens: 1199,

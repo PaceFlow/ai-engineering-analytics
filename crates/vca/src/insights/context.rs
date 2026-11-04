@@ -100,6 +100,8 @@ struct Call {
     usage_id: i64,
     ts: Option<i64>,
     ts_text: Option<String>,
+    /// When the request was sent, if the provider logs it apart from `ts`.
+    request_ts: Option<i64>,
     model: Option<String>,
     fresh_input: i64,
     cache_read: i64,
@@ -441,12 +443,12 @@ struct Ledger {
 }
 
 fn build_ledger(calls: &[Call], items: &mut [Item], table: &pricing::PricingTable) -> Ledger {
-    // Assign each item to the first call at or after its timestamp.
+    // Assign each item to the first call sent at or after its timestamp.
     for item in items.iter_mut() {
         item.entered_call = match item.ts {
             Some(ts) => calls
                 .iter()
-                .position(|call| call.ts.is_some_and(|call_ts| call_ts >= ts))
+                .position(|call| call.request_ts.or(call.ts).is_some_and(|sent| sent >= ts))
                 .unwrap_or(calls.len()),
             None => 0,
         };
@@ -875,7 +877,7 @@ fn load_calls(conn: &Connection) -> Result<BTreeMap<Key, Vec<Call>>> {
     let mut stmt = conn.prepare(
         "SELECT id, provider, session_id, usage_ts, model_name, input_tokens, cached_input_tokens,
                 cache_creation_tokens, cache_creation_1h_tokens, output_tokens, context_window,
-                CASE WHEN reasoning_in_output = 0 THEN reasoning_tokens ELSE 0 END
+                CASE WHEN reasoning_in_output = 0 THEN reasoning_tokens ELSE 0 END, request_ts
          FROM fact_session_usage
          WHERE token_source = 'reported' AND usage_ts IS NOT NULL
          ORDER BY provider, session_id, usage_ts, usage_index",
@@ -888,6 +890,10 @@ fn load_calls(conn: &Connection) -> Result<BTreeMap<Key, Vec<Call>>> {
                 usage_id: row.get(0)?,
                 ts: ts_text.as_deref().and_then(parse_ts),
                 ts_text,
+                request_ts: row
+                    .get::<_, Option<String>>(12)?
+                    .as_deref()
+                    .and_then(parse_ts),
                 model: row.get(4)?,
                 fresh_input: row.get(5)?,
                 cache_read: row.get(6)?,
@@ -1135,6 +1141,48 @@ mod tests {
         };
         assert_eq!(tokens("assistant_reasoning")?, 4_000);
         assert_eq!(tokens("unexplained")?, 500);
+        Ok(())
+    }
+
+    #[test]
+    fn tool_output_enters_the_call_sent_after_it_when_steps_finish_after_their_tools() -> Result<()>
+    {
+        let conn = Connection::open_in_memory()?;
+        init_app_schema(&conn)?;
+        let mut record = SessionRecord::new("opencode", "s1");
+        record.started_at = Some("2026-10-01T10:00:00Z".into());
+        record.tool_calls.push(ToolCallRecord {
+            key: "t1".into(),
+            ts: Some("2026-10-01T10:00:05Z".into()),
+            ended_ts: Some("2026-10-01T10:00:09Z".into()),
+            tool_name: "shell".into(),
+            target: Some("multica issue list".into()),
+            output_chars: 40_000,
+            output_in_context: true,
+            status: "ok".into(),
+            ..ToolCallRecord::default()
+        });
+        // The first step ran the tool and was marked complete after it.
+        let mut first = call("m1", "2026-10-01T10:00:10Z", 2, 0, 20_000, 100);
+        first.request_ts = Some("2026-10-01T10:00:00Z".into());
+        let mut second = call("m2", "2026-10-01T10:00:20Z", 2, 20_000, 10_100, 100);
+        second.request_ts = Some("2026-10-01T10:00:10Z".into());
+        record.usage = vec![first, second];
+        store_session_record(&conn, &record)?;
+        refresh_context_ledger(&conn)?;
+        let (entered, tokens): (i64, i64) = conn.query_row(
+            "SELECT entered_call, tokens FROM derived_context_item WHERE item_key = 'tool:t1'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        assert_eq!(entered, 1);
+        assert_eq!(tokens, 10_000);
+        let unexplained: i64 = conn.query_row(
+            "SELECT COALESCE(SUM(tokens), 0) FROM derived_context_item WHERE kind = 'unexplained'",
+            [],
+            |r| r.get(0),
+        )?;
+        assert_eq!(unexplained, 0);
         Ok(())
     }
 
