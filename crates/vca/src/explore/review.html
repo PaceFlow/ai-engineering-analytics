@@ -136,6 +136,8 @@ button.primary { background: var(--accent); border-color: var(--accent); color: 
 .goal li.this { font-weight: 600; }
 .stack { display: flex; height: 10px; border-radius: 5px; overflow: hidden; margin: 6px 0; background: var(--line); }
 .stack span { display: block; height: 100%; }
+.comp { margin: 6px 0; }
+.comp-items tr.fresh td { font-weight: 600; }
 </style>
 </head>
 <body>
@@ -275,6 +277,68 @@ button.primary { background: var(--accent); border-color: var(--accent); color: 
       '; counted again by ' + c.carried + ' later calls; ' + (c.usd == null ? 'unpriced' : usd(c.usd)) + ' in total">' + num(c.tokens) + ' tok · resent in ' + c.carried +
       ' calls' + (c.usd ? ' · ' + usd(c.usd) : '') + '</span>';
   }
+  // ── Context at one call: every ledger item that entered at or before it and was not yet evicted ──
+  const agentOf = (e) => e.agent === 'main' ? S.session_id : e.agent;
+  const KIND_COLORS = { tool_result: 'var(--tool)', subagent_result: 'var(--tool)', user_message: 'var(--user)', assistant_output: 'var(--assistant)',
+    assistant_reasoning: 'var(--assistant)', assistant_text: 'var(--assistant)', baseline: 'var(--event)', compacted_history: 'var(--warn)', unexplained: 'var(--bad)' };
+  const kindColor = (k) => KIND_COLORS[k] || 'var(--call)';
+  let entryByItem = null;  // 'agent key' -> timeline entry id, for jumping from an item to its source
+  function sourceEntry(agent, key) {
+    if (!entryByItem) {
+      entryByItem = new Map();
+      for (const e of DATA.timeline) {
+        const c = e.meta && e.meta.ctx;
+        if (!c) continue;
+        if (c.key) entryByItem.set(agentOf(e) + ' ' + c.key, e.id);
+        if (e.kind === 'call' && c.call != null) entryByItem.set(agentOf(e) + ' call:' + c.call, e.id);
+      }
+    }
+    const direct = entryByItem.get(agent + ' ' + key);
+    if (direct != null) return direct;
+    // The model's reply and reasoning enter the call after the one that produced them.
+    const m = /^(output|reasoning):(\d+)$/.exec(key);
+    return m ? entryByItem.get(agent + ' call:' + (Number(m[2]) - 1)) : undefined;
+  }
+  function compositionHtml(e) {
+    const call = e.meta.ctx.call, agent = agentOf(e);
+    const live = M.context.items.filter((i) => i.agent === agent && i.entered <= call && (i.evicted == null || i.evicted > call));
+    if (!live.length) return '<div class="meta">No context ledger items for this call.</div>';
+    const total = live.reduce((s, i) => s + i.tokens, 0);
+    const byKind = new Map();
+    for (const i of live) {
+      const k = byKind.get(i.kind) || { n: 0, tokens: 0, fresh: 0 };
+      k.n++; k.tokens += i.tokens; if (i.entered === call) k.fresh += i.tokens;
+      byKind.set(i.kind, k);
+    }
+    const kinds = [...byKind.entries()].sort((a, b) => b[1].tokens - a[1].tokens);
+    const share = (t) => total ? (100 * t / total).toFixed(t / total < 0.1 ? 1 : 0) + '%' : '—';
+    let html = '<div class="comp"><div class="meta">Context at call ' + call + ': ' + num(e.meta.ctx.context) + ' tokens reported, ' + num(total) +
+      ' placed on ' + live.length + ' items. New at this call: ' + num(live.filter((i) => i.entered === call).reduce((s, i) => s + i.tokens, 0)) + '.</div>';
+    html += '<div class="stack">' + kinds.map(([k, v]) => '<span title="' + esc(k + ' ' + num(v.tokens) + ' tokens (' + share(v.tokens) + ')') + '" style="width:' +
+      (100 * v.tokens / (total || 1)) + '%;background:' + kindColor(k) + '"></span>').join('') + '</div>';
+    html += '<table class="dm"><tr><th>kind</th><th>items</th><th>tokens</th><th>share</th><th>new here</th></tr>' + kinds.map(([k, v]) =>
+      '<tr><td><span style="color:' + kindColor(k) + '">■</span> ' + esc(k) + '</td><td class="n">' + num(v.n) + '</td><td class="n">' + num(v.tokens) +
+      '</td><td class="n">' + share(v.tokens) + '</td><td class="n">' + (v.fresh ? num(v.fresh) : '') + '</td></tr>').join('') + '</table>';
+    const LIMIT = 40;
+    const rows = live.slice().sort((a, b) => b.tokens - a.tokens);
+    html += '<table class="dm comp-items"><tr><th>tokens</th><th>kind</th><th>what</th><th>since</th></tr>' + rows.slice(0, LIMIT).map((i) => {
+      const target = sourceEntry(agent, i.key);
+      const what = esc((i.target || i.source || i.tool || i.key).slice(0, 140));
+      return '<tr' + (i.entered === call ? ' class="fresh"' : '') + '><td class="n">' + num(i.tokens) + '</td><td>' + esc(i.kind) + '</td><td>' +
+        (target != null ? '<a href="#" data-jump="' + target + '" title="Show where this entered">' + what + '</a>' : what) + '</td><td class="n">' +
+        (i.entered === call ? 'new' : 'call ' + i.entered) + '</td></tr>';
+    }).join('') + '</table>';
+    if (rows.length > LIMIT) html += '<div class="meta">and ' + (rows.length - LIMIT) + ' smaller items</div>';
+    return html + '<p class="hint">Sizes are estimates calibrated to how much the context grew; baseline, compacted history and unexplained are what the logged items do not cover.</p></div>';
+  }
+  document.getElementById('timeline').addEventListener('click', (ev) => {
+    const a = ev.target.closest('a[data-jump]'); if (!a) return;
+    ev.preventDefault();
+    const el = document.querySelector('#timeline .e[data-id="' + a.dataset.jump + '"]');
+    if (!el) { a.title = 'Hidden by the current filters'; return; }
+    el.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    el.classList.add('hl'); setTimeout(() => el.classList.remove('hl'), 1500);
+  });
   // How many times each command ran, and which run this row is.
   const commandRuns = new Map(), commandNth = new Map();
   for (const e of DATA.timeline) {
@@ -311,7 +375,7 @@ button.primary { background: var(--accent); border-color: var(--accent); color: 
     const cls = 'e ' + e.kind + (sub ? ' sub' : '') + (highlighted.has(e.id) ? ' hl' : '');
     const agent = sub ? '<span class="badge agent" title="' + esc(e.agent) + '">sub ' + esc(e.agent.slice(0, 8)) + '</span>' : '';
     let head = agent, expandable = false;
-    if (e.kind === 'call') head += callLine(e.meta) + ctxPill(e.meta.ctx, 'call') + '<span class="title">' + esc(e.title) + '</span>';
+    if (e.kind === 'call') { head += callLine(e.meta) + ctxPill(e.meta.ctx, 'call') + '<span class="title">' + esc(e.title) + '</span>'; expandable = !!(e.meta.ctx && e.meta.ctx.call != null); }
     else if (e.kind === 'tool') { head += toolLine(e.meta) + commandBadge(e) + ctxPill(e.meta.ctx) + '<span class="title">' + esc(e.title) + '</span>'; expandable = true; }
     else { head += ctxPill(e.meta.ctx) + '<span class="title">' + esc(e.title || '(empty)') + '</span>'; expandable = e.body && e.body !== e.title; }
     const left = '<span class="t">' + esc(time(e.ts)) + '</span><span class="k ' + e.kind + '">' + e.kind + '</span>';
@@ -363,6 +427,7 @@ button.primary { background: var(--accent); border-color: var(--accent); color: 
         (m.child_session ? ' · child ' + esc(m.child_session) : '') + '</div>';
       if (m.target && m.target.length > 160) html += '<pre class="body">' + esc(m.target) + '</pre>';
     }
+    if (e.kind === 'call') html += compositionHtml(e);
     if (e.body) html += '<pre class="body">' + esc(e.body) + '</pre>';
     d.insertAdjacentHTML('beforeend', html || '<div class="meta">no further detail</div>');
     d.dataset.filled = '1';

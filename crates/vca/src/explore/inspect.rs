@@ -362,9 +362,11 @@ pub fn footprints(
     )?;
     for agent in agents {
         let rows = stmt.query_map(params![provider, agent], |r| {
+            let key = r.get::<_, String>(0)?;
             Ok((
-                r.get::<_, String>(0)?,
+                key.clone(),
                 json!({
+                    "key": key,
                     "tokens": r.get::<_, i64>(1)?,
                     "carried": r.get::<_, i64>(2)?,
                     "usd": r.get::<_, Option<f64>>(3)?,
