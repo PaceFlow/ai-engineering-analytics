@@ -117,6 +117,12 @@ impl Call {
     fn context(&self) -> i64 {
         self.fresh_input + self.cache_read + self.cache_write
     }
+
+    /// Some routes report no usage at all (every count zero); such a call says
+    /// nothing about the context, so the ledger steps over it.
+    fn measured(&self) -> bool {
+        self.context() > 0 || self.output > 0
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -443,22 +449,32 @@ struct Ledger {
 }
 
 fn build_ledger(calls: &[Call], items: &mut [Item], table: &pricing::PricingTable) -> Ledger {
-    // Assign each item to the first call sent at or after its timestamp.
+    let measured: Vec<usize> = (0..calls.len())
+        .filter(|index| calls[*index].measured())
+        .collect();
+    // With no usage anywhere, items keep their estimated sizes on the calls they reached.
+    let unmeasured_session = measured.is_empty();
+
+    // Assign each item to the first measured call sent at or after its timestamp.
     for item in items.iter_mut() {
         item.entered_call = match item.ts {
             Some(ts) => calls
                 .iter()
-                .position(|call| call.request_ts.or(call.ts).is_some_and(|sent| sent >= ts))
+                .position(|call| {
+                    (unmeasured_session || call.measured())
+                        && call.request_ts.or(call.ts).is_some_and(|sent| sent >= ts)
+                })
                 .unwrap_or(calls.len()),
-            None => 0,
+            None => measured.first().copied().unwrap_or(0),
         };
     }
     items.sort_by_key(|item| (item.entered_call, item.ts.unwrap_or(0)));
 
     // Calibration factor: observed growth vs estimated entering items.
     let mut ratios: Vec<f64> = Vec::new();
-    for index in 1..calls.len() {
-        let growth = calls[index].context() - calls[index - 1].context() - calls[index - 1].output;
+    for pair in measured.windows(2) {
+        let (previous, index) = (pair[0], pair[1]);
+        let growth = calls[index].context() - calls[previous].context() - calls[previous].output;
         let estimated: f64 = items
             .iter()
             .filter(|item| item.entered_call == index)
@@ -481,17 +497,35 @@ fn build_ledger(calls: &[Call], items: &mut [Item], table: &pricing::PricingTabl
     let mut previous_context = 0i64;
     let mut previous_output = 0i64;
     let mut previous_reasoning = 0i64;
+    // The last measured call; unmeasured calls in between are skipped.
+    let mut previous_call: Option<usize> = None;
 
     for (call_index, call) in calls.iter().enumerate() {
+        if !call.measured() {
+            if unmeasured_session {
+                for item in items
+                    .iter_mut()
+                    .filter(|item| item.entered_call == call_index)
+                {
+                    item.tokens = item.est_tokens;
+                }
+            }
+            rows.push(CallRow {
+                cache_event: "usage_missing",
+                ..CallRow::default()
+            });
+            continue;
+        }
         let context = call.context();
-        let mut cache_event = if call_index == 0 {
+        let mut cache_event = if previous_call.is_none() {
             "cold_start"
         } else {
             "normal"
         };
 
         // Compaction: context shrank. Evict everything except the baseline.
-        if call_index > 0 && (context as f64) < previous_context as f64 * COMPACTION_SHRINK {
+        if previous_call.is_some() && (context as f64) < previous_context as f64 * COMPACTION_SHRINK
+        {
             cache_event = "compaction";
             live.retain(|(is_synthetic, index)| {
                 let keep = *is_synthetic && synthetic[*index].kind == "baseline";
@@ -525,15 +559,13 @@ fn build_ledger(calls: &[Call], items: &mut [Item], table: &pricing::PricingTabl
             .filter(|index| items[*index].entered_call == call_index)
             .collect();
         let mut budget = new_tokens;
-        if call_index == 0 {
-            // Everything logged before the first call; the rest is baseline.
-        } else if previous_output > 0 {
+        if let Some(previous) = previous_call.filter(|_| previous_output > 0) {
             let output_tokens = (previous_output as f64).min(budget);
             if output_tokens > 0.0 {
                 let mut item = Item::new(
                     format!("output:{call_index}"),
                     "assistant_output",
-                    calls[call_index - 1].ts_text.clone(),
+                    calls[previous].ts_text.clone(),
                     0,
                 );
                 item.tokens = output_tokens;
@@ -560,16 +592,14 @@ fn build_ledger(calls: &[Call], items: &mut [Item], table: &pricing::PricingTabl
         let mut residual = (budget - estimated * scale).max(0.0);
         // Some providers send the previous call's reasoning back. Whether one did is not
         // logged, so reasoning only explains growth the logged items leave over.
-        let reasoning = if call_index == 0 {
-            0.0
-        } else {
-            (previous_reasoning as f64).min(residual)
-        };
-        if reasoning >= 1.0 {
+        let reasoning = previous_call
+            .map(|previous| (previous, (previous_reasoning as f64).min(residual)))
+            .filter(|(_, tokens)| *tokens >= 1.0);
+        if let Some((previous, reasoning)) = reasoning {
             let mut item = Item::new(
                 format!("reasoning:{call_index}"),
                 "assistant_reasoning",
-                calls[call_index - 1].ts_text.clone(),
+                calls[previous].ts_text.clone(),
                 0,
             );
             item.tokens = reasoning;
@@ -580,7 +610,7 @@ fn build_ledger(calls: &[Call], items: &mut [Item], table: &pricing::PricingTabl
             residual -= reasoning;
         }
         if residual >= 1.0 {
-            let kind = if call_index == 0 {
+            let kind = if previous_call.is_none() {
                 "baseline"
             } else if cache_event == "compaction" {
                 // What a compaction kept or summarized, which can't be split by source.
@@ -606,7 +636,7 @@ fn build_ledger(calls: &[Call], items: &mut [Item], table: &pricing::PricingTabl
             new_tokens: new_tokens.round() as i64,
             carried_tokens: carried_before.round() as i64,
             cache_event,
-            residual_tokens: if call_index == 0 {
+            residual_tokens: if previous_call.is_none() {
                 0
             } else {
                 residual.round() as i64
@@ -614,7 +644,7 @@ fn build_ledger(calls: &[Call], items: &mut [Item], table: &pricing::PricingTabl
             ..CallRow::default()
         };
         let carried_reading_cache = call.cache_read as f64 >= carried_before * REBUILD_READ_SHARE;
-        if call_index > 0
+        if previous_call.is_some()
             && carried_before > 0.0
             && !carried_reading_cache
             && cache_event == "normal"
@@ -692,6 +722,7 @@ fn build_ledger(calls: &[Call], items: &mut [Item], table: &pricing::PricingTabl
         previous_context = context;
         previous_output = call.output;
         previous_reasoning = call.reasoning;
+        previous_call = Some(call_index);
     }
 
     // Items logged after the last call never entered a billed context.
@@ -1183,6 +1214,98 @@ mod tests {
             |r| r.get(0),
         )?;
         assert_eq!(unexplained, 0);
+        Ok(())
+    }
+
+    fn shell_output(key: &str, ts: &str, chars: i64) -> ToolCallRecord {
+        ToolCallRecord {
+            key: key.into(),
+            ts: Some(ts.into()),
+            ended_ts: Some(ts.into()),
+            tool_name: "shell".into(),
+            target: Some("multica issue list".into()),
+            output_chars: chars,
+            output_in_context: true,
+            status: "ok".into(),
+            ..ToolCallRecord::default()
+        }
+    }
+
+    #[test]
+    fn calls_that_report_no_usage_are_stepped_over() -> Result<()> {
+        let conn = Connection::open_in_memory()?;
+        init_app_schema(&conn)?;
+        let mut record = SessionRecord::new("opencode", "s1");
+        record.started_at = Some("2026-10-01T10:00:00Z".into());
+        record
+            .tool_calls
+            .push(shell_output("t1", "2026-10-01T10:00:05Z", 40_000));
+        record.usage = vec![
+            call("m1", "2026-10-01T10:00:02Z", 2, 0, 20_000, 100),
+            // The route returned no usage for this step.
+            call("m2", "2026-10-01T10:00:07Z", 0, 0, 0, 0),
+            call("m3", "2026-10-01T10:00:09Z", 2, 20_000, 10_100, 100),
+        ];
+        store_session_record(&conn, &record)?;
+        refresh_context_ledger(&conn)?;
+        let (entered, tokens): (i64, i64) = conn.query_row(
+            "SELECT entered_call, tokens FROM derived_context_item WHERE item_key = 'tool:t1'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        assert_eq!((entered, tokens), (2, 10_000));
+        let skipped: String = conn.query_row(
+            "SELECT cache_event FROM derived_api_call WHERE call_index = 1",
+            [],
+            |r| r.get(0),
+        )?;
+        assert_eq!(skipped, "usage_missing");
+        let (output, unexplained): (i64, i64) = conn.query_row(
+            "SELECT COALESCE(SUM(CASE WHEN kind = 'assistant_output' THEN tokens END), 0),
+                    COALESCE(SUM(CASE WHEN kind = 'unexplained' THEN tokens END), 0)
+             FROM derived_context_item",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        assert_eq!((output, unexplained), (100, 0));
+        Ok(())
+    }
+
+    #[test]
+    fn items_keep_estimated_sizes_when_no_call_reports_usage() -> Result<()> {
+        let conn = Connection::open_in_memory()?;
+        init_app_schema(&conn)?;
+        let mut record = SessionRecord::new("opencode", "s1");
+        record.started_at = Some("2026-10-01T10:00:00Z".into());
+        record
+            .tool_calls
+            .push(shell_output("t1", "2026-10-01T10:00:05Z", 40_000));
+        record.usage = vec![
+            call("m1", "2026-10-01T10:00:02Z", 0, 0, 0, 0),
+            call("m2", "2026-10-01T10:00:07Z", 0, 0, 0, 0),
+        ];
+        store_session_record(&conn, &record)?;
+        refresh_context_ledger(&conn)?;
+        let (entered, tokens): (i64, i64) = conn.query_row(
+            "SELECT entered_call, tokens FROM derived_context_item WHERE item_key = 'tool:t1'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        // Uncalibrated: no growth was observed to calibrate against.
+        assert_eq!((entered, tokens), (1, 11_111));
+        let synthetic: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM derived_context_item
+             WHERE kind IN ('baseline', 'unexplained', 'assistant_output')",
+            [],
+            |r| r.get(0),
+        )?;
+        assert_eq!(synthetic, 0);
+        let missing: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM derived_api_call WHERE cache_event = 'usage_missing'",
+            [],
+            |r| r.get(0),
+        )?;
+        assert_eq!(missing, 2);
         Ok(())
     }
 

@@ -242,6 +242,7 @@ button.primary { background: var(--accent); border-color: var(--accent); color: 
   const turnInfo = new Map(DATA.turns.map((t) => [t.turn, t]));
 
   function callLine(m) {
+    if (!m.total && m.cost == null) return '<span class="pill" title="The provider recorded zero for every count, so this call\'s size and cost are unknown">usage not reported</span>';
     return '<span class="pill">in ' + num(m.input) + '</span><span class="pill">cache r ' + num(m.cache_read) +
       '</span><span class="pill">cache w ' + num(m.cache_write) + '</span><span class="pill">out ' + num(m.output) +
       (m.reasoning ? '</span><span class="pill">reason ' + num(m.reasoning) : '') + '</span><span class="pill">' +
@@ -272,6 +273,7 @@ button.primary { background: var(--accent); border-color: var(--accent); color: 
   const reviewUrl = (p, s) => CORPUS_LINKS ? '/review/' + encodeURIComponent(p) + '/' + encodeURIComponent(s) : '#';
   function ctxPill(c, kind) {
     if (!c) return '';
+    if (kind === 'call' && c.cache_event === 'usage_missing') return '<span class="ctx" title="No usage was reported, so the context ledger skips this call; what was logged before it is counted at the next call that reported usage">ctx unknown</span>';
     if (kind === 'call') return '<span class="ctx" title="Context ledger: context size at this call, newly written and carried tokens, cache event">ctx ' +
       num(c.context) + ' · new ' + num(c.new) + ' · carried ' + num(c.carried) + (c.cache_event && c.cache_event !== 'hit' ? ' · ' + esc(c.cache_event) : '') + '</span>';
     return '<span class="ctx" title="Entered the context at call ' + c.entered + (c.evicted != null ? ', evicted at call ' + c.evicted : '') +
@@ -284,7 +286,15 @@ button.primary { background: var(--accent); border-color: var(--accent); color: 
     assistant_reasoning: 'var(--assistant)', assistant_text: 'var(--assistant)', baseline: 'var(--event)', compacted_history: 'var(--warn)', unexplained: 'var(--bad)' };
   const kindColor = (k) => KIND_COLORS[k] || 'var(--call)';
   let entryByItem = null;  // 'agent key' -> timeline entry id, for jumping from an item to its source
-  function sourceEntry(agent, key) {
+  // The call that produced a reply or reasoning item: the measured call before the one it entered,
+  // found by timestamp because calls that reported no usage can sit in between.
+  function producerCall(i) {
+    const c = M.context.calls.find((c) => c.agent === i.agent && c.ts === i.ts && c.call < i.entered);
+    if (c) return c.call;
+    const n = /:(\d+)$/.exec(i.key);
+    return n ? Number(n[1]) - 1 : null;
+  }
+  function sourceEntry(agent, key, item) {
     if (!entryByItem) {
       entryByItem = new Map();
       for (const e of DATA.timeline) {
@@ -297,25 +307,25 @@ button.primary { background: var(--accent); border-color: var(--accent); color: 
     const direct = entryByItem.get(agent + ' ' + key);
     if (direct != null) return direct;
     // The model's reply and reasoning enter the call after the one that produced them.
-    const m = /^(output|reasoning):(\d+)$/.exec(key);
-    return m ? entryByItem.get(agent + ' call:' + (Number(m[2]) - 1)) : undefined;
+    return /^(output|reasoning):\d+$/.test(key) && item ? entryByItem.get(agent + ' call:' + producerCall(item)) : undefined;
   }
   function itemLabel(i) {
     if (i.target || i.source) return i.target || i.source;
-    const n = /:(\d+)$/.exec(i.key), from = n ? Number(n[1]) - 1 : null;
+    const from = producerCall(i);
     switch (i.kind) {
       case 'user_message': return 'message from you';
       case 'assistant_output': return 'reply from call ' + from;
       case 'assistant_reasoning': return 'reasoning from call ' + from;
       case 'baseline': return 'system prompt and tool list (not logged)';
-      case 'compacted_history': return 'history kept by the compaction at call ' + (from + 1);
-      case 'unexplained': return 'growth at call ' + (from + 1) + ' nothing logged accounts for';
+      case 'compacted_history': return 'history kept by the compaction at call ' + i.entered;
+      case 'unexplained': return 'growth at call ' + i.entered + ' nothing logged accounts for';
       default: return i.tool || i.key;
     }
   }
   function compositionHtml(e) {
     const call = e.meta.ctx.call, agent = agentOf(e);
     const live = M.context.items.filter((i) => i.agent === agent && i.entered <= call && (i.evicted == null || i.evicted > call));
+    const missing = e.meta.ctx.cache_event === 'usage_missing';
     if (!live.length) return '<div class="meta">No context ledger items for this call.</div>';
     const total = live.reduce((s, i) => s + i.tokens, 0);
     const byKind = new Map();
@@ -326,8 +336,9 @@ button.primary { background: var(--accent); border-color: var(--accent); color: 
     }
     const kinds = [...byKind.entries()].sort((a, b) => b[1].tokens - a[1].tokens);
     const share = (t) => total ? (100 * t / total).toFixed(t / total < 0.1 ? 1 : 0) + '%' : '—';
-    let html = '<div class="comp"><div class="meta">Context at call ' + call + ': ' + num(e.meta.ctx.context) + ' tokens reported, ' + num(total) +
-      ' placed on ' + live.length + ' items. New at this call: ' + num(live.filter((i) => i.entered === call).reduce((s, i) => s + i.tokens, 0)) + '.</div>';
+    let html = '<div class="comp"><div class="meta">Context at call ' + call + ': ' + (missing ? 'no usage reported, so the size is unknown; ' +
+      num(total) + ' tokens estimated from what was logged' : num(e.meta.ctx.context) + ' tokens reported, ' + num(total) + ' placed') + ' on ' + live.length +
+      ' items. New at this call: ' + num(live.filter((i) => i.entered === call).reduce((s, i) => s + i.tokens, 0)) + '.</div>';
     html += '<div class="stack">' + kinds.map(([k, v]) => '<span title="' + esc(k + ' ' + num(v.tokens) + ' tokens (' + share(v.tokens) + ')') + '" style="width:' +
       (100 * v.tokens / (total || 1)) + '%;background:' + kindColor(k) + '"></span>').join('') + '</div>';
     html += '<table class="dm"><tr><th>kind</th><th>items</th><th>tokens</th><th>share</th><th>new here</th></tr>' + kinds.map(([k, v]) =>
@@ -336,7 +347,7 @@ button.primary { background: var(--accent); border-color: var(--accent); color: 
     const LIMIT = 40;
     const rows = live.slice().sort((a, b) => b.tokens - a.tokens);
     html += '<table class="dm comp-items"><tr><th>tokens</th><th>kind</th><th>what</th><th>since</th></tr>' + rows.slice(0, LIMIT).map((i) => {
-      const target = sourceEntry(agent, i.key);
+      const target = sourceEntry(agent, i.key, i);
       const what = esc(itemLabel(i).slice(0, 140));
       return '<tr' + (i.entered === call ? ' class="fresh"' : '') + '><td class="n">' + num(i.tokens) + '</td><td>' + esc(i.kind) + '</td><td>' +
         (target != null ? '<a href="#" data-jump="' + target + '" title="Show where this entered">' + what + '</a>' : what) + '</td><td class="n">' +
