@@ -13,6 +13,10 @@ context.baseline:
   items: 1
   tokens: 6727
   total_usd: 0.351123
+context.compacted_history:
+  items: 1
+  tokens: 4206
+  total_usd: 0.114221
 context.system_prompt:
   items: 4
   tokens: 4297
@@ -22,9 +26,9 @@ context.tool_result:
   tokens: 112461
   total_usd: 1.771194
 context.unexplained:
-  items: 115
-  tokens: 173215
-  total_usd: 3.396176
+  items: 114
+  tokens: 169009
+  total_usd: 3.281955
 context.user_message:
   items: 15
   tokens: 18
