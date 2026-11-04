@@ -138,6 +138,7 @@ button.primary { background: var(--accent); border-color: var(--accent); color: 
 .stack span { display: block; height: 100%; }
 .comp { margin: 6px 0; }
 .comp-items tr.fresh td { font-weight: 600; }
+.comp .dm td:not(:nth-child(3)) { white-space: nowrap; overflow-wrap: normal; }
 </style>
 </head>
 <body>
@@ -299,6 +300,19 @@ button.primary { background: var(--accent); border-color: var(--accent); color: 
     const m = /^(output|reasoning):(\d+)$/.exec(key);
     return m ? entryByItem.get(agent + ' call:' + (Number(m[2]) - 1)) : undefined;
   }
+  function itemLabel(i) {
+    if (i.target || i.source) return i.target || i.source;
+    const n = /:(\d+)$/.exec(i.key), from = n ? Number(n[1]) - 1 : null;
+    switch (i.kind) {
+      case 'user_message': return 'message from you';
+      case 'assistant_output': return 'reply from call ' + from;
+      case 'assistant_reasoning': return 'reasoning from call ' + from;
+      case 'baseline': return 'system prompt and tool list (not logged)';
+      case 'compacted_history': return 'history kept by the compaction at call ' + (from + 1);
+      case 'unexplained': return 'growth at call ' + (from + 1) + ' nothing logged accounts for';
+      default: return i.tool || i.key;
+    }
+  }
   function compositionHtml(e) {
     const call = e.meta.ctx.call, agent = agentOf(e);
     const live = M.context.items.filter((i) => i.agent === agent && i.entered <= call && (i.evicted == null || i.evicted > call));
@@ -323,7 +337,7 @@ button.primary { background: var(--accent); border-color: var(--accent); color: 
     const rows = live.slice().sort((a, b) => b.tokens - a.tokens);
     html += '<table class="dm comp-items"><tr><th>tokens</th><th>kind</th><th>what</th><th>since</th></tr>' + rows.slice(0, LIMIT).map((i) => {
       const target = sourceEntry(agent, i.key);
-      const what = esc((i.target || i.source || i.tool || i.key).slice(0, 140));
+      const what = esc(itemLabel(i).slice(0, 140));
       return '<tr' + (i.entered === call ? ' class="fresh"' : '') + '><td class="n">' + num(i.tokens) + '</td><td>' + esc(i.kind) + '</td><td>' +
         (target != null ? '<a href="#" data-jump="' + target + '" title="Show where this entered">' + what + '</a>' : what) + '</td><td class="n">' +
         (i.entered === call ? 'new' : 'call ' + i.entered) + '</td></tr>';
