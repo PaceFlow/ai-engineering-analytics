@@ -137,6 +137,12 @@ button.primary { background: var(--accent); border-color: var(--accent); color: 
 .stack { display: flex; height: 10px; border-radius: 5px; overflow: hidden; margin: 6px 0; background: var(--line); }
 .stack span { display: block; height: 100%; }
 .comp { margin: 6px 0; }
+.raw { border-left: 3px solid var(--line); padding-left: 8px; margin: 6px 0; }
+.raw-h { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .04em; margin-top: 6px; }
+.raw pre.raw-reasoning { font-style: italic; color: var(--muted); }
+.raw-msg { margin: 10px 0; }
+.raw-msg > .meta b { text-transform: uppercase; font-size: 11px; }
+.raw-tool > summary { cursor: pointer; font: 12.5px var(--mono); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .comp-items tr.fresh td { font-weight: 600; }
 .comp .dm td:not(:nth-child(3)) { white-space: nowrap; overflow-wrap: normal; }
 </style>
@@ -151,6 +157,7 @@ button.primary { background: var(--accent); border-color: var(--accent); color: 
     <span class="chips" id="kinds"></span>
     <button id="subs" class="on" title="Show subagent entries">subagents</button>
     <button id="onlyhl" title="Show only entries behind the selected number">only selected</button>
+    <button id="rawbtn" hidden title="Read the whole conversation from the provider's own files: prompts, reasoning, replies, tool input and output. Read on request and never stored.">raw transcript</button>
     <span class="progress" id="progress"></span>
     <label class="btn" title="Load an earlier expectations file">Import<input type="file" id="import" accept=".json" hidden></label>
     <button id="export" title="Download approved and rejected numbers">Export expectations</button>
@@ -417,7 +424,48 @@ button.primary { background: var(--accent); border-color: var(--accent); color: 
     }
     return true;
   }
+  // ── Raw transcript: read from the provider's files on request, never stored ──
+  let rawMode = false;
+  const PROVIDER = DATA.key.split(':')[0];
+  const rawCache = new Map();  // agent session -> promise of {messages} or {error}
+  function rawOf(agent) {
+    if (!rawCache.has(agent)) {
+      rawCache.set(agent, fetch('/api/raw/' + encodeURIComponent(PROVIDER) + '/' + encodeURIComponent(agent))
+        .then((r) => r.json()).catch((err) => ({ error: String(err) })));
+    }
+    return rawCache.get(agent);
+  }
+  function fillRaw(el, agent, pick) {
+    rawOf(agent).then((raw) => {
+      el.innerHTML = raw.error ? '<div class="meta">Raw view: ' + esc(raw.error) + '</div>' : (pick(raw.messages || []) || '<div class="meta">Not found in the source.</div>');
+    });
+  }
+  const cutNote = (n) => n ? '<div class="meta">… ' + num(n) + ' more characters not shown</div>' : '';
+  function rawToolHtml(b, open) {
+    const head = (b.input || '').replace(/\s+/g, ' ').slice(0, 160);
+    return '<details class="raw-tool"' + (open ? ' open' : '') + '><summary><span class="badge">' + esc(b.tool || 'tool') + '</span> ' +
+      (b.status && b.status !== 'completed' ? '<span class="badge err">' + esc(b.status) + '</span> ' : '') + esc(head) + '</summary>' +
+      (b.input ? '<div class="raw-h">input</div><pre class="body">' + esc(b.input) + '</pre>' + cutNote(b.input_cut) : '') +
+      '<div class="raw-h">output</div><pre class="body">' + esc(b.text || '(no output recorded)') + '</pre>' + cutNote(b.cut) + '</details>';
+  }
+  function rawBlockHtml(b) {
+    if (b.kind === 'tool') return rawToolHtml(b, false);
+    return '<div class="raw-h">' + esc(b.kind) + '</div><pre class="body raw-' + esc(b.kind) + '">' + esc(b.text) + '</pre>' + cutNote(b.cut);
+  }
+  function renderRaw() {
+    const el = document.getElementById('timeline');
+    el.innerHTML = '<p class="meta">Reading the conversation from the source…</p>';
+    rawOf(S.session_id).then((raw) => {
+      if (!rawMode) return;
+      if (raw.error) { el.innerHTML = '<p class="empty">Raw view: ' + esc(raw.error) + '</p>'; return; }
+      const msgs = (raw.messages || []).filter((m) => !query || JSON.stringify(m.blocks).toLowerCase().includes(query));
+      el.innerHTML = '<p class="meta">' + num(msgs.length) + ' messages read from ' + esc(raw.source) + '. Shown here only; nothing is copied into the VCA database.</p>' +
+        msgs.map((m) => '<div class="raw-msg"><div class="meta"><b>' + esc(m.role) + '</b> · ' + esc(time(m.ts)) + ' · ' + esc(m.id) + '</div><div class="raw">' +
+          (m.blocks.length ? m.blocks.map((b) => rawBlockHtml(b)).join('') : '<div class="meta">(no content)</div>') + '</div></div>').join('');
+    });
+  }
   function renderTimeline() {
+    if (rawMode) return renderRaw();
     const out = [];
     let lastTurn;
     for (const e of DATA.timeline) {
@@ -454,10 +502,23 @@ button.primary { background: var(--accent); border-color: var(--accent); color: 
     }
     if (e.kind === 'call') html += compositionHtml(e);
     if (e.body) html += '<pre class="body">' + esc(e.body) + '</pre>';
+    const rawKey = !CORPUS_LINKS ? null : e.kind === 'call' ? e.meta.usage_key : e.kind === 'tool' ? e.meta.call_key : null;
+    if (rawKey) html += '<div class="raw">Reading the source…</div>';
     d.insertAdjacentHTML('beforeend', html || '<div class="meta">no further detail</div>');
     d.dataset.filled = '1';
+    if (rawKey) fillRaw(d.querySelector('.raw'), agentOf(e), (messages) => {
+      if (e.kind === 'tool') {
+        for (const m of messages) for (const b of m.blocks) if (b.kind === 'tool' && b.call_id === rawKey) return rawToolHtml(b, true);
+        return '';
+      }
+      const m = messages.find((m) => m.id === rawKey);
+      return m ? '<div class="meta">What the model produced in this step, from the source (not stored)</div>' + m.blocks.map((b) => rawBlockHtml(b)).join('') : '';
+    });
   }, true);
   document.getElementById('q').addEventListener('input', (ev) => { query = ev.target.value.trim().toLowerCase(); renderTimeline(); });
+  const rawBtn = document.getElementById('rawbtn');
+  rawBtn.hidden = !CORPUS_LINKS;
+  rawBtn.onclick = () => { rawMode = !rawMode; rawBtn.classList.toggle('on', rawMode); renderTimeline(); };
   document.getElementById('subs').onclick = (ev) => { showSubs = !showSubs; ev.target.classList.toggle('on'); renderTimeline(); };
   document.getElementById('onlyhl').onclick = (ev) => { onlyHl = !onlyHl; ev.target.classList.toggle('on'); renderTimeline(); };
 

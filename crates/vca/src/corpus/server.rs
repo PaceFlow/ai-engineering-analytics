@@ -287,6 +287,26 @@ impl State {
                     &data, &corpus,
                 )?))
             }
+            ("GET", ["api", "raw", provider, session]) => {
+                // Prompts and tool output, read from the source on each request and never
+                // stored. Only for this server's own host name, so a page served from another
+                // name that resolves here (DNS rebinding) cannot read them.
+                if !req
+                    .headers
+                    .get("host")
+                    .is_some_and(|host| same_origin(&format!("http://{host}"), &self.origin))
+                {
+                    return Ok(Response::json(
+                        403,
+                        &json!({ "error": "unknown host name refused" }),
+                    ));
+                }
+                let conn = crate::db::open()?;
+                Ok(Response::json(
+                    200,
+                    &explore::raw::raw_transcript(&conn, provider, session)?,
+                ))
+            }
             ("POST", ["api", "save", provider, session]) => {
                 if let Some(origin) = req.headers.get("origin")
                     && !same_origin(origin, &self.origin)
