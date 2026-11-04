@@ -471,6 +471,7 @@ fn context_kind(kind: &str) -> &'static str {
         "assistant_reasoning" => "The model's earlier reasoning, sent back to it",
         "baseline" => "The fixed start of every call (system prompt and tool list)",
         "unexplained" => "Context vca could not attribute to anything it saw",
+        "compacted_history" => "Earlier conversation a compaction kept or summarized",
         "tool_definitions" => "Tool definitions",
         "environment" => "Environment details the tool injects (cwd, date, git status)",
         "skill_listing" => "The list of available skills",

@@ -498,6 +498,9 @@ pub fn explain(app: &App) -> Option<(String, Vec<String>)> {
                 "assistant_reasoning = the previous call's reasoning, when growth left room for it."
                     .into(),
             );
+            lines.push(
+                "compacted_history = earlier conversation a compaction kept or summarized.".into(),
+            );
             lines.push("unexplained = growth the logged items do not account for.".into());
         }
         (_, Data::ContextItems(rows)) => {

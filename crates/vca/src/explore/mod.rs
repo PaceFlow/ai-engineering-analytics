@@ -2222,7 +2222,7 @@ pub fn session_detail(
                 CASE WHEN c.context_tokens = 0 THEN 'usage unavailable'
                   WHEN EXISTS (
                     SELECT 1 FROM derived_context_item i WHERE i.provider = c.provider
-                      AND i.session_id = c.session_id AND i.kind IN ('baseline', 'unexplained')
+                      AND i.session_id = c.session_id AND i.kind IN ('baseline', 'unexplained', 'compacted_history')
                       AND i.entered_call <= c.call_index
                       AND (i.evicted_call IS NULL OR i.evicted_call > c.call_index)
                 ) THEN 'partial' ELSE 'observed sizes' END,

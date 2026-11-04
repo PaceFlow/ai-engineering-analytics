@@ -380,7 +380,7 @@ fn origin_labels(item: &Item) -> (&'static str, &'static str, &'static str) {
         "user_message" | "assistant_text" | "assistant_output" | "assistant_reasoning" => {
             "conversation"
         }
-        "baseline" | "unexplained" => "unknown",
+        "baseline" | "unexplained" | "compacted_history" => "unknown",
         "tool_result"
             if item.tool_name.as_deref().is_some_and(|name| {
                 let name = name.to_ascii_lowercase();
@@ -580,6 +580,9 @@ fn build_ledger(calls: &[Call], items: &mut [Item], table: &pricing::PricingTabl
         if residual >= 1.0 {
             let kind = if call_index == 0 {
                 "baseline"
+            } else if cache_event == "compaction" {
+                // What a compaction kept or summarized, which can't be split by source.
+                "compacted_history"
             } else {
                 "unexplained"
             };
@@ -1132,6 +1135,37 @@ mod tests {
         };
         assert_eq!(tokens("assistant_reasoning")?, 4_000);
         assert_eq!(tokens("unexplained")?, 500);
+        Ok(())
+    }
+
+    #[test]
+    fn context_kept_by_a_compaction_is_compacted_history() -> Result<()> {
+        let conn = Connection::open_in_memory()?;
+        init_app_schema(&conn)?;
+        let mut record = SessionRecord::new("opencode", "s1");
+        record.started_at = Some("2026-10-01T10:00:00Z".into());
+        record.context_injections.push(ContextInjectionRecord {
+            key: "i1".into(),
+            ts: Some("2026-10-01T10:00:00Z".into()),
+            kind: "instructions".into(),
+            source: None,
+            chars: 80_000,
+        });
+        record.usage = vec![
+            call("m1", "2026-10-01T10:00:02Z", 2, 0, 24_000, 100),
+            call("m2", "2026-10-01T10:00:07Z", 2, 0, 9_000, 100),
+        ];
+        store_session_record(&conn, &record)?;
+        refresh_context_ledger(&conn)?;
+        let tokens = |kind: &str| -> Result<i64> {
+            Ok(conn.query_row(
+                "SELECT COALESCE(SUM(tokens), 0) FROM derived_context_item WHERE kind = ?1",
+                [kind],
+                |r| r.get(0),
+            )?)
+        };
+        assert!(tokens("compacted_history")? > 0);
+        assert_eq!(tokens("unexplained")?, 0);
         Ok(())
     }
 
