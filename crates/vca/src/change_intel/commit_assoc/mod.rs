@@ -69,8 +69,14 @@ pub fn plan(conn: &Connection) -> Result<AssociationWorkPlan> {
         }
     }
 
-    for (repo_root, absorbed_roots) in choose_scan_roots(conn, shared)? {
-        repo_plans.push(plan_repo(conn, repo_root, absorbed_roots)?);
+    let scan_roots = choose_scan_roots(conn, shared)?;
+    // Separate clones of one repository list the same commits; each is stored once.
+    storage::drop_commits_stored_in_another_clone(conn)?;
+    let mut claimed = storage::stored_commits_by_repository(conn)?;
+    for (repo_root, absorbed_roots) in scan_roots {
+        let repository = storage::repository_of(conn, &repo_root)?;
+        let claimed = claimed.entry(repository).or_default();
+        repo_plans.push(plan_repo(conn, repo_root, absorbed_roots, claimed)?);
     }
     Ok(AssociationWorkPlan { repo_plans })
 }
@@ -189,6 +195,7 @@ fn plan_repo(
     conn: &Connection,
     repo_root: String,
     absorbed_roots: Vec<String>,
+    claimed: &mut BTreeSet<String>,
 ) -> Result<RepoAssociationPlan> {
     let mut repo_plan = RepoAssociationPlan {
         repo_root: repo_root.clone(),
@@ -228,18 +235,17 @@ fn plan_repo(
     };
 
     let cached_commit_shas = list_cached_commit_shas(conn, &repo_root)?;
-    let cached_lookup: std::collections::HashSet<String> =
-        cached_commit_shas.iter().cloned().collect();
 
     let mut work_index: HashMap<String, usize> = HashMap::new();
     let mut commits = Vec::new();
 
+    // `claimed` holds the commits stored or planned under any clone of this repository.
     merge_work_items(
         &mut commits,
         &mut work_index,
         commit_shas
             .into_iter()
-            .filter(|commit_sha| !cached_lookup.contains(commit_sha)),
+            .filter(|commit_sha| claimed.insert(commit_sha.clone())),
         true,
         true,
         CommitDiffSource::Git,
@@ -716,6 +722,85 @@ mod tests {
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
             .collect::<rusqlite::Result<_>>()?;
         assert_eq!(matched, [("s1".to_string(), "add lib".to_string())]);
+        Ok(())
+    }
+
+    #[test]
+    fn clones_of_one_repository_store_each_commit_once() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let first = dir.path().join("a");
+        std::fs::create_dir(&first)?;
+        git(&first, &["init", "-q", "-b", "main"]);
+        std::fs::write(first.join("README"), "start\n")?;
+        git(&first, &["add", "."]);
+        git(&first, &["commit", "-q", "-m", "start"]);
+        let content = "fn alpha() {}\nfn beta() {}\nfn gamma() {}\n";
+        std::fs::write(first.join("lib.rs"), content)?;
+        git(&first, &["add", "."]);
+        git(&first, &["commit", "-q", "-m", "add lib"]);
+        let second = dir.path().join("b");
+        git(
+            dir.path(),
+            &[
+                "clone",
+                "-q",
+                first.to_str().unwrap(),
+                second.to_str().unwrap(),
+            ],
+        );
+
+        let first_root = validate_git_repo(first.to_str().unwrap())?.unwrap();
+        let second_root = validate_git_repo(second.to_str().unwrap())?.unwrap();
+        let mut conn = Connection::open_in_memory()?;
+        crate::db::init_app_schema(&conn)?;
+        for root in [&first_root, &second_root] {
+            observation::set_alias(&conn, root, "git:example.com/app", "source")?;
+        }
+        let edited = (Utc::now() - Duration::hours(1)).to_rfc3339();
+        conn.execute(
+            "INSERT INTO fact_session_code_change (provider, session_id, source_kind, repo_root, rel_path, change_ts)
+             VALUES ('opencode', 's1', 'accepted_change', ?1, 'lib.rs', ?2)",
+            params![second_root, edited],
+        )?;
+        let change_id = conn.last_insert_rowid();
+        for hash in hashes_for_text(content, LineSide::Added) {
+            conn.execute(
+                "INSERT INTO fact_session_code_change_line_hashes VALUES (?1, '+', ?2, ?3)",
+                params![change_id, hash.line_hash, hash.count],
+            )?;
+        }
+        conn.execute(
+            "INSERT INTO fact_session_code_change (provider, session_id, source_kind, repo_root, rel_path, change_ts)
+             VALUES ('opencode', 's0', 'accepted_change', ?1, 'README', ?2)",
+            params![first_root, edited],
+        )?;
+        let work = plan(&conn)?;
+        run_with_plan(&mut conn, &work, false, None)?;
+        // A copy stored under the second clone by an earlier version.
+        conn.execute(
+            "INSERT INTO fact_commit (repo_root, commit_sha, commit_time, subject)
+             SELECT ?1, commit_sha, commit_time, subject FROM fact_commit WHERE subject = 'add lib'",
+            params![second_root],
+        )?;
+        let work = plan(&conn)?;
+        run_with_plan(&mut conn, &work, false, None)?;
+
+        let commits: Vec<(String, String)> = conn
+            .prepare("SELECT repo_root, subject FROM fact_commit ORDER BY subject")?
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        assert_eq!(
+            commits,
+            [
+                (first_root.clone(), "add lib".to_string()),
+                (first_root, "start".to_string()),
+            ]
+        );
+        let matched: Vec<String> = conn
+            .prepare("SELECT c.subject FROM fact_commit_session_match m JOIN fact_commit c USING (repo_root, commit_sha) WHERE m.session_id = 's1'")?
+            .query_map([], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        assert_eq!(matched, ["add lib"]);
         Ok(())
     }
 

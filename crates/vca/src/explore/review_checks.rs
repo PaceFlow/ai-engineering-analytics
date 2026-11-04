@@ -468,6 +468,7 @@ fn context_kind(kind: &str) -> &'static str {
     match kind {
         "tool_result" => "Tool output (file contents, command output)",
         "assistant_output" => "The model's own earlier replies",
+        "assistant_reasoning" => "The model's earlier reasoning, sent back to it",
         "baseline" => "The fixed start of every call (system prompt and tool list)",
         "unexplained" => "Context vca could not attribute to anything it saw",
         "tool_definitions" => "Tool definitions",

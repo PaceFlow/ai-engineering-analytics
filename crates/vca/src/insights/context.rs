@@ -106,6 +106,8 @@ struct Call {
     cache_write: i64,
     cache_write_1h: i64,
     output: i64,
+    /// Reasoning tokens not already counted in `output`.
+    reasoning: i64,
     context_window: Option<i64>,
 }
 
@@ -375,7 +377,9 @@ fn origin_labels(item: &Item) -> (&'static str, &'static str, &'static str) {
         "mcp_instructions" => "mcp_server",
         "tool_definitions" => "tool_schema",
         "instructions" | "system_prompt" => "instructions",
-        "user_message" | "assistant_text" | "assistant_output" => "conversation",
+        "user_message" | "assistant_text" | "assistant_output" | "assistant_reasoning" => {
+            "conversation"
+        }
         "baseline" | "unexplained" => "unknown",
         "tool_result"
             if item.tool_name.as_deref().is_some_and(|name| {
@@ -474,6 +478,7 @@ fn build_ledger(calls: &[Call], items: &mut [Item], table: &pricing::PricingTabl
     let mut live: Vec<(bool, usize)> = Vec::new(); // (is_synthetic, index)
     let mut previous_context = 0i64;
     let mut previous_output = 0i64;
+    let mut previous_reasoning = 0i64;
 
     for (call_index, call) in calls.iter().enumerate() {
         let context = call.context();
@@ -498,6 +503,7 @@ fn build_ledger(calls: &[Call], items: &mut [Item], table: &pricing::PricingTabl
                 keep
             });
             previous_output = 0;
+            previous_reasoning = 0;
         }
 
         let carried_before: f64 = live
@@ -549,7 +555,28 @@ fn build_ledger(calls: &[Call], items: &mut [Item], table: &pricing::PricingTabl
             items[*index].tokens = items[*index].est_tokens * factor * scale;
             live.push((false, *index));
         }
-        let residual = (budget - estimated * scale).max(0.0);
+        let mut residual = (budget - estimated * scale).max(0.0);
+        // Some providers send the previous call's reasoning back. Whether one did is not
+        // logged, so reasoning only explains growth the logged items leave over.
+        let reasoning = if call_index == 0 {
+            0.0
+        } else {
+            (previous_reasoning as f64).min(residual)
+        };
+        if reasoning >= 1.0 {
+            let mut item = Item::new(
+                format!("reasoning:{call_index}"),
+                "assistant_reasoning",
+                calls[call_index - 1].ts_text.clone(),
+                0,
+            );
+            item.tokens = reasoning;
+            item.est_tokens = reasoning;
+            item.entered_call = call_index;
+            synthetic.push(item);
+            live.push((true, synthetic.len() - 1));
+            residual -= reasoning;
+        }
         if residual >= 1.0 {
             let kind = if call_index == 0 {
                 "baseline"
@@ -659,6 +686,7 @@ fn build_ledger(calls: &[Call], items: &mut [Item], table: &pricing::PricingTabl
         rows.push(row);
         previous_context = context;
         previous_output = call.output;
+        previous_reasoning = call.reasoning;
     }
 
     // Items logged after the last call never entered a billed context.
@@ -843,7 +871,8 @@ fn load_sessions(conn: &Connection) -> Result<HashMap<Key, SessionInfo>> {
 fn load_calls(conn: &Connection) -> Result<BTreeMap<Key, Vec<Call>>> {
     let mut stmt = conn.prepare(
         "SELECT id, provider, session_id, usage_ts, model_name, input_tokens, cached_input_tokens,
-                cache_creation_tokens, cache_creation_1h_tokens, output_tokens, context_window
+                cache_creation_tokens, cache_creation_1h_tokens, output_tokens, context_window,
+                CASE WHEN reasoning_in_output = 0 THEN reasoning_tokens ELSE 0 END
          FROM fact_session_usage
          WHERE token_source = 'reported' AND usage_ts IS NOT NULL
          ORDER BY provider, session_id, usage_ts, usage_index",
@@ -862,6 +891,7 @@ fn load_calls(conn: &Connection) -> Result<BTreeMap<Key, Vec<Call>>> {
                 cache_write: row.get(7)?,
                 cache_write_1h: row.get(8)?,
                 output: row.get(9)?,
+                reasoning: row.get(11)?,
                 context_window: row.get(10)?,
             },
         ))
@@ -1075,6 +1105,33 @@ mod tests {
                 r.get(0)
             })?;
         assert!((calls - items).abs() < 1e-9, "calls {calls} items {items}");
+        Ok(())
+    }
+
+    #[test]
+    fn growth_after_reasoning_is_attributed_to_reasoning() -> Result<()> {
+        let conn = Connection::open_in_memory()?;
+        init_app_schema(&conn)?;
+        let mut record = SessionRecord::new("opencode", "s1");
+        record.started_at = Some("2026-10-01T10:00:00Z".into());
+        let mut first = call("m1", "2026-10-01T10:00:02Z", 2, 0, 20_000, 100);
+        first.reasoning_tokens = 4_000;
+        record.usage = vec![
+            first,
+            // Grew by the reply plus the reasoning, plus 500 nothing logged accounts for.
+            call("m2", "2026-10-01T10:00:07Z", 2, 20_000, 4_600, 100),
+        ];
+        store_session_record(&conn, &record)?;
+        refresh_context_ledger(&conn)?;
+        let tokens = |kind: &str| -> Result<i64> {
+            Ok(conn.query_row(
+                "SELECT COALESCE(SUM(tokens), 0) FROM derived_context_item WHERE kind = ?1",
+                [kind],
+                |r| r.get(0),
+            )?)
+        };
+        assert_eq!(tokens("assistant_reasoning")?, 4_000);
+        assert_eq!(tokens("unexplained")?, 500);
         Ok(())
     }
 

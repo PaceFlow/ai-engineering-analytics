@@ -494,6 +494,10 @@ pub fn explain(app: &App) -> Option<(String, Vec<String>)> {
             lines.push(
                 "baseline = system prompt and tool schemas not logged in the transcript.".into(),
             );
+            lines.push(
+                "assistant_reasoning = the previous call's reasoning, when growth left room for it."
+                    .into(),
+            );
             lines.push("unexplained = growth the logged items do not account for.".into());
         }
         (_, Data::ContextItems(rows)) => {

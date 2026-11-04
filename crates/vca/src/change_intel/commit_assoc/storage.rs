@@ -129,6 +129,69 @@ pub fn absorb_worktree_commits(
     Ok(hashes)
 }
 
+/// The repository a stored commit belongs to: its root's canonical repository, or the root.
+const COMMIT_REPOSITORY: &str = "COALESCE((SELECT canonical FROM repository_alias WHERE alias = fact_commit.repo_root), repo_root)";
+
+/// Separate clones of one repository each scan the same commits. Keeps one stored copy per
+/// repository, under the first root by path, and returns how many copies were dropped.
+/// Matching reads the edits of every clone, so the kept copy carries the same matches.
+pub fn drop_commits_stored_in_another_clone(conn: &Connection) -> Result<usize> {
+    conn.execute_batch(&format!(
+        "DROP TABLE IF EXISTS temp.duplicate_commit;
+         CREATE TEMP TABLE duplicate_commit AS
+         WITH stored AS (SELECT repo_root, commit_sha, {COMMIT_REPOSITORY} AS repository
+                         FROM fact_commit)
+         SELECT s.repo_root, s.commit_sha FROM stored s
+         WHERE EXISTS (SELECT 1 FROM stored k WHERE k.repository = s.repository
+                         AND k.commit_sha = s.commit_sha AND k.repo_root < s.repo_root);"
+    ))?;
+    const DUPLICATE: &str =
+        "(repo_root, commit_sha) IN (SELECT repo_root, commit_sha FROM temp.duplicate_commit)";
+    conn.execute(
+        &format!(
+            "DELETE FROM fact_commit_file_change_line_hashes WHERE file_change_id IN
+                (SELECT id FROM fact_commit_file_change WHERE {DUPLICATE})"
+        ),
+        [],
+    )?;
+    for table in [
+        "fact_commit_file_change",
+        "fact_commit_session_match",
+        "fact_task_commit_assignment",
+    ] {
+        conn.execute(&format!("DELETE FROM {table} WHERE {DUPLICATE}"), [])?;
+    }
+    let dropped = conn.execute(&format!("DELETE FROM fact_commit WHERE {DUPLICATE}"), [])?;
+    conn.execute_batch("DROP TABLE temp.duplicate_commit")?;
+    Ok(dropped)
+}
+
+/// Stored commit SHAs by the repository they belong to.
+pub fn stored_commits_by_repository(
+    conn: &Connection,
+) -> Result<BTreeMap<String, BTreeSet<String>>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {COMMIT_REPOSITORY}, commit_sha FROM fact_commit"
+    ))?;
+    let mut out: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for row in stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))? {
+        let (repository, sha) = row?;
+        out.entry(repository).or_default().insert(sha);
+    }
+    Ok(out)
+}
+
+pub fn repository_of(conn: &Connection, repo_root: &str) -> Result<String> {
+    Ok(conn
+        .query_row(
+            "SELECT canonical FROM repository_alias WHERE alias = ?1",
+            params![repo_root],
+            |r| r.get(0),
+        )
+        .optional()?
+        .unwrap_or_else(|| repo_root.to_string()))
+}
+
 pub fn upsert_git_commit_with_diffs(
     conn: &Connection,
     repo_root: &str,
