@@ -318,6 +318,33 @@ button.primary { background: var(--accent); border-color: var(--accent); color: 
     return a != null && b != null && b >= a ? [a, b] : null;
   }
   const estimated = (e) => e.kind === 'call' && !!(callStart.get(e.id) || [])[1];
+  // Some providers (OpenCode) time a step from request to the end of the tools
+  // it ran; model time is that span minus the agent's tool time.
+  const toolTime = new Map();
+  for (const e of DATA.timeline) {
+    const s = e.kind === 'tool' && spanOf(e);
+    if (s) { const xs = toolTime.get(e.agent) || []; xs.push(s); toolTime.set(e.agent, xs); }
+  }
+  for (const [agent, xs] of toolTime) {
+    const merged = [];
+    for (const [a, b] of xs.sort((x, y) => x[0] - y[0])) {
+      const last = merged[merged.length - 1];
+      if (last && a <= last[1]) last[1] = Math.max(last[1], b); else merged.push([a, b]);
+    }
+    toolTime.set(agent, merged);
+  }
+  function modelSegs(e) {
+    const s = spanOf(e);
+    if (!s) return [];
+    let segs = [s];
+    for (const [a, b] of toolTime.get(e.agent) || []) {
+      if (b <= s[0] || a >= s[1]) continue;
+      segs = segs.flatMap(([x, y]) => [[x, Math.min(y, a)], [Math.max(x, b), y]].filter(([p, q]) => q > p));
+    }
+    return segs;
+  }
+  const segsOf = (e) => e.kind === 'call' ? modelSegs(e) : (spanOf(e) ? [spanOf(e)] : []);
+  const lengthOf = (e) => { const segs = segsOf(e); return segs.length || spanOf(e) ? segs.reduce((n, [a, b]) => n + b - a, 0) : null; };
   const T0 = Math.min(ms(S.started_at) ?? Infinity, ...DATA.timeline.map((e) => (spanOf(e) || [ms(e.ts)])[0]).filter((v) => v != null));
   const clock = (sec) => {
     const h = Math.floor(sec / 3600), m = Math.floor(sec % 3600 / 60), s = sec % 60, p = (n) => String(n).padStart(2, '0');
@@ -355,10 +382,10 @@ button.primary { background: var(--accent); border-color: var(--accent); color: 
     const end = Math.max(ms(S.ended_at) || 0, ...spans.map(([, s]) => s[1]));
     const total = Math.max(1000, end - T0), pct = (v) => (100 * v / total).toFixed(3) + '%';
     const lane = (kind, name, note) => {
-      const xs = spans.filter(([e]) => e.kind === kind);
-      const bars = xs.map(([e, s]) => '<span data-jump="' + e.id + '" class="' + (e.agent !== 'main' ? 'sub' : '') + (failed(e) ? ' err' : '') +
-        '" style="left:' + pct(s[0] - T0) + ';width:' + pct(s[1] - s[0]) + '" title="' + esc(rel(s[0]) + ' · ' + e.title + ' · ' + dur(s[1] - s[0]) + (estimated(e) ? ' (estimated from the previous step)' : '')) + '"></span>').join('');
-      return '<div class="lh" title="' + esc(note) + '">' + name + '<small>' + (xs.length ? dur(busy(xs.map(([, s]) => s))) : 'no timing') + '</small></div>' +
+      const xs = spans.filter(([e]) => e.kind === kind).map(([e]) => [e, segsOf(e)]);
+      const bars = xs.flatMap(([e, segs]) => segs.map((s) => '<span data-jump="' + e.id + '" class="' + (e.agent !== 'main' ? 'sub' : '') + (failed(e) ? ' err' : '') +
+        '" style="left:' + pct(s[0] - T0) + ';width:' + pct(s[1] - s[0]) + '" title="' + esc(rel(s[0]) + ' · ' + e.title + ' · ' + dur(lengthOf(e)) + (estimated(e) ? ' (estimated from the previous step)' : '')) + '"></span>')).join('');
+      return '<div class="lh" title="' + esc(note) + '">' + name + '<small>' + (xs.length ? dur(busy(xs.flatMap(([, segs]) => segs))) : 'no timing') + '</small></div>' +
         '<div class="lane ' + (kind === 'call' ? 'model' : 'tools') + '">' + bars + '</div>';
     };
     const step = [10, 30, 60, 120, 300, 600, 900, 1800, 3600, 7200, 10800, 21600, 43200, 86400].find((x) => total / 1000 / x <= 5) || 86400;
@@ -367,7 +394,7 @@ button.primary { background: var(--accent); border-color: var(--accent); color: 
     for (let sec = 0; sec * 1000 < total * 0.92; sec += step) axis += '<span style="left:' + pct(sec * 1000) + '">' + tick(sec) + '</span>';
     axis += '<span class="end" style="left:100%">' + dur(total) + '</span>';
     return '<div class="run">' + prod + '<div class="lanes"><div></div><div class="axis">' + axis + '</div>' +
-      lane('call', 'Model', 'Time waiting for model responses, from request to response; overlaps count once. Where the provider logs no request time, a call starts when the agent\'s previous step ended.') +
+      lane('call', 'Model', 'Time waiting for model responses, from request to response, less the time tools ran; overlaps count once. Where the provider logs no request time, a call starts when the agent\'s previous step ended.') +
       lane('tool', 'Tools', 'Time tools were running; parallel tools count once') + '</div></div>';
   }
   function costText(cost, calls, missing) {
@@ -546,7 +573,7 @@ button.primary { background: var(--accent); border-color: var(--accent); color: 
     // long they ran; a call's time is its response, so the list stays in order.
     const span = spanOf(e), at = ms(e.ts);
     const left = '<span class="t" title="' + esc(at == null ? '' : time(new Date(at).toISOString()) + ' UTC') + '">' + esc(rel(at)) + '</span><span class="k ' + e.kind + '">' + e.kind + '</span>';
-    const right = '<span class="d"' + (estimated(e) ? ' title="Estimated: from the end of the previous step">~' : '>') + (span ? dur(span[1] - span[0]) : '') + '</span>';
+    const right = '<span class="d"' + (estimated(e) ? ' title="Estimated: from the end of the previous step">~' : '>') + (span ? dur(lengthOf(e)) : '') + '</span>';
     if (!expandable) return '<div class="' + cls + '" data-id="' + e.id + '">' + left + '<div>' + head + '</div>' + right + '</div>';
     return '<div class="' + cls + '" data-id="' + e.id + '">' + left + '<details data-id="' + e.id + '"><summary>' + head + '</summary></details>' + right + '</div>';
   }
