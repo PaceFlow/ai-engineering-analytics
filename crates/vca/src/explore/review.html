@@ -48,7 +48,30 @@ aside { position: sticky; top: var(--head, 92px); align-self: start; max-height:
 .turn { margin: 18px 0 6px; padding: 6px 10px; border-radius: 6px; background: var(--accent-soft); color: var(--ink); font-size: 12.5px; display: flex; gap: 10px; flex-wrap: wrap; align-items: baseline; }
 .turn b { font-weight: 600; }
 .turn .cost { margin-left: auto; font-variant-numeric: tabular-nums; }
-.e { display: grid; grid-template-columns: 64px 86px minmax(0, 1fr); gap: 8px; padding: 3px 6px; border-radius: 4px; align-items: baseline; }
+.e { display: grid; grid-template-columns: 58px 86px minmax(0, 1fr) 64px; gap: 8px; padding: 5px 6px; border-radius: 4px; align-items: baseline; border-bottom: 1px solid var(--line); }
+.e .d { color: var(--muted); font: 11.5px var(--mono); text-align: right; white-space: nowrap; }
+.e.assistant .title { display: block; border-left: 3px solid var(--ok); padding-left: 10px; }
+.e.tool .tname { font-weight: 600; margin-right: 6px; }
+.e.tool .title { font: 12.5px var(--mono); }
+.e > div, .e > details { min-width: 0; }
+.e.tool summary { display: flex; flex-wrap: wrap; gap: 2px 4px; align-items: baseline; min-width: 0; }
+.e.tool summary .title { flex: 1 1 260px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.e.tool details[open] summary .title { white-space: normal; overflow-wrap: anywhere; }
+.run { border: 1px solid var(--line); border-radius: 8px; background: var(--panel); margin: 8px 0 12px; }
+.run .prod { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; padding: 8px 12px; border-bottom: 1px solid var(--line); font-size: 13px; }
+.run .prod > span:first-child { color: var(--muted); }
+.run .chip { border: 1px solid var(--line); border-radius: 6px; padding: 2px 8px; font-variant-numeric: tabular-nums; }
+.run .add { color: var(--ok); } .run .del { color: var(--bad); }
+.lanes { display: grid; grid-template-columns: 112px minmax(0, 1fr); gap: 4px 10px; padding: 8px 12px 10px; align-items: center; font-size: 12.5px; }
+.lanes .lh { color: var(--ink); white-space: nowrap; } .lanes .lh small { color: var(--muted); font-size: 12px; margin-left: 4px; }
+.lane { position: relative; height: 16px; background: var(--bg); border-radius: 3px; }
+.lane span { position: absolute; top: 1px; bottom: 1px; min-width: 2px; border-radius: 2px; cursor: pointer; }
+.lane.model span { background: var(--ok); } .lane.tools span { background: var(--accent); opacity: .75; }
+.lane span.sub { opacity: .4; } .lane span.err { background: var(--bad); opacity: 1; }
+.lane span:hover { outline: 2px solid var(--ink); }
+.axis { position: relative; height: 16px; color: var(--muted); font-size: 11.5px; }
+.axis span { position: absolute; transform: translateX(-50%); white-space: nowrap; }
+.axis span:first-child { transform: none; } .axis span.end { transform: translateX(-100%); }
 .e.sub { margin-left: 22px; border-left: 2px solid var(--line); padding-left: 8px; }
 .e:hover { background: color-mix(in srgb, var(--accent-soft) 45%, transparent); }
 .e.hl { background: var(--hl); }
@@ -261,6 +284,92 @@ button.primary { background: var(--accent); border-color: var(--accent); color: 
     for (const [turn, c] of turnCalls) if (turn >= first && turn <= (last == null ? first : last)) { calls += c.calls; missing += c.missing; }
     return costText(cost, calls, missing);
   }
+  // ── Run strip: what the session produced and when the model and tools were busy ──
+  const ms = (ts) => { const v = ts ? Date.parse(ts) : NaN; return isNaN(v) ? null : v; };
+  // A call runs from its request to its response; a tool from start to end.
+  // Providers that log no request time (Claude, Codex) get the end of the
+  // agent's previous step as the start, marked as estimated.
+  const callStart = new Map();
+  {
+    // Steps that end before a call was answered: user messages, finished
+    // tools and earlier calls. Assistant text belongs to the call itself, and
+    // a tool the call started ends after it.
+    const ends = new Map();
+    for (const e of DATA.timeline) {
+      const at = ms(e.ts);
+      if (at == null) continue;
+      const mine = ends.get(e.agent) || [];
+      if (e.kind === 'call') {
+        const sent = ms(e.meta.started);
+        let prev = null;
+        for (let i = mine.length - 1, seen = 0; i >= 0 && seen < 200; i--, seen++) {
+          if (mine[i] < at && (prev == null || mine[i] > prev)) prev = mine[i];
+        }
+        if (sent != null) callStart.set(e.id, [sent, false]);
+        else if (prev != null) callStart.set(e.id, [prev, true]);
+      }
+      const end = e.kind === 'tool' ? ms(e.meta.ended) : e.kind === 'assistant' ? null : at;
+      if (end != null) { mine.push(end); ends.set(e.agent, mine); }
+    }
+  }
+  function spanOf(e) {
+    if (e.kind !== 'call' && e.kind !== 'tool') return null;
+    const a = e.kind === 'call' ? (callStart.get(e.id) || [])[0] : ms(e.ts), b = ms(e.kind === 'call' ? e.ts : e.meta.ended);
+    return a != null && b != null && b >= a ? [a, b] : null;
+  }
+  const estimated = (e) => e.kind === 'call' && !!(callStart.get(e.id) || [])[1];
+  const T0 = Math.min(ms(S.started_at) ?? Infinity, ...DATA.timeline.map((e) => (spanOf(e) || [ms(e.ts)])[0]).filter((v) => v != null));
+  const clock = (sec) => {
+    const h = Math.floor(sec / 3600), m = Math.floor(sec % 3600 / 60), s = sec % 60, p = (n) => String(n).padStart(2, '0');
+    return h ? h + ':' + p(m) + ':' + p(s) : m + ':' + p(s);
+  };
+  // Time since the session started.
+  const rel = (v) => v == null || !isFinite(T0) ? '' : '+' + clock(Math.max(0, Math.round((v - T0) / 1000)));
+  const dur = (d) => {
+    if (d == null) return '';
+    if (d < 100) return '<0.1s';
+    const s = d / 1000;
+    if (s < 10) return s.toFixed(1) + 's';
+    if (s < 60) return Math.round(s) + 's';
+    const m = Math.floor(s / 60);
+    return m < 60 ? m + 'm ' + Math.round(s % 60) + 's' : Math.floor(m / 60) + 'h ' + (m % 60) + 'm';
+  };
+  // Busy time: overlapping spans (parallel tools, subagents) count once.
+  function busy(spans) {
+    let total = 0, end = -Infinity;
+    for (const [a, b] of spans.slice().sort((x, y) => x[0] - y[0])) {
+      if (b <= end) continue;
+      total += b - Math.max(a, end); end = b;
+    }
+    return total;
+  }
+  const failed = (e) => e.kind === 'tool' && ['error', 'failed'].includes(e.meta.status);
+  function runHtml() {
+    const tools = DATA.timeline.filter((e) => e.kind === 'tool'), calls = DATA.timeline.filter((e) => e.kind === 'call');
+    const commands = tools.filter((e) => e.meta.category === 'exec' || e.meta.category === 'validate').length;
+    const add = DATA.files.reduce((n, f) => n + (f.session_added || 0), 0), del = DATA.files.reduce((n, f) => n + (f.session_removed || 0), 0);
+    const prod = '<div class="prod"><span>Produced</span><span class="chip">' + num(DATA.files.length) + ' files <span class="add">+' + num(add) + '</span> <span class="del">−' + num(del) + '</span></span>' +
+      '<span class="chip">' + num(commands) + ' commands</span><span class="chip">' + num(tools.length) + ' tool calls</span><span class="chip">' + num(calls.length) + ' model calls</span></div>';
+    const spans = DATA.timeline.map((e) => [e, spanOf(e)]).filter(([, s]) => s);
+    if (!spans.length || !isFinite(T0)) return '<div class="run">' + prod + '</div>';
+    const end = Math.max(ms(S.ended_at) || 0, ...spans.map(([, s]) => s[1]));
+    const total = Math.max(1000, end - T0), pct = (v) => (100 * v / total).toFixed(3) + '%';
+    const lane = (kind, name, note) => {
+      const xs = spans.filter(([e]) => e.kind === kind);
+      const bars = xs.map(([e, s]) => '<span data-jump="' + e.id + '" class="' + (e.agent !== 'main' ? 'sub' : '') + (failed(e) ? ' err' : '') +
+        '" style="left:' + pct(s[0] - T0) + ';width:' + pct(s[1] - s[0]) + '" title="' + esc(rel(s[0]) + ' · ' + e.title + ' · ' + dur(s[1] - s[0]) + (estimated(e) ? ' (estimated from the previous step)' : '')) + '"></span>').join('');
+      return '<div class="lh" title="' + esc(note) + '">' + name + '<small>' + (xs.length ? dur(busy(xs.map(([, s]) => s))) : 'no timing') + '</small></div>' +
+        '<div class="lane ' + (kind === 'call' ? 'model' : 'tools') + '">' + bars + '</div>';
+    };
+    const step = [10, 30, 60, 120, 300, 600, 900, 1800, 3600, 7200, 10800, 21600, 43200, 86400].find((x) => total / 1000 / x <= 5) || 86400;
+    const tick = (sec) => sec < 60 ? sec + 's' : sec < 3600 ? sec / 60 + 'm' : Math.floor(sec / 3600) + 'h' + (sec % 3600 ? ' ' + (sec % 3600) / 60 + 'm' : '');
+    let axis = '';
+    for (let sec = 0; sec * 1000 < total * 0.92; sec += step) axis += '<span style="left:' + pct(sec * 1000) + '">' + tick(sec) + '</span>';
+    axis += '<span class="end" style="left:100%">' + dur(total) + '</span>';
+    return '<div class="run">' + prod + '<div class="lanes"><div></div><div class="axis">' + axis + '</div>' +
+      lane('call', 'Model', 'Time waiting for model responses, from request to response; overlaps count once. Where the provider logs no request time, a call starts when the agent\'s previous step ended.') +
+      lane('tool', 'Tools', 'Time tools were running; parallel tools count once') + '</div></div>';
+  }
   function costText(cost, calls, missing) {
     if (!missing) return usd(cost);
     if (missing === calls) return '<span title="No call reported usage, so the cost is unknown">unknown</span>';
@@ -383,7 +492,7 @@ button.primary { background: var(--accent); border-color: var(--accent); color: 
     return html + '<p class="hint">Sizes are estimates calibrated to how much the context grew; baseline, compacted history and unexplained are what the logged items do not cover.</p></div>';
   }
   document.getElementById('timeline').addEventListener('click', (ev) => {
-    const a = ev.target.closest('a[data-jump]'); if (!a) return;
+    const a = ev.target.closest('[data-jump]'); if (!a) return;
     ev.preventDefault();
     const el = document.querySelector('#timeline .e[data-id="' + a.dataset.jump + '"]');
     if (!el) { a.title = 'Hidden by the current filters'; return; }
@@ -427,11 +536,19 @@ button.primary { background: var(--accent); border-color: var(--accent); color: 
     const agent = sub ? '<span class="badge agent" title="' + esc(e.agent) + '">sub ' + esc(e.agent.slice(0, 8)) + '</span>' : '';
     let head = agent, expandable = false;
     if (e.kind === 'call') { head += callLine(e.meta) + ctxPill(e.meta.ctx, 'call') + '<span class="title">' + esc(e.title) + '</span>'; expandable = !!(e.meta.ctx && e.meta.ctx.call != null); }
-    else if (e.kind === 'tool') { head += toolLine(e.meta) + commandBadge(e) + ctxPill(e.meta.ctx) + '<span class="title">' + esc(e.title) + '</span>'; expandable = true; }
+    else if (e.kind === 'tool') {
+      const target = (e.meta.target || '').split(NL)[0].slice(0, 160);
+      head += '<span class="tname">' + esc(e.meta.tool) + '</span><span class="title">' + esc(target) + '</span> ' + toolLine(e.meta) + commandBadge(e) + ctxPill(e.meta.ctx);
+      expandable = true;
+    }
     else { head += ctxPill(e.meta.ctx) + '<span class="title">' + esc(e.title || '(empty)') + '</span>'; expandable = e.body && e.body !== e.title; }
-    const left = '<span class="t">' + esc(time(e.ts)) + '</span><span class="k ' + e.kind + '">' + e.kind + '</span>';
-    if (!expandable) return '<div class="' + cls + '" data-id="' + e.id + '">' + left + '<div>' + head + '</div></div>';
-    return '<div class="' + cls + '" data-id="' + e.id + '">' + left + '<details data-id="' + e.id + '"><summary>' + head + '</summary></details></div>';
+    // Steps show when they happened since the session started (UTC on hover) and how
+    // long they ran; a call's time is its response, so the list stays in order.
+    const span = spanOf(e), at = ms(e.ts);
+    const left = '<span class="t" title="' + esc(at == null ? '' : time(new Date(at).toISOString()) + ' UTC') + '">' + esc(rel(at)) + '</span><span class="k ' + e.kind + '">' + e.kind + '</span>';
+    const right = '<span class="d"' + (estimated(e) ? ' title="Estimated: from the end of the previous step">~' : '>') + (span ? dur(span[1] - span[0]) : '') + '</span>';
+    if (!expandable) return '<div class="' + cls + '" data-id="' + e.id + '">' + left + '<div>' + head + '</div>' + right + '</div>';
+    return '<div class="' + cls + '" data-id="' + e.id + '">' + left + '<details data-id="' + e.id + '"><summary>' + head + '</summary></details>' + right + '</div>';
   }
   function visible(e) {
     if (!shown.has(e.kind)) return false;
@@ -504,7 +621,7 @@ button.primary { background: var(--accent); border-color: var(--accent); color: 
       out.push(entryHtml(e));
     }
     const el = document.getElementById('timeline');
-    el.innerHTML = out.length ? out.join('') : '<p class="empty">Nothing matches the current filters.</p>';
+    el.innerHTML = runHtml() + (out.length ? out.join('') : '<p class="empty">Nothing matches the current filters.</p>');
   }
   // Bodies are filled on first open, to keep the page light.
   document.getElementById('timeline').addEventListener('toggle', (ev) => {

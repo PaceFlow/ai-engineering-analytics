@@ -551,7 +551,8 @@ fn timeline(
                     COALESCE(f.cache_creation_1h_tokens, 0), u.output_tokens,
                     COALESCE(f.reasoning_tokens, 0), u.total_tokens, u.context_tokens,
                     u.api_equiv_usd, u.price_match, u.token_source, u.background_flag,
-                    COALESCE(f.input_tokens, u.fresh_tokens - u.output_tokens), f.usage_key
+                    COALESCE(f.input_tokens, u.fresh_tokens - u.output_tokens), f.usage_key,
+                    f.request_ts
              FROM derived_usage_event u
              LEFT JOIN fact_session_usage f ON f.id = u.usage_id
              WHERE u.provider = ?1 AND u.session_id = ?2
@@ -579,6 +580,8 @@ fn timeline(
                     "token_source": row.get::<_, String>(14)?,
                     "background": row.get::<_, i64>(15)? != 0,
                     "usage_key": row.get::<_, Option<String>>(17)?,
+                    // When the request was sent; `ts` is when the response finished.
+                    "started": row.get::<_, Option<String>>(18)?,
                 }),
             ))
         })?;
