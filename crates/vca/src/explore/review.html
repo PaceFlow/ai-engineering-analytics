@@ -247,6 +247,25 @@ button.primary { background: var(--accent); border-color: var(--accent); color: 
     kindsEl.appendChild(b);
   });
   const turnInfo = new Map(DATA.turns.map((t) => [t.turn, t]));
+  // Calls that reported no usage leave cost unknown; never show them as $0.
+  const noUsage = (m) => !m.total && m.cost == null;
+  const turnCalls = new Map();
+  for (const e of DATA.timeline) {
+    if (e.kind !== 'call' || e.turn == null) continue;
+    const c = turnCalls.get(e.turn) || { calls: 0, missing: 0 };
+    c.calls++; if (noUsage(e.meta)) c.missing++;
+    turnCalls.set(e.turn, c);
+  }
+  function costOf(cost, first, last) {
+    let calls = 0, missing = 0;
+    for (const [turn, c] of turnCalls) if (turn >= first && turn <= (last == null ? first : last)) { calls += c.calls; missing += c.missing; }
+    return costText(cost, calls, missing);
+  }
+  function costText(cost, calls, missing) {
+    if (!missing) return usd(cost);
+    if (missing === calls) return '<span title="No call reported usage, so the cost is unknown">unknown</span>';
+    return '<span title="' + missing + ' of ' + calls + ' calls reported no usage; their cost is unknown">≥ ' + usd(cost) + '</span>';
+  }
 
   function callLine(m) {
     if (!m.total && m.cost == null) return '<span class="pill" title="The provider recorded zero for every count, so this call\'s size and cost are unknown">usage not reported</span>';
@@ -479,7 +498,7 @@ button.primary { background: var(--accent); border-color: var(--accent); color: 
           (t.task != null ? '<span>Task T' + t.task + '</span>' : '<span>no task</span>') +
           (t.stage ? '<span>stage ' + esc(t.stage) + '</span>' : '') +
           (t.request_kind ? '<span>asked for ' + esc(t.request_kind) + '</span>' : '') +
-          '<span class="cost">' + usd(t.cost) + '</span>' + (labs ? '<div class="labels">' + labs + '</div>' : '') + '</div>');
+          '<span class="cost">' + costOf(t.cost, e.turn) + '</span>' + (labs ? '<div class="labels">' + labs + '</div>' : '') + '</div>');
         lastTurn = e.turn;
       }
       out.push(entryHtml(e));
@@ -652,6 +671,8 @@ button.primary { background: var(--accent); border-color: var(--accent); color: 
   }
   // The few numbers that sum up the session; each opens its check.
   function renderKpis() {
+    const sessionCost = (cost) => { const all = DATA.timeline.filter((e) => e.kind === 'call');
+      return costText(cost, all.length, all.filter((e) => noUsage(e.meta)).length); };
     const v = (id) => { const s = statById.get(id); return s ? s.value : null; };
     const mins = (m) => m == null ? '—' : m < 60 ? Math.round(m) + 'm' : Math.floor(m / 60) + 'h ' + Math.round(m % 60) + 'm';
     const short = (n) => n == null ? '—' : n >= 1e6 ? (n / 1e6).toFixed(1) + 'M' : n >= 1e4 ? Math.round(n / 1e3) + 'k' : num(n);
@@ -662,7 +683,7 @@ button.primary { background: var(--accent); border-color: var(--accent); color: 
       ['tool_calls', num(v('tools.calls')), 'tool calls' + (v('tools.failed') ? ' · ' + v('tools.failed') + ' failed' : '')],
       ['cost', num(v('calls.model_calls')), 'model calls'],
       ['cost', short(tokens), 'tokens' + (tokens ? ' · ' + Math.round(100 * (cache || 0) / tokens) + '% cache' : '')],
-      ['cost', v('cost.total_usd') == null ? '—' : usd(v('cost.total_usd')), 'list price'],
+      ['cost', v('cost.total_usd') == null ? '—' : sessionCost(v('cost.total_usd')), 'list price'],
       ['files', num(v('tools.files_edited')), 'files edited'],
       ['commits', num(v('delivery.commits')), 'commits'],
     ];
@@ -806,7 +827,7 @@ button.primary { background: var(--accent); border-color: var(--accent); color: 
         (t.completion_turn != null ? ' · done at turn ' + t.completion_turn + ' (' + esc(t.completion_source || '') + ')' : '') + '</div>' +
         '<div>' + esc(t.title || '') + '</div>' +
         '<div class="labels">' + labelsOf(['task', 'task_completion', 'work_start'], t.task).map(labChip).join('') + '</div>' +
-        '<div class="meta">segmentation ' + esc(t.segmentation || '—') + ' · cost ' + usd(t.cost) + ' · commits ' + num(t.commits) + '</div>' +
+        '<div class="meta">segmentation ' + esc(t.segmentation || '—') + ' · cost ' + costOf(t.cost, t.first_turn, t.last_turn) + ' · commits ' + num(t.commits) + '</div>' +
         '<div class="meta">goal ' + esc(g.id || '—') + ' · ' + esc(g.state || '—') + ' · intent ' + esc(g.intent || '—') + ' (' + esc(g.intent_source || '') + ') · ' +
         num(g.conversations) + ' conversations · ' + num(g.corrections) + ' corrections · ' + num(g.validation_failures) + ' failed validations</div>' +
         (members ? '<div>Goal members</div><ul>' + members + '</ul>' : '') + (rels ? '<div>Links</div><ul>' + rels + '</ul>' : '') + '</div>';
