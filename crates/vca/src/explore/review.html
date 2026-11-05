@@ -671,8 +671,10 @@ button.primary { background: var(--accent); border-color: var(--accent); color: 
   }
   // The few numbers that sum up the session; each opens its check.
   function renderKpis() {
-    const sessionCost = (cost) => { const all = DATA.timeline.filter((e) => e.kind === 'call');
-      return costText(cost, all.length, all.filter((e) => noUsage(e.meta)).length); };
+    const all = DATA.timeline.filter((e) => e.kind === 'call'), gaps = all.filter((e) => noUsage(e.meta)).length;
+    const sessionCost = (cost) => costText(cost, all.length, gaps);
+    const tokenText = (n) => !gaps ? short(n) : gaps === all.length ? '<span title="No call reported usage">unknown</span>'
+      : '<span title="' + gaps + ' of ' + all.length + ' calls reported no usage">≥ ' + short(n) + '</span>';
     const v = (id) => { const s = statById.get(id); return s ? s.value : null; };
     const mins = (m) => m == null ? '—' : m < 60 ? Math.round(m) + 'm' : Math.floor(m / 60) + 'h ' + Math.round(m % 60) + 'm';
     const short = (n) => n == null ? '—' : n >= 1e6 ? (n / 1e6).toFixed(1) + 'M' : n >= 1e4 ? Math.round(n / 1e3) + 'k' : num(n);
@@ -682,8 +684,8 @@ button.primary { background: var(--accent); border-color: var(--accent); color: 
       ['messages', num(v('shape.user_messages')), 'your messages'],
       ['tool_calls', num(v('tools.calls')), 'tool calls' + (v('tools.failed') ? ' · ' + v('tools.failed') + ' failed' : '')],
       ['cost', num(v('calls.model_calls')), 'model calls'],
-      ['cost', short(tokens), 'tokens' + (tokens ? ' · ' + Math.round(100 * (cache || 0) / tokens) + '% cache' : '')],
-      ['cost', v('cost.total_usd') == null ? '—' : sessionCost(v('cost.total_usd')), 'list price'],
+      ['cost', tokenText(tokens), 'tokens' + (tokens && !gaps ? ' · ' + Math.round(100 * (cache || 0) / tokens) + '% cache' : '')],
+      ['cost', v('cost.total_usd') == null && gaps !== all.length ? '—' : sessionCost(v('cost.total_usd')), 'list price'],
       ['files', num(v('tools.files_edited')), 'files edited'],
       ['commits', num(v('delivery.commits')), 'commits'],
     ];
