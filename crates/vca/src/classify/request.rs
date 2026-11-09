@@ -154,6 +154,9 @@ fn multica(raw: &str, mut stripped: Vec<&'static str>) -> Request {
     } else {
         "unknown"
     };
+    if let Some(request) = autopilot(raw, &stripped) {
+        return request;
+    }
     let quoted: Vec<_> = raw
         .lines()
         .filter_map(|line| line.strip_prefix("> ").or((line == ">").then_some("")))
@@ -183,6 +186,44 @@ fn multica(raw: &str, mut stripped: Vec<&'static str>) -> Request {
         }
         None => request,
     }
+}
+
+/// A scheduled Multica Autopilot run without an assigned issue states its goal
+/// as the autopilot's title and instructions. Run ids, the trigger, the
+/// pointer to the autopilot configuration and the "On Behalf Of" section are
+/// envelope.
+fn autopilot(raw: &str, stripped: &[&'static str]) -> Option<Request> {
+    if !raw.contains("triggered by an Autopilot") {
+        return None;
+    }
+    let title = raw
+        .lines()
+        .find_map(|line| line.strip_prefix("Autopilot title:"))
+        .map(str::trim)
+        .unwrap_or_default();
+    let instructions = raw
+        .split_once("Autopilot instructions:")
+        .map(|(_, rest)| {
+            let end = [
+                "\nStart by running `multica autopilot get",
+                "\n## On Behalf Of",
+            ]
+            .iter()
+            .filter_map(|marker| rest.find(marker))
+            .min()
+            .unwrap_or(rest.len());
+            rest[..end].trim()
+        })
+        .unwrap_or_default();
+    let body = match (title.is_empty(), instructions.is_empty()) {
+        (true, true) => return None,
+        (false, true) => title.to_owned(),
+        (true, false) => instructions.to_owned(),
+        (false, false) => format!("{title}\n\n{instructions}"),
+    };
+    let mut stripped = stripped.to_vec();
+    stripped.push("autopilot_envelope");
+    Some(finish(&body, "platform", "recognized_autopilot", stripped))
 }
 
 /// Injected context blocks that are never part of the request.
@@ -410,6 +451,21 @@ mod tests {
         assert!(!r.text.contains("comment"));
         // Normalized titles are normalized again by later passes.
         assert!(normalize(&r.text).goal_unavailable());
+    }
+    #[test]
+    fn an_autopilot_run_states_its_goal_by_title_and_instructions() {
+        let raw = "You are running as a local coding agent for a Multica workspace.\n\nThis task was triggered by an Autopilot in run-only mode. There is no assigned Multica issue for this run.\n\nAutopilot run ID: 01a15062-fb01-7368-ad3f-6a0dfe7238af\nAutopilot ID: 87ddf63d-3fb7-4a8e-bf7d-a642b91f326b\nAutopilot title: AI CRM delivery reconciler\nTrigger source: schedule\n\nAutopilot instructions:\nRun a bounded delivery check every two hours.\n\n> Quoted guidance is part of the instructions.\n\n\nStart by running `multica autopilot get 87ddf63d-3fb7-4a8e-bf7d-a642b91f326b --output json` if you need the full autopilot configuration, then complete the instructions above.\n\n## On Behalf Of\n\nYou are acting on behalf of **someone** (someone@example.com).";
+        let r = normalize(raw);
+        assert_eq!(r.extraction, "recognized_autopilot");
+        assert_eq!(r.speaker, "platform");
+        assert_eq!(
+            r.text,
+            "AI CRM delivery reconciler\n\nRun a bounded delivery check every two hours.\n\n> Quoted guidance is part of the instructions."
+        );
+        assert!(!r.goal_unavailable());
+        // A head cut before the instructions still names the autopilot.
+        let head: String = raw.chars().take(330).collect();
+        assert_eq!(normalize(&head).text, "AI CRM delivery reconciler");
     }
     #[test]
     fn strips_routing_sentences_but_keeps_code_comment_asks() {
