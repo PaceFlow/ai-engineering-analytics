@@ -794,3 +794,110 @@ fn comparisons_warn_when_the_baseline_predates_recorded_history() -> Result<()> 
     assert!(r.warnings.iter().any(|s| s.contains("unverified coverage")));
     Ok(())
 }
+
+fn multica_run(c: &Connection, id: &str, day: u32, opening: &str) -> Result<()> {
+    let start = format!("2026-10-{day:02}T04:00:00Z");
+    session(c, id, &start, &format!("2026-10-{day:02}T04:10:00Z"), 100)?;
+    c.execute(
+        "UPDATE fact_session_message SET content=?1 WHERE session_id=?2 AND role='user'",
+        params![opening, id],
+    )?;
+    Ok(())
+}
+const PREAMBLE: &str = "You are running as a local coding agent for a Multica workspace.\n";
+
+#[test]
+fn runs_for_one_assigned_issue_are_one_goal_across_phases() -> Result<()> {
+    let c = db()?;
+    let issue = |id: &str, task: &str| {
+        format!("{PREAMBLE}Your assigned issue ID is: {id}\n**Task:** {task}")
+    };
+    multica_run(
+        &c,
+        "root-cause",
+        1,
+        &issue("01a1577e-0001", "root-cause the emit recursion"),
+    )?;
+    multica_run(
+        &c,
+        "implement",
+        2,
+        &issue("01a1577e-0001", "implement the bounded fix"),
+    )?;
+    multica_run(
+        &c,
+        "validate",
+        3,
+        &issue("01a1577e-0001", "black-box validation"),
+    )?;
+    multica_run(&c, "other", 4, &issue("01a1577e-0002", "unrelated issue"))?;
+    refresh(&c)?;
+    let mut sizes: Vec<usize> = work::items(&c)?.iter().map(|w| w.conversations).collect();
+    sizes.sort();
+    assert_eq!(sizes, vec![1, 3]);
+    assert_eq!(
+        work::relations(&c)?
+            .iter()
+            .filter(|r| r.source == "assigned_issue")
+            .count(),
+        2
+    );
+    // A person can still split them, and that survives a refresh.
+    let link = work::relations(&c)?
+        .into_iter()
+        .find(|r| r.source == "assigned_issue")
+        .unwrap();
+    work::decide(&c, &link.id, false)?;
+    refresh(&c)?;
+    assert_eq!(work::items(&c)?.len(), 3);
+    Ok(())
+}
+
+#[test]
+fn automatic_links_never_merge_different_issues_or_autopilot_runs() -> Result<()> {
+    let c = db()?;
+    multica_run(
+        &c,
+        "day1",
+        1,
+        &format!("{PREAMBLE}Your assigned issue ID is: 01a0d6b8-0001\nDaily digest"),
+    )?;
+    multica_run(
+        &c,
+        "day2",
+        2,
+        &format!("{PREAMBLE}Your assigned issue ID is: 01a0e62b-0002\nDaily digest"),
+    )?;
+    let autopilot = |run: &str| {
+        format!(
+            "{PREAMBLE}This task was triggered by an Autopilot in run-only mode.\nAutopilot run ID: {run}\nAutopilot ID: 87ddf63d-3fb7\nAutopilot title: Delivery reconciler"
+        )
+    };
+    multica_run(&c, "run1", 3, &autopilot("01a15062-0001"))?;
+    multica_run(&c, "run2", 4, &autopilot("01a15062-0002"))?;
+    refresh(&c)?;
+    let link = |a: &str, b: &str, source: &str| -> Result<()> {
+        let (a, b) = (
+            work::resolve_member(&c, &format!("codex:{a}#0"))?,
+            work::resolve_member(&c, &format!("codex:{b}#0"))?,
+        );
+        work::insert_relation(
+            &c,
+            &a,
+            &b,
+            "continuation",
+            "accepted",
+            source,
+            "continues",
+            Some(0.9),
+        )?;
+        Ok(())
+    };
+    link("day1", "day2", "classifier")?;
+    link("run1", "run2", "classifier")?;
+    assert_eq!(work::items(&c)?.len(), 4);
+    // A manual link is the person's decision and is applied.
+    link("day1", "day2", "manual")?;
+    assert_eq!(work::items(&c)?.len(), 3);
+    Ok(())
+}

@@ -441,7 +441,80 @@ fn discover(conn: &Connection, tasks: &[TaskRow]) -> Result<()> {
             }
         }
     }
+    // Runs an agent platform started for one assigned issue are one piece of
+    // work, whatever phase each run was asked to do: link each run's first
+    // task to the previous run's.
+    let keys = run_keys(conn)?;
+    let mut by_issue: BTreeMap<&str, Vec<&TaskRow>> = BTreeMap::new();
+    let mut first_task: BTreeMap<(&str, &str), &TaskRow> = BTreeMap::new();
+    for task in tasks {
+        let slot = first_task
+            .entry((task.provider.as_str(), task.session_id.as_str()))
+            .or_insert(task);
+        if task.task_index < slot.task_index {
+            *slot = task;
+        }
+    }
+    for ((provider, session), task) in first_task {
+        if let Some(key) = keys
+            .get(&(provider.to_string(), session.to_string()))
+            .filter(|key| key.starts_with("issue:"))
+        {
+            by_issue.entry(key.as_str()).or_default().push(task);
+        }
+    }
+    for (key, mut runs) in by_issue {
+        runs.sort_by(|a, b| {
+            a.started_at
+                .cmp(&b.started_at)
+                .then(a.session_id.cmp(&b.session_id))
+        });
+        for pair in runs.windows(2) {
+            let id =
+                |t: &TaskRow| ids.get(&(t.provider.clone(), t.session_id.clone(), t.task_index));
+            if let (Some(a), Some(b)) = (id(pair[0]), id(pair[1])) {
+                insert_relation(
+                    conn,
+                    a,
+                    b,
+                    "continuation",
+                    "accepted",
+                    "assigned_issue",
+                    &format!("Same assigned issue {}", &key["issue:".len()..]),
+                    Some(1.0),
+                )?;
+            }
+        }
+    }
     Ok(())
+}
+
+/// The platform run key (`classify::request::run_key`) of every conversation,
+/// read from its first request.
+fn run_keys(conn: &Connection) -> Result<BTreeMap<(String, String), String>> {
+    let mut stmt = conn.prepare(
+        "SELECT m.provider, m.session_id, m.content FROM fact_session_message m
+         JOIN (SELECT provider, session_id, MIN(message_index) i FROM fact_session_message
+               WHERE role='user' GROUP BY provider, session_id) f
+           ON f.provider=m.provider AND f.session_id=m.session_id AND f.i=m.message_index",
+    )?;
+    let mut keys = BTreeMap::new();
+    for row in stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, Option<String>>(2)?,
+        ))
+    })? {
+        let (provider, session, content) = row?;
+        if let Some(key) = content
+            .as_deref()
+            .and_then(crate::classify::request::run_key)
+        {
+            keys.insert((provider, session), key);
+        }
+    }
+    Ok(keys)
 }
 #[allow(clippy::too_many_arguments)]
 pub fn insert_relation(
@@ -475,7 +548,7 @@ pub fn insert_relation(
     } else {
         conn.execute("INSERT INTO work_relation(id,from_id,to_id,kind,decision,source,evidence,confidence) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)
           ON CONFLICT(from_id,to_id) DO UPDATE SET kind=excluded.kind,decision=excluded.decision,source=excluded.source,evidence=excluded.evidence,confidence=excluded.confidence
-          WHERE work_relation.source != 'manual' AND (excluded.source='explicit_reference' OR work_relation.source='heuristic')",
+          WHERE work_relation.source != 'manual' AND (excluded.source IN ('explicit_reference','assigned_issue') OR work_relation.source='heuristic')",
           params![id,from,to,kind,decision,source,evidence,confidence])?;
     }
     Ok(id)
@@ -564,27 +637,54 @@ pub fn items(conn: &Connection) -> Result<Vec<WorkItem>> {
     }
     let mut groups: BTreeMap<String, String> =
         members.keys().map(|id| (id.clone(), id.clone())).collect();
-    for r in relations.iter().filter(|r| {
-        r.decision == "accepted"
-            && r.review_reason.is_none()
-            && ["continuation", "reopens"].contains(&r.kind.as_str())
-    }) {
-        if let (Some(a), Some(b)) = (
+    // Platform runs each goal holds (assigned issues, Autopilot runs). An
+    // automatic link never merges goals holding different runs: a daily job
+    // that opens a new issue each day, or an Autopilot that runs every two
+    // hours, is a recurring stream, not one piece of work. Manual links can.
+    let run_keys = run_keys(conn)?;
+    let mut held: BTreeMap<String, BTreeSet<String>> = members
+        .iter()
+        .map(|(id, m)| {
+            let key = run_keys.get(&(m.task.provider.clone(), m.task.session_id.clone()));
+            (id.clone(), key.into_iter().cloned().collect())
+        })
+        .collect();
+    let mut joining: Vec<&Relation> = relations
+        .iter()
+        .filter(|r| {
+            r.decision == "accepted"
+                && r.review_reason.is_none()
+                && ["continuation", "reopens"].contains(&r.kind.as_str())
+        })
+        .collect();
+    // Stronger evidence joins first, so a weaker link cannot claim a run first.
+    joining.sort_by_key(|r| match r.source.as_str() {
+        "manual" => 0,
+        "assigned_issue" | "explicit_reference" => 1,
+        _ => 2,
+    });
+    for r in joining {
+        let (Some(a), Some(b)) = (
             groups.get(&r.from_id).cloned(),
             groups.get(&r.to_id).cloned(),
-        ) {
-            let canonical = a.min(b.clone());
-            let other = if canonical == b {
-                groups[&r.from_id].clone()
-            } else {
-                b
-            };
-            for group in groups.values_mut() {
-                if *group == other {
-                    *group = canonical.clone();
-                }
+        ) else {
+            continue;
+        };
+        if a == b {
+            continue;
+        }
+        let (ka, kb) = (&held[&a], &held[&b]);
+        if r.source != "manual" && !ka.is_empty() && !kb.is_empty() && ka.is_disjoint(kb) {
+            continue;
+        }
+        let (canonical, other) = if a < b { (a, b) } else { (b, a) };
+        for group in groups.values_mut() {
+            if *group == other {
+                *group = canonical.clone();
             }
         }
+        let moved = held.remove(&other).unwrap_or_default();
+        held.entry(canonical).or_default().extend(moved);
     }
     let mut grouped: BTreeMap<String, Vec<Member>> = BTreeMap::new();
     for (id, member) in members {

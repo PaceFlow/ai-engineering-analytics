@@ -412,6 +412,32 @@ pub fn references(raw: &str) -> Vec<String> {
     found
 }
 
+/// The unit an agent platform started this conversation for: its assigned
+/// issue (`issue:<id>`) or, for a scheduled Autopilot run without one, the run
+/// itself (`autopilot_run:<id>`). Runs on one issue are one piece of work;
+/// runs for different issues, or separate Autopilot runs, never are, however
+/// alike their requests read.
+pub fn run_key(raw: &str) -> Option<String> {
+    static PATTERNS: std::sync::OnceLock<[regex::Regex; 2]> = std::sync::OnceLock::new();
+    let [issue, run] = PATTERNS.get_or_init(|| {
+        [
+            regex::Regex::new(r"assigned issue ID is:\s*([0-9A-Za-z][0-9A-Za-z-]{7,})")
+                .expect("valid issue regex"),
+            regex::Regex::new(r"Autopilot run ID:\s*([0-9A-Za-z][0-9A-Za-z-]{7,})")
+                .expect("valid autopilot run regex"),
+        ]
+    });
+    if let Some(m) = issue.captures(raw) {
+        return Some(format!("issue:{}", &m[1]));
+    }
+    if raw.contains("triggered by an Autopilot") {
+        return run
+            .captures(raw)
+            .map(|m| format!("autopilot_run:{}", &m[1]));
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -451,6 +477,20 @@ mod tests {
         assert!(!r.text.contains("comment"));
         // Normalized titles are normalized again by later passes.
         assert!(normalize(&r.text).goal_unavailable());
+    }
+    #[test]
+    fn run_key_names_the_assigned_issue_or_the_autopilot_run() {
+        assert_eq!(
+            run_key("Your assigned issue ID is: 01a19256-52b9-71d5-a7d2-2fb48b90809b\nGo."),
+            Some("issue:01a19256-52b9-71d5-a7d2-2fb48b90809b".into())
+        );
+        assert_eq!(
+            run_key(
+                "This task was triggered by an Autopilot in run-only mode.\nAutopilot run ID: 01a15062-fb01-7368\nAutopilot ID: 87ddf63d-3fb7"
+            ),
+            Some("autopilot_run:01a15062-fb01-7368".into())
+        );
+        assert_eq!(run_key("Fix the cache limit for KLIK-209"), None);
     }
     #[test]
     fn an_autopilot_run_states_its_goal_by_title_and_instructions() {

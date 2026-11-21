@@ -1977,6 +1977,18 @@ impl Runner<'_> {
             if manual {
                 continue;
             }
+            // A later run on an assigned issue belongs to that issue's work;
+            // there is nothing for the classifier to decide, and an older
+            // classifier link into it must not override the issue.
+            let by_issue: bool = self.conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM work_relation WHERE to_id=?1 AND source='assigned_issue' AND decision='accepted')",
+                [&this.member],
+                |r| r.get(0),
+            )?;
+            if by_issue {
+                changed |= self.set_work_start(this, None)?;
+                continue;
+            }
             let own =
                 session_references(self.conn, &mut references, &this.provider, &this.session_id)?;
             let own_goal = find(&mut parent, position);
@@ -3121,7 +3133,7 @@ mod tests {
     }
 
     #[test]
-    fn a_request_continuing_an_earlier_conversation_joins_its_goal() -> Result<()> {
+    fn runs_on_one_issue_join_without_asking_and_other_runs_are_asked() -> Result<()> {
         let (conn, sessions) = issue_runs()?;
         let client = issue_aware();
         run(&conn, &client, &config(), &sessions, &starts_only())?;
@@ -3133,37 +3145,31 @@ mod tests {
             ]
         );
         let requests = client.requests.lock().unwrap().clone();
-        // The first run has nothing earlier to continue, so it is not asked about.
-        assert_eq!(requests.len(), 3);
-        let last = &requests[2];
-        assert_eq!(last.state["references"][0], "issue:issue-0001-aaaa");
-        // Two runs of the issue are one option, so they cannot split the answer.
-        let offered = last.state["earlier_work"].as_array().unwrap();
-        assert_eq!(offered.len(), 2);
-        assert_eq!(offered[0]["conversations"], 2);
-        assert_eq!(offered[0]["shared_references"][0], "issue:issue-0001-aaaa");
-        let described = last.questions["work_start"]["criteria"]["resume_C1"]
+        // The first run has nothing earlier to continue, and later runs on its
+        // issue are joined by the issue; only the run on another issue is asked.
+        assert_eq!(requests.len(), 1);
+        let asked = &requests[0];
+        assert_eq!(asked.state["references"][0], "issue:issue-0002-bbbb");
+        let offered = asked.state["earlier_work"].as_array().unwrap();
+        assert_eq!(offered.len(), 1);
+        assert_eq!(offered[0]["conversations"], 1);
+        let described = asked.questions["work_start"]["criteria"]["resume_C1"]
             .as_str()
             .unwrap();
         assert!(
-            described.contains("first 'Fix the RocketReach"),
-            "{described}"
-        );
-        assert!(described.contains("latest 'Monitoring"), "{described}");
-        assert!(
-            described.contains("(2 conversations; same assigned issue issue-0001-aaaa)"),
+            described.contains("(1 conversation): 'Fix the RocketReach"),
             "{described}"
         );
         assert!(
-            !last.state["new_message"]
+            !asked.state["new_message"]
                 .as_str()
                 .unwrap()
-                .contains("issue-0001"),
+                .contains("issue-0002"),
             "the goal text stays free of the envelope"
         );
         // Re-running is served from cache and keeps the same goals.
         run(&conn, &client, &config(), &sessions, &starts_only())?;
-        assert_eq!(client.calls(), 3);
+        assert_eq!(client.calls(), 1);
         Ok(())
     }
 
@@ -3181,7 +3187,9 @@ mod tests {
             }))
         });
         run(&conn, &client, &config(), &sessions, &starts_only())?;
-        assert_eq!(goal_members(&conn)?.len(), 4);
+        // "New work" keeps the run on another issue apart; runs on one issue
+        // stay one goal whatever the classifier answers.
+        assert_eq!(goal_members(&conn)?.len(), 2);
         Ok(())
     }
 
