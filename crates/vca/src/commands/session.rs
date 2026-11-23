@@ -342,7 +342,7 @@ fn task_report_hidden_branch_rows_exist(
 }
 
 fn shorten_path(path: &str) -> String {
-    if let Some(home) = dirs::home_dir() {
+    if let Some(home) = crate::path_utils::agent_home() {
         let home_str = home.to_string_lossy();
         if path.starts_with(home_str.as_ref()) {
             return format!("~{}", &path[home_str.len()..]);

@@ -104,6 +104,15 @@ pub(crate) struct CursorBubbleEvent {
     /// Per-message wall-clock timestamp (ISO-8601) sourced from the bubble's own
     /// `createdAt`. `None` for legacy inline `conversation` rows that don't carry one.
     pub timestamp: Option<String>,
+    pub bubble_id: Option<String>,
+    pub model_name: Option<String>,
+    /// Provider-reported token counts when the bubble carries `tokenCount`.
+    pub input_tokens: Option<i64>,
+    pub output_tokens: Option<i64>,
+    /// `timingInfo` (request sent, response finished; epoch ms) on the first
+    /// assistant bubble of each response. Older composers (before per-bubble
+    /// `createdAt`) carry only this.
+    pub timing_ms: Option<(i64, i64)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -278,6 +287,37 @@ struct BubbleSlim<'a> {
     created_at: Option<JsonValue>,
     #[serde(rename = "toolFormerData", borrow, default)]
     tool_former_data: Option<&'a RawValue>,
+    #[serde(rename = "tokenCount", default)]
+    token_count: Option<TokenCountSlim>,
+    #[serde(rename = "timingInfo", default)]
+    timing_info: Option<TimingInfoSlim>,
+}
+
+#[derive(Deserialize)]
+struct TimingInfoSlim {
+    #[serde(rename = "clientRpcSendTime")]
+    rpc_send: Option<f64>,
+    #[serde(rename = "clientEndTime")]
+    end: Option<f64>,
+}
+
+impl TimingInfoSlim {
+    /// Both values must be epoch milliseconds (`clientStartTime` is a monotonic
+    /// clock and is ignored).
+    fn bounds_ms(&self) -> Option<(i64, i64)> {
+        const YEAR_2000_MS: f64 = 946_684_800_000.0;
+        let send = self.rpc_send.filter(|ms| *ms > YEAR_2000_MS)?;
+        let end = self.end.filter(|ms| *ms >= send).unwrap_or(send);
+        Some((send as i64, end as i64))
+    }
+}
+
+#[derive(Deserialize)]
+struct TokenCountSlim {
+    #[serde(rename = "inputTokens")]
+    input_tokens: Option<i64>,
+    #[serde(rename = "outputTokens")]
+    output_tokens: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -557,6 +597,11 @@ pub(crate) fn build_seed_graph(
             text: bubble.text.clone(),
             order_key: idx as i64,
             timestamp: None,
+            bubble_id: None,
+            model_name: None,
+            input_tokens: None,
+            output_tokens: None,
+            timing_ms: None,
         });
     }
 
@@ -746,11 +791,24 @@ fn populate_bubbles(
                 .unwrap_or(rowid);
             let model_name = slim.model_info.as_ref().and_then(|m| m.model_name.clone());
 
+            let (input_tokens, output_tokens) = slim
+                .token_count
+                .as_ref()
+                .map(|count| (count.input_tokens, count.output_tokens))
+                .unwrap_or((None, None));
             graphs[graph_idx].bubble_events.push(CursorBubbleEvent {
                 role,
                 text,
                 order_key,
                 timestamp: bubble_ts.clone(),
+                bubble_id: Some(bubble_id.to_string()),
+                model_name: model_name.clone(),
+                input_tokens: input_tokens.filter(|value| *value > 0),
+                output_tokens: output_tokens.filter(|value| *value > 0),
+                timing_ms: slim
+                    .timing_info
+                    .as_ref()
+                    .and_then(TimingInfoSlim::bounds_ms),
             });
 
             if graphs[graph_idx].model_name.is_none() {
@@ -788,9 +846,57 @@ fn populate_bubbles(
 
     for graph in graphs.iter_mut() {
         graph.bubble_events.sort_by_key(|event| event.order_key);
+        fill_bubble_timestamps_from_timing(graph);
     }
 
     Ok(())
+}
+
+/// Older composers have no per-bubble `createdAt`, so every message and tool
+/// call collapsed onto the composer's creation time (zero active time). Their
+/// responses still carry `timingInfo`: a user bubble is stamped with the next
+/// response's send time, the timed bubble with its send time, and the rest of
+/// that response with its end time. Bubbles with their own `createdAt` and
+/// sessions without any timing are left unchanged.
+fn fill_bubble_timestamps_from_timing(graph: &mut CursorSessionGraph) {
+    if !graph
+        .bubble_events
+        .iter()
+        .any(|event| event.timestamp.is_none() && event.timing_ms.is_some())
+    {
+        return;
+    }
+    let events = &mut graph.bubble_events;
+    let mut filled: HashMap<String, String> = HashMap::new();
+    let mut response_end: Option<i64> = None;
+    for index in 0..events.len() {
+        if events[index].timestamp.is_some() {
+            continue;
+        }
+        let ms = match (events[index].timing_ms, events[index].role) {
+            (Some((send, end)), _) => {
+                response_end = Some(end);
+                Some(send)
+            }
+            (None, Some(CursorBubbleRole::User)) => events[index + 1..]
+                .iter()
+                .find_map(|event| event.timing_ms.map(|(send, _)| send))
+                .or(response_end),
+            (None, _) => response_end,
+        };
+        let Some(ts) = ms.and_then(ms_to_iso) else {
+            continue;
+        };
+        if let Some(bubble_id) = events[index].bubble_id.clone() {
+            filled.insert(bubble_id, ts.clone());
+        }
+        events[index].timestamp = Some(ts);
+    }
+    for call in &mut graph.tool_calls {
+        if let Some(ts) = filled.get(&call.bubble_id) {
+            call.timestamp = Some(ts.clone());
+        }
+    }
 }
 
 /// Loads `bubbleId:*` rows for a single session so token estimation and tooling see the full transcript.
@@ -2189,6 +2295,82 @@ mod tests {
             timestamps.contains(&Some("2026-06-02T06:40:58.614Z")),
             "expected second bubble's own createdAt, got {timestamps:?}"
         );
+    }
+
+    /// Composers from 2025 (`_v` 9) have no bubble `createdAt`; the first assistant
+    /// bubble of each response carries `timingInfo` instead.
+    #[test]
+    fn populate_bubbles_derives_timestamps_from_timing_info() {
+        let file = NamedTempFile::new().expect("temp db should be created");
+        let conn = Connection::open(file.path()).expect("temp db should open");
+        conn.execute_batch("CREATE TABLE cursorDiskKV (key TEXT PRIMARY KEY, value TEXT);")
+            .expect("schema should be created");
+        let insert = |key: &str, value: serde_json::Value| {
+            conn.execute(
+                "INSERT INTO cursorDiskKV (key, value) VALUES (?1, ?2)",
+                params![key, value.to_string()],
+            )
+            .expect("row should insert");
+        };
+        let (send1, end1) = (1_760_651_279_182i64, 1_760_651_316_532i64);
+        let (send2, end2) = (1_760_686_832_804i64, 1_760_686_950_367i64);
+        insert(
+            "composerData:old",
+            json!({
+                "composerId": "old", "_v": 9,
+                "createdAt": 1_760_651_246_367i64, "lastUpdatedAt": 1_760_698_095_375i64,
+                "fullConversationHeadersOnly": [
+                    {"bubbleId": "u1"}, {"bubbleId": "a1"}, {"bubbleId": "a2"},
+                    {"bubbleId": "u2"}, {"bubbleId": "a3"}
+                ]
+            }),
+        );
+        insert(
+            "bubbleId:old:u1",
+            json!({"type": 1, "text": "fix the staff lines"}),
+        );
+        insert(
+            "bubbleId:old:a1",
+            json!({"type": 2, "text": "Looking.", "timingInfo": {
+                "clientStartTime": 18_991_644.8, "clientRpcSendTime": send1,
+                "clientSettleTime": end1, "clientEndTime": end1}}),
+        );
+        insert(
+            "bubbleId:old:a2",
+            json!({"type": 2, "text": "", "toolFormerData": {
+                "name": "read_file", "toolCallId": "t1", "status": "completed",
+                "params": "{\"targetFile\":\"src/staff.ts\"}"}}),
+        );
+        insert(
+            "bubbleId:old:u2",
+            json!({"type": 1, "text": "still broken"}),
+        );
+        insert(
+            "bubbleId:old:a3",
+            json!({"type": 2, "text": "Fixed.", "timingInfo": {
+                "clientRpcSendTime": send2, "clientEndTime": end2}}),
+        );
+
+        let graphs =
+            load_cursor_session_graphs(&conn, "/tmp/state.vscdb").expect("graph load should work");
+        let iso = |ms: i64| ms_to_iso(ms).expect("valid ms");
+        let stamps: Vec<(Option<&str>, Option<String>)> = graphs[0]
+            .bubble_events
+            .iter()
+            .map(|event| (event.bubble_id.as_deref(), event.timestamp.clone()))
+            .collect();
+        assert_eq!(
+            stamps,
+            [
+                (Some("u1"), Some(iso(send1))),
+                (Some("a1"), Some(iso(send1))),
+                (Some("a2"), Some(iso(end1))),
+                (Some("u2"), Some(iso(send2))),
+                (Some("a3"), Some(iso(send2))),
+            ]
+        );
+        assert_eq!(graphs[0].tool_calls.len(), 1);
+        assert_eq!(graphs[0].tool_calls[0].timestamp, Some(iso(end1)));
     }
 
     #[test]

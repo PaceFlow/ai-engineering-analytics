@@ -124,7 +124,7 @@ fn env_override(env_var: &str) -> Option<PathBuf> {
 }
 
 fn default_cursor_user_roots() -> Vec<PathBuf> {
-    build_cursor_user_roots(dirs::config_dir(), dirs::home_dir())
+    build_cursor_user_roots(dirs::config_dir(), crate::path_utils::agent_home())
 }
 
 fn build_cursor_user_roots(config_dir: Option<PathBuf>, home_dir: Option<PathBuf>) -> Vec<PathBuf> {

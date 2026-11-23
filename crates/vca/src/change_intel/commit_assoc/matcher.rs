@@ -3,6 +3,7 @@ use rusqlite::{Connection, params};
 use std::collections::HashMap;
 
 use crate::change_intel::lockfiles::is_lock_file;
+use crate::change_intel::storage::SAME_REPOSITORY_ROOTS;
 use crate::change_intel::types::LineSide;
 
 use super::types::{CommitAttribution, GitCommitDiff, SessionAttributionRow};
@@ -13,6 +14,18 @@ const FALLBACK_MIN_MATCHED_LINES: i64 = 10;
 const FALLBACK_WINNER_MARGIN: f64 = 0.20;
 const HUMAN_PROVIDER: &str = "human";
 const HUMAN_SESSION_ID: &str = "__human__";
+/// A commit can only contain work from sessions that had started by then;
+/// this allows for clock differences between the agent and git.
+const SESSION_START_SLACK_MS: i64 = 60 * 60 * 1000;
+/// A session is linked to a commit only when it wrote a real part of it. A few
+/// shared lines (imports, braces, a changelog heading) match many unrelated
+/// commits and are not evidence.
+pub const MIN_SESSION_MATCHED_LINES: f64 = 10.0;
+pub const MIN_SESSION_SHARE_OF_COMMIT: f64 = 0.10;
+
+pub fn is_session_match_evidence(matched_lines: f64, share_of_commit: f64) -> bool {
+    matched_lines >= MIN_SESSION_MATCHED_LINES || share_of_commit >= MIN_SESSION_SHARE_OF_COMMIT
+}
 
 type SessionAvailabilityKey = (String, LineSide, String);
 type AliasCandidateKey = (LineSide, String);
@@ -50,6 +63,8 @@ struct SessionAvailability {
     provider: String,
     session_id: String,
     avail: i64,
+    /// Session start (epoch ms), when known.
+    started_ms: Option<i64>,
 }
 
 #[derive(Debug, Default)]
@@ -104,6 +119,7 @@ pub fn compute_commit_attribution(
         .sum();
     let commit_total = total_added + total_removed;
     let files = build_commit_files(commit);
+    let commit_ms = parse_ms(&commit.commit_time);
 
     let mut matched_added = 0i64;
     let mut matched_removed = 0i64;
@@ -111,7 +127,8 @@ pub fn compute_commit_attribution(
     let mut session_matched: HashMap<(String, String), f64> = HashMap::new();
 
     for file in files {
-        let strict_match = evaluate_file_match_for_path(preload, &file.rel_path, &file.rows);
+        let strict_match =
+            evaluate_file_match_for_path(preload, &file.rel_path, &file.rows, commit_ms);
         let strict_ratio = if file.total_lines > 0 {
             strict_match.matched_total() as f64 / file.total_lines as f64
         } else {
@@ -122,7 +139,8 @@ pub fn compute_commit_attribution(
             if let Some(alias_path) =
                 choose_fallback_alias_path(preload, &file.rel_path, &file.rows, file.total_lines)
             {
-                let alias_match = evaluate_file_match_for_path(preload, &alias_path, &file.rows);
+                let alias_match =
+                    evaluate_file_match_for_path(preload, &alias_path, &file.rows, commit_ms);
                 if alias_match.matched_total() > strict_match.matched_total() {
                     alias_match
                 } else {
@@ -172,8 +190,9 @@ pub fn compute_commit_attribution(
                 },
             },
         )
+        .filter(|row| is_session_match_evidence(row.matched_lines, row.share_of_commit))
         .collect();
-    if matched_total == 0 && session_rows.is_empty() {
+    if session_rows.is_empty() {
         session_rows.push(SessionAttributionRow {
             provider: HUMAN_PROVIDER.to_string(),
             session_id: HUMAN_SESSION_ID.to_string(),
@@ -227,15 +246,30 @@ fn build_commit_files(commit: &GitCommitDiff) -> Vec<FileCommitRows> {
     files
 }
 
+fn parse_ms(ts: &str) -> Option<i64> {
+    chrono::DateTime::parse_from_rfc3339(ts.trim())
+        .ok()
+        .map(|dt| dt.timestamp_millis())
+}
+
 fn evaluate_file_match_for_path(
     preload: &RepoMatchPreload,
     target_path: &str,
     rows: &[CommitHashRow],
+    commit_ms: Option<i64>,
 ) -> PathMatch {
     let mut out = PathMatch::default();
+    let started_in_time = |a: &&SessionAvailability| match (a.started_ms, commit_ms) {
+        (Some(started), Some(commit)) => started <= commit + SESSION_START_SLACK_MS,
+        _ => true,
+    };
 
     for row in rows {
-        let avail = preload.session_availability_for(target_path, row.side, &row.line_hash);
+        let avail: Vec<&SessionAvailability> = preload
+            .session_availability_for(target_path, row.side, &row.line_hash)
+            .iter()
+            .filter(started_in_time)
+            .collect();
         if avail.is_empty() {
             continue;
         }
@@ -347,14 +381,16 @@ fn load_session_availability_map(
     conn: &Connection,
     repo_root: &str,
 ) -> Result<HashMap<SessionAvailabilityKey, Vec<SessionAvailability>>> {
-    let mut stmt = conn.prepare(
-        "SELECT co.rel_path, hol.side, hol.line_hash, co.provider, co.session_id, MAX(hol.count) AS avail
+    let mut stmt = conn.prepare(&format!(
+        "SELECT co.rel_path, hol.side, hol.line_hash, co.provider, co.session_id, MAX(hol.count) AS avail,
+                MIN(ms.started_at)
          FROM fact_session_code_change co
-         JOIN fact_session_code_change_line_hashes hol ON hol.code_change_id = co.id
-         WHERE co.repo_root = ?1
+         CROSS JOIN fact_session_code_change_line_hashes hol ON hol.code_change_id = co.id
+         LEFT JOIN metadata_sessions ms ON ms.provider = co.provider AND ms.session_id = co.session_id
+         WHERE co.repo_root IN ({SAME_REPOSITORY_ROOTS})
            AND co.rel_path IS NOT NULL
-         GROUP BY co.rel_path, hol.side, hol.line_hash, co.provider, co.session_id",
-    )?;
+         GROUP BY co.rel_path, hol.side, hol.line_hash, co.provider, co.session_id"
+    ))?;
 
     let rows = stmt.query_map(params![repo_root], |row| {
         Ok((
@@ -365,6 +401,10 @@ fn load_session_availability_map(
                 provider: row.get::<_, String>(3)?,
                 session_id: row.get::<_, String>(4)?,
                 avail: row.get::<_, i64>(5)?,
+                started_ms: row
+                    .get::<_, Option<String>>(6)?
+                    .as_deref()
+                    .and_then(parse_ms),
             },
         ))
     })?;
@@ -384,14 +424,14 @@ fn load_alias_candidate_map(
     conn: &Connection,
     repo_root: &str,
 ) -> Result<HashMap<AliasCandidateKey, Vec<(String, i64)>>> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare(&format!(
         "SELECT co.rel_path, hol.side, hol.line_hash, MAX(hol.count) AS avail
          FROM fact_session_code_change co
          JOIN fact_session_code_change_line_hashes hol ON hol.code_change_id = co.id
-         WHERE co.repo_root = ?1
+         WHERE co.repo_root IN ({SAME_REPOSITORY_ROOTS})
            AND co.rel_path IS NOT NULL
-         GROUP BY co.rel_path, hol.side, hol.line_hash",
-    )?;
+         GROUP BY co.rel_path, hol.side, hol.line_hash"
+    ))?;
 
     let rows = stmt.query_map(params![repo_root], |row| {
         Ok((
@@ -472,6 +512,63 @@ mod tests {
     }
 
     #[test]
+    fn sessions_that_started_after_the_commit_get_no_credit() -> Result<()> {
+        let commit = sample_commit();
+        let commit_ms = parse_ms(&commit.commit_time).expect("sample commit time");
+        let mut preload = RepoMatchPreload::default();
+        let session = |id: &str, started_ms: i64| SessionAvailability {
+            provider: "claude".to_string(),
+            session_id: id.to_string(),
+            avail: 4,
+            started_ms: Some(started_ms),
+        };
+        preload.session_availability.insert(
+            ("src/lib.rs".to_string(), LineSide::Added, "h1".to_string()),
+            vec![
+                session("before", commit_ms - 3_600_000),
+                session("within_slack", commit_ms + 30 * 60_000),
+                session("days_later", commit_ms + 8 * 86_400_000),
+            ],
+        );
+        let (_, rows) = compute_commit_attribution(&commit, &preload)?;
+        let ids: Vec<&str> = rows.iter().map(|r| r.session_id.as_str()).collect();
+        assert_eq!(ids, ["before", "within_slack"]);
+        Ok(())
+    }
+
+    #[test]
+    fn edits_in_another_worktree_of_the_same_repository_match() -> Result<()> {
+        let conn = Connection::open_in_memory()?;
+        crate::db::init_app_schema(&conn)?;
+        crate::insights::observation::set_alias(&conn, "/w/issue-1/worktree", "git:repo", "git")?;
+        crate::insights::observation::set_alias(
+            &conn,
+            "/w/issue-2/workdir/repo",
+            "git:repo",
+            "git",
+        )?;
+        crate::insights::observation::set_alias(&conn, "/other", "git:other", "git")?;
+        for (session, root) in [("s1", "/w/issue-1/worktree"), ("s2", "/other")] {
+            conn.execute(
+                "INSERT INTO fact_session_code_change (provider, session_id, source_kind, repo_root, rel_path)
+                 VALUES ('opencode', ?1, 'accepted_change', ?2, 'src/lib.rs')",
+                params![session, root],
+            )?;
+            conn.execute(
+                "INSERT INTO fact_session_code_change_line_hashes VALUES (?1, '+', 'h1', 4)",
+                params![conn.last_insert_rowid()],
+            )?;
+        }
+
+        let preload = preload_repo_match_data(&conn, "/w/issue-2/workdir/repo")?;
+        let (_, rows) = compute_commit_attribution(&sample_commit(), &preload)?;
+
+        let ids: Vec<&str> = rows.iter().map(|r| r.session_id.as_str()).collect();
+        assert_eq!(ids, ["s1"]);
+        Ok(())
+    }
+
+    #[test]
     fn partially_matched_commit_does_not_get_human_remainder() -> Result<()> {
         let commit = sample_commit();
         let mut preload = RepoMatchPreload::default();
@@ -481,6 +578,7 @@ mod tests {
                 provider: "codex".to_string(),
                 session_id: "s1".to_string(),
                 avail: 4,
+                started_ms: None,
             }],
         );
 
@@ -496,6 +594,76 @@ mod tests {
                 .iter()
                 .all(|row| row.provider != HUMAN_PROVIDER)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn a_few_shared_lines_do_not_link_a_session_to_a_large_commit() -> Result<()> {
+        let mut commit = sample_commit();
+        commit.file_diffs[0].added_lines = 100;
+        commit.file_diffs[0].line_hashes = vec![
+            LineHashCount {
+                side: LineSide::Added,
+                line_hash: "brace".to_string(),
+                count: 2,
+            },
+            LineHashCount {
+                side: LineSide::Added,
+                line_hash: "body".to_string(),
+                count: 98,
+            },
+        ];
+        let mut preload = RepoMatchPreload::default();
+        let session = |id: &str, avail: i64| SessionAvailability {
+            provider: "opencode".to_string(),
+            session_id: id.to_string(),
+            avail,
+            started_ms: None,
+        };
+        preload.session_availability.insert(
+            (
+                "src/lib.rs".to_string(),
+                LineSide::Added,
+                "brace".to_string(),
+            ),
+            vec![session("unrelated", 2)],
+        );
+        preload.session_availability.insert(
+            (
+                "src/lib.rs".to_string(),
+                LineSide::Added,
+                "body".to_string(),
+            ),
+            vec![session("author", 12)],
+        );
+
+        let (_, rows) = compute_commit_attribution(&commit, &preload)?;
+
+        let ids: Vec<&str> = rows.iter().map(|r| r.session_id.as_str()).collect();
+        assert_eq!(ids, ["author"]);
+        Ok(())
+    }
+
+    #[test]
+    fn a_commit_with_only_weak_matches_is_human() -> Result<()> {
+        let mut commit = sample_commit();
+        commit.file_diffs[0].added_lines = 100;
+        commit.file_diffs[0].line_hashes[0].count = 100;
+        let mut preload = RepoMatchPreload::default();
+        preload.session_availability.insert(
+            ("src/lib.rs".to_string(), LineSide::Added, "h1".to_string()),
+            vec![SessionAvailability {
+                provider: "opencode".to_string(),
+                session_id: "unrelated".to_string(),
+                avail: 3,
+                started_ms: None,
+            }],
+        );
+
+        let (_, rows) = compute_commit_attribution(&commit, &preload)?;
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].session_id, HUMAN_SESSION_ID);
         Ok(())
     }
 
@@ -543,6 +711,7 @@ mod tests {
                 provider: "codex".to_string(),
                 session_id: "s1".to_string(),
                 avail: 50,
+                started_ms: None,
             }],
         );
 

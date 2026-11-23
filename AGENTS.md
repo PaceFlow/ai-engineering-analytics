@@ -25,5 +25,8 @@ Tests are a mix of inline unit tests under `#[cfg(test)]` blocks in the owning m
 ## Commit & Pull Request Guidelines
 Recent history uses short, imperative commit subjects such as `add task stats and task to commit association` and `ingest code change by default`. Keep commits narrowly scoped and write subjects in that style. Pull requests should explain the user-visible or analytics-impacting change, note schema or command changes, link related issues, and include example CLI output when behavior changes.
 
+## Learnings
+`LEARNINGS.md` records lessons from past incidents and investigations, such as write amplification, alias fan-out and how to measure ingest I/O. Read it before changing ingestion, commit association or migrations. When an investigation turns up something non-obvious, add a short entry there (what happened, why, the rule now) in the same change as the fix.
+
 ## Data & Configuration Notes
 This project analyzes local editor/session history and git metadata. Avoid committing local databases or generated reports, and document any new provider-specific assumptions in `README.md`.

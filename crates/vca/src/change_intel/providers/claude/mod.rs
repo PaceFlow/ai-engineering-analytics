@@ -41,9 +41,16 @@ pub fn ingest_claude_code_changes_from_sources(
                 }
             }
 
-            let parsed = shared::parse_session_file(source)?;
+            let mut parsed = shared::parse_session_file(source)?;
             if parsed.session_id.trim().is_empty() {
                 return Ok(());
+            }
+            let effective_id = crate::providers::claude::effective_session_id(source, &parsed);
+            if effective_id != parsed.session_id {
+                for write in &mut parsed.structured_writes {
+                    write.session_id = effective_id.clone();
+                }
+                parsed.session_id = effective_id;
             }
 
             summary.tool_calls_inspected += parsed.tool_call_count;

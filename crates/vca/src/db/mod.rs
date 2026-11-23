@@ -1,3 +1,5 @@
+pub mod session_store;
+
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::path::Path;
@@ -76,9 +78,13 @@ pub(crate) fn tune_connection(conn: &Connection) -> Result<()> {
 }
 
 pub fn init_app_schema(conn: &Connection) -> Result<()> {
+    let previous: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
     init_metadata_schema(conn)?;
 
     init_change_intel_schema(conn)?;
+    if previous > 0 && previous < 5 {
+        crate::insights::refresh(conn)?;
+    }
     Ok(())
 }
 
@@ -694,7 +700,13 @@ pub(crate) fn init_metadata_schema(conn: &Connection) -> Result<()> {
     ] {
         add_column_if_missing(conn, statement)?;
     }
+    for statement in session_store::SESSION_STORE_COLUMNS {
+        add_column_if_missing(conn, statement)?;
+    }
     conn.execute_batch(&indexes)?;
+    conn.execute_batch(session_store::SESSION_STORE_SCHEMA)?;
+    session_store::apply_data_migrations(conn)?;
+    crate::insights::init_schema(conn)?;
     conn.execute_batch(
         "CREATE INDEX IF NOT EXISTS idx_metadata_sessions_model
             ON metadata_sessions(model_id, provider);",
@@ -711,76 +723,11 @@ fn add_column_if_missing(conn: &Connection, statement: &str) -> Result<()> {
     let columns = query
         .query_map([], |row| row.get::<_, String>(1))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    if !columns.iter().any(|name| name == column) {
+    // A missing table is created later with the column already in it.
+    if !columns.is_empty() && !columns.iter().any(|name| name == column) {
         conn.execute_batch(statement)?;
     }
     Ok(())
-}
-
-pub fn session_exists(conn: &Connection, session_id: &str) -> Result<bool> {
-    let evidence_count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM metadata_sessions WHERE session_id = ?1",
-        params![session_id],
-        |row| row.get(0),
-    )?;
-    Ok(evidence_count > 0)
-}
-
-pub fn session_usage_exists(conn: &Connection, provider: &str, session_id: &str) -> Result<bool> {
-    let evidence_count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM fact_session_usage WHERE provider = ?1 AND session_id = ?2",
-        params![provider, session_id],
-        |row| row.get(0),
-    )?;
-    Ok(evidence_count > 0)
-}
-
-/// Batched equivalent of [`session_exists`] for many session_ids at once.
-///
-/// Returns the subset of `candidate_ids` that already exist in `metadata_sessions`.
-/// Provider filtering matches [`session_exists`] (i.e. none), so the same id
-/// ingested under a different provider will still be reported as present.
-///
-/// Candidates are chunked so we never exceed sqlite's compile-time variable
-/// limit, and duplicates are de-duplicated up front to avoid bloating the IN
-/// clause. This lets cursor ingest skip the expensive bubble-scan work for
-/// sessions that were already materialized on a previous run.
-pub fn sessions_present(
-    conn: &Connection,
-    candidate_ids: &[&str],
-) -> Result<std::collections::HashSet<String>> {
-    use std::collections::HashSet;
-
-    let mut present: HashSet<String> = HashSet::new();
-    if candidate_ids.is_empty() {
-        return Ok(present);
-    }
-
-    let mut unique: Vec<&str> = candidate_ids.to_vec();
-    unique.sort_unstable();
-    unique.dedup();
-
-    // Stay well under sqlite's default `SQLITE_MAX_VARIABLE_NUMBER` (32766
-    // on modern builds, 999 on very old ones); 500 is a safe, cache-friendly size.
-    const CHUNK: usize = 500;
-    for chunk in unique.chunks(CHUNK) {
-        let placeholders = std::iter::repeat_n("?", chunk.len())
-            .collect::<Vec<_>>()
-            .join(",");
-        let sql = format!(
-            "SELECT session_id FROM metadata_sessions WHERE session_id IN ({placeholders})"
-        );
-        let mut stmt = conn.prepare(&sql)?;
-        let params_iter = chunk.iter().map(|s| s as &dyn rusqlite::ToSql);
-        let rows = stmt.query_map(rusqlite::params_from_iter(params_iter), |row| {
-            row.get::<_, String>(0)
-        })?;
-        for row in rows {
-            present.insert(row?);
-        }
-    }
-
-    Ok(present)
 }
 
 fn derive_repo_root(project_path: Option<&str>, file_path: Option<&str>) -> Option<String> {
@@ -986,7 +933,16 @@ fn upsert_metadata_session_with_model_internal(
     model_name: Option<&str>,
     store_unknown_if_missing: bool,
 ) -> Result<()> {
-    let repo_root = derive_repo_root(project_path, source_path);
+    let recorded_root: Option<String> = conn
+        .query_row(
+            "SELECT project_root FROM fact_session_project WHERE provider=?1 AND session_id=?2",
+            params![provider, session_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let repo_root = recorded_root
+        .map(|root| path_to_string(&crate::path_utils::on_disk(Path::new(&root))))
+        .or_else(|| derive_repo_root(project_path, source_path));
     let repository_id = if let Some(repo_root) = repo_root.as_deref() {
         upsert_metadata_repository(conn, repo_root)?
     } else {
@@ -1267,15 +1223,15 @@ pub fn ingest_session_message(
     )
 }
 
+/// Stores one accepted change and returns the repository root it was assigned to.
 pub fn ingest_accepted_code_change(
     conn: &Connection,
     provider: &str,
     session_id: &str,
-    file_path: &str,
-    lines_added: i64,
-    lines_removed: i64,
-    timestamp: Option<&str>,
-) -> Result<()> {
+    change: &session_store::AcceptedChangeRecord,
+) -> Result<Option<String>> {
+    let file_path = change.abs_path.as_str();
+    let timestamp = change.ts.as_deref();
     let metadata = load_session_metadata(conn, provider, session_id)?;
     let repo_root = metadata
         .repo_root
@@ -1303,9 +1259,17 @@ pub fn ingest_accepted_code_change(
         repo_root.as_deref(),
         file_path,
         rel_path.as_deref(),
-        lines_added,
-        lines_removed,
-    )
+        change.lines_added,
+        change.lines_removed,
+    )?;
+    if !change.line_hashes.is_empty() {
+        replace_fact_session_code_change_line_hashes(
+            conn,
+            conn.last_insert_rowid(),
+            &change.line_hashes,
+        )?;
+    }
+    Ok(repo_root)
 }
 
 fn next_usage_index(conn: &Connection, provider: &str, session_id: &str) -> Result<i64> {
@@ -1912,7 +1876,7 @@ mod tests {
         )?;
         assert_eq!(
             repo_row.0,
-            std::fs::canonicalize(&repo_root)?.to_string_lossy()
+            crate::path_utils::canonicalize(&repo_root)?.to_string_lossy()
         );
         assert_eq!(repo_row.1, "sample-repo");
 

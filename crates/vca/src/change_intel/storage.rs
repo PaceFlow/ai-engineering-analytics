@@ -43,6 +43,50 @@ pub fn replace_line_hashes(
     db::replace_fact_session_code_change_line_hashes(conn, op_id, line_hashes)
 }
 
+/// Every recorded path of the repository at `?1`: worktrees and clones that
+/// `repository_alias` maps to the same canonical repository, including `?1` itself.
+pub const SAME_REPOSITORY_ROOTS: &str = "SELECT ?1 UNION SELECT alias FROM repository_alias
+     WHERE canonical = COALESCE((SELECT canonical FROM repository_alias WHERE alias = ?1), ?1)";
+
+/// Paths of the repository that store commits. Only these read the dirty-hash queue:
+/// commits are kept under the path they were scanned from, and a path's first scan
+/// matches its commits against every stored edit anyway.
+const SAME_REPOSITORY_COMMIT_ROOTS: &str = "SELECT root FROM (
+         SELECT ?1 AS root UNION SELECT alias FROM repository_alias
+         WHERE canonical = COALESCE((SELECT canonical FROM repository_alias WHERE alias = ?1), ?1)
+     ) WHERE EXISTS (SELECT 1 FROM fact_commit c WHERE c.repo_root = root)";
+
+/// Marks session line hashes for re-association in every path of the repository that
+/// stores commits, so commits scanned from a different worktree than the edit are
+/// re-matched. Paths without commits (removed Multica workdirs, worktrees scanned from
+/// their shared root) get no queue: nothing would ever read or clear it, and fanning
+/// every edit out to hundreds of such paths made re-reads write hundreds of GB.
+pub fn mark_hashes_dirty(
+    conn: &Connection,
+    repo_root: &str,
+    hashes: &BTreeSet<(String, String)>,
+) -> Result<()> {
+    if hashes.is_empty() {
+        return Ok(());
+    }
+    let roots = conn
+        .prepare_cached(SAME_REPOSITORY_COMMIT_ROOTS)?
+        .query_map(params![repo_root], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for root in roots {
+        bump_repo_session_facts_version(conn, &root)?;
+        insert_dirty_hashes(conn, &root, hashes)?;
+    }
+    Ok(())
+}
+
+pub fn dirty_hash_keys(line_hashes: &[LineHashCount]) -> BTreeSet<(String, String)> {
+    line_hashes
+        .iter()
+        .map(|h| (h.side.as_str().to_string(), h.line_hash.clone()))
+        .collect()
+}
+
 #[derive(Debug, Clone)]
 pub struct RepoAssocState {
     pub session_facts_version: i64,
@@ -138,8 +182,7 @@ pub fn reconcile_source_tool_writes(
         if hashes.is_empty() {
             continue;
         }
-        bump_repo_session_facts_version(conn, &repo_root)?;
-        insert_dirty_hashes(conn, &repo_root, &hashes)?;
+        mark_hashes_dirty(conn, &repo_root, &hashes)?;
         summary.repos_marked_dirty += 1;
     }
 
@@ -268,13 +311,13 @@ pub fn insert_dirty_hashes(
     repo_root: &str,
     hashes: &BTreeSet<(String, String)>,
 ) -> Result<()> {
+    let mut stmt = conn.prepare_cached(
+        "INSERT INTO commit_assoc_dirty_hash (repo_root, side, line_hash)
+         VALUES (?1, ?2, ?3)
+         ON CONFLICT(repo_root, side, line_hash) DO NOTHING",
+    )?;
     for (side, line_hash) in hashes {
-        conn.execute(
-            "INSERT INTO commit_assoc_dirty_hash (repo_root, side, line_hash)
-             VALUES (?1, ?2, ?3)
-             ON CONFLICT(repo_root, side, line_hash) DO NOTHING",
-            params![repo_root, side, line_hash],
-        )?;
+        stmt.execute(params![repo_root, side, line_hash])?;
     }
     Ok(())
 }

@@ -27,6 +27,7 @@ impl TestEnv {
             .current_dir(&self.home)
             .env("PACEFLOW_HOME", &self.home)
             .env("VCA_HOME", &self.home)
+            .env("VCA_PRICING_OFFLINE", "1")
             .env_remove("VCA_GITHUB_TOKEN")
             .env("HOME", &self.home)
             .env("USERPROFILE", &self.home)

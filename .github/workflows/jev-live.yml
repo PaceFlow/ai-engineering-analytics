@@ -1,0 +1,35 @@
+name: Jev Live
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  jev-live:
+    name: jev-live
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    env:
+      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_KEY }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Check live test configuration
+        id: config
+        shell: bash
+        run: |
+          if [ -z "$OPENROUTER_API_KEY" ]; then
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Skip live Jev test
+        if: steps.config.outputs.enabled != 'true'
+        run: |
+          echo "Skipping live Jev test: missing OPENROUTER_KEY secret"
+      - name: Run live Jev test
+        if: steps.config.outputs.enabled == 'true'
+        run: cargo test -p vibe-coding-analytics --test jev_live -- --ignored --nocapture --test-threads=1
