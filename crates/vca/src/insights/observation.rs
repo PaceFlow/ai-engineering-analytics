@@ -460,6 +460,11 @@ mod tests {
         let c = Connection::open_in_memory()?;
         crate::db::init_app_schema(&c)?;
         set_alias(&c, "/removed/ws/issue-1/workdir/repo", "git:repo", "git")?;
+        // Commits of the repository were scanned from issue-1.
+        c.execute(
+            "INSERT INTO fact_commit (repo_root, commit_sha, commit_time, subject) VALUES ('/removed/ws/issue-1/workdir/repo', 'c1', '2026-11-01T00:00:00Z', 's')",
+            [],
+        )?;
         c.execute(
             "INSERT INTO fact_session_code_change (provider, session_id, source_kind, repo_root, rel_path)
              VALUES ('opencode', 's', 'accepted_change', '/removed/ws/issue-2/workdir', 'a.rs')",
@@ -483,6 +488,11 @@ mod tests {
             |r| r.get(0),
         )?;
         assert_eq!(queued, 1);
+        // issue-2 stores no commits, so nothing would ever read a queue there.
+        let all: i64 = c.query_row("SELECT COUNT(*) FROM commit_assoc_dirty_hash", [], |r| {
+            r.get(0)
+        })?;
+        assert_eq!(all, 1);
         Ok(())
     }
 
